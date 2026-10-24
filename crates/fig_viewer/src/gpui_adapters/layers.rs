@@ -244,13 +244,17 @@ fn context_actions_with_kind(
         if inherited_lock {
             return matches!(
                 action,
-                Action::Copy | Action::CopyPasteAs | Action::GoToMainComponent
+                Action::Copy | Action::CopyPasteAs | Action::GoToMainComponent | Action::AddToAgent
             );
         }
         if locked {
             return matches!(
                 action,
-                Action::Copy | Action::CopyPasteAs | Action::LockUnlock | Action::GoToMainComponent
+                Action::Copy
+                    | Action::CopyPasteAs
+                    | Action::LockUnlock
+                    | Action::GoToMainComponent
+                    | Action::AddToAgent
             );
         }
         match action {
@@ -288,7 +292,10 @@ pub(crate) fn restrict_read_only(items: &mut [LayersPanelItem]) {
             actions.retain(|action| {
                 matches!(
                     action,
-                    Action::Copy | Action::CopyPasteAs | Action::GoToMainComponent
+                    Action::Copy
+                        | Action::CopyPasteAs
+                        | Action::GoToMainComponent
+                        | Action::AddToAgent
                 )
             });
         }
@@ -563,7 +570,17 @@ mod tests {
         assert!(!context_actions(&doc, frame).contains(&Action::ConvertToSection));
         for id in [frame, text, rectangle, image] {
             assert!(!context_actions(&doc, id).contains(&Action::SendToFigmaMake));
+            assert!(context_actions(&doc, id).contains(&Action::AddToAgent));
         }
+        // Mentioning a layer edits nothing, so locked layers keep the action.
+        doc.scene
+            .get_mut(frame)
+            .expect("frame")
+            .flags
+            .insert(fanta_doc::NodeFlags::LOCKED);
+        assert!(context_actions(&doc, frame).contains(&Action::AddToAgent));
+        assert!(context_actions(&doc, text).contains(&Action::AddToAgent));
+        assert!(!context_actions(&doc, text).contains(&Action::EditText));
     }
 
     #[test]
@@ -805,7 +822,10 @@ mod tests {
             .flags
             .insert(fanta_doc::NodeFlags::LOCKED);
         let actions = context_actions(&doc, child);
-        assert_eq!(actions, vec![Action::Copy, Action::CopyPasteAs]);
+        assert_eq!(
+            actions,
+            vec![Action::Copy, Action::CopyPasteAs, Action::AddToAgent]
+        );
         let parent_actions = context_actions(&doc, parent);
         assert!(parent_actions.contains(&Action::LockUnlock));
         let mut tree = layers_tree(&doc, None, &HashSet::from([parent]));
@@ -815,7 +835,10 @@ mod tests {
                 .flat_map(|item| item.context_actions.as_ref().expect("policy"))
                 .all(|action| matches!(
                     action,
-                    Action::Copy | Action::CopyPasteAs | Action::GoToMainComponent
+                    Action::Copy
+                        | Action::CopyPasteAs
+                        | Action::GoToMainComponent
+                        | Action::AddToAgent
                 ))
         );
     }

@@ -440,7 +440,7 @@ impl UserMessage {
                         MentionUri::PastedImage { .. } => {
                             debug_panic!("pasted image URI should not be used in mention content")
                         }
-                        MentionUri::CanvasSelection { name } => {
+                        MentionUri::CanvasSelection { name, .. } => {
                             let content = escape_json_for_tagged_context(content);
                             canvas_selection_context.push_str(&format!(
                                 "\nCanvas snapshot {}:\n{}",
@@ -9754,6 +9754,7 @@ mod tests {
     fn test_canvas_selection_resource_keeps_its_immutable_snapshot() {
         let uri = MentionUri::CanvasSelection {
             name: "Canvas selection — Home".to_owned(),
+            nodes: Vec::new(),
         };
         let snapshot = r#"{"page":"Home","selected":[{"id":"1:2"}]}"#;
         let original = UserMessageContent::Mention {
@@ -9780,6 +9781,7 @@ mod tests {
             content: vec![UserMessageContent::Mention {
                 uri: MentionUri::CanvasSelection {
                     name: "Canvas selection — Home (1 layer)".to_string(),
+                    nodes: Vec::new(),
                 },
                 content: snapshot.into(),
             }]
@@ -9813,6 +9815,7 @@ mod tests {
             content: vec![UserMessageContent::Mention {
                 uri: MentionUri::CanvasSelection {
                     name: name.to_string(),
+                    nodes: Vec::new(),
                 },
                 content: snapshot.into(),
             }]

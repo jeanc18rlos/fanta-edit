@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::str::FromStr as _;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -391,6 +392,20 @@ impl DesignSurface for FigDesignSurface {
 
     fn has_open_design(&self, _cx: &App) -> bool {
         self.item().is_ok()
+    }
+
+    fn reveal_nodes(&self, node_ids: &[String], cx: &mut App) -> Result<()> {
+        let item = self.item()?;
+        let nodes = node_ids
+            .iter()
+            .map(|id| NodeId::from_str(id).with_context(|| format!("invalid layer id {id}")))
+            .collect::<Result<Vec<_>>>()?;
+        anyhow::ensure!(!nodes.is_empty(), "no layers to show");
+        let view = active_view_for_item(item.entity_id(), cx);
+        item.update(cx, |_, cx| {
+            cx.emit(crate::document::FigItemEvent::RevealNodes { nodes, view })
+        });
+        Ok(())
     }
 
     fn design_review_prompt(&self, ultra: bool, cx: &mut App) -> Result<String> {

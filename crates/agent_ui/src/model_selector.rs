@@ -43,6 +43,20 @@ enum ModelPickerEntry {
     Model(AgentModelInfo, bool),
 }
 
+/// How many models the composer's model menu lists at the top level when
+/// there are no favorites.
+const MENU_PRIMARY_MODELS: usize = 8;
+
+/// The models the composer's model menu lists.
+#[derive(Debug, Default, Clone)]
+pub struct ModelMenuModels {
+    /// The top level: the favorites or, without favorites, the active model's
+    /// group, always including the active model.
+    pub primary: Vec<AgentModelInfo>,
+    /// Every other model, by group, for the More Models submenu.
+    pub more: Vec<(SharedString, Vec<AgentModelInfo>)>,
+}
+
 pub struct ModelPickerDelegate {
     selector: Rc<dyn AgentModelSelector>,
     filtered_entries: Vec<ModelPickerEntry>,
@@ -133,6 +147,95 @@ impl ModelPickerDelegate {
         self.favorites.len()
     }
 
+    pub fn menu_models(&self) -> ModelMenuModels {
+        let mut primary: Vec<AgentModelInfo> = Vec::new();
+        let groups: Vec<(Option<&SharedString>, &Vec<AgentModelInfo>)> = match &self.models {
+            Some(AgentModelList::Flat(models)) => vec![(None, models)],
+            Some(AgentModelList::Grouped(groups)) => groups
+                .iter()
+                .map(|(name, models)| (Some(&name.0), models))
+                .collect(),
+            None => Vec::new(),
+        };
+        let active = self.selected_model.as_ref();
+        if self.favorites.is_empty() {
+            let active_group = groups
+                .iter()
+                .find(|(_, models)| {
+                    active.is_some_and(|active| models.iter().any(|model| model.id == active.id))
+                })
+                .or(groups.first());
+            if let Some((_, models)) = active_group {
+                primary.extend(models.iter().take(MENU_PRIMARY_MODELS).cloned());
+            }
+        } else {
+            for model in groups.iter().flat_map(|(_, models)| models.iter()) {
+                if self.favorites.contains(&model.id)
+                    && !primary.iter().any(|listed| listed.id == model.id)
+                {
+                    primary.push(model.clone());
+                }
+            }
+        }
+        if let Some(active) = active
+            && !primary.iter().any(|listed| listed.id == active.id)
+        {
+            primary.insert(0, active.clone());
+        }
+        let more = groups
+            .into_iter()
+            .filter_map(|(name, models)| {
+                let rest = models
+                    .iter()
+                    .filter(|model| !primary.iter().any(|listed| listed.id == model.id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!rest.is_empty()).then(|| (name.cloned().unwrap_or_else(|| "Models".into()), rest))
+            })
+            .collect();
+        ModelMenuModels { primary, more }
+    }
+
+    /// Selects the model with `id`, as confirming it in the picker would.
+    pub fn select_model_with_id(
+        &mut self,
+        id: &AgentModelId,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        let model = match &self.models {
+            Some(AgentModelList::Flat(models)) => models.iter().find(|model| &model.id == id),
+            Some(AgentModelList::Grouped(groups)) => {
+                groups.values().flatten().find(|model| &model.id == id)
+            }
+            None => None,
+        };
+        if let Some(model) = model.filter(|model| model.disabled.is_none()).cloned() {
+            self.select(model, window, cx);
+        }
+    }
+
+    fn select(
+        &mut self,
+        model: AgentModelInfo,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        self.selector
+            .select_model(model.id.clone(), cx)
+            .detach_and_log_err(cx);
+        let id = model.id.clone();
+        self.selected_model = Some(model);
+        // Keep the picker selection aligned with the newly-selected model
+        if let Some(new_index) = self.filtered_entries.iter().position(
+            |entry| matches!(entry, ModelPickerEntry::Model(model_info, _) if model_info.id == id),
+        ) {
+            self.set_selected_index(new_index, window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
     pub fn cycle_favorite_models(&mut self, window: &mut Window, cx: &mut Context<Picker<Self>>) {
         if self.favorites.is_empty() {
             return;
@@ -169,22 +272,8 @@ impl ModelPickerDelegate {
             (current_index_in_favorites + 1) % favorite_models.len()
         };
 
-        let next_model = favorite_models[next_index].clone();
-
-        self.selector
-            .select_model(next_model.id.clone(), cx)
-            .detach_and_log_err(cx);
-
-        self.selected_model = Some(next_model);
-
-        // Keep the picker selection aligned with the newly-selected model
-        if let Some(new_index) = self.filtered_entries.iter().position(|entry| {
-            matches!(entry, ModelPickerEntry::Model(model_info, _) if self.selected_model.as_ref().is_some_and(|selected| model_info.id == selected.id))
-        }) {
-            self.set_selected_index(new_index, window, cx);
-        } else {
-            cx.notify();
-        }
+        let next_model = (*favorite_models[next_index]).clone();
+        self.select(next_model, window, cx);
     }
 }
 
@@ -493,7 +582,7 @@ async fn fuzzy_search(
 
 #[cfg(test)]
 mod tests {
-    use gpui::{App, TestAppContext, VisualTestContext};
+    use gpui::{App, TestAppContext, VisualTestContext, WindowHandle};
     use std::cell::RefCell;
 
     use super::*;
@@ -598,6 +687,122 @@ mod tests {
             })
             .unwrap();
 
+        assert_eq!(
+            model_selector.selected_models.borrow().as_slice(),
+            &[AgentModelId::new("manual")]
+        );
+    }
+
+    fn menu_test_picker(
+        cx: &mut TestAppContext,
+    ) -> (
+        Rc<TestModelSelector>,
+        WindowHandle<ModelSelector>,
+        VisualTestContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+        let model_selector = Rc::new(TestModelSelector::new());
+        let window_handle = cx.add_window({
+            let model_selector = model_selector.clone();
+            move |window, cx| {
+                let selector: Rc<dyn AgentModelSelector> = model_selector;
+                acp_model_selector(selector, cx.focus_handle(), window, cx)
+            }
+        });
+        cx.run_until_parked();
+        let cx = VisualTestContext::from_window(window_handle.into(), cx);
+        (model_selector, window_handle, cx)
+    }
+
+    fn menu_model_names(models: &[AgentModelInfo]) -> Vec<&str> {
+        models.iter().map(|model| model.name.as_ref()).collect()
+    }
+
+    #[gpui::test]
+    fn menu_models_list_favorites_and_the_active_model_then_group_the_rest(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, window_handle, mut cx) = menu_test_picker(cx);
+        window_handle
+            .update(&mut cx, |picker, _, _| {
+                let delegate = &mut picker.delegate;
+                delegate.models = Some(create_model_list(vec![
+                    ("Anthropic", vec!["opus", "sonnet", "haiku"]),
+                    ("OpenAI", vec!["gpt", "mini"]),
+                ]));
+                delegate.favorites = create_favorites(vec!["sonnet", "mini"]);
+                delegate.selected_model = Some(AgentModelInfo {
+                    id: AgentModelId::new("opus"),
+                    name: "opus".into(),
+                    description: None,
+                    icon: None,
+                    is_latest: false,
+                    disabled: None,
+                    cost: None,
+                });
+                let menu = delegate.menu_models();
+                assert_eq!(menu_model_names(&menu.primary), ["opus", "sonnet", "mini"]);
+                assert_eq!(
+                    menu.more
+                        .iter()
+                        .map(|(group, models)| (group.as_ref(), menu_model_names(models)))
+                        .collect::<Vec<_>>(),
+                    [("Anthropic", vec!["haiku"]), ("OpenAI", vec!["gpt"])]
+                );
+            })
+            .expect("picker window");
+    }
+
+    #[gpui::test]
+    fn menu_models_without_favorites_list_the_active_models_group(cx: &mut TestAppContext) {
+        let (_, window_handle, mut cx) = menu_test_picker(cx);
+        window_handle
+            .update(&mut cx, |picker, _, _| {
+                let delegate = &mut picker.delegate;
+                delegate.models = Some(create_model_list(vec![
+                    ("Anthropic", vec!["opus", "sonnet"]),
+                    ("OpenAI", vec!["gpt", "mini"]),
+                ]));
+                delegate.favorites = HashSet::default();
+                delegate.selected_model = Some(AgentModelInfo {
+                    id: AgentModelId::new("mini"),
+                    name: "mini".into(),
+                    description: None,
+                    icon: None,
+                    is_latest: false,
+                    disabled: None,
+                    cost: None,
+                });
+                let menu = delegate.menu_models();
+                assert_eq!(menu_model_names(&menu.primary), ["gpt", "mini"]);
+                assert_eq!(menu.more.len(), 1);
+                assert_eq!(menu.more[0].0.as_ref(), "Anthropic");
+            })
+            .expect("picker window");
+    }
+
+    #[gpui::test]
+    fn selecting_a_menu_model_selects_it(cx: &mut TestAppContext) {
+        let (model_selector, window_handle, mut cx) = menu_test_picker(cx);
+        window_handle
+            .update(&mut cx, |picker, window, cx| {
+                picker
+                    .delegate
+                    .select_model_with_id(&AgentModelId::new("manual"), window, cx);
+                assert_eq!(
+                    picker
+                        .delegate
+                        .active_model()
+                        .map(|model| model.name.as_ref()),
+                    Some("Manual")
+                );
+            })
+            .expect("picker window");
         assert_eq!(
             model_selector.selected_models.borrow().as_slice(),
             &[AgentModelId::new("manual")]

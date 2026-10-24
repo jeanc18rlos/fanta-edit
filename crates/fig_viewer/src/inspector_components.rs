@@ -121,6 +121,11 @@ impl RenderOnce for CollapsibleIconTab {
             ),
             Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint()),
             move |tab, delta| {
+                if selected && delta >= 1. {
+                    // Settled: size to the label, which the measured width can
+                    // undershoot by a few pixels and clip.
+                    return tab;
+                }
                 let width = if selected {
                     collapsed_width + (expanded_width - collapsed_width) * delta
                 } else {

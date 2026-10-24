@@ -26,6 +26,9 @@ pub enum MentionUri {
     },
     CanvasSelection {
         name: String,
+        /// The selected layers' ids (`n_…`), which a click on the mention
+        /// selects and reveals on the canvas.
+        nodes: Vec<String>,
     },
     Directory {
         abs_path: PathBuf,
@@ -185,9 +188,19 @@ impl MentionUri {
                         single_query_param(&url, "name")?.unwrap_or_else(|| "Image".to_string());
                     Ok(Self::PastedImage { name })
                 } else if path.starts_with("/agent/canvas-selection") {
-                    let name = single_query_param(&url, "name")?
-                        .unwrap_or_else(|| "Canvas selection".to_string());
-                    Ok(Self::CanvasSelection { name })
+                    let mut name = None;
+                    let mut nodes = Vec::new();
+                    for (key, value) in url.query_pairs() {
+                        match key.as_ref() {
+                            "name" if name.is_none() => name = Some(value.into_owned()),
+                            "node" => nodes.push(value.into_owned()),
+                            _ => bail!("invalid query parameter"),
+                        }
+                    }
+                    Ok(Self::CanvasSelection {
+                        name: name.unwrap_or_else(|| "Canvas selection".to_string()),
+                        nodes,
+                    })
                 } else if path.starts_with("/agent/untitled-buffer") {
                     let fragment = url
                         .fragment()
@@ -349,7 +362,7 @@ impl MentionUri {
                 .to_string_lossy()
                 .into_owned(),
             MentionUri::PastedImage { name } => name.clone(),
-            MentionUri::CanvasSelection { name } => name.clone(),
+            MentionUri::CanvasSelection { name, .. } => name.clone(),
             MentionUri::Symbol { name, .. } => name.clone(),
             MentionUri::Thread { name, .. } => name.clone(),
             MentionUri::Rule { name, .. } => name.clone(),
@@ -439,6 +452,9 @@ impl MentionUri {
             MentionUri::Skill {
                 skill_file_path, ..
             } => Some(skill_file_path.to_string_lossy().into_owned().into()),
+            MentionUri::CanvasSelection { nodes, .. } if !nodes.is_empty() => {
+                Some("Show on Canvas".into())
+            }
             _ => None,
         }
     }
@@ -481,10 +497,16 @@ impl MentionUri {
                 url.query_pairs_mut().append_pair("name", name);
                 url
             }
-            MentionUri::CanvasSelection { name } => {
+            MentionUri::CanvasSelection { name, nodes } => {
                 let mut url = Url::parse("fanta:///agent/canvas-selection")
                     .expect("the static canvas selection URI is valid");
-                url.query_pairs_mut().append_pair("name", name);
+                {
+                    let mut query = url.query_pairs_mut();
+                    query.append_pair("name", name);
+                    for node in nodes {
+                        query.append_pair("node", node);
+                    }
+                }
                 url
             }
             MentionUri::Directory { abs_path } => {
@@ -1435,11 +1457,23 @@ mod tests {
     fn test_canvas_selection_uri_round_trip() {
         let mention = MentionUri::CanvasSelection {
             name: "Canvas selection (3 layers)".to_owned(),
+            nodes: vec!["n_01JB7Y0N7Z3X1".to_owned(), "n_01JB7Y0N7Z3X2".to_owned()],
         };
         let uri = mention.to_uri();
         assert_eq!(
             MentionUri::parse(uri.as_str(), PathStyle::local()).expect("parse canvas selection"),
             mention
+        );
+        assert_eq!(
+            MentionUri::parse(
+                "fanta:///agent/canvas-selection?name=Home",
+                PathStyle::local()
+            )
+            .expect("parse a mention without layer ids"),
+            MentionUri::CanvasSelection {
+                name: "Home".to_owned(),
+                nodes: Vec::new(),
+            }
         );
     }
 

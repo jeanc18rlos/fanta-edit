@@ -13535,6 +13535,7 @@ mod tests {
             crate::attach_canvas_selection_for_review(
                 workspace.clone(),
                 name.to_string(),
+                vec!["n_01JB7Y0N7Z3X1".to_string()],
                 content.to_string(),
                 window,
                 cx,
@@ -13545,6 +13546,7 @@ mod tests {
 
         let expected_uri = MentionUri::CanvasSelection {
             name: name.to_string(),
+            nodes: vec!["n_01JB7Y0N7Z3X1".to_string()],
         }
         .to_uri()
         .to_string();
@@ -13594,6 +13596,7 @@ mod tests {
             crate::attach_canvas_selection_for_review(
                 workspace.clone(),
                 first_name.to_string(),
+                vec!["n_01JB7Y0N7Z3X1".to_string()],
                 first_content.to_string(),
                 window,
                 cx,
@@ -13602,6 +13605,7 @@ mod tests {
             crate::attach_canvas_selection_for_review(
                 workspace.clone(),
                 second_name.to_string(),
+                vec!["n_01JB7Y0N7Z3X1".to_string()],
                 second_content.to_string(),
                 window,
                 cx,
@@ -13619,6 +13623,7 @@ mod tests {
             (
                 MentionUri::CanvasSelection {
                     name: first_name.to_string(),
+                    nodes: vec!["n_01JB7Y0N7Z3X1".to_string()],
                 }
                 .to_uri()
                 .to_string(),
@@ -13627,6 +13632,7 @@ mod tests {
             (
                 MentionUri::CanvasSelection {
                     name: second_name.to_string(),
+                    nodes: vec!["n_01JB7Y0N7Z3X1".to_string()],
                 }
                 .to_uri()
                 .to_string(),

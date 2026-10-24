@@ -205,8 +205,10 @@ fn open_mention_uri(
         MentionUri::Fetch { url } => {
             cx.open_url(url.as_str());
         }
+        MentionUri::CanvasSelection { nodes, .. } => {
+            crate::reveal_canvas_selection(&nodes, workspace, cx);
+        }
         MentionUri::PastedImage { .. }
-        | MentionUri::CanvasSelection { .. }
         | MentionUri::Selection { abs_path: None, .. }
         | MentionUri::Diagnostics { .. }
         | MentionUri::TerminalSelection { .. }

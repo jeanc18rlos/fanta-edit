@@ -665,6 +665,16 @@ The toolbar's **Replace content**, **Rewrite text**, **Translate text** and
 **Rename layers** commands open a draft in the Agent Panel with the current page
 and selection context. Review and send that prompt to request the edit.
 
+**Add to Agent**, in the canvas and layers context menus, mentions the selected
+layers in the Agent Panel's draft with a snapshot the agent reads. The mention
+is a link: clicking it in the draft or a sent message selects those layers and
+brings them into view, switching pages when needed.
+
+The Agent Panel's model button opens a menu of favorite models (or, with no
+favorites, the current provider's), **More Models** grouped by provider, and
+**Search Models…**. For models with reasoning effort, its **Effort** submenu
+picks the level (or turns thinking off) and the button shows the current effort.
+
 External agents connect to the local live MCP surface. Core tools include
 `get_editor_state`, `batch_get`, `batch_design`, `get_screenshot`,
 `get_guidelines`, `read_fnx_source` and `validate_fnx_source`; design-system,

@@ -1276,6 +1276,15 @@ impl FigView {
                         cx.notify();
                     }
                 }
+                FigItemEvent::RevealNodes { nodes, view } => {
+                    let follows = match view {
+                        Some(view) => *view == cx.entity_id(),
+                        None => this.is_focused,
+                    };
+                    if follows {
+                        this.reveal_nodes(nodes, cx);
+                    }
+                }
             }
             cx.notify();
         })
@@ -2899,6 +2908,52 @@ impl FigView {
             },
             cx,
         );
+    }
+
+    /// Select `nodes` and frame them, switching to their page first: what
+    /// clicking an Agent mention of them does. Nodes that no longer exist are
+    /// skipped.
+    pub(crate) fn reveal_nodes(&mut self, nodes: &[NodeId], cx: &mut Context<Self>) {
+        let selected_page = self.selected_page_index();
+        let target = self.item.read(cx).document().and_then(|document| {
+            let nodes = nodes
+                .iter()
+                .copied()
+                .filter(|node| document.doc.scene.contains(*node))
+                .collect::<Vec<_>>();
+            let page = document.page_index_of_node(*nodes.first()?);
+            Some((nodes, page, document.page_index(selected_page)))
+        });
+        let Some((nodes, page, current_page)) = target else {
+            show_canvas_notice_deferred(
+                "These layers are no longer in this design.".to_string(),
+                cx,
+            );
+            return;
+        };
+        if let Some(page) = page
+            && Some(page) != current_page
+        {
+            if self.item.read(cx).source_edit_locked() {
+                show_canvas_notice_deferred(
+                    "Save or discard source edits before showing layers on another page."
+                        .to_string(),
+                    cx,
+                );
+                return;
+            }
+            self.select_page(page, cx);
+        }
+        self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with(nodes.clone());
+                ((), DocChange::Selection)
+            });
+        });
+        match nodes.as_slice() {
+            [node] => self.focus_node(*node, cx),
+            _ => self.zoom_to_selection(cx),
+        }
     }
 
     // === Tool routing =====================================================
@@ -21171,7 +21226,7 @@ mod tests {
             view.read_with(&visual, |view, _| {
                 assert!(view.canvas_context_menu.is_some());
             });
-            visual.simulate_keystrokes("home down down down down down enter");
+            visual.simulate_keystrokes("home down down down down down down enter");
         } else {
             mounted_canvas_click(&mut visual, position, 1);
             mounted_canvas_click(&mut visual, position, 2);
@@ -21775,7 +21830,7 @@ mod tests {
             view.read_with(&visual, |view, _| {
                 assert!(view.canvas_context_menu.is_some())
             });
-            visual.simulate_keystrokes("home down down down down down enter");
+            visual.simulate_keystrokes("home down down down down down down enter");
             view.read_with(&visual, |view, _| assert_anchors(view));
         } else {
             mounted_canvas_click(&mut visual, position, 1);
@@ -23187,41 +23242,37 @@ impl FigView {
     /// trip.
     #[cfg(feature = "fanta-gpui-ui")]
     fn open_toolbar_agent_attachment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let workspace = window
+        if self.add_selection_to_agent(window, cx) {
+            return;
+        }
+        let Some(workspace) = window
             .root::<MultiWorkspace>()
             .flatten()
-            .map(|multi_workspace| multi_workspace.read(cx).workspace().clone());
-        let Some(workspace) = workspace else {
+            .map(|multi_workspace| multi_workspace.read(cx).workspace().clone())
+        else {
+            return;
+        };
+        if let Err(error) = agent_ui::open_agent_add_context_menu(workspace, window, cx) {
+            log::error!("opening the toolbar Agent attachment workflow failed: {error:#}");
             show_canvas_notice(
-                "This window has no workspace for the Agent Panel.".to_string(),
+                format!("The Agent attachment workflow could not be opened: {error:#}"),
                 window,
                 cx,
             );
-            return;
-        };
-        match self.agent_canvas_selection_snapshot(cx) {
-            Ok(Some((name, content))) => {
-                if let Err(error) = agent_ui::attach_canvas_selection_for_review(
-                    workspace, name, content, window, cx,
-                ) {
-                    log::error!("attaching the canvas selection failed: {error:#}");
-                    show_canvas_notice(
-                        format!("The canvas selection could not be attached: {error:#}"),
-                        window,
-                        cx,
-                    );
-                }
-            }
-            Ok(None) => {
-                if let Err(error) = agent_ui::open_agent_add_context_menu(workspace, window, cx) {
-                    log::error!("opening the toolbar Agent attachment workflow failed: {error:#}");
-                    show_canvas_notice(
-                        format!("The Agent attachment workflow could not be opened: {error:#}"),
-                        window,
-                        cx,
-                    );
-                }
-            }
+        }
+    }
+
+    /// Mention the selected layers in the Agent Panel's draft: a link that
+    /// selects them again when clicked, carrying a snapshot the agent reads.
+    /// Returns false, having done nothing, when nothing is selected.
+    pub(crate) fn add_selection_to_agent(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let selection = match self.agent_canvas_selection_snapshot(cx) {
+            Ok(Some(selection)) => selection,
+            Ok(None) => return false,
             Err(error) => {
                 log::error!("snapshotting the canvas selection failed: {error:#}");
                 show_canvas_notice(
@@ -23229,15 +23280,43 @@ impl FigView {
                     window,
                     cx,
                 );
+                return true;
             }
+        };
+        let Some(workspace) = window
+            .root::<MultiWorkspace>()
+            .flatten()
+            .map(|multi_workspace| multi_workspace.read(cx).workspace().clone())
+        else {
+            show_canvas_notice(
+                "This window has no workspace for the Agent Panel.".to_string(),
+                window,
+                cx,
+            );
+            return true;
+        };
+        if let Err(error) = agent_ui::attach_canvas_selection_for_review(
+            workspace,
+            selection.name,
+            selection.nodes,
+            selection.content,
+            window,
+            cx,
+        ) {
+            log::error!("attaching the canvas selection failed: {error:#}");
+            show_canvas_notice(
+                format!("The canvas selection could not be attached: {error:#}"),
+                window,
+                cx,
+            );
         }
+        true
     }
 
-    #[cfg(feature = "fanta-gpui-ui")]
-    fn agent_canvas_selection_snapshot(
+    pub(crate) fn agent_canvas_selection_snapshot(
         &self,
         cx: &App,
-    ) -> anyhow::Result<Option<(String, String)>> {
+    ) -> anyhow::Result<Option<AgentCanvasSelection>> {
         let item = self.item.read(cx);
         let Some(document) = item.document() else {
             return Ok(None);
@@ -23344,13 +23423,35 @@ impl FigView {
                 );
             }
         };
-        let noun = if selected_count == 1 {
-            "layer"
-        } else {
-            "layers"
+        let name = match doc.selection.as_slice() {
+            [node] => doc
+                .scene
+                .get(*node)
+                .map(|node| node.name.trim())
+                .filter(|name| !name.is_empty())
+                .map_or_else(
+                    || "Untitled layer".to_string(),
+                    |name| {
+                        crate::agent_surface::truncate_summary_string(
+                            name,
+                            crate::agent_surface::SUMMARY_LABEL_CHARS,
+                        )
+                    },
+                ),
+            _ => format!("{selected_count} layers on {scope_name}"),
         };
-        let name = format!("Canvas selection — {scope_name} ({selected_count} {noun})");
-        Ok(Some((name, content)))
+        let included = nodes.len();
+        let nodes = doc
+            .selection
+            .iter()
+            .take(included)
+            .map(|node| node.to_string())
+            .collect();
+        Ok(Some(AgentCanvasSelection {
+            name,
+            nodes,
+            content,
+        }))
     }
 
     #[cfg(feature = "fanta-gpui-ui")]
@@ -23548,10 +23649,16 @@ pub(crate) const CANVAS_NOTICE_ID: &str = "fanta-canvas-notice";
 /// How many selected layers a toolbar Agent prompt lists by id.
 #[cfg(feature = "fanta-gpui-ui")]
 const AGENT_PROMPT_CONTEXT_LAYERS: usize = 8;
-#[cfg(feature = "fanta-gpui-ui")]
 const AGENT_ATTACHMENT_CONTEXT_LAYERS: usize = 64;
-#[cfg(feature = "fanta-gpui-ui")]
 const AGENT_ATTACHMENT_MAX_BYTES: usize = 128 * 1024;
+
+/// The selection the Agent Panel's draft mentions: its label, the layers a
+/// click on the mention reveals, and the snapshot the agent reads.
+pub(crate) struct AgentCanvasSelection {
+    pub(crate) name: String,
+    pub(crate) nodes: Vec<String>,
+    pub(crate) content: String,
+}
 
 /// The draft prompt a text-editing toolbar command opens in the Agent Panel.
 /// Generation commands open the dedicated generation workspace.

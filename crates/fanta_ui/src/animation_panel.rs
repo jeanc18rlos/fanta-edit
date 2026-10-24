@@ -128,8 +128,10 @@ impl RenderOnce for AnimationPropertyRow {
             .id(self.id)
             .debug_selector(|| property_selector)
             .mx_2()
-            .h_10()
+            .my_0p5()
+            .min_h_10()
             .px_2()
+            .py_1()
             .gap_2()
             .items_center()
             .rounded_md()
@@ -147,7 +149,7 @@ impl RenderOnce for AnimationPropertyRow {
                 Icon::new(property.icon())
                     .size(IconSize::Small)
                     .color(if enabled {
-                        Color::Default
+                        Color::Muted
                     } else {
                         Color::Disabled
                     }),
@@ -158,17 +160,19 @@ impl RenderOnce for AnimationPropertyRow {
                     .min_w_0()
                     .child(
                         Label::new(property.label())
-                            .size(LabelSize::Small)
                             .color(if enabled {
                                 Color::Default
                             } else {
                                 Color::Disabled
-                            }),
+                            })
+                            .single_line(),
                     )
                     .children(self.subtitle.map(|subtitle| {
                         Label::new(subtitle)
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Small)
                             .color(Color::Muted)
+                            .single_line()
+                            .truncate()
                     })),
             )
             .children(on_remove.map(|handler| {
@@ -179,7 +183,8 @@ impl RenderOnce for AnimationPropertyRow {
                             format!("fanta-animation-remove-{}", property.label()),
                             IconName::Close,
                         )
-                        .icon_size(IconSize::XSmall)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
                         .tooltip(Tooltip::text("Remove animation"))
                         .disabled(!enabled)
                         .on_click(move |_, window, cx| handler(window, cx)),
@@ -211,13 +216,17 @@ impl AnimationDetailHeader {
 impl RenderOnce for AnimationDetailHeader {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         h_flex()
-            .h_11()
+            .h_10()
             .px_3()
             .gap_2()
             .items_center()
             .border_b_1()
             .border_color(cx.theme().colors().border_variant)
-            .child(Icon::new(self.property.icon()).size(IconSize::Small))
+            .child(
+                Icon::new(self.property.icon())
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
             .child(Label::new(self.property.label()).weight(FontWeight::SEMIBOLD))
             .child(div().flex_1())
             .children(self.on_close.map(|handler| {
@@ -226,6 +235,7 @@ impl RenderOnce for AnimationDetailHeader {
                     .child(
                         IconButton::new("fanta-animation-detail-close", IconName::Close)
                             .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
                             .tooltip(Tooltip::text("Close animation details"))
                             .on_click(move |_, window, cx| handler(window, cx)),
                     )

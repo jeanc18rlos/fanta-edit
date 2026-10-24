@@ -418,7 +418,7 @@ impl Render for CommentsPanel {
             .border_b_1()
             .border_color(cx.theme().colors().border_variant)
             .child(
-                div().min_w_0().child(
+                div().flex_1().min_w_0().child(
                     Label::new(if self.rows.is_empty() {
                         "No threads".to_string()
                     } else {

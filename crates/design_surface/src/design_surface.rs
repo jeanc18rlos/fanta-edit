@@ -335,6 +335,12 @@ pub trait DesignSurface: 'static {
         anyhow::bail!("this design surface cannot prepare design reviews")
     }
 
+    /// Select the layers with these ids (`n_…`) on the open design and
+    /// bring them into view: what clicking a canvas-selection mention does.
+    fn reveal_nodes(&self, _node_ids: &[String], _cx: &mut App) -> Result<()> {
+        anyhow::bail!("this design surface cannot reveal layers")
+    }
+
     /// Place a new comment on the canvas as an agent.
     fn add_comment(&self, _draft: CommentDraft, _cx: &mut App) -> Result<serde_json::Value> {
         anyhow::bail!("this design surface cannot add comments")

@@ -180,6 +180,7 @@ pub fn open_agent_add_context_menu(
 pub fn attach_canvas_selection_for_review(
     workspace: Entity<Workspace>,
     name: String,
+    nodes: Vec<String>,
     content: String,
     window: &mut Window,
     cx: &mut App,
@@ -196,7 +197,7 @@ pub fn attach_canvas_selection_for_review(
         .read(cx)
         .panel::<AgentPanel>(cx)
         .ok_or_else(|| anyhow::anyhow!("the Agent Panel is not available in this workspace"))?;
-    let mention = MentionUri::CanvasSelection { name };
+    let mention = MentionUri::CanvasSelection { name, nodes };
     let block = acp::ContentBlock::Resource(acp::EmbeddedResource::new(
         acp::EmbeddedResourceResource::TextResourceContents(acp::TextResourceContents::new(
             content,
@@ -214,6 +215,35 @@ pub fn attach_canvas_selection_for_review(
         workspace.focus_panel::<AgentPanel>(window, cx);
     });
     Ok(())
+}
+
+/// Selects and reveals a canvas-selection mention's layers on the open
+/// design; a toast says why when it cannot.
+pub(crate) fn reveal_canvas_selection(
+    nodes: &[String],
+    workspace: &mut Workspace,
+    cx: &mut Context<Workspace>,
+) {
+    let result = (|| {
+        anyhow::ensure!(
+            !nodes.is_empty(),
+            "this selection was attached before mentions linked to their layers"
+        );
+        let surface = design_surface::active(cx)
+            .ok_or_else(|| anyhow::anyhow!("open the design these layers belong to"))?;
+        surface.reveal_nodes(nodes, cx)
+    })();
+    if let Err(error) = result {
+        struct RevealCanvasSelectionToast;
+        workspace.show_toast(
+            workspace::Toast::new(
+                workspace::notifications::NotificationId::unique::<RevealCanvasSelectionToast>(),
+                format!("Could not show the layers: {error:#}"),
+            )
+            .autohide(),
+            cx,
+        );
+    }
 }
 
 pub(crate) fn resolve_agent_image(

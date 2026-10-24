@@ -29,10 +29,13 @@ for provider routing, catalog and service-acceptance limits. `design_system` exp
 the supported variable, collection, mode, binding, and component schema; agents
 should inspect it before creating foundations.
 
-The composer displays Thinking and an effort slider using the selected model's
-reported capabilities. Unsupported models show an unavailable state. Effort
-selection changes the actual request and is persisted for matching configured
-models. It does not expose private reasoning or add unsupported provider options.
+The composer's model button opens a menu built from the selected model's
+reported capabilities: an **Effort** submenu for models with effort levels, a
+**Thinking** toggle for models that only switch thinking on or off, and neither
+for models without reasoning controls. The button shows the current effort.
+Effort selection changes the actual request and is persisted for matching
+configured models. It does not expose private reasoning or add unsupported
+provider options.
 
 Generated fenced code folds while streaming and stays folded after completion.
 Manual expansion remains stable as new text arrives. A single source writer opens
