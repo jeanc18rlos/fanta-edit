@@ -13,7 +13,9 @@ journey has passed.
 
 ## V2 implementation additions
 
-AI Review and Ultrareview prepare a manual-send draft in the Review profile.
+AI Review and Ultrareview start from the Agent Panel's new-thread menu (also
+the Design menu and the canvas toolbar) and prepare a manual-send draft in the
+Review profile.
 Agents can create anchored findings with severity, category and a review run id;
 the pin follows its layer and falls back to its saved position if the layer is
 deleted. A suggested design-op fix is applied explicitly from its thread as one
@@ -185,7 +187,10 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   All, OS-error Discard and cold recovery are not covered by that route. These
   internal QA results do not establish fa47 or shipping acceptance. See the
   [current scoped results](../alpha/CAPABILITY_COVERAGE.md#current-fa47-hosted-results-and-build44-native-samples--11-october).
-- The **Code** workspace edits FNX and supported JSON sources. Saving valid
+- The **Code** workspace edits FNX and supported JSON sources, and lists the
+  project's `doc/variables.json` (editable) and `fanta.json` and `workspace.fnx`
+  (read-only) beside the page pair; opening it from Variables shows
+  `variables.json`. Saving valid
   source updates the canvas; invalid drafts preserve the last valid file and
   scene. Multi-buffer Save is sequential, not atomic: in a bounded build39 check,
   valid FNX was saved before a second invalid JSON draft was rejected. Cancel
@@ -575,7 +580,11 @@ Implementation: [component actions](../../crates/fig_viewer/src/component_action
   overlays, supported links and property-animation bindings. Presentation
   provides frame navigation/restart and restores the editor viewport on exit.
 - **Comments:** canvas pins, threads/replies, resolve and motion anchors;
-  supported rich messages and agent attribution persist in the project.
+  supported rich messages and agent attribution persist in the project. In a
+  composer, Enter posts, Shift-Enter adds a line and Escape cancels. The
+  Comments panel lists each thread by its opening message; opening one shows
+  every message and a reply composer on a page of the panel, with a back
+  button to the list. A pin click still opens the thread on the canvas.
 - **Measurements and annotations:** persistent review metadata, editing and
   undo, with unsent annotation drafts preserved through navigation. Review
   overlays do not become artwork in exports.
@@ -647,9 +656,24 @@ instructions, prepare design assets, follow source edits and report agent
 activity. Plan/Review and editing modes have distinct write permissions. See
 [AI_DESIGNER.md](../alpha/AI_DESIGNER.md).
 
+**Plan & Build** (the Agent Panel's new-thread menu, the Design menu or
+`/plan-build`) opens an empty thread in the Plan profile for the open design.
+The agent reads the canvas and proposes a plan without editing; **Apply plan**
+switches the thread to Write and builds it on the canvas.
+
 The toolbar's **Replace content**, **Rewrite text**, **Translate text** and
 **Rename layers** commands open a draft in the Agent Panel with the current page
 and selection context. Review and send that prompt to request the edit.
+
+**Add to Agent**, in the canvas and layers context menus, mentions the selected
+layers in the Agent Panel's draft with a snapshot the agent reads. The mention
+is a link: clicking it in the draft or a sent message selects those layers and
+brings them into view, switching pages when needed.
+
+The Agent Panel's model button opens a menu of favorite models (or, with no
+favorites, the current provider's), **More Models** grouped by provider, and
+**Search Models…**. For models with reasoning effort, its **Effort** submenu
+picks the level (or turns thinking off) and the button shows the current effort.
 
 External agents connect to the local live MCP surface. Core tools include
 `get_editor_state`, `batch_get`, `batch_design`, `get_screenshot`,

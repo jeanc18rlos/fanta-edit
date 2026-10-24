@@ -6,6 +6,7 @@ use fanta_doc::{
     Color as FantaColor, Doc, Easing, Interpolation, Keyframe, KeyframeId, MotionProperty,
     MotionTarget, MotionTransform, NodeId, Operation, ResolvedVarValue, Transaction,
 };
+use fanta_gpui::molecules::{InspectorFieldAccess, InspectorMetrics, inspector_field_frame};
 use fanta_ui::animation_panel::{AnimationDetailHeader, AnimationProperty, AnimationPropertyRow};
 use fanta_ui::inspector::{InspectorEmptyState, InspectorFieldRow, InspectorSection};
 use gpui::{
@@ -201,6 +202,21 @@ fn motion_property_id(property: TimelineProperty) -> &'static str {
         TimelineProperty::Opacity => "opacity",
         TimelineProperty::FillColor => "fill-color",
     }
+}
+
+fn motion_property_caption(caption: &'static str) -> Label {
+    Label::new(caption)
+        .size(LabelSize::Small)
+        .color(Color::Muted)
+}
+
+/// Two fields sharing a row, or one at full width.
+fn motion_property_pair(cells: Vec<AnyElement>) -> gpui::Div {
+    h_flex().w_full().min_w_0().gap_2().children(
+        cells
+            .into_iter()
+            .map(|cell| div().flex_1().min_w_0().child(cell)),
+    )
 }
 
 fn motion_property_suffix(property: TimelineProperty) -> Option<&'static str> {
@@ -996,6 +1012,7 @@ impl FantaMotionPanel {
     fn render_numeric_property(
         &self,
         property: TimelineProperty,
+        prefix: Option<&'static str>,
         value: Option<ResolvedVarValue>,
         editable: bool,
         cx: &mut Context<Self>,
@@ -1004,25 +1021,24 @@ impl FantaMotionPanel {
             .as_ref()
             .and_then(|value| motion_numeric_value(property, value));
         let editing = self.editing_property == Some(property);
-        let colors = cx.theme().colors().clone();
-        let cell = h_flex()
-            .id(format!(
-                "fanta-motion-property-{}",
-                motion_property_id(property)
-            ))
-            .h_7()
-            .w_full()
-            .min_w_0()
-            .px_2()
-            .gap_1()
-            .rounded_sm()
-            .border_1()
-            .border_color(if editing {
-                colors.border_focused
-            } else {
-                colors.border_variant
-            })
-            .bg(colors.editor_background);
+        let access = if editable && numeric.is_some() {
+            InspectorFieldAccess::Editable
+        } else {
+            InspectorFieldAccess::ReadOnly { reason: None }
+        };
+        let cell = inspector_field_frame(
+            format!("fanta-motion-property-{}", motion_property_id(property)),
+            &access,
+            InspectorMetrics::default(),
+            cx,
+        )
+        .w_full()
+        .when(editing, |cell| {
+            cell.border_color(cx.theme().colors().border_focused)
+        })
+        .when_some(prefix, |cell, prefix| {
+            cell.child(Label::new(prefix).color(Color::Muted))
+        });
         #[cfg(test)]
         let cell = cell.debug_selector({
             let property = motion_property_id(property);
@@ -1031,14 +1047,19 @@ impl FantaMotionPanel {
         let mut cell = if editing {
             cell.child(div().flex_1().min_w_0().child(self.field_editor.clone()))
         } else {
-            let display: SharedString = numeric
-                .map(format_number)
-                .unwrap_or_else(|| "Unavailable".to_string())
-                .into();
+            let display: SharedString = match numeric {
+                // `+ 0.0` turns a negative zero into zero, which reads as "-0".
+                Some(numeric) => format!(
+                    "{}{}",
+                    format_number(numeric + 0.0),
+                    motion_property_suffix(property).unwrap_or_default()
+                ),
+                None => "Unavailable".to_string(),
+            }
+            .into();
             cell.child(
                 div().flex_1().min_w_0().overflow_hidden().child(
                     Label::new(display)
-                        .size(LabelSize::Small)
                         .color(if editable && numeric.is_some() {
                             Color::Default
                         } else {
@@ -1048,19 +1069,10 @@ impl FantaMotionPanel {
                 ),
             )
         };
-        if !editing && let Some(suffix) = motion_property_suffix(property) {
-            cell = cell.child(
-                Label::new(suffix)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            );
-        }
         if editable && let (Some(value), Some(_)) = (value, numeric) {
-            cell = cell
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.start_numeric_property(property, value.clone(), window, cx);
-                }));
+            cell = cell.on_click(cx.listener(move |this, _, window, cx| {
+                this.start_numeric_property(property, value.clone(), window, cx);
+            }));
         }
         cell.into_any_element()
     }
@@ -1079,7 +1091,7 @@ impl FantaMotionPanel {
         let mut swatch = div()
             .id("fanta-motion-property-fill-swatch")
             .relative()
-            .size(px(18.))
+            .size(px(14.))
             .flex_none()
             .rounded_sm()
             .border_1()
@@ -1119,47 +1131,119 @@ impl FantaMotionPanel {
                 ),
             );
         }
-        h_flex()
-            .id("fanta-motion-property-fill-color")
-            .h_7()
-            .w_full()
-            .min_w_0()
-            .px_2()
-            .gap_2()
-            .rounded_sm()
-            .border_1()
-            .border_color(colors.border_variant)
-            .bg(colors.editor_background)
-            .child(swatch)
-            .child(
-                Label::new(
-                    color
-                        .map(FantaColor::to_hex)
-                        .unwrap_or_else(|| "Unavailable".to_string()),
-                )
-                .size(LabelSize::Small)
-                .color(if editable && color.is_some() {
-                    Color::Default
-                } else {
-                    Color::Muted
-                })
-                .single_line(),
+        let access = if editable && color.is_some() {
+            InspectorFieldAccess::Editable
+        } else {
+            InspectorFieldAccess::ReadOnly { reason: None }
+        };
+        inspector_field_frame(
+            "fanta-motion-property-fill-color",
+            &access,
+            InspectorMetrics::default(),
+            cx,
+        )
+        .w_full()
+        .child(swatch)
+        .child(
+            Label::new(
+                color
+                    .map(|color| color.to_hex().trim_start_matches('#').to_string())
+                    .unwrap_or_else(|| "Unavailable".to_string()),
             )
-            .into_any_element()
+            .color(if editable && color.is_some() {
+                Color::Default
+            } else {
+                Color::Muted
+            })
+            .single_line(),
+        )
+        .into_any_element()
     }
 
-    fn render_motion_property(
+    /// The values at the playhead, laid out like the Design inspector:
+    /// paired fields under a caption, X and Y named inside their fields.
+    fn render_playhead_properties(
         &self,
-        snapshot: MotionPropertySnapshot,
+        mut properties: Vec<MotionPropertySnapshot>,
         editable: bool,
         cx: &mut Context<Self>,
-    ) -> InspectorFieldRow {
-        let value = if snapshot.property == TimelineProperty::FillColor {
-            self.render_fill_property(snapshot.value, editable, cx)
-        } else {
-            self.render_numeric_property(snapshot.property, snapshot.value, editable, cx)
+    ) -> gpui::Div {
+        let mut take = |property: TimelineProperty| {
+            properties
+                .iter()
+                .position(|snapshot| snapshot.property == property)
+                .map(|index| properties.remove(index))
         };
-        InspectorFieldRow::new(snapshot.property.label(), value)
+        let mut grid = v_flex().w_full().min_w_0().px_4().pb_3().gap_2();
+        for (caption, fields) in [
+            (
+                "Position",
+                [
+                    (TimelineProperty::PositionX, "X"),
+                    (TimelineProperty::PositionY, "Y"),
+                ],
+            ),
+            (
+                "Scale",
+                [
+                    (TimelineProperty::ScaleX, "X"),
+                    (TimelineProperty::ScaleY, "Y"),
+                ],
+            ),
+        ] {
+            let cells = fields
+                .into_iter()
+                .filter_map(|(property, prefix)| {
+                    take(property).map(|snapshot| {
+                        self.render_numeric_property(
+                            property,
+                            Some(prefix),
+                            snapshot.value,
+                            editable,
+                            cx,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !cells.is_empty() {
+                grid = grid.child(
+                    v_flex()
+                        .gap_1()
+                        .child(motion_property_caption(caption))
+                        .child(motion_property_pair(cells)),
+                );
+            }
+        }
+        let captioned = [TimelineProperty::Rotation, TimelineProperty::Opacity]
+            .into_iter()
+            .filter_map(|property| {
+                take(property).map(|snapshot| {
+                    v_flex()
+                        .gap_1()
+                        .child(motion_property_caption(property.label()))
+                        .child(self.render_numeric_property(
+                            property,
+                            None,
+                            snapshot.value,
+                            editable,
+                            cx,
+                        ))
+                        .into_any_element()
+                })
+            })
+            .collect::<Vec<_>>();
+        if !captioned.is_empty() {
+            grid = grid.child(motion_property_pair(captioned));
+        }
+        if let Some(fill) = take(TimelineProperty::FillColor) {
+            grid = grid.child(
+                v_flex()
+                    .gap_1()
+                    .child(motion_property_caption("Fill"))
+                    .child(self.render_fill_property(fill.value, editable, cx)),
+            );
+        }
+        grid
     }
 
     fn render_detail(
@@ -1505,9 +1589,7 @@ impl Render for FantaMotionPanel {
                     editable && auto_keyframe && !playing && active_clip.is_some();
                 let property_section =
                     InspectorSection::new("fanta-motion-playhead-properties", "At playhead")
-                        .children(properties.into_iter().map(|property| {
-                            self.render_motion_property(property, property_editable, cx)
-                        }));
+                        .child(self.render_playhead_properties(properties, property_editable, cx));
                 let property_hint = if active_clip.is_none() {
                     "Create or select an animation clip to edit properties."
                 } else if playing {
@@ -1540,17 +1622,17 @@ impl Render for FantaMotionPanel {
                     });
                     DropdownMenu::new(
                         "fanta-motion-clip-selector",
-                        clip_name.unwrap_or_else(|| "Select animation clip".into()),
+                        clip_name.unwrap_or_else(|| "Select clip".into()),
                         menu,
                     )
-                    .style(DropdownStyle::Outlined)
+                    .style(DropdownStyle::Subtle)
                     .trigger_size(ButtonSize::Compact)
-                    .full_width(true)
                     .into_any_element()
                 } else {
-                    Label::new(clip_name.unwrap_or_else(|| "No animation clip yet".into()))
-                        .size(LabelSize::XSmall)
+                    Label::new(clip_name.unwrap_or_else(|| "No clip yet".into()))
+                        .size(LabelSize::Small)
                         .color(Color::Muted)
+                        .single_line()
                         .into_any_element()
                 };
                 let mut content = v_flex()
@@ -1559,19 +1641,27 @@ impl Render for FantaMotionPanel {
                     .min_h_0()
                     .overflow_y_scroll()
                     .child(
-                        v_flex()
-                            .px_3()
-                            .py_2()
-                            .gap_1()
-                            .child(Label::new(node_name).single_line())
-                            .child(clip_control),
+                        h_flex()
+                            .h_10()
+                            .px_4()
+                            .gap_2()
+                            .child(
+                                div().flex_1().min_w_0().child(
+                                    Label::new(node_name)
+                                        .weight(gpui::FontWeight::SEMIBOLD)
+                                        .single_line()
+                                        .truncate(),
+                                ),
+                            )
+                            .child(div().flex_none().child(clip_control)),
                     )
-                    .child(property_section)
                     .child(
-                        div().px_3().pb_2().child(
-                            Label::new(property_hint)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
+                        property_section.child(
+                            div().px_4().pb_3().child(
+                                Label::new(property_hint)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
                         ),
                     )
                     .child(animation_section);
@@ -2202,6 +2292,12 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             release_channel::init(semver::Version::new(0, 0, 0), cx);
             editor::init(cx);
+            #[cfg(feature = "fanta-gpui-ui")]
+            {
+                gpui_component::init(cx);
+                fanta_gpui::init(cx);
+                crate::theme_bridge::init(cx);
+            }
             let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
                 settings::DEFAULT_KEYMAP_PATH,
                 cx,

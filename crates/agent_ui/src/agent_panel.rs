@@ -24,9 +24,9 @@ use serde::{Deserialize, Serialize};
 use fanta_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
     agent::{
-        AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
-        ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
-        ResolveConflictsWithAgent, ReviewBranchDiff, SelectAgent,
+        AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, PlanAndBuildDesign,
+        ReauthenticateAgent, ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
+        ResolveConflictsWithAgent, ReviewBranchDiff, ReviewDesign, SelectAgent, UltrareviewDesign,
     },
     assistant::{
         FocusAgent, ManageSkills, OpenGlobalAgentsMdRules, OpenProjectAgentsMdRules, Toggle,
@@ -101,6 +101,86 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
     item::{ItemEvent, ItemHandle},
 };
+
+/// The Fanta Agent threads the agent panel starts for the open design.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DesignThread {
+    /// A Review draft for the active page.
+    Review,
+    /// A Review draft that reviews every page in focused passes.
+    Ultrareview,
+    /// A Plan thread: the agent plans the brief the user writes, and Apply
+    /// plan builds it on the canvas.
+    PlanAndBuild,
+}
+
+impl DesignThread {
+    fn profile(self) -> &'static str {
+        match self {
+            Self::Review | Self::Ultrareview => agent_settings::builtin_profiles::REVIEW,
+            Self::PlanAndBuild => agent_settings::builtin_profiles::PLAN,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Review | Self::Ultrareview => "the design review",
+            Self::PlanAndBuild => "Plan & Build",
+        }
+    }
+}
+
+/// Opens a Fanta Agent thread about the open design. Reviews start as drafts
+/// whose prompt the canvas supplies through the design surface, and the user
+/// sends them; Plan & Build starts empty for the user's brief.
+fn open_design_thread(
+    workspace: &mut Workspace,
+    kind: DesignThread,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let result = (|| {
+        anyhow::ensure!(
+            !workspace.root_paths(cx).is_empty(),
+            "open a project before starting {}",
+            kind.name()
+        );
+        let surface = design_surface::active(cx)
+            .with_context(|| format!("{} needs the design editor", kind.name()))?;
+        let initial_content = match kind {
+            DesignThread::Review | DesignThread::Ultrareview => {
+                let prompt = surface.design_review_prompt(kind == DesignThread::Ultrareview, cx)?;
+                let prompt =
+                    ExternalSourcePrompt::new(&prompt).context("the review prompt was empty")?;
+                Some(AgentInitialContent::from(prompt))
+            }
+            DesignThread::PlanAndBuild => {
+                anyhow::ensure!(surface.has_open_design(cx), "open a design first");
+                None
+            }
+        };
+        let panel = workspace
+            .panel::<AgentPanel>(cx)
+            .context("the agent panel is not available in this workspace")?;
+        workspace.reveal_panel::<AgentPanel>(window, cx);
+        panel.update(cx, |panel, cx| {
+            panel.new_design_thread(kind.profile(), initial_content, window, cx)
+        });
+        workspace.focus_panel::<AgentPanel>(window, cx);
+        anyhow::Ok(())
+    })();
+    if let Err(error) = result {
+        struct DesignThreadToast;
+        workspace.show_toast(
+            workspace::Toast::new(
+                workspace::notifications::NotificationId::unique::<DesignThreadToast>(),
+                format!("Could not start {}: {error:#}", kind.name()),
+            )
+            .autohide(),
+            cx,
+        );
+    }
+}
 
 const AGENT_PANEL_KEY: &str = "agent_panel";
 const MIN_PANEL_WIDTH: Pixels = px(300.);
@@ -533,6 +613,15 @@ pub fn init(cx: &mut App) {
                             );
                         });
                     }
+                })
+                .register_action(|workspace, _: &ReviewDesign, window, cx| {
+                    open_design_thread(workspace, DesignThread::Review, window, cx);
+                })
+                .register_action(|workspace, _: &UltrareviewDesign, window, cx| {
+                    open_design_thread(workspace, DesignThread::Ultrareview, window, cx);
+                })
+                .register_action(|workspace, _: &PlanAndBuildDesign, window, cx| {
+                    open_design_thread(workspace, DesignThread::PlanAndBuild, window, cx);
                 })
                 .register_action(|workspace, action: &ReviewBranchDiff, window, cx| {
                     let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
@@ -4536,9 +4625,12 @@ impl AgentPanel {
         })
     }
 
-    pub(crate) fn new_design_review_thread(
+    /// Starts a Fanta Agent thread in `profile`; the profile is applied once
+    /// the native thread exists.
+    pub(crate) fn new_design_thread(
         &mut self,
-        prompt: ExternalSourcePrompt,
+        profile: &'static str,
+        initial_content: Option<AgentInitialContent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -4548,7 +4640,7 @@ impl AgentPanel {
             None,
             None,
             None,
-            Some(AgentInitialContent::from(prompt)),
+            initial_content,
             None,
             AgentThreadSource::AgentPanel,
             window,
@@ -4557,10 +4649,7 @@ impl AgentPanel {
         let conversation = thread.conversation_view.clone();
         if let Some(native) = conversation.read(cx).as_native_thread(cx) {
             native.update(cx, |thread, cx| {
-                thread.set_profile(
-                    agent_settings::AgentProfileId(agent_settings::builtin_profiles::REVIEW.into()),
-                    cx,
-                )
+                thread.set_profile(agent_settings::AgentProfileId(profile.into()), cx)
             });
         } else {
             let applied = Cell::new(false);
@@ -4572,12 +4661,7 @@ impl AgentPanel {
                     }
                     if let Some(native) = conversation.read(cx).as_native_thread(cx) {
                         native.update(cx, |thread, cx| {
-                            thread.set_profile(
-                                agent_settings::AgentProfileId(
-                                    agent_settings::builtin_profiles::REVIEW.into(),
-                                ),
-                                cx,
-                            )
+                            thread.set_profile(agent_settings::AgentProfileId(profile.into()), cx)
                         });
                         applied.set(true);
                     }
@@ -6137,6 +6221,42 @@ impl AgentPanel {
                                         }
                                     }),
                             )
+                        })
+                        .map(|menu| {
+                            let design_available = design_surface::active(cx)
+                                .is_some_and(|surface| surface.has_open_design(cx));
+                            menu.separator()
+                                .header("Design")
+                                .item(
+                                    ContextMenuEntry::new("Plan & Build")
+                                        .icon(IconName::ListTodo)
+                                        .icon_color(Color::Muted)
+                                        .disabled(!design_available || is_via_collab)
+                                        .action(Box::new(PlanAndBuildDesign))
+                                        .handler(|window, cx| {
+                                            window.dispatch_action(Box::new(PlanAndBuildDesign), cx)
+                                        }),
+                                )
+                                .item(
+                                    ContextMenuEntry::new("AI Review")
+                                        .icon(IconName::Eye)
+                                        .icon_color(Color::Muted)
+                                        .disabled(!design_available || is_via_collab)
+                                        .action(Box::new(ReviewDesign))
+                                        .handler(|window, cx| {
+                                            window.dispatch_action(Box::new(ReviewDesign), cx)
+                                        }),
+                                )
+                                .item(
+                                    ContextMenuEntry::new("Ultrareview")
+                                        .icon(IconName::CheckDouble)
+                                        .icon_color(Color::Muted)
+                                        .disabled(!design_available || is_via_collab)
+                                        .action(Box::new(UltrareviewDesign))
+                                        .handler(|window, cx| {
+                                            window.dispatch_action(Box::new(UltrareviewDesign), cx)
+                                        }),
+                                )
                         })
                         .map(|mut menu| {
                             let agent_server_store = agent_server_store.read(cx);
@@ -13114,35 +13234,71 @@ mod tests {
         });
     }
 
-    #[gpui::test]
-    async fn test_design_review_route_initializes_native_review_profile_without_sending(
-        cx: &mut TestAppContext,
-    ) {
-        cx.update(|cx| {
-            cx.set_global(crate::thread_metadata_store::TestMetadataDbName(format!(
-                "design-review-{}",
-                uuid::Uuid::new_v4()
-            )))
-        });
-        let (workspace, panel, mut cx) = setup_workspace_panel(cx).await;
-        panel.update(&mut cx, |panel, _| panel.selected_agent = Agent::Stub);
-        let prompt = "Review every frame and post actionable canvas comments";
-        cx.update(|window, cx| {
-            crate::open_design_review_prompt(workspace.clone(), prompt, window, cx)
-                .expect("review prompt routes to the registered panel");
-        });
-        panel.read_with(&cx, |panel, cx| {
+    struct ReviewSurface;
+
+    impl design_surface::DesignSurface for ReviewSurface {
+        fn state(&self, _cx: &mut App) -> Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+
+        fn get_nodes(
+            &self,
+            _query: design_surface::NodeQuery,
+            _cx: &mut App,
+        ) -> Result<serde_json::Value> {
+            Ok(json!([]))
+        }
+
+        fn apply(
+            &self,
+            _ops: Vec<design_surface::DesignOp>,
+            _label: String,
+            _cx: &mut App,
+        ) -> Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+
+        fn screenshot(
+            &self,
+            _target: design_surface::ScreenshotTarget,
+            _cx: &mut App,
+        ) -> Task<Result<Vec<u8>>> {
+            Task::ready(Ok(Vec::new()))
+        }
+
+        fn read_source(&self, _path: Option<String>, _cx: &mut App) -> Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+
+        fn find_empty_space(
+            &self,
+            _width: f64,
+            _height: f64,
+            _page: Option<usize>,
+            _cx: &mut App,
+        ) -> Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+
+        fn has_open_design(&self, _cx: &App) -> bool {
+            true
+        }
+
+        fn design_review_prompt(&self, ultra: bool, _cx: &mut App) -> Result<String> {
+            Ok(if ultra {
+                "Review every page and post actionable canvas comments".to_string()
+            } else {
+                "Review the active page and post actionable canvas comments".to_string()
+            })
+        }
+    }
+
+    fn assert_review_draft(panel: &Entity<AgentPanel>, prompt: &str, cx: &VisualTestContext) {
+        panel.read_with(cx, |panel, cx| {
             let conversation = panel
                 .active_conversation_view()
                 .expect("review conversation");
             assert_eq!(conversation.read(cx).agent_key(), &Agent::NativeAgent);
-        });
-        cx.run_until_parked();
-        assert!(cx.update(|_, cx| AgentPanel::is_visible(&workspace, cx)));
-        panel.read_with(&cx, |panel, cx| {
-            let conversation = panel
-                .active_conversation_view()
-                .expect("review conversation");
             let native = conversation
                 .read(cx)
                 .as_native_thread(cx)
@@ -13160,6 +13316,148 @@ mod tests {
                 "review stays a draft until the user sends it"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_design_review_actions_open_native_review_drafts_without_sending(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_global(crate::thread_metadata_store::TestMetadataDbName(format!(
+                "design-review-{}",
+                uuid::Uuid::new_v4()
+            )))
+        });
+        let (workspace, panel, mut cx) = setup_workspace_panel(cx).await;
+        cx.update(|_, cx| design_surface::register(std::rc::Rc::new(ReviewSurface), cx));
+        for (action, prompt) in [
+            (
+                Box::new(ReviewDesign) as Box<dyn gpui::Action>,
+                "Review the active page and post actionable canvas comments",
+            ),
+            (
+                Box::new(UltrareviewDesign),
+                "Review every page and post actionable canvas comments",
+            ),
+        ] {
+            panel.update(&mut cx, |panel, _| panel.selected_agent = Agent::Stub);
+            cx.update(|window, cx| window.dispatch_action(action, cx));
+            cx.run_until_parked();
+            assert!(cx.update(|_, cx| AgentPanel::is_visible(&workspace, cx)));
+            assert_review_draft(&panel, prompt, &cx);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_ultrareview_slash_command_opens_a_review_draft(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(crate::thread_metadata_store::TestMetadataDbName(format!(
+                "design-review-slash-{}",
+                uuid::Uuid::new_v4()
+            )))
+        });
+        let (_workspace, panel, mut cx) = setup_workspace_panel(cx).await;
+        cx.update(|_, cx| design_surface::register(std::rc::Rc::new(ReviewSurface), cx));
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let message_editor = panel.read_with(&cx, |panel, cx| {
+            let view = panel.active_thread_view(cx).expect("thread view");
+            view.read(cx).message_editor.clone()
+        });
+        let editor = message_editor.update_in(&mut cx, |message_editor, window, cx| {
+            message_editor.focus_handle(cx).focus(window, cx);
+            message_editor.editor().clone()
+        });
+
+        cx.simulate_input("/ultrareview");
+        cx.run_until_parked();
+        editor.read_with(&cx, |editor, _| {
+            let labels = editor
+                .current_completions()
+                .expect("slash completions")
+                .into_iter()
+                .map(|completion| completion.label.text)
+                .collect::<Vec<_>>();
+            assert_eq!(labels, ["Ultrareview"]);
+        });
+        editor.update_in(&mut cx, |editor, window, cx| {
+            editor.confirm_completion(&editor::actions::ConfirmCompletion::default(), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_review_draft(
+            &panel,
+            "Review every page and post actionable canvas comments",
+            &cx,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_plan_build_slash_command_opens_an_empty_plan_thread(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(crate::thread_metadata_store::TestMetadataDbName(format!(
+                "design-plan-build-{}",
+                uuid::Uuid::new_v4()
+            )))
+        });
+        let (workspace, panel, mut cx) = setup_workspace_panel(cx).await;
+        cx.update(|_, cx| design_surface::register(std::rc::Rc::new(ReviewSurface), cx));
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let message_editor = panel.read_with(&cx, |panel, cx| {
+            let view = panel.active_thread_view(cx).expect("thread view");
+            view.read(cx).message_editor.clone()
+        });
+        let editor = message_editor.update_in(&mut cx, |message_editor, window, cx| {
+            message_editor.focus_handle(cx).focus(window, cx);
+            message_editor.editor().clone()
+        });
+
+        cx.simulate_input("/plan-build");
+        cx.run_until_parked();
+        editor.read_with(&cx, |editor, _| {
+            let labels = editor
+                .current_completions()
+                .expect("slash completions")
+                .into_iter()
+                .map(|completion| completion.label.text)
+                .collect::<Vec<_>>();
+            assert_eq!(labels, ["Plan & Build"]);
+        });
+        editor.update_in(&mut cx, |editor, window, cx| {
+            editor.confirm_completion(&editor::actions::ConfirmCompletion::default(), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(cx.update(|_, cx| AgentPanel::is_visible(&workspace, cx)));
+        let composer = panel.read_with(&cx, |panel, cx| {
+            let conversation = panel.active_conversation_view().expect("plan conversation");
+            assert_eq!(conversation.read(cx).agent_key(), &Agent::NativeAgent);
+            let native = conversation
+                .read(cx)
+                .as_native_thread(cx)
+                .expect("native thread initialized asynchronously");
+            assert_eq!(
+                native.read(cx).profile().as_str(),
+                agent_settings::builtin_profiles::PLAN
+            );
+            let view = panel.active_thread_view(cx).expect("plan composer");
+            let view = view.read(cx);
+            assert!(
+                view.message_editor.read(cx).text(cx).is_empty(),
+                "the user writes the brief"
+            );
+            assert!(!view.show_external_source_prompt_warning);
+            assert!(view.thread.read(cx).entries().is_empty());
+            view.message_editor.clone()
+        });
+        assert_ne!(composer, message_editor, "Plan & Build starts a new thread");
     }
 
     #[gpui::test]
@@ -13237,6 +13535,7 @@ mod tests {
             crate::attach_canvas_selection_for_review(
                 workspace.clone(),
                 name.to_string(),
+                vec!["n_01JB7Y0N7Z3X1".to_string()],
                 content.to_string(),
                 window,
                 cx,
@@ -13247,6 +13546,7 @@ mod tests {
 
         let expected_uri = MentionUri::CanvasSelection {
             name: name.to_string(),
+            nodes: vec!["n_01JB7Y0N7Z3X1".to_string()],
         }
         .to_uri()
         .to_string();
@@ -13296,6 +13596,7 @@ mod tests {
             crate::attach_canvas_selection_for_review(
                 workspace.clone(),
                 first_name.to_string(),
+                vec!["n_01JB7Y0N7Z3X1".to_string()],
                 first_content.to_string(),
                 window,
                 cx,
@@ -13304,6 +13605,7 @@ mod tests {
             crate::attach_canvas_selection_for_review(
                 workspace.clone(),
                 second_name.to_string(),
+                vec!["n_01JB7Y0N7Z3X1".to_string()],
                 second_content.to_string(),
                 window,
                 cx,
@@ -13321,6 +13623,7 @@ mod tests {
             (
                 MentionUri::CanvasSelection {
                     name: first_name.to_string(),
+                    nodes: vec!["n_01JB7Y0N7Z3X1".to_string()],
                 }
                 .to_uri()
                 .to_string(),
@@ -13329,6 +13632,7 @@ mod tests {
             (
                 MentionUri::CanvasSelection {
                     name: second_name.to_string(),
+                    nodes: vec!["n_01JB7Y0N7Z3X1".to_string()],
                 }
                 .to_uri()
                 .to_string(),

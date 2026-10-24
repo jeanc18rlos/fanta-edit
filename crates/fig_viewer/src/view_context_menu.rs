@@ -1,8 +1,9 @@
 //! The canvas context menu (right-click, or a two-finger click on a
 //! trackpad): the layer under the pointer is selected the way a click would
-//! select it, and the menu offers what applies to it: clipboard and
-//! arrangement, and for components, creating an instance, going to the main
-//! component, detaching or resetting an instance.
+//! select it, and the menu offers what applies to it: clipboard, adding it to
+//! the Agent Panel's draft, and arrangement, and for components, creating an
+//! instance, going to the main component, detaching or resetting an
+//! instance.
 
 use anyhow::Context as _;
 use fanta_canvas::HitPrecision;
@@ -216,6 +217,17 @@ impl FigView {
             menu = menu
                 .action_disabled_when(!editable, "Duplicate", Box::new(DuplicateSelection))
                 .action_disabled_when(!editable, "Delete", Box::new(DeleteSelection));
+            {
+                let view = view.clone();
+                menu = menu
+                    .separator()
+                    .item(
+                        ContextMenuEntry::new("Add to Agent").handler(move |window, cx| {
+                            view.update(cx, |view, cx| view.add_selection_to_agent(window, cx))
+                                .log_err();
+                        }),
+                    );
+            }
             if single {
                 if let Some(label) = doc_target.editor_label() {
                     let view = view.clone();
@@ -648,6 +660,116 @@ fn top_level_under(scene: &fanta_doc::Scene, leaf: NodeId, container: Option<Nod
 mod tests {
     use super::*;
     use fanta_doc::{CanvasNode, ComponentDef, ComponentId, Doc, GroupNode, Operation};
+
+    #[gpui::test]
+    async fn canvas_menu_adds_the_layer_to_the_agent_and_a_reveal_brings_it_back(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use fanta_doc::{Color, VectorNode, Viewport};
+        use gpui::{MouseButton, MouseUpEvent, px, size};
+        use project::Project;
+
+        init_context_menu_test(cx);
+        let project = Project::test(fs::FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = Doc::new();
+        let mut page_ids = Vec::new();
+        for name in ["First", "Second"] {
+            let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+            page.name = name.into();
+            let page_id = page.id;
+            page_ids.push(page_id);
+            doc.apply(Operation::create_node(page)).expect("page");
+            doc.add_page(page_id);
+        }
+        let (first, second) = (page_ids[0], page_ids[1]);
+        let mut hero = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            -50.,
+            -50.,
+            100.,
+            100.,
+            Color::BLACK,
+        )));
+        hero.name = "Hero".into();
+        hero.parent = Some(second);
+        let hero_id = hero.id;
+        doc.apply(Operation::create_node(hero)).expect("hero");
+        doc.set_active_page(Some(second));
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/CanvasMenuAgent.fig".into(),
+            doc,
+            cx,
+        );
+        let (view, visual) = cx.add_window_view({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        visual.simulate_resize(size(px(1400.), px(900.)));
+        view.update(visual, |view, cx| {
+            view.set_viewport_silent(Viewport::default());
+            cx.notify();
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        let position = view.read_with(visual, |view, _| {
+            view.container_bounds.expect("canvas").center()
+        });
+        visual.simulate_event(MouseDownEvent {
+            position,
+            button: MouseButton::Right,
+            modifiers: Default::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        visual.simulate_event(MouseUpEvent {
+            position,
+            button: MouseButton::Right,
+            modifiers: Default::default(),
+            click_count: 1,
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        assert!(
+            visual.debug_bounds("MENU_ITEM-Add to Agent").is_some(),
+            "the layer's menu offers Add to Agent"
+        );
+        let selection = view
+            .read_with(visual, |view, cx| view.agent_canvas_selection_snapshot(cx))
+            .expect("snapshot")
+            .expect("a layer is selected");
+        assert_eq!(selection.name, "Hero");
+        assert_eq!(selection.nodes, [hero_id.to_string()]);
+        assert!(selection.content.contains(&hero_id.to_string()));
+
+        visual.simulate_keystrokes("escape");
+        view.update(visual, |view, cx| {
+            view.select_page(0, cx);
+            view.item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.selection.clear();
+                    ((), DocChange::Selection)
+                })
+            });
+        });
+        visual.run_until_parked();
+        item.read_with(visual, |item, _| {
+            assert_eq!(item.doc().and_then(|doc| doc.active_page()), Some(first))
+        });
+        let view_id = view.entity_id();
+        item.update(visual, |_, cx| {
+            cx.emit(crate::document::FigItemEvent::RevealNodes {
+                nodes: vec![hero_id],
+                view: Some(view_id),
+            })
+        });
+        visual.run_until_parked();
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.active_page(), Some(second), "the reveal switches pages");
+            assert_eq!(doc.selection.as_slice(), &[hero_id]);
+        });
+    }
 
     fn init_context_menu_test(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -1263,10 +1385,10 @@ mod tests {
                 menu.update(cx, |menu, cx| {
                     menu.select_first(&menu::SelectFirst, window, cx);
                     let steps = match action {
-                        LayerAction::GoToMainComponent if policy != "editable" => 1,
-                        LayerAction::GoToMainComponent => 5,
-                        LayerAction::DetachInstance => 6,
-                        LayerAction::ResetInstance => 7,
+                        LayerAction::GoToMainComponent if policy != "editable" => 2,
+                        LayerAction::GoToMainComponent => 6,
+                        LayerAction::DetachInstance => 7,
+                        LayerAction::ResetInstance => 8,
                         _ => unreachable!(),
                     };
                     for _ in 0..steps {
@@ -1507,7 +1629,7 @@ mod tests {
                     .clone();
                 menu.update(cx, |menu, cx| {
                     menu.select_first(&menu::SelectFirst, window, cx);
-                    for _ in 0..5 {
+                    for _ in 0..6 {
                         menu.select_next(&menu::SelectNext, window, cx);
                     }
                     menu.confirm(&menu::Confirm, window, cx);
@@ -1751,7 +1873,7 @@ mod tests {
                     .clone();
                 menu.update(cx, |menu, cx| {
                     menu.select_first(&menu::SelectFirst, window, cx);
-                    for _ in 0..5 {
+                    for _ in 0..6 {
                         menu.select_next(&menu::SelectNext, window, cx);
                     }
                     menu.confirm(&menu::Confirm, window, cx);

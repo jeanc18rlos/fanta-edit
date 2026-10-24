@@ -564,6 +564,14 @@ pub mod agent {
             ResetAgentZoom,
             /// Pastes clipboard content without any formatting.
             PasteRaw,
+            /// Opens a Review-profile draft in the agent panel that reviews the open design's active page.
+            #[action(deprecated_aliases = ["fig_viewer::RunAiReview"])]
+            ReviewDesign,
+            /// Opens a Review-profile draft in the agent panel that runs a multi-pass review of every page.
+            #[action(deprecated_aliases = ["fig_viewer::RunUltraReview"])]
+            UltrareviewDesign,
+            /// Opens a Plan-profile thread in the agent panel for the open design; Apply plan builds the agreed plan on the canvas.
+            PlanAndBuildDesign,
         ]
     );
 

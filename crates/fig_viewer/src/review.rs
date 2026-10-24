@@ -1,42 +1,6 @@
 use anyhow::{Context as _, Result};
 use fanta_doc::{Doc, NodeId};
-use gpui::{Context, Window};
 use serde_json::json;
-use workspace::MultiWorkspace;
-
-impl crate::view::FigView {
-    pub(crate) fn run_ai_review(
-        &mut self,
-        depth: ReviewDepth,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let result = (|| {
-            let document = self
-                .item
-                .read(cx)
-                .document()
-                .context("the design is still loading")?;
-            let page = document
-                .doc
-                .active_page()
-                .context("select a page to review")?;
-            let prompt = review_prompt(&document.doc, page, depth, &NodeId::new().to_string())?;
-            let workspace = window
-                .root::<MultiWorkspace>()
-                .flatten()
-                .map(|workspace| workspace.read(cx).workspace().clone())
-                .context("the review needs an open project workspace")?;
-            agent_ui::open_design_review_prompt(workspace, &prompt, window, cx)
-        })();
-        if let Err(error) = result {
-            crate::view::show_canvas_notice_deferred(
-                format!("Could not prepare AI Review: {error:#}"),
-                cx,
-            );
-        }
-    }
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReviewDepth {

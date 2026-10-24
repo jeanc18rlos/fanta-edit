@@ -3658,6 +3658,7 @@ impl FantaDesignPanel {
                     LayersPanelContextAction::Copy
                         | LayersPanelContextAction::CopyPasteAs
                         | LayersPanelContextAction::GoToMainComponent
+                        | LayersPanelContextAction::AddToAgent
                 ))
         });
         if !allowed {
@@ -3669,6 +3670,7 @@ impl FantaDesignPanel {
             LayersPanelContextAction::Copy
                 | LayersPanelContextAction::Duplicate
                 | LayersPanelContextAction::Delete
+                | LayersPanelContextAction::AddToAgent
         ) && self.active_view(cx).is_some_and(|view| {
             view.read(cx)
                 .item()
@@ -3801,6 +3803,11 @@ impl FantaDesignPanel {
                 window,
                 cx,
             ),
+            LayersPanelContextAction::AddToAgent => {
+                if let Some(view) = self.active_view(cx) {
+                    view.update(cx, |view, cx| view.add_selection_to_agent(window, cx));
+                }
+            }
             // Retained upstream for source compatibility; never offered by the shared menu.
             LayersPanelContextAction::SendToFigmaMake
             | LayersPanelContextAction::FindSimilarDesigns

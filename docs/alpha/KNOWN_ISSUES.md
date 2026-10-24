@@ -394,15 +394,11 @@ actually driven. Nothing here claims more than that record supports.
 
 ## Agents
 
-- **Plan & build** (the Build tab in the inspector) needs the Fanta v2 API and a
-  signed-in account. Dev and preview builds point at it (`api-v2.fantaisa.net`);
-  a stable build gets a 404 and says so. A task's ops are previewed by applying
-  them to the canvas as one undo step, not as a ghost layer. Retry and Skip undo
-  that step, but only while it is still the latest edit: after other edits the
-  preview stays and the panel says so. The page it sends the agent is the active
-  page's first 50 top-level layers, 8 levels deep. Covered by a unit test
-  against a fake session server; it has not been run against the deployed
-  backend from the app.
+- **Plan & Build** is a Plan-profile thread in the Agent Panel. Apply plan
+  builds the whole plan in one Write turn; there is no per-task accept, retry or
+  skip, and each canvas batch the agent applies is its own undo step. Covered by
+  a test that the action opens an empty Plan thread; the build step has not been
+  run against a model from the app.
 - The agent panel needs a project open before it will chat. Opening a `.fig` or
   a Fanta project satisfies this.
 - The managed Fanta provider requires signing in. Without it, set an Anthropic

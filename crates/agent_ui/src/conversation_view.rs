@@ -5659,6 +5659,55 @@ pub(crate) mod tests {
         });
     }
 
+    struct ThreadViewHost(Entity<ThreadView>);
+
+    impl Render for ThreadViewHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.0.clone())
+        }
+    }
+
+    #[gpui::test]
+    async fn test_model_button_opens_the_model_menu_and_search_opens_the_picker(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let (_, cx) = cx.add_window_view({
+            let thread_view = thread_view.clone();
+            move |_, _| ThreadViewHost(thread_view)
+        });
+        cx.simulate_resize(gpui::size(px(900.), px(700.)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+
+        let button = cx
+            .debug_bounds("agent-model-menu-button")
+            .expect("the composer shows the model button");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, _| {
+            assert!(view.model_menu_handle.is_deployed(), "the model menu opens");
+        });
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.model_menu_handle.hide(cx);
+            view.message_editor.focus_handle(cx).focus(window, cx);
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(ToggleModelSelector);
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, cx| {
+            let selector = view.model_selector.as_ref().expect("model selector");
+            assert!(
+                selector.read(cx).is_picker_open(),
+                "Search Models opens the searchable picker beside the button"
+            );
+        });
+    }
+
     async fn setup_conversation_view_with_initial_content(
         agent: impl AgentServer + 'static,
         initial_content: AgentInitialContent,
