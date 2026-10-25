@@ -5,6 +5,7 @@
 //! `fanta-headless`, and is the surface language bindings wrap.
 
 mod nodes;
+mod properties;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -15,7 +16,9 @@ use fanta_doc::{Doc, Operation};
 use fanta_headless::{HeadlessDocument, HeadlessProject};
 
 pub use fanta_doc::{AssetId, Color, ComponentId, NodeId};
+pub use fanta_doc::{BlurKind, ShadowKind};
 pub use nodes::{NodeKind, NodeType};
+pub use properties::{PropertyInfo, PropertyKind, PropertyValue};
 
 /// Why a call was refused or failed.
 #[derive(Debug, thiserror::Error)]
@@ -26,6 +29,20 @@ pub enum ApiError {
     InvalidArgument(String),
     #[error("the session was not opened from a project directory")]
     NoProject,
+    #[error("node {node} has no property `{path}`")]
+    UnknownProperty { node: NodeId, path: String },
+    #[error("`{path}` holds a {expected:?} value, not a {found:?}")]
+    PropertyKind {
+        path: String,
+        expected: PropertyKind,
+        found: PropertyKind,
+    },
+    #[error("`{value}` is not a value of `{path}`")]
+    InvalidEnumValue { path: String, value: String },
+    #[error("`{0}` is read-only")]
+    ReadOnly(String),
+    #[error("`{0}` is bound to a variable; unbind it before writing a value")]
+    PropertyBound(String),
     #[error(transparent)]
     Engine(#[from] anyhow::Error),
 }
