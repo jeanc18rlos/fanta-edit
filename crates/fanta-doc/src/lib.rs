@@ -35,6 +35,7 @@ pub use boolean::{
 pub mod color;
 pub mod component;
 pub mod doc;
+pub mod editing;
 pub mod history;
 pub mod id;
 pub mod index;
@@ -72,6 +73,7 @@ pub use doc::{
     ProjectAssetKind, SCHEMA_VERSION, Viewport, migrate_doc_json, migrate_doc_json_to,
     prepare_doc_json,
 };
+pub use editing::{EditingRules, Placeholder, Scope};
 pub use history::{History, Transaction};
 pub use id::{
     AnimationClipId, AnimationTrackId, AssetId, ComponentId, ComponentPropId, DocId, IdBuildHasher,

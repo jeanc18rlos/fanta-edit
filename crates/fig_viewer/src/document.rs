@@ -1259,6 +1259,7 @@ impl FigDocument {
             | Operation::SetMaskType { .. }
             | Operation::SetLayoutChild { .. }
             | Operation::SetConstraints { .. }
+            | Operation::SetEditingRules { .. }
             | Operation::ReplaceData { .. }
             | Operation::SetComponentProps { .. }
             | Operation::DefineComponentSet { .. }

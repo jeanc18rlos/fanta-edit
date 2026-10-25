@@ -5,6 +5,7 @@
 use crate::binding::BoundProp;
 use crate::component::{ComponentDef, ComponentPropDef, ComponentSet, ComponentSetMembership};
 use crate::doc::{Flow, PresentationConfig};
+use crate::editing::EditingRules;
 use crate::id::{
     AnimationClipId, AnimationTrackId, ComponentId, ComponentPropId, KeyframeId, ModeId, NodeId,
     VariableCollectionId, VariableId,
@@ -149,6 +150,14 @@ pub enum Operation {
         id: NodeId,
         old: Option<Constraints>,
         new: Option<Constraints>,
+    },
+
+    /// Change which scopes a node forbids and whether it is a placeholder.
+    /// `None` is the default: nothing forbidden, not a placeholder.
+    SetEditingRules {
+        id: NodeId,
+        old: Option<Box<EditingRules>>,
+        new: Option<Box<EditingRules>>,
     },
 
     /// Replace the variant-specific data. Heaviest op; AI re-rolls, path edits.
@@ -493,6 +502,7 @@ impl Operation {
             | Self::SetMaskType { id, .. }
             | Self::SetLayoutChild { id, .. }
             | Self::SetConstraints { id, .. }
+            | Self::SetEditingRules { id, .. }
             | Self::ReplaceData { id, .. }
             | Self::SetInstanceOverride { id, .. }
             | Self::SwapInstance { id, .. }
@@ -539,6 +549,7 @@ impl Operation {
             Self::SetMaskType { .. } => "Mask type",
             Self::SetLayoutChild { .. } => "Layout Child",
             Self::SetConstraints { .. } => "Constraints",
+            Self::SetEditingRules { .. } => "Editing Rules",
             Self::ReplaceData { .. } => "Edit",
             Self::CreateInstance { .. } => "Insert Instance",
             Self::DefineComponent { .. } => "Create Component",

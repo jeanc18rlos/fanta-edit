@@ -79,6 +79,7 @@ pub use variants::{
 };
 
 use crate::binding::BoundProp;
+use crate::editing::EditingRules;
 use crate::id::{NodeId, VariableId};
 use crate::index::IndexKey;
 use crate::style::{BlendMode, Blur, Shadow, Stroke, UnitInterval};
@@ -229,6 +230,12 @@ pub struct CanvasNode {
     /// side a Stage-2 layout pass reads alongside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout_child: Option<LayoutChild>,
+
+    /// What a template's users may change on this node, and whether it is a
+    /// placeholder they fill in. `None` on almost every node, so old files
+    /// round-trip byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editing: Option<Box<EditingRules>>,
 }
 
 impl CanvasNode {
@@ -259,6 +266,7 @@ impl CanvasNode {
             bindings: BTreeMap::new(),
             reactions: Vec::new(),
             layout_child: None,
+            editing: None,
         }
     }
 

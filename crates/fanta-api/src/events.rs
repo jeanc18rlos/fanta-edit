@@ -218,6 +218,7 @@ pub(crate) fn node_events(
         | Operation::SetMaskType { id, .. }
         | Operation::SetLayoutChild { id, .. }
         | Operation::SetConstraints { id, .. }
+        | Operation::SetEditingRules { id, .. }
         | Operation::ReplaceData { id, .. }
         | Operation::SetInstanceOverride { id, .. }
         | Operation::SwapInstance { id, .. }
