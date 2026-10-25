@@ -159,6 +159,8 @@ engine produce the same document.
 ```rust
 HeadlessProject::open(root) -> Result<HeadlessProject>
     .doc() -> &Doc
+    .document() -> &HeadlessDocument
+    .document_mut() -> &mut HeadlessDocument
     .warnings() -> &[String]
     .font_families() -> BTreeSet<String>
     .inspect() -> Result<Value>
