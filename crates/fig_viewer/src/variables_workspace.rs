@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
+pub(crate) use fanta_headless::edit_operations::{set_variable_value_operation, validate_alias};
+
 use crate::document::{DocChange, FigItem, FigItemEvent};
 use crate::mode_overrides::mode_override_operation;
 use crate::variable_binding::{
@@ -914,42 +916,6 @@ fn add_mode_transaction(
     )?)
 }
 
-pub(crate) fn set_variable_value_operation(
-    doc: &Doc,
-    variable_id: VariableId,
-    mode_id: ModeId,
-    new_value: VarValue,
-) -> Result<Option<Operation>, &'static str> {
-    let variable = doc
-        .variables
-        .variables
-        .get(&variable_id)
-        .ok_or("The variable no longer exists")?;
-    let collection = doc
-        .variables
-        .collections
-        .get(&variable.collection)
-        .ok_or("The variable's collection no longer exists")?;
-    if !collection.has_mode(mode_id) {
-        return Err("The mode no longer exists");
-    }
-    if let VarValue::Alias { variable: target } = &new_value {
-        validate_alias(doc, variable_id, *target)?;
-    } else if new_value.variable_type() != Some(variable.ty) {
-        return Err("The value does not match the variable type");
-    }
-    let old = variable.values_by_mode.get(&mode_id).cloned();
-    if old.as_ref() == Some(&new_value) {
-        return Ok(None);
-    }
-    Ok(Some(Operation::SetVariableValue {
-        variable: variable_id,
-        mode: mode_id,
-        old,
-        new: Some(new_value),
-    }))
-}
-
 fn unique_collection_name(doc: &Doc) -> String {
     unique_numbered_name("Collection", |candidate| {
         doc.variables
@@ -1392,43 +1358,6 @@ fn screen_operation(
         }
         _ => Ok(None),
     }
-}
-
-fn validate_alias(doc: &Doc, source: VariableId, target: VariableId) -> Result<(), &'static str> {
-    let source_type = doc
-        .variables
-        .variables
-        .get(&source)
-        .ok_or("The variable no longer exists")?
-        .ty;
-    let mut pending = vec![target];
-    let mut visited = BTreeSet::new();
-    while let Some(id) = pending.pop() {
-        if id == source {
-            return Err("Variable aliases cannot form a cycle");
-        }
-        if !visited.insert(id) {
-            continue;
-        }
-        let variable = doc
-            .variables
-            .variables
-            .get(&id)
-            .ok_or("The alias target no longer exists")?;
-        if variable.ty != source_type {
-            return Err("The alias must have the same variable type");
-        }
-        pending.extend(
-            variable
-                .values_by_mode
-                .values()
-                .filter_map(|value| match value {
-                    VarValue::Alias { variable } => Some(*variable),
-                    _ => None,
-                }),
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]

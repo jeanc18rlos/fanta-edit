@@ -180,6 +180,7 @@ impl EngineInfo {
             capabilities: [
                 "inspect",
                 "create_page",
+                "apply",
                 "add_comments",
                 "project",
                 "render",
@@ -187,6 +188,11 @@ impl EngineInfo {
             ]
             .into_iter()
             .map(|step| format!("step:{step}"))
+            .chain(
+                fanta_design_ops::DESIGN_OP_CAPABILITIES
+                    .iter()
+                    .map(|capability| (*capability).to_owned()),
+            )
             .collect(),
         }
     }
@@ -683,6 +689,103 @@ mod tests {
             .expect("base64");
         assert!(String::from_utf8_lossy(&source).contains("Too faint"));
         assert_eq!(changeset["ops"][0]["op"], "set_meta");
+    }
+
+    #[test]
+    fn a_generation_run_applies_ops_and_returns_the_changeset() {
+        use fanta_doc::{CanvasNode, Doc, GroupNode, NodeData, Operation};
+        let mut doc = Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = "Home".into();
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page)).expect("page");
+        doc.add_page(page_id);
+        let directory = tempfile::tempdir().expect("project directory");
+        fanta_format::write_project_tree(directory.path(), &doc, &Default::default())
+            .expect("write the project");
+
+        let response = run_in(
+            &request(json!({
+                "request_id": "gen_1",
+                "deadline_ms": 60000,
+                "source": {"kind": "dir", "dir": directory.path()},
+                "steps": [
+                    {"step": "create_page", "name": "Landing"},
+                    {"step": "apply", "page": {"created": 0}, "label": "Draft the hero", "ops": [
+                        {"op": "create_node", "node_type": "frame", "name": "Hero",
+                         "x": 0, "y": 0, "width": 1440, "height": 640},
+                        {"op": "create_node", "node_type": "text", "text": "Ship faster",
+                         "x": 80, "y": 80, "width": 600, "height": 80}
+                    ]},
+                    {"step": "apply", "label": "Checked only", "commit": false, "ops": [
+                        {"op": "create_node", "node_type": "rectangle",
+                         "x": 0, "y": 0, "width": 10, "height": 10}
+                    ]},
+                    {"step": "changeset", "contents": true, "ops": true}
+                ]
+            })),
+            directory.path(),
+        )
+        .expect("the run answers");
+        assert!(
+            response.results.iter().all(|result| result.ok),
+            "{:?}",
+            response.results
+        );
+        let result = |index: usize| {
+            response.results[index]
+                .result
+                .clone()
+                .expect("a successful step has a result")
+        };
+        let created_page = result(0)["page"]["id"].clone();
+        let applied = result(1);
+        assert_eq!(applied["applied"], true, "{applied}");
+        assert_eq!(applied["created"].as_array().map(Vec::len), Some(2));
+        assert_eq!(result(2)["applied"], true);
+        let changeset = result(3);
+        let files = changeset["files"].as_array().expect("files");
+        let landing = files
+            .iter()
+            .find(|file| {
+                file["status"] == "added"
+                    && file["path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with("/page.fnx"))
+            })
+            .expect("the created page is a new source");
+        let source = base64::engine::general_purpose::STANDARD
+            .decode(landing["content_b64"].as_str().expect("content_b64"))
+            .expect("base64");
+        let source = String::from_utf8_lossy(&source);
+        assert!(
+            source.contains("Hero") && source.contains("Ship faster"),
+            "{source}"
+        );
+        let operations = changeset["ops"].as_array().expect("ops");
+        assert!(
+            operations
+                .iter()
+                .any(|operation| operation["op"] == "create_node"),
+            "the journal carries the applied ops"
+        );
+        assert!(created_page.is_string());
+    }
+
+    #[test]
+    fn engine_info_advertises_apply_and_the_design_op_capabilities() {
+        let info = EngineInfo::current();
+        assert!(
+            info.capabilities
+                .iter()
+                .any(|capability| capability == "step:apply")
+        );
+        for capability in fanta_design_ops::DESIGN_OP_CAPABILITIES {
+            assert!(
+                info.capabilities.iter().any(|listed| listed == capability),
+                "{capability}"
+            );
+        }
     }
 
     #[test]
