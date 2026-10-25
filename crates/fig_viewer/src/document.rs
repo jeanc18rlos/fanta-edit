@@ -1313,7 +1313,7 @@ impl FigDocument {
 
     /// Recompute only the layout islands whose inputs changed, retaining the
     /// imported geometry of every unaffected island.
-    fn resolve_after_edit(&mut self, page_root: Option<NodeId>) {
+    pub(crate) fn resolve_after_edit(&mut self, page_root: Option<NodeId>) {
         if let Err(error) = layout::settle(&mut self.doc, &mut self.layout_state) {
             log::error!("applying computed layout: {error:#}");
             return;

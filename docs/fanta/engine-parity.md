@@ -45,7 +45,7 @@ compatibility adapter is a separate, optional layer.
 
 | Area | CE.SDK | Fanta | Phase |
 | --- | --- | --- | --- |
-| Headless editing | edits in Node without a UI | 🟡 `fanta-headless` loads, renders PNG and saves; design ops apply only in the editor | 0 |
+| Headless editing | edits in Node without a UI | ✅ `fanta-headless` applies design ops with the editor's applier, renders PNG and saves | 0 |
 | Design API | typed properties, lifecycle, hierarchy, find, metadata | ❌ only the coarse agent `DesignOp`s | 1 |
 | Events | per-block Created, Updated, Destroyed | ❌ pull-only journal | 1 |
 | Undo | explicit steps, several histories | 🟡 one history of transactions | 1 |
@@ -74,9 +74,9 @@ over MCP and cloud review. The plan keeps all of them.
 
 ## Roadmap
 
-0. **Engine apply.** Move the design-op applier from `fig_viewer` into
-   `fanta-headless`, so the engine and the editor apply the same ops and the
-   cloud worker's `apply` step works.
+0. **Engine apply** (done). The design-op applier lives in `fanta-headless`,
+   so the engine and the editor apply the same ops and the cloud worker's
+   `apply` step works.
 1. **Design API** (`crates/fanta-api`). Scenes in memory or on disk, typed
    property reflection, node lifecycle, explicit undo steps, polled change
    events, `{{name}}` text variables, placeholders and permission scopes, and

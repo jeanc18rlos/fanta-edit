@@ -309,6 +309,8 @@ pub enum BatchEffect {
 pub struct BatchOutcome {
     pub value: Value,
     pub effect: BatchEffect,
+    /// The image assets a committed batch added to the project.
+    pub ingested_assets: Vec<AssetId>,
 }
 
 /// What one applied op affected, for dirty/selection tracking and reporting.
@@ -492,6 +494,7 @@ impl BatchProgress {
                     } else {
                         BatchEffect::None
                     },
+                    ingested_assets: std::mem::take(&mut self.ingested_assets),
                 }
             }
             Some((index, mut message)) => {
@@ -517,8 +520,39 @@ impl BatchProgress {
                     } else {
                         BatchEffect::None
                     },
+                    ingested_assets: Vec::new(),
                 }
             }
+        }
+    }
+
+    /// Roll the batch back whether or not it failed: a dry run that checks
+    /// the ops without keeping them. A batch that would apply reports
+    /// `applied: true` with the ids it created, which no longer exist.
+    /// Selection and viewport changes are the caller's to restore.
+    pub fn roll_back(
+        &mut self,
+        doc: &mut Doc,
+        assets: &mut dyn ImageStore,
+        operation_count: usize,
+    ) -> BatchOutcome {
+        if self.failure.is_some() {
+            return self.finish(doc, assets, operation_count);
+        }
+        let mut value = json!({ "applied": true, "created": self.created, "ops": self.statuses });
+        if self.history_started
+            && let Err(error) = doc.abort_transaction()
+        {
+            value = json!({ "applied": false,
+                "error": format!("rolling back the checked batch failed: {error}"), "ops": self.statuses });
+        }
+        for asset in self.ingested_assets.drain(..) {
+            assets.remove(asset);
+        }
+        BatchOutcome {
+            value,
+            effect: BatchEffect::None,
+            ingested_assets: Vec::new(),
         }
     }
 }

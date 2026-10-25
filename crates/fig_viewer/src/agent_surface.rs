@@ -2794,6 +2794,65 @@ mod tests {
     /// The cloud engine renders through `fanta_headless`. A project it opens
     /// must render exactly as the editor's screenshot tool renders the same
     /// files after the editor opens them.
+    /// The engine applies a batch through the editor's applier, so the same
+    /// ops leave both documents drawing the same pixels.
+    #[test]
+    fn headless_engine_applies_ops_like_the_editor() -> Result<()> {
+        let mut doc = Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = "Home".into();
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page))?;
+        doc.add_page(page_id);
+        let directory = tempfile::tempdir()?;
+        fanta_format::write_project_tree(directory.path(), &doc, &Default::default())?;
+        let batch = ops(json!([
+            {"op": "create_node", "node_type": "frame", "name": "Row",
+             "x": 20, "y": 20, "width": 160, "height": 60},
+            {"op": "create_image", "source": tiny_png_base64(), "x": 40, "y": 100, "width": 30},
+            {"op": "create_node", "node_type": "text", "text": "Shared",
+             "x": 200, "y": 20, "width": 120, "height": 30},
+        ]));
+
+        let mut editor = crate::document::load_project_document(directory.path())?;
+        let editor_result = {
+            let (doc, mut assets) = editor.doc_and_assets();
+            let default_container = doc.active_page();
+            apply_batch(doc, &mut assets, &batch, "Draft", default_container).value
+        };
+        editor.resolve_after_edit(None);
+        let mut engine = fanta_headless::HeadlessProject::open(directory.path())?;
+        let engine_result = engine.apply(None, "Draft", &batch, true)?;
+        assert_eq!(editor_result["applied"], json!(true), "{editor_result}");
+        assert_eq!(engine_result["applied"], json!(true), "{engine_result}");
+
+        let editor_png = render_surface_screenshot(
+            &editor.doc,
+            editor.asset_resolver.clone(),
+            Some(page_id),
+            None,
+            ScreenshotTarget {
+                max_dimension: Some(400),
+                ..Default::default()
+            },
+        )?;
+        let engine_png = engine
+            .render(&fanta_headless::RenderTarget {
+                id: "page".into(),
+                page: fanta_headless::PageRef::Index { index: 0 },
+                node: None,
+                max_dimension: 400,
+                motion_clip: None,
+                playhead_ms: None,
+            })?
+            .png;
+        assert!(
+            editor_png == engine_png,
+            "the engine and the editor applied the batch differently"
+        );
+        Ok(())
+    }
+
     #[test]
     fn headless_engine_renders_match_editor_screenshots() -> Result<()> {
         use fanta_doc::{TextNode, color::Color};
