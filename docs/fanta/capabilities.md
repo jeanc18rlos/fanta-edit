@@ -546,6 +546,12 @@ apply at project, page and parent scopes. Unbinding bakes the resolved value.
 Shared styles and imported bindings participate in rendering and source
 persistence.
 
+Text can show variables inline. A `{{name}}` token shows the value of the
+variable it names: its bare name when only one variable has it, otherwise its
+`Collection/Name` path. String, number, boolean and enum variables resolve, in
+the text's mode; a token that names nothing shows as typed. The source keeps
+the tokens, and the text being edited shows them raw.
+
 Bound solid fills show their resolved mode color and variable name in the
 inspector and picker. Alpha is read-only while the variable controls the full
 color; **Detach** bakes the active value and makes it directly editable. Undo
