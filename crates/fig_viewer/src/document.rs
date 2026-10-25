@@ -16,10 +16,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use fanta_doc::{AssetId, Doc, NodeId, Operation, Viewport};
 use fanta_fig_interop::{fig_to_doc, read_fig};
-use fanta_render::{
-    AssetResolver, DecodeListener, DecodedImage, LevelLookup, LeveledImage,
-    asset::LazyAssetResolver,
-};
+use fanta_render::{AssetResolver, asset::LazyAssetResolver};
 use futures::{FutureExt as _, StreamExt as _, channel::mpsc};
 use gpui::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, Image, ImageFormat,
@@ -41,12 +38,9 @@ use fanta_headless::save::{
 /// project files) settle before reloading from disk.
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// Cap on the encoded bytes of one image ingested as a project asset (a paste,
-/// a drop, an agent's `create_image`). Generous for any generated PNG while
-/// keeping a bad payload from ballooning the document — and enforced before
-/// decoding, since a decoder handed arbitrary bytes can allocate far more
-/// than it was given.
-pub(crate) const MAX_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) use fanta_headless::assets::{
+    MAX_IMAGE_SOURCE_BYTES, OverlayAssetResolver, PreparedImage,
+};
 
 #[derive(Default)]
 struct ProjectReads {
@@ -1356,121 +1350,22 @@ impl FigDocument {
         (
             &mut self.doc,
             AssetStores {
-                raw_assets: &mut self.raw_assets,
-                asset_resolver: &mut self.asset_resolver,
-                overlay: &mut self.agent_asset_overlay,
+                stores: fanta_headless::assets::AssetStores::new(
+                    &mut self.raw_assets,
+                    &mut self.asset_resolver,
+                    &mut self.agent_asset_overlay,
+                ),
                 gpui_images: &mut self.gpui_images,
             },
         )
     }
 }
 
-/// Layers agent-ingested images over the resolver built at load, so placing
-/// one image is O(1) instead of a re-decode of every embedded asset. Interior
-/// mutability because the resolver is shared as an `Arc<dyn AssetResolver>`
-/// with background renders; reads take the lock only on the overlay map.
-pub(crate) struct OverlayAssetResolver {
-    base: Option<Arc<dyn AssetResolver>>,
-    added: std::sync::RwLock<HashMap<AssetId, DecodedImage>>,
-    added_bytes: std::sync::RwLock<HashMap<AssetId, Arc<Vec<u8>>>>,
-}
-
-impl AssetResolver for OverlayAssetResolver {
-    fn resolve(&self, id: AssetId) -> Option<DecodedImage> {
-        if let Some(image) = self.added.read().unwrap().get(&id) {
-            return Some(image.clone());
-        }
-        self.base.as_ref()?.resolve(id)
-    }
-
-    fn resolve_bytes(&self, id: AssetId) -> Option<Arc<Vec<u8>>> {
-        if let Some(bytes) = self.added_bytes.read().unwrap().get(&id) {
-            return Some(bytes.clone());
-        }
-        self.base.as_ref()?.resolve_bytes(id)
-    }
-
-    fn image_size(&self, id: AssetId) -> Option<[u32; 2]> {
-        if let Some(image) = self
-            .added
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&id)
-        {
-            return Some([image.width, image.height]);
-        }
-        self.base.as_ref()?.image_size(id)
-    }
-
-    fn resolve_level_nonblocking(&self, id: AssetId, level: u32) -> LevelLookup {
-        if let Some(image) = self
-            .added
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&id)
-        {
-            return LevelLookup::Decoded(LeveledImage {
-                image: image.clone(),
-                level: 0,
-            });
-        }
-        match &self.base {
-            Some(base) => base.resolve_level_nonblocking(id, level),
-            None => LevelLookup::Unavailable,
-        }
-    }
-
-    fn decode_generation(&self) -> u64 {
-        self.base
-            .as_ref()
-            .map_or(0, |base| base.decode_generation())
-    }
-
-    fn subscribe_decodes(&self, listener: std::sync::Weak<dyn DecodeListener>) {
-        if let Some(base) = &self.base {
-            base.subscribe_decodes(listener);
-        }
-    }
-}
-
-/// Mutable views of every store an ingested image must reach: the raw bytes
-/// (persisted on save), the render resolver, and the GPUI thumbnail cache.
+/// The headless asset stores plus the GPUI thumbnail cache the asset panel
+/// draws from, kept in step with every ingest and rollback.
 pub(crate) struct AssetStores<'a> {
-    raw_assets: &'a mut Arc<BTreeMap<AssetId, Vec<u8>>>,
-    asset_resolver: &'a mut Option<Arc<dyn AssetResolver>>,
-    overlay: &'a mut Option<Arc<OverlayAssetResolver>>,
+    stores: fanta_headless::assets::AssetStores<'a>,
     gpui_images: &'a mut HashMap<AssetId, Arc<Image>>,
-}
-
-pub(crate) struct PreparedImage {
-    id: AssetId,
-    bytes: Vec<u8>,
-    rgba: Vec<u8>,
-    size: [u32; 2],
-    format: Option<ImageFormat>,
-}
-
-impl PreparedImage {
-    pub(crate) fn new(bytes: Vec<u8>) -> Result<Self> {
-        anyhow::ensure!(
-            bytes.len() <= MAX_IMAGE_SOURCE_BYTES,
-            "the image is {} bytes; the limit is {MAX_IMAGE_SOURCE_BYTES} bytes",
-            bytes.len()
-        );
-        let id = fanta_format::asset_id_for_bytes(&bytes);
-        let decoded = image::load_from_memory(&bytes).context("decoding image bytes")?;
-        let rgba = decoded.to_rgba8();
-        let (width, height) = rgba.dimensions();
-        anyhow::ensure!(width > 0 && height > 0, "the image has no pixels");
-        let format = image::guess_format(&bytes).ok().and_then(gpui_image_format);
-        Ok(Self {
-            id,
-            bytes,
-            rgba: rgba.into_raw(),
-            size: [width, height],
-            format,
-        })
-    }
 }
 
 /// Owned backing for [`AssetStores`] — for tests that exercise batch
@@ -1488,9 +1383,11 @@ pub(crate) struct TestAssetStores {
 impl TestAssetStores {
     pub(crate) fn stores(&mut self) -> AssetStores<'_> {
         AssetStores {
-            raw_assets: &mut self.raw_assets,
-            asset_resolver: &mut self.asset_resolver,
-            overlay: &mut self.overlay,
+            stores: fanta_headless::assets::AssetStores::new(
+                &mut self.raw_assets,
+                &mut self.asset_resolver,
+                &mut self.overlay,
+            ),
             gpui_images: &mut self.gpui_images,
         }
     }
@@ -1506,29 +1403,7 @@ impl TestAssetStores {
 
 impl AssetStores<'_> {
     pub(crate) fn add_raw_bytes_tracked(&mut self, bytes: Vec<u8>) -> Result<(AssetId, bool)> {
-        let id = fanta_format::asset_id_for_bytes(&bytes);
-        if let Some(existing) = self.raw_assets.get(&id) {
-            anyhow::ensure!(
-                existing == &bytes,
-                "asset {id} has a content hash collision"
-            );
-            return Ok((id, false));
-        }
-        Arc::make_mut(self.raw_assets).insert(id, bytes.clone());
-        let overlay = self.overlay.get_or_insert_with(|| {
-            Arc::new(OverlayAssetResolver {
-                base: self.asset_resolver.clone(),
-                added: std::sync::RwLock::new(HashMap::default()),
-                added_bytes: std::sync::RwLock::new(HashMap::default()),
-            })
-        });
-        overlay
-            .added_bytes
-            .write()
-            .unwrap()
-            .insert(id, Arc::new(bytes));
-        *self.asset_resolver = Some(overlay.clone() as Arc<dyn AssetResolver>);
-        Ok((id, true))
+        self.stores.add_raw_bytes_tracked(bytes)
     }
 
     /// Ingest encoded image bytes as a project asset and return its natural size.
@@ -1551,51 +1426,33 @@ impl AssetStores<'_> {
         &mut self,
         prepared: PreparedImage,
     ) -> Result<(AssetId, [u32; 2], bool)> {
-        let PreparedImage {
-            id,
-            bytes,
-            rgba,
-            size: [width, height],
-            format,
-        } = prepared;
-        if let Some(existing) = self.raw_assets.get(&id) {
-            anyhow::ensure!(
-                existing == &bytes,
-                "asset {id} has a content hash collision"
-            );
-            return Ok((id, [width, height], false));
-        }
-
-        self.add_raw_bytes_tracked(bytes.clone())?;
-        let overlay = self
-            .overlay
-            .as_ref()
-            .context("ingested image has no resolver")?;
-        overlay
-            .added
-            .write()
-            .unwrap()
-            .insert(id, DecodedImage::new(&rgba, width, height));
-        *self.asset_resolver = Some(overlay.clone() as Arc<dyn AssetResolver>);
-
-        if let Some(format) = format {
+        let thumbnail = prepared
+            .image_format()
+            .and_then(gpui_image_format)
+            .map(|format| (format, prepared.encoded().to_vec()));
+        let (id, size, inserted) = self.stores.add_prepared_image_tracked(prepared)?;
+        if inserted && let Some((format, bytes)) = thumbnail {
             self.gpui_images
                 .insert(id, Arc::new(Image::from_bytes(format, bytes)));
         }
-        Ok((id, [width, height], true))
+        Ok((id, size, inserted))
     }
 
     /// Drop an asset ingested by [`add_image`](Self::add_image) again — the
     /// rollback path when a batch fails after ingesting.
     pub(crate) fn remove(&mut self, id: AssetId) {
-        if self.raw_assets.contains_key(&id) {
-            Arc::make_mut(self.raw_assets).remove(&id);
-        }
-        if let Some(overlay) = self.overlay.as_ref() {
-            overlay.added.write().unwrap().remove(&id);
-            overlay.added_bytes.write().unwrap().remove(&id);
-        }
+        self.stores.remove(id);
         self.gpui_images.remove(&id);
+    }
+}
+
+impl fanta_headless::assets::ImageStore for AssetStores<'_> {
+    fn add_image_tracked(&mut self, bytes: Vec<u8>) -> Result<(AssetId, [u32; 2], bool)> {
+        AssetStores::add_image_tracked(self, bytes)
+    }
+
+    fn remove(&mut self, asset: AssetId) {
+        AssetStores::remove(self, asset);
     }
 }
 
@@ -7272,9 +7129,6 @@ mod tests {
                 .agent_asset_overlay
                 .as_ref()
                 .context("poster overlay")?
-                .added
-                .read()
-                .expect("overlay lock")
                 .is_empty()
         );
         Ok(())

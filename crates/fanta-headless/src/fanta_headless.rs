@@ -5,6 +5,7 @@
 //!
 //! The facade is frozen by `docs/cloud-engine-contracts.md`.
 
+pub mod assets;
 pub mod clipboard;
 pub mod comments;
 pub mod component_properties;

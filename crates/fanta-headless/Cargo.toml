@@ -13,6 +13,7 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 fanta-canvas.workspace = true
 fanta-design-ops.workspace = true
 fanta-doc.workspace = true

@@ -550,7 +550,7 @@ impl McpServerTool for ImportImageTool {
             }).await?
         } else {
             let source = input.source.context("the image source is missing")?;
-            cx.background_spawn(async move { crate::agent_surface::decode_image_source(&source) })
+            cx.background_spawn(async move { fanta_headless::assets::decode_image_source(&source) })
                 .await?
         };
         let name = input.name.unwrap_or_else(|| "Generated image".into());

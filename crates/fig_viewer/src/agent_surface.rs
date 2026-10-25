@@ -11,7 +11,6 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use base64::Engine as _;
 use design_surface::{
     AlignContent, AlignEdge, CellAlignment, CrossAxisAlignment, DEFAULT_CHILD_LIMIT,
     DesignComponentPropertyKind, DesignEffect, DesignImageFit, DesignNodeType, DesignOp,
@@ -30,6 +29,7 @@ use fanta_doc::{
     UnitInterval, VarValue, Variable, VariableCollection, VariableCollectionId, VariableId,
     VariableType, VectorNode, Viewport,
 };
+use fanta_headless::assets::decode_image_source;
 use fanta_headless::scene::{
     COMPONENT_OVERVIEW_LIMIT, bounds_json, check_page_listing_budget, components_json,
     content_bounds, design_system_json, empty_space, find_collection, paginated_node_summary,
@@ -50,8 +50,7 @@ use util::ResultExt as _;
 
 use crate::clipboard::{create_operations, duplicate_operations};
 use crate::document::{
-    AssetStores, DocChange, FigDocument, FigItem, FigItemEvent, FigPage, MAX_IMAGE_SOURCE_BYTES,
-    PreparedImage, SaveKind,
+    AssetStores, DocChange, FigDocument, FigItem, FigItemEvent, FigPage, PreparedImage, SaveKind,
 };
 use crate::properties_ops::{
     DEFAULT_FILL_COLOR, blurs_operations, create_component_operations, default_shadow,
@@ -4197,45 +4196,6 @@ fn layer_position_index(
     Ok(Some(new))
 }
 
-/// Decode a `create_image` source: a `data:` URI or raw base64. URLs are
-/// deliberately not fetched here — the surface is synchronous and network
-/// access belongs to the tool layer (`place_generation`), which downloads and
-/// re-issues the op with base64.
-pub(crate) fn decode_image_source(source: &str) -> Result<Vec<u8>> {
-    let source = source.trim();
-    if source.starts_with("http://") || source.starts_with("https://") {
-        bail!(
-            "create_image does not fetch URLs; use the place_generation tool, or fetch the \
-             bytes yourself and pass them as base64"
-        );
-    }
-    let payload = match source.strip_prefix("data:") {
-        Some(rest) => {
-            let (header, payload) = rest
-                .split_once(',')
-                .context("the data: URI has no `,` separating the payload")?;
-            if !header.ends_with(";base64") {
-                bail!("only base64 data: URIs are supported");
-            }
-            payload
-        }
-        None => source,
-    };
-    // Models occasionally hard-wrap long base64 payloads; strip whitespace
-    // before decoding so that doesn't fail the op.
-    let compact: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(compact.as_bytes())
-        .context("the image source is not valid base64")?;
-    if bytes.len() > MAX_IMAGE_SOURCE_BYTES {
-        bail!(
-            "the image is {} bytes; the limit is {MAX_IMAGE_SOURCE_BYTES}",
-            bytes.len()
-        );
-    }
-    Ok(bytes)
-}
-
 fn parse_fill_color(raw: &str) -> Result<Color> {
     parse_color(raw)
         .with_context(|| format!("`{raw}` is not a valid hex color (use #RRGGBB or #RRGGBBAA)"))
@@ -4387,6 +4347,7 @@ fn set_solid_fill(data: &mut NodeData, color: Color) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     #[test]
     fn agent_source_focus_accepts_new_files_inside_the_project() -> Result<()> {
