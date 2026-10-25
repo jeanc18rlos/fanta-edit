@@ -7,6 +7,7 @@
 mod events;
 mod nodes;
 mod properties;
+mod variables;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
