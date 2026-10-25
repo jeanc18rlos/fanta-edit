@@ -54,6 +54,7 @@ pub mod snapshot;
 pub mod spatial;
 pub mod style;
 pub mod stylesheet;
+pub mod text_tokens;
 pub mod transform;
 pub mod value;
 pub mod variables;
@@ -121,6 +122,10 @@ pub use resolve::{
     resolved_component_rev_with_context, resolved_component_root,
     resolved_component_root_with_context, resolved_component_with_context,
     strip_redundant_instance_overrides,
+};
+pub use text_tokens::{
+    apply_text_tokens, displayed_text_node, has_text_tokens, interpolate_text, resolve_text_token,
+    text_token_variable, text_tokens,
 };
 pub use scene::{Ancestors, Descendants, Scene, SceneError};
 pub use selection::Selection;

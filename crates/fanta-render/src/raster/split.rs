@@ -241,6 +241,7 @@ impl<'inputs> SplitSpec<'inputs> {
             motion: None,
             playback: None,
             video_fill_frames: None,
+            raw_text_node: None,
         }
     }
 

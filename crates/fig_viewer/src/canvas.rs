@@ -2529,6 +2529,7 @@ impl MacGpuRenderer {
             playback: playback.as_ref(),
             video_fill_frames: (!video_fill_frames.is_empty()).then_some(&video_fill_frames),
             dark_ui: false,
+            raw_text_node: None,
         };
         let render_started = Instant::now();
         let resolver = inputs.asset_resolver.map(|resolver| resolver.as_ref());
@@ -4479,6 +4480,7 @@ fn render_fig_canvas(
         playback,
         video_fill_frames,
         dark_ui: false,
+        raw_text_node: None,
     };
     renderer.render_page_with(&document.doc.scene, &render_viewport, page_root, &inputs);
     render_image_from_rgba(width, height, renderer.copy_rgba(), scale_factor)

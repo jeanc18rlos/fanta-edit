@@ -960,16 +960,18 @@ impl PlaybackSession {
                 .get(&identity)
                 .and_then(|occurrence| self.doc.scene.get(occurrence.node))
                 .unwrap_or(&node);
-            if authored.bindings.iter().any(|(property, _)| {
-                matches!(
-                    property,
-                    fanta_doc::BoundProp::TextStyle
-                        | fanta_doc::BoundProp::TextContent
-                        | fanta_doc::BoundProp::ClipWidth
-                        | fanta_doc::BoundProp::ClipHeight
-                        | fanta_doc::BoundProp::Visible
-                )
-            }) {
+            if fanta_doc::has_text_tokens(authored)
+                || authored.bindings.iter().any(|(property, _)| {
+                    matches!(
+                        property,
+                        fanta_doc::BoundProp::TextStyle
+                            | fanta_doc::BoundProp::TextContent
+                            | fanta_doc::BoundProp::ClipWidth
+                            | fanta_doc::BoundProp::ClipHeight
+                            | fanta_doc::BoundProp::Visible
+                    )
+                })
+            {
                 layout_changes.insert(identity);
             }
         }
@@ -1003,6 +1005,13 @@ impl PlaybackSession {
                 property.apply_resolved(&mut node, value);
             }
         }
+        fanta_doc::apply_text_tokens(
+            &mut node,
+            &self.variables,
+            &self.doc.scene,
+            anchor,
+            &self.active_modes,
+        );
         node.bindings.clear();
         match self.apply_runtime_style(&node) {
             Ok(patched) => node = patched,

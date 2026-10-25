@@ -1039,7 +1039,8 @@ pub(crate) fn resolve_overlay(
         .inputs
         .motion
         .is_some_and(|motion| motion.overrides.keys().any(|target| target.node == id));
-    if node.bindings.is_empty() && !has_motion {
+    let has_tokens = ctx.inputs.raw_text_node != Some(id) && fanta_doc::has_text_tokens(node);
+    if node.bindings.is_empty() && !has_motion && !has_tokens {
         return None;
     }
     let mut scratch = node.clone();
@@ -1062,6 +1063,15 @@ pub(crate) fn resolve_overlay(
         ) {
             prop.apply_resolved(&mut scratch, resolved);
         }
+    }
+    if has_tokens {
+        fanta_doc::apply_text_tokens(
+            &mut scratch,
+            ctx.inputs.variables,
+            ctx.scene,
+            id,
+            ctx.inputs.active_modes,
+        );
     }
     if let Some(motion) = ctx.inputs.motion {
         scratch = motion.apply_to_node(&scratch);

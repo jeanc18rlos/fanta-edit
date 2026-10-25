@@ -67,6 +67,7 @@ fn instance_of_one_rect_master_renders_that_rect() {
         playback: None,
         video_fill_frames: None,
         dark_ui: false,
+        raw_text_node: None,
     };
 
     let mut r = RasterRenderer::new(64, 64).unwrap();
@@ -131,6 +132,7 @@ fn unclipped_component_root_effect_layer_includes_overflowing_children() {
         playback: None,
         video_fill_frames: None,
         dark_ui: false,
+        raw_text_node: None,
     };
     let mut renderer = RasterRenderer::new(64, 64).unwrap();
     renderer.render_with(&doc.scene, &doc.viewport, &inputs);
@@ -202,6 +204,7 @@ fn instance_text_override_renders_the_overridden_glyphs() {
         playback: None,
         video_fill_frames: None,
         dark_ui: false,
+        raw_text_node: None,
     };
 
     let mut r = RasterRenderer::new(160, 64).unwrap();
@@ -244,6 +247,7 @@ fn dangling_instance_draws_a_faint_outline_not_a_blue_block() {
         playback: None,
         video_fill_frames: None,
         dark_ui: false,
+        raw_text_node: None,
     };
 
     let mut r = RasterRenderer::new(64, 64).unwrap();
@@ -361,6 +365,7 @@ fn derived_instance_preserves_baked_positions_instead_of_reflowing() {
         playback: None,
         video_fill_frames: None,
         dark_ui: false,
+        raw_text_node: None,
     };
 
     let mut renderer = RasterRenderer::new(128, 64).unwrap();
@@ -406,6 +411,7 @@ fn instance_expansion_is_memoized_across_frames() {
         playback: None,
         video_fill_frames: None,
         dark_ui: false,
+        raw_text_node: None,
     };
 
     let mut r = RasterRenderer::new(64, 64).unwrap();
@@ -483,6 +489,7 @@ fn instance_master_root_outside_stroke_escapes_the_instance_box() {
         playback: None,
         video_fill_frames: None,
         dark_ui: false,
+        raw_text_node: None,
     };
     let mut r = RasterRenderer::new(64, 64).unwrap();
     r.render_with(&doc.scene, &doc.viewport, &inputs);
@@ -572,6 +579,7 @@ fn editing_a_master_repaints_a_plain_instance() {
             playback: None,
             video_fill_frames: None,
             dark_ui: false,
+            raw_text_node: None,
         },
     );
     let before = rgba_at(&r.copy_rgba(), 64, 32, 32);
@@ -594,6 +602,7 @@ fn editing_a_master_repaints_a_plain_instance() {
             playback: None,
             video_fill_frames: None,
             dark_ui: false,
+            raw_text_node: None,
         },
     );
     let after = rgba_at(&r.copy_rgba(), 64, 32, 32);
