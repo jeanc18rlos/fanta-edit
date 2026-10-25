@@ -4369,6 +4369,7 @@ name = "fanta-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "fanta-canvas",
  "fanta-design-ops",
  "fanta-doc",
@@ -4380,6 +4381,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.17",
+ "ureq",
 ]
 
 [[package]]

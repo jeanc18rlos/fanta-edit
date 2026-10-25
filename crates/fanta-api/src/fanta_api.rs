@@ -8,10 +8,12 @@ mod editing;
 mod events;
 mod nodes;
 mod properties;
+mod templates;
 mod variables;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use fanta_design_ops::DesignOp;
@@ -25,6 +27,7 @@ pub use fanta_doc::{BlurKind, Placeholder, Scope, ShadowKind};
 pub use fanta_headless::export::{ExportEncoding, ExportSizing, ExportedImage};
 pub use nodes::{NodeKind, NodeType};
 pub use properties::{PropertyInfo, PropertyKind, PropertyValue};
+pub use templates::{DataUriFetcher, DirectoryFetcher, HttpFetcher, ImageFetcher};
 
 /// Why a call was refused or failed.
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +77,7 @@ pub struct DesignSession {
     backing: Backing,
     events: events::EventHub,
     permissions: editing::Permissions,
+    image_fetcher: Arc<dyn ImageFetcher>,
 }
 
 impl DesignSession {
@@ -113,6 +117,18 @@ impl DesignSession {
         Ok(Self::with_backing(Backing::Memory(HeadlessDocument::new(
             doc, assets,
         ))))
+    }
+
+    /// A new in-memory session holding a copy of this design and its assets,
+    /// without history or subscriptions. It keeps this session's role, scope
+    /// rules and image fetcher.
+    pub fn copy(&self) -> DesignSession {
+        DesignSession {
+            backing: Backing::Memory(self.document().copy()),
+            events: events::EventHub::default(),
+            permissions: self.permissions.clone(),
+            image_fetcher: self.image_fetcher.clone(),
+        }
     }
 
     /// Write the edits back to the project directory the session was opened
@@ -300,6 +316,7 @@ impl DesignSession {
             backing,
             events: events::EventHub::default(),
             permissions: editing::Permissions::default(),
+            image_fetcher: Arc::new(DataUriFetcher),
         }
     }
 

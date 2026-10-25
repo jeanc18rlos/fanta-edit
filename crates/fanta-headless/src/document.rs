@@ -36,10 +36,20 @@ pub struct HeadlessDocument {
 impl HeadlessDocument {
     /// Take `doc` and its encoded image assets for editing: record its
     /// committed edits from here on and take its current layout as solved.
-    pub fn new(mut doc: Doc, raw_assets: BTreeMap<AssetId, Vec<u8>>) -> Self {
+    pub fn new(doc: Doc, raw_assets: BTreeMap<AssetId, Vec<u8>>) -> Self {
+        Self::with_assets(doc, Arc::new(raw_assets))
+    }
+
+    /// An independent copy of the design and its assets, without history:
+    /// edits to one never show in the other. The asset bytes are shared until
+    /// either side ingests an image.
+    pub fn copy(&self) -> Self {
+        Self::with_assets(self.doc.clone_for_persist(), self.raw_assets.clone())
+    }
+
+    fn with_assets(mut doc: Doc, raw_assets: Arc<BTreeMap<AssetId, Vec<u8>>>) -> Self {
         let (sender, journal_events) = mpsc::channel();
         doc.set_journal_sink(Some(JournalSink::new(sender)));
-        let raw_assets = Arc::new(raw_assets);
         let asset_resolver = (!raw_assets.is_empty()).then(|| {
             Arc::new(LazyAssetResolver::with_size_reader(
                 raw_assets.clone(),
@@ -229,6 +239,17 @@ impl HeadlessDocument {
         Ok(redone)
     }
 
+    /// Roll the open transaction back to `savepoint`, its length when the
+    /// caller took it. The rolled-back operations include the layout they
+    /// settled, so the layout baseline only catches up, as for undo.
+    pub fn roll_back_to(&mut self, savepoint: usize) -> Result<()> {
+        self.doc
+            .rollback_open_transaction(savepoint)
+            .context("rolling back the open transaction")?;
+        self.layout.catch_up(&self.doc);
+        Ok(())
+    }
+
     /// Every operation committed since the document was opened, in order,
     /// with the geometry each edit's layout solve added: the journal the
     /// editor replays to bring an open document up to date.
@@ -276,6 +297,61 @@ mod tests {
         assert_eq!(doc.history.undo_depth(), 0);
         assert!(document.journal().is_empty());
         assert!(document.raw_assets().is_empty());
+    }
+
+    #[test]
+    fn edits_to_a_copy_never_reach_the_original() {
+        let mut original = HeadlessDocument::empty().expect("empty document");
+        let page = original.doc().active_page().expect("page");
+        let rectangle = serde_json::json!([
+            {"op": "create_node", "node_type": "rectangle", "x": 0, "y": 0,
+             "width": 10, "height": 10},
+        ]);
+        original
+            .apply_design_ops(Some(page), "Card", &design_ops(rectangle.clone()), true)
+            .expect("card");
+        let mut copy = original.copy();
+        assert_eq!(copy.doc().history.undo_depth(), 0, "a copy has no history");
+        let nodes = |document: &HeadlessDocument| document.doc().scene.descendants_of(page).count();
+        assert_eq!(nodes(&copy), nodes(&original));
+
+        copy.apply_design_ops(Some(page), "Second", &design_ops(rectangle), true)
+            .expect("second card");
+        let mut pixels = Vec::new();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut pixels),
+                image::ImageFormat::Png,
+            )
+            .expect("encode png");
+        let (asset, _, inserted) = copy.ingest_image(pixels).expect("ingest");
+        assert!(inserted);
+        assert_eq!(nodes(&copy), nodes(&original) + 1);
+        assert!(!original.raw_assets().contains_key(&asset));
+        assert_eq!(original.doc().history.undo_depth(), 1);
+    }
+
+    #[test]
+    fn rolling_back_to_a_savepoint_keeps_the_earlier_edits() {
+        let mut document = HeadlessDocument::empty().expect("empty document");
+        let page = document.doc().active_page().expect("page");
+        let child = || {
+            let mut node = CanvasNode::new(NodeData::Group(GroupNode::default()));
+            node.parent = Some(page);
+            node
+        };
+        let (first, second) = (child(), child());
+        let (first_id, second_id) = (first.id, second.id);
+        let doc = document.doc_mut();
+        doc.history.begin("Edits", &mut doc.scene);
+        doc.apply(Operation::create_node(first)).expect("first");
+        let savepoint = doc.history.open_len().expect("an open transaction");
+        doc.apply(Operation::create_node(second)).expect("second");
+
+        document.roll_back_to(savepoint).expect("roll back");
+        assert!(document.doc().scene.get(first_id).is_some());
+        assert!(document.doc().scene.get(second_id).is_none());
+        assert_eq!(document.doc().history.open_len(), Some(savepoint));
     }
 
     fn design_ops(value: serde_json::Value) -> Vec<DesignOp> {
