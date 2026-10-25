@@ -37,7 +37,17 @@ declare global {
     | "hue"
     | "saturation"
     | "color"
-    | "luminosity";
+    | "luminosity"
+    | "linear_burn"
+    | "linear_dodge"
+    | "darker_color"
+    | "lighter_color"
+    | "vivid_light"
+    | "linear_light"
+    | "pin_light"
+    | "hard_mix"
+    | "subtract"
+    | "divide";
 
   interface FnxGradientStop {
     position: number;

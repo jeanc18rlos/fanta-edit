@@ -158,6 +158,14 @@ pub(crate) fn design_blend_mode(mode: BlendMode) -> DesignBlendMode {
         BlendMode::Luminosity => DesignBlendMode::Luminosity,
         BlendMode::LinearBurn => DesignBlendMode::LinearBurn,
         BlendMode::LinearDodge => DesignBlendMode::LinearDodge,
+        BlendMode::DarkerColor => DesignBlendMode::DarkerColor,
+        BlendMode::LighterColor => DesignBlendMode::LighterColor,
+        BlendMode::VividLight => DesignBlendMode::VividLight,
+        BlendMode::LinearLight => DesignBlendMode::LinearLight,
+        BlendMode::PinLight => DesignBlendMode::PinLight,
+        BlendMode::HardMix => DesignBlendMode::HardMix,
+        BlendMode::Subtract => DesignBlendMode::Subtract,
+        BlendMode::Divide => DesignBlendMode::Divide,
     }
 }
 
@@ -183,6 +191,14 @@ pub(crate) fn engine_blend_mode(mode: DesignBlendMode) -> Option<BlendMode> {
         DesignBlendMode::Luminosity => BlendMode::Luminosity,
         DesignBlendMode::LinearBurn => BlendMode::LinearBurn,
         DesignBlendMode::LinearDodge => BlendMode::LinearDodge,
+        DesignBlendMode::DarkerColor => BlendMode::DarkerColor,
+        DesignBlendMode::LighterColor => BlendMode::LighterColor,
+        DesignBlendMode::VividLight => BlendMode::VividLight,
+        DesignBlendMode::LinearLight => BlendMode::LinearLight,
+        DesignBlendMode::PinLight => BlendMode::PinLight,
+        DesignBlendMode::HardMix => BlendMode::HardMix,
+        DesignBlendMode::Subtract => BlendMode::Subtract,
+        DesignBlendMode::Divide => BlendMode::Divide,
         DesignBlendMode::PassThrough => return None,
     })
 }
@@ -15925,6 +15941,16 @@ mod tests {
             doc.scene.get(id).expect("text exists").blend_mode,
             BlendMode::Normal
         );
+    }
+
+    #[test]
+    fn every_blend_mode_round_trips_through_the_panel() {
+        for (mode, _) in crate::properties_snapshot::BLEND_MODES {
+            assert_eq!(engine_blend_mode(design_blend_mode(mode)), Some(mode));
+        }
+        for mode in DesignBlendMode::NON_PASS_THROUGH {
+            assert_eq!(engine_blend_mode(mode).map(design_blend_mode), Some(mode));
+        }
     }
 
     #[test]

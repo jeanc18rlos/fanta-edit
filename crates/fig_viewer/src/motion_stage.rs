@@ -108,7 +108,15 @@ fn css_blend(mode: BlendMode) -> Option<Option<&'static str>> {
         BlendMode::Color => Some("color"),
         BlendMode::Luminosity => Some("luminosity"),
         BlendMode::LinearDodge => Some("plus-lighter"),
-        BlendMode::LinearBurn => return None,
+        BlendMode::LinearBurn
+        | BlendMode::DarkerColor
+        | BlendMode::LighterColor
+        | BlendMode::VividLight
+        | BlendMode::LinearLight
+        | BlendMode::PinLight
+        | BlendMode::HardMix
+        | BlendMode::Subtract
+        | BlendMode::Divide => return None,
     })
 }
 
@@ -509,8 +517,12 @@ fn layer_entry(
     let blend = match css_blend(node.blend_mode) {
         Some(blend) => blend,
         None => {
+            let mode = crate::properties_snapshot::BLEND_MODES
+                .iter()
+                .find_map(|(mode, name)| (*mode == node.blend_mode).then_some(*name))
+                .unwrap_or("a blend mode");
             notes.push(format!(
-                "{label} uses Linear Burn, which CSS cannot blend; it is drawn normally."
+                "{label} uses {mode}, which CSS cannot blend; it is drawn normally."
             ));
             None
         }
