@@ -31,6 +31,7 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 - Infer vector viewports only at the `.fig` decoding boundary. An omitted `local_size` in a native project is valid authored state. (#62)
 - After Save, refreshing embedded source buffers keeps the transaction a no-op reload returns (it can be the previous authored one), and merges canonical layout changes into the triggering source edit so one Undo restores both. (#54)
 - Derive macOS video duration from native playback preparation. Raw MP4 track duration can include samples an edit list excludes. (#4)
+- Ingest and roll back images through `document::AssetStores`, never the same-named `fanta_headless::assets::AssetStores` it wraps. Only the wrapper keeps the asset panel's GPUI thumbnail cache in step, so the headless store alone leaves new images without thumbnails and removed ones with stale ones. (#160)
 
 ## Input, focus and keymaps
 
