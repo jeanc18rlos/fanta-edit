@@ -11,7 +11,7 @@ Fanta is a macOS design editor built as a fork of Zed. The `fanta` package build
 | Viewport math, tools | `crates/fanta-canvas`, `crates/fanta-tools` |
 | `.fig` import, prototype playback | `crates/fanta-fig-interop`, `crates/fanta-present` |
 | Agent seam, design ops and built-in canvas tools | `crates/design_surface`, `crates/fanta-design-ops`, `crates/agent/src/tools/design_*` |
-| Headless engine and cloud engine worker | `crates/fanta-headless`, `crates/fanta-engine` |
+| Headless engine, design API and cloud engine worker | `crates/fanta-headless`, `crates/fanta-api`, `crates/fanta-engine` |
 | Shared Fanta UI | `crates/fanta_ui` |
 
 GPUI and the reusable UI crates are not in this repository. They come from `squidred-dev/fanta-ui`, pinned by git revision in `Cargo.toml`; read their source under `~/.cargo/git/checkouts/fanta-ui-*/<rev>/crates/`. `vendor/skia-bindings-0.153.3` carries Fanta's Graphite shim (see its `FANTA-PROVENANCE.txt`).
@@ -26,6 +26,7 @@ Crate rules record traps that earlier changes hit. Claude Code loads them when i
 - `crates/fanta-fnx/AGENTS.md`
 - `crates/fanta-render/AGENTS.md`
 - `crates/fanta-headless/AGENTS.md`
+- `crates/fanta-api/AGENTS.md`
 - `crates/design_surface/AGENTS.md`: also covers `crates/fanta-design-ops` (linked there), `crates/agent/src/tools/design_*`, `fig_viewer`'s `agent_surface.rs` and `live_mcp.rs`, and the guide seeded into new projects
 - `docs/AGENTS.md`: writing docs
 

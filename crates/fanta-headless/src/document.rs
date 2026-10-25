@@ -96,6 +96,21 @@ impl HeadlessDocument {
         self.asset_resolver.clone()
     }
 
+    /// The document together with the stores an edit ingests images into, so
+    /// one edit can create nodes and their image assets in the same pass.
+    /// Marks the assets changed, so the next save writes them.
+    pub fn doc_and_images(&mut self) -> (&mut Doc, AssetStores<'_>) {
+        self.assets_changed = true;
+        (
+            &mut self.doc,
+            AssetStores::new(
+                &mut self.raw_assets,
+                &mut self.asset_resolver,
+                &mut self.asset_overlay,
+            ),
+        )
+    }
+
     /// Ingest encoded image bytes as an asset of the document. Returns the
     /// asset, its natural size and whether this call added it.
     pub fn ingest_image(&mut self, bytes: Vec<u8>) -> Result<(AssetId, [u32; 2], bool)> {
@@ -194,6 +209,24 @@ impl HeadlessDocument {
         let result = layout::settle(&mut self.doc, &mut self.layout);
         self.drain_journal();
         result
+    }
+
+    /// Undo the last step, committing an open transaction first so that it is
+    /// the step undone. The undone step restores its own solved layout, so the
+    /// layout baseline only catches up. Returns whether a step was undone.
+    pub fn undo(&mut self) -> Result<bool> {
+        let undone = self.doc.undo().context("undoing the last step")?;
+        self.layout.catch_up(&self.doc);
+        self.drain_journal();
+        Ok(undone)
+    }
+
+    /// Redo the last undone step. Returns whether a step was redone.
+    pub fn redo(&mut self) -> Result<bool> {
+        let redone = self.doc.redo().context("redoing the last step")?;
+        self.layout.catch_up(&self.doc);
+        self.drain_journal();
+        Ok(redone)
     }
 
     /// Every operation committed since the document was opened, in order,

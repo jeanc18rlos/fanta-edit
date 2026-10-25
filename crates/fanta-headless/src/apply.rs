@@ -557,6 +557,57 @@ impl BatchProgress {
     }
 }
 
+/// Apply one op into the caller's open history transaction, without a
+/// batch's commit or rollback: the building block for callers that gather
+/// several edits into one undo step. Returns the node the op created, if any.
+/// When the op fails, the images it ingested are removed again, but the
+/// operations it applied before failing stay in the open transaction for the
+/// caller to roll back with [`Doc::rollback_open_transaction`].
+pub fn apply_design_op(
+    doc: &mut Doc,
+    assets: &mut dyn ImageStore,
+    operation: &DesignOp,
+    default_container: Option<NodeId>,
+) -> Result<Option<NodeId>> {
+    let mut ingested_assets = Vec::new();
+    let mut removed_nodes = HashSet::new();
+    let applied = match apply_one(
+        doc,
+        assets,
+        &mut ingested_assets,
+        &mut removed_nodes,
+        operation,
+        default_container,
+    ) {
+        Ok(applied) => applied,
+        Err(error) => {
+            for asset in ingested_assets {
+                assets.remove(asset);
+            }
+            return Err(error);
+        }
+    };
+    if doc
+        .selection
+        .iter()
+        .any(|selected| removed_nodes.contains(selected))
+    {
+        let surviving: Vec<NodeId> = doc
+            .selection
+            .iter()
+            .copied()
+            .filter(|selected| !removed_nodes.contains(selected))
+            .collect();
+        doc.selection.replace_with(surviving);
+    }
+    match applied {
+        Applied::Content {
+            created: Some(id), ..
+        } => parse_node_id(&id).map(Some),
+        _ => Ok(None),
+    }
+}
+
 pub fn design_operation_is_presence(operation: &DesignOp) -> bool {
     matches!(
         operation,

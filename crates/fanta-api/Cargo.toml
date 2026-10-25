@@ -1,0 +1,29 @@
+[package]
+name = "fanta-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+description = "Fanta's programmatic design API: create or open a design, edit its nodes, follow its changes and export it without the app."
+
+[lib]
+path = "src/fanta_api.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+fanta-design-ops.workspace = true
+fanta-doc.workspace = true
+fanta-format.workspace = true
+fanta-headless.workspace = true
+glam.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+image.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
