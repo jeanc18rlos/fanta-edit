@@ -9,8 +9,8 @@ use fanta_canvas::transform_angle;
 use fanta_design_ops::DesignOp;
 use fanta_doc::{
     BlendMode, Blur, BlurKind, BoundProp, CanvasNode, Color, Doc, Fill, ImageAdjust, ImageFitMode,
-    LayoutMode, NodeData, NodeFlags, NodeId, Operation, ShadowKind, Stroke, StrokeAlign, StrokeCap,
-    StrokeJoin, TextAlign, TextAutoResize, TextStyle, Transform2D, UnitInterval, VAlign,
+    LayoutMode, NodeData, NodeFlags, NodeId, Operation, Scope, ShadowKind, Stroke, StrokeAlign,
+    StrokeCap, StrokeJoin, TextAlign, TextAutoResize, TextStyle, Transform2D, UnitInterval, VAlign,
 };
 use fanta_headless::edit_operations::{
     authored_local_bounds, blurs_operations, default_shadow, effects_operations,
@@ -77,6 +77,9 @@ struct PropertyDef {
     /// The path, with `#` standing for a list index.
     pattern: &'static str,
     kind: PropertyKind,
+    /// The scope a write needs; `None` for what no template locks, such as
+    /// the name.
+    scope: Option<Scope>,
     /// How many entries of the property the node has; 0 when it has none.
     count: fn(&CanvasNode) -> usize,
     get: Getter,
@@ -193,6 +196,9 @@ impl DesignSession {
     /// Write a property. The value's kind must match the property's.
     pub fn set_property(&mut self, node: NodeId, path: &str, value: PropertyValue) -> Result<()> {
         let (def, index) = self.resolve(node, path)?;
+        if let Some(scope) = def.scope {
+            self.permit(Some(node), scope)?;
+        }
         if value.kind() != def.kind {
             return Err(ApiError::PropertyKind {
                 path: path.to_owned(),
@@ -291,6 +297,7 @@ impl DesignSession {
 
     /// Add a solid fill on top of `node`'s fills and return its index.
     pub fn add_fill(&mut self, node: NodeId, color: Color) -> Result<usize> {
+        self.permit(Some(node), Scope::FillChange)?;
         let canvas_node = self.node(node)?;
         if !has_fills(canvas_node) {
             return Err(ApiError::InvalidArgument(format!("{node} has no fills")));
@@ -312,6 +319,7 @@ impl DesignSession {
     }
 
     pub fn remove_fill(&mut self, node: NodeId, index: usize) -> Result<()> {
+        self.permit(Some(node), Scope::FillChange)?;
         let canvas_node = self.node(node)?;
         if index >= fill_count(canvas_node) {
             return Err(ApiError::InvalidArgument(format!(
@@ -344,6 +352,7 @@ impl DesignSession {
 
     /// Add a solid stroke on top of `node`'s strokes and return its index.
     pub fn add_stroke(&mut self, node: NodeId, color: Color, width: f64) -> Result<usize> {
+        self.permit(Some(node), Scope::StrokeChange)?;
         if !(width.is_finite() && width > 0.0) {
             return Err(ApiError::InvalidArgument(
                 "a stroke width must be positive".into(),
@@ -363,6 +372,7 @@ impl DesignSession {
     }
 
     pub fn remove_stroke(&mut self, node: NodeId, index: usize) -> Result<()> {
+        self.permit(Some(node), Scope::StrokeChange)?;
         let canvas_node = self.node(node)?;
         if index >= stroke_count(canvas_node) {
             return Err(ApiError::InvalidArgument(format!(
@@ -379,6 +389,7 @@ impl DesignSession {
 
     /// Add a shadow with the editor's defaults and return its index.
     pub fn add_shadow(&mut self, node: NodeId, kind: ShadowKind) -> Result<usize> {
+        self.permit(Some(node), Scope::AppearanceShadow)?;
         let index = self.node(node)?.effects.len();
         let operations = effects_operations(self.doc(), node, |effects| {
             effects.push(fanta_doc::Shadow {
@@ -391,6 +402,7 @@ impl DesignSession {
     }
 
     pub fn remove_shadow(&mut self, node: NodeId, index: usize) -> Result<()> {
+        self.permit(Some(node), Scope::AppearanceShadow)?;
         if index >= self.node(node)?.effects.len() {
             return Err(ApiError::InvalidArgument(format!(
                 "{node} has no shadow {index}"
@@ -403,6 +415,7 @@ impl DesignSession {
     }
 
     pub fn add_blur(&mut self, node: NodeId, kind: BlurKind, radius: f64) -> Result<usize> {
+        self.permit(Some(node), Scope::AppearanceBlur)?;
         if !(radius.is_finite() && radius >= 0.0) {
             return Err(ApiError::InvalidArgument(
                 "a blur radius must be zero or positive".into(),
@@ -416,6 +429,7 @@ impl DesignSession {
     }
 
     pub fn remove_blur(&mut self, node: NodeId, index: usize) -> Result<()> {
+        self.permit(Some(node), Scope::AppearanceBlur)?;
         if index >= self.node(node)?.blurs.len() {
             return Err(ApiError::InvalidArgument(format!(
                 "{node} has no blur {index}"
@@ -429,6 +443,7 @@ impl DesignSession {
 
     /// Mirror `node` across its centre, horizontally or vertically.
     pub fn flip(&mut self, node: NodeId, horizontally: bool) -> Result<()> {
+        self.permit(Some(node), Scope::LayerFlip)?;
         let canvas_node = self.node(node)?;
         let doc = self.doc();
         let center = doc
@@ -580,7 +595,7 @@ fn has_fills(node: &CanvasNode) -> bool {
 
 /// A node's fills in stacking order. A frame's background is fill 0, as
 /// variable bindings count it.
-fn fills(data: &NodeData) -> Vec<&Fill> {
+pub(crate) fn fills(data: &NodeData) -> Vec<&Fill> {
     match data {
         NodeData::Vector(vector) => vector.fills.iter().collect(),
         NodeData::Boolean(boolean) => boolean.fills.iter().collect(),
@@ -593,7 +608,7 @@ fn fills(data: &NodeData) -> Vec<&Fill> {
     }
 }
 
-fn fill_mut(data: &mut NodeData, index: usize) -> Option<&mut Fill> {
+pub(crate) fn fill_mut(data: &mut NodeData, index: usize) -> Option<&mut Fill> {
     match data {
         NodeData::Vector(vector) => vector.fills.get_mut(index),
         NodeData::Boolean(boolean) => boolean.fills.get_mut(index),
@@ -704,6 +719,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "name",
             kind: PropertyKind::String,
+            scope: None,
             count: one,
             get: |_, node, _| Some(PropertyValue::String(node.name.clone())),
             set: Some(|_, node, _, value| {
@@ -724,6 +740,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "visible",
             kind: PropertyKind::Bool,
+            scope: Some(Scope::LayerVisibility),
             count: one,
             get: |_, node, _| Some(PropertyValue::Bool(!node.flags.contains(NodeFlags::HIDDEN))),
             set: Some(|_, node, _, value| {
@@ -735,6 +752,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "locked",
             kind: PropertyKind::Bool,
+            scope: None,
             count: one,
             get: |_, node, _| Some(PropertyValue::Bool(node.flags.contains(NodeFlags::LOCKED))),
             set: Some(|_, node, _, value| Ok(flag_write(node, NodeFlags::LOCKED, boolean(value)?))),
@@ -744,6 +762,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "opacity",
             kind: PropertyKind::Float,
+            scope: Some(Scope::LayerOpacity),
             count: one,
             get: |_, node, _| Some(PropertyValue::Float(f64::from(node.opacity.get()))),
             set: Some(|_, node, _, value| {
@@ -764,6 +783,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "blend_mode",
             kind: PropertyKind::Enum,
+            scope: Some(Scope::LayerBlendMode),
             count: one,
             get: |_, node, _| Some(PropertyValue::Enum(enum_name(&node.blend_mode))),
             set: Some(|_, node, _, value| {
@@ -784,6 +804,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "position/x",
             kind: PropertyKind::Float,
+            scope: Some(Scope::LayerMove),
             count: one,
             get: |doc, node, _| {
                 doc.scene
@@ -803,6 +824,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "position/y",
             kind: PropertyKind::Float,
+            scope: Some(Scope::LayerMove),
             count: one,
             get: |doc, node, _| {
                 doc.scene
@@ -822,6 +844,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "size/width",
             kind: PropertyKind::Float,
+            scope: Some(Scope::LayerResize),
             count: one,
             get: |doc, node, _| {
                 oriented_size(doc, node).map(|[width, _]| PropertyValue::Float(width))
@@ -839,6 +862,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "size/height",
             kind: PropertyKind::Float,
+            scope: Some(Scope::LayerResize),
             count: one,
             get: |doc, node, _| {
                 oriented_size(doc, node).map(|[_, height]| PropertyValue::Float(height))
@@ -856,6 +880,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "rotation",
             kind: PropertyKind::Float,
+            scope: Some(Scope::LayerRotate),
             count: one,
             get: |doc, node, _| {
                 doc.scene
@@ -874,6 +899,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "corner_radius",
             kind: PropertyKind::Float,
+            scope: Some(Scope::ShapeChange),
             count: |node| {
                 usize::from(matches!(
                     node.data,
@@ -908,6 +934,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "fills/#/type",
             kind: PropertyKind::Enum,
+            scope: Some(Scope::FillChangeType),
             count: fill_count,
             get: |_, node, index| {
                 let name = match fill_at(node, index)? {
@@ -927,6 +954,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "fills/#/color",
             kind: PropertyKind::Color,
+            scope: Some(Scope::FillChange),
             count: fill_count,
             get: |_, node, index| match fill_at(node, index)? {
                 Fill::Solid { color, .. } => Some(PropertyValue::Color(*color)),
@@ -957,6 +985,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "fills/#/blend_mode",
             kind: PropertyKind::Enum,
+            scope: Some(Scope::FillChange),
             count: fill_count,
             get: |_, node, index| {
                 let blend = match fill_at(node, index)? {
@@ -995,6 +1024,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "fills/#/image/fit",
             kind: PropertyKind::Enum,
+            scope: Some(Scope::LayerCrop),
             count: fill_count,
             get: |_, node, index| match fill_at(node, index)? {
                 Fill::Image { mode, .. } => Some(PropertyValue::Enum(enum_name(mode))),
@@ -1018,6 +1048,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "image/fit",
             kind: PropertyKind::Enum,
+            scope: Some(Scope::LayerCrop),
             count: |node| usize::from(matches!(node.data, NodeData::Bitmap(_))),
             get: |_, node, _| match &node.data {
                 NodeData::Bitmap(bitmap) => Some(PropertyValue::Enum(enum_name(&bitmap.fit))),
@@ -1041,6 +1072,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "strokes/#/color",
             kind: PropertyKind::Color,
+            scope: Some(Scope::StrokeChange),
             count: stroke_count,
             get: |_, node, index| match &stroke_at(node, index)?.paint {
                 Fill::Solid { color, .. } => Some(PropertyValue::Color(*color)),
@@ -1078,6 +1110,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "strokes/#/width",
             kind: PropertyKind::Float,
+            scope: Some(Scope::StrokeChange),
             count: stroke_count,
             get: |_, node, index| Some(PropertyValue::Float(stroke_at(node, index)?.width)),
             set: Some(|doc, node, index, value| {
@@ -1108,6 +1141,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "strokes/#/align",
             kind: PropertyKind::Enum,
+            scope: Some(Scope::StrokeChange),
             count: stroke_count,
             get: |_, node, index| {
                 Some(PropertyValue::Enum(enum_name(
@@ -1135,6 +1169,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "strokes/#/cap",
             kind: PropertyKind::Enum,
+            scope: Some(Scope::StrokeChange),
             count: stroke_count,
             get: |_, node, index| {
                 Some(PropertyValue::Enum(enum_name(&stroke_at(node, index)?.cap)))
@@ -1160,6 +1195,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "strokes/#/join",
             kind: PropertyKind::Enum,
+            scope: Some(Scope::StrokeChange),
             count: stroke_count,
             get: |_, node, index| {
                 Some(PropertyValue::Enum(enum_name(
@@ -1187,6 +1223,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "effects/#/type",
             kind: PropertyKind::Enum,
+            scope: Some(Scope::AppearanceShadow),
             count: |node| node.effects.len(),
             get: |_, node, index| {
                 Some(PropertyValue::Enum(enum_name(
@@ -1200,6 +1237,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "effects/#/color",
             kind: PropertyKind::Color,
+            scope: Some(Scope::AppearanceShadow),
             count: |node| node.effects.len(),
             get: |_, node, index| Some(PropertyValue::Color(node.effects.get(index)?.color)),
             set: Some(|doc, node, index, value| {
@@ -1220,6 +1258,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "effects/#/blur",
             kind: PropertyKind::Float,
+            scope: Some(Scope::AppearanceShadow),
             count: |node| node.effects.len(),
             get: |_, node, index| Some(PropertyValue::Float(node.effects.get(index)?.blur)),
             set: Some(|doc, node, index, value| {
@@ -1240,6 +1279,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "effects/#/spread",
             kind: PropertyKind::Float,
+            scope: Some(Scope::AppearanceShadow),
             count: |node| node.effects.len(),
             get: |_, node, index| Some(PropertyValue::Float(node.effects.get(index)?.spread)),
             set: Some(|doc, node, index, value| {
@@ -1260,6 +1300,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "blurs/#/type",
             kind: PropertyKind::Enum,
+            scope: Some(Scope::AppearanceBlur),
             count: |node| node.blurs.len(),
             get: |_, node, index| {
                 Some(PropertyValue::Enum(enum_name(&node.blurs.get(index)?.kind)))
@@ -1271,6 +1312,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "blurs/#/radius",
             kind: PropertyKind::Float,
+            scope: Some(Scope::AppearanceBlur),
             count: |node| node.blurs.len(),
             get: |_, node, index| Some(PropertyValue::Float(node.blurs.get(index)?.radius)),
             set: Some(|doc, node, index, value| {
@@ -1287,6 +1329,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "text/content",
             kind: PropertyKind::String,
+            scope: Some(Scope::TextEdit),
             count: text_count,
             get: |_, node, _| match &node.data {
                 NodeData::Text(text) => Some(PropertyValue::String(text.content.clone())),
@@ -1305,6 +1348,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "text/font_family",
             kind: PropertyKind::String,
+            scope: Some(Scope::TextCharacter),
             count: text_count,
             get: |_, node, _| Some(PropertyValue::String(text_style(node)?.font_family.clone())),
             set: Some(|doc, node, _, value| {
@@ -1324,6 +1368,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "text/font_size",
             kind: PropertyKind::Float,
+            scope: Some(Scope::TextCharacter),
             count: text_count,
             get: |_, node, _| Some(PropertyValue::Float(text_style(node)?.size_px)),
             set: Some(|doc, node, _, value| {
@@ -1341,6 +1386,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "text/font_weight",
             kind: PropertyKind::Int,
+            scope: Some(Scope::TextCharacter),
             count: text_count,
             get: |_, node, _| Some(PropertyValue::Int(i64::from(text_style(node)?.weight))),
             set: Some(|doc, node, _, value| {
@@ -1361,6 +1407,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "text/italic",
             kind: PropertyKind::Bool,
+            scope: Some(Scope::TextCharacter),
             count: text_count,
             get: |_, node, _| Some(PropertyValue::Bool(text_style(node)?.italic)),
             set: Some(|doc, node, _, value| {
@@ -1373,6 +1420,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "text/underline",
             kind: PropertyKind::Bool,
+            scope: Some(Scope::TextCharacter),
             count: text_count,
             get: |_, node, _| Some(PropertyValue::Bool(text_style(node)?.underline)),
             set: Some(|doc, node, _, value| {
@@ -1387,6 +1435,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "text/strikethrough",
             kind: PropertyKind::Bool,
+            scope: Some(Scope::TextCharacter),
             count: text_count,
             get: |_, node, _| Some(PropertyValue::Bool(text_style(node)?.strikethrough)),
             set: Some(|doc, node, _, value| {
@@ -1401,6 +1450,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "text/letter_spacing",
             kind: PropertyKind::Float,
+            scope: Some(Scope::TextCharacter),
             count: text_count,
             get: |_, node, _| Some(PropertyValue::Float(text_style(node)?.letter_spacing)),
             set: Some(|doc, node, _, value| {
@@ -1415,6 +1465,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "text/line_height",
             kind: PropertyKind::Float,
+            scope: Some(Scope::TextCharacter),
             count: text_count,
             get: |_, node, _| Some(PropertyValue::Float(text_style(node)?.line_height)),
             set: Some(|doc, node, _, value| {
@@ -1435,6 +1486,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "text/color",
             kind: PropertyKind::Color,
+            scope: Some(Scope::TextCharacter),
             count: text_count,
             get: |_, node, _| Some(PropertyValue::Color(text_style(node)?.color)),
             set: Some(|doc, node, _, value| {
@@ -1447,6 +1499,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "text/align",
             kind: PropertyKind::Enum,
+            scope: Some(Scope::TextCharacter),
             count: text_count,
             get: |_, node, _| match &node.data {
                 NodeData::Text(text) => Some(PropertyValue::Enum(enum_name(&text.align))),
@@ -1470,6 +1523,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "text/vertical_align",
             kind: PropertyKind::Enum,
+            scope: Some(Scope::TextCharacter),
             count: text_count,
             get: |_, node, _| match &node.data {
                 NodeData::Text(text) => Some(PropertyValue::Enum(enum_name(&text.vertical_align))),
@@ -1493,6 +1547,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "text/auto_resize",
             kind: PropertyKind::Enum,
+            scope: Some(Scope::TextCharacter),
             count: text_count,
             get: |_, node, _| match &node.data {
                 NodeData::Text(text) => Some(PropertyValue::Enum(enum_name(&text.auto_resize))),
@@ -1516,6 +1571,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "layout/mode",
             kind: PropertyKind::Enum,
+            scope: Some(Scope::LayerResize),
             count: auto_layout_count,
             get: |_, node, _| match &node.data {
                 NodeData::Group(group) => group
@@ -1531,6 +1587,7 @@ fn property_table() -> Vec<PropertyDef> {
         PropertyDef {
             pattern: "layout/gap",
             kind: PropertyKind::Float,
+            scope: Some(Scope::LayerResize),
             count: auto_layout_count,
             get: |_, node, _| match &node.data {
                 NodeData::Group(group) => group
@@ -1643,6 +1700,7 @@ fn property_table() -> Vec<PropertyDef> {
     table.push(PropertyDef {
         pattern: "effects/#/x",
         kind: PropertyKind::Float,
+        scope: Some(Scope::AppearanceShadow),
         count: |node| node.effects.len(),
         get: |_, node, index| Some(PropertyValue::Float(node.effects.get(index)?.offset[0])),
         set: Some(|doc, node, index, value| set_shadow_offset(doc, node, index, 0, value)),
@@ -1652,6 +1710,7 @@ fn property_table() -> Vec<PropertyDef> {
     table.push(PropertyDef {
         pattern: "effects/#/y",
         kind: PropertyKind::Float,
+        scope: Some(Scope::AppearanceShadow),
         count: |node| node.effects.len(),
         get: |_, node, index| Some(PropertyValue::Float(node.effects.get(index)?.offset[1])),
         set: Some(|doc, node, index, value| set_shadow_offset(doc, node, index, 1, value)),
@@ -1665,6 +1724,7 @@ fn padding_def(pattern: &'static str, get: Getter, set: Setter) -> PropertyDef {
     PropertyDef {
         pattern,
         kind: PropertyKind::Float,
+        scope: Some(Scope::LayerResize),
         count: auto_layout_count,
         get,
         set: Some(set),
@@ -1677,6 +1737,7 @@ fn adjust_def(pattern: &'static str, get: Getter, set: Setter) -> PropertyDef {
     PropertyDef {
         pattern,
         kind: PropertyKind::Float,
+        scope: Some(Scope::AppearanceAdjustments),
         count: fill_count,
         get,
         set: Some(set),
