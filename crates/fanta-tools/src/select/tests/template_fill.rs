@@ -64,7 +64,19 @@ fn fill_mode_clicks_through_a_layer_whose_selection_is_disabled() {
     let size = DVec2::new(800.0, 600.0);
     let mut doc = Doc::new();
     let below = rect_at_origin(&mut doc, 60.0, 60.0);
-    let above = rect_at_origin(&mut doc, 60.0, 60.0);
+    // Siblings with equal index keys fall back to id order, which is random
+    // for ids minted in the same millisecond, so give the top layer its own.
+    let mut upper = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        -30.0,
+        -30.0,
+        60.0,
+        60.0,
+        Color::WHITE,
+    )));
+    upper.index = IndexKey::after(IndexKey::FIRST);
+    let above = upper.id;
+    doc.apply(Operation::create_node(upper))
+        .expect("create the top layer");
     disable(&mut doc, above, &[Scope::EditorSelect]);
     let mut viewport = Viewport::default();
     let mut ctx =
