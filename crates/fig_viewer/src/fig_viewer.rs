@@ -3,7 +3,7 @@
 //! panels and the floating canvas toolbar.
 
 use fanta_headless::style as agent_style;
-use fanta_headless::{component_properties, componentize, structure, variant_sets};
+use fanta_headless::{component_properties, structure, variant_sets};
 mod agent_surface;
 mod annotations;
 mod canvas;
