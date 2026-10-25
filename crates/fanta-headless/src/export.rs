@@ -19,13 +19,16 @@ pub const MAX_EXPORT_PIXELS: u32 = 8192;
 /// The most pixels a raster export may hold.
 pub const MAX_EXPORT_TOTAL_PIXELS: u64 = 16 * 1024 * 1024;
 
-/// How large a raster export is: a multiple of the design's size, or a
-/// target width or height that the other side follows.
+/// How large a raster export is: a multiple of the design's size, a target
+/// width or height that the other side follows, or a cap on the longer side.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ExportSizing {
     Scale(f64),
     Width(f64),
     Height(f64),
+    /// The design's own size, scaled down when its longer side is over this
+    /// many pixels; never scaled up.
+    MaxDimension(f64),
 }
 
 impl ExportSizing {
@@ -34,6 +37,7 @@ impl ExportSizing {
             Self::Scale(scale) => scale,
             Self::Width(width) => width / bounds.width(),
             Self::Height(height) => height / bounds.height(),
+            Self::MaxDimension(limit) => (limit / bounds.width().max(bounds.height())).min(1.0),
         };
         if !zoom.is_finite() || zoom <= 0.0 {
             bail!("export size must be a finite positive value");
@@ -47,6 +51,7 @@ impl ExportSizing {
             Self::Scale(scale) => format!("{scale}x"),
             Self::Width(width) => format!("{width}w"),
             Self::Height(height) => format!("{height}h"),
+            Self::MaxDimension(limit) => format!("{limit}max"),
         }
     }
 }
@@ -161,7 +166,7 @@ pub fn raster_dimensions(
     let sizing = sizing.into();
     let multiplier = sizing.zoom(bounds)?;
     let (width, height) = match sizing {
-        ExportSizing::Scale(_) => (
+        ExportSizing::Scale(_) | ExportSizing::MaxDimension(_) => (
             (bounds.width() * multiplier).ceil(),
             (bounds.height() * multiplier).ceil(),
         ),
@@ -535,5 +540,19 @@ mod tests {
         )
         .expect_err("too large");
         assert!(error.to_string().contains("limit"), "{error}");
+    }
+
+    #[test]
+    fn a_max_dimension_scales_down_and_never_up() {
+        let wide = Bounds::from_xywh(0.0, 0.0, 4000.0, 1000.0);
+        assert_eq!(
+            raster_dimensions(wide, ExportSizing::MaxDimension(1568.0), "Banner").expect("fits"),
+            (1568, 392)
+        );
+        assert_eq!(
+            raster_dimensions(wide, ExportSizing::MaxDimension(8000.0), "Banner").expect("fits"),
+            (4000, 1000)
+        );
+        assert!(raster_dimensions(wide, ExportSizing::MaxDimension(0.0), "Banner").is_err());
     }
 }

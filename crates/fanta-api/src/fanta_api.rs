@@ -91,9 +91,31 @@ impl DesignSession {
     /// Open the Fanta project directory at `root`; [`save`](Self::save)
     /// writes the edits back to it.
     pub fn open_project(root: &Path) -> Result<Self> {
-        Ok(Self::with_backing(Backing::Project(Box::new(
-            HeadlessProject::open(root)?,
-        ))))
+        Ok(Self::from_project(HeadlessProject::open(root)?))
+    }
+
+    /// Edit a project the caller already opened, such as the cloud engine's.
+    pub fn from_project(project: HeadlessProject) -> Self {
+        Self::with_backing(Backing::Project(Box::new(project)))
+    }
+
+    /// The project the session edits, when it was opened from one.
+    pub fn project(&self) -> Option<&HeadlessProject> {
+        match &self.backing {
+            Backing::Project(project) => Some(project),
+            Backing::Memory(_) => None,
+        }
+    }
+
+    /// The project, for edits of its own such as the engine's steps. Make
+    /// them only while no edits are pending (after
+    /// [`add_undo_step`](Self::add_undo_step)): a project edit commits its own
+    /// undo step, which would split the pending one.
+    pub fn project_mut(&mut self) -> Option<&mut HeadlessProject> {
+        match &mut self.backing {
+            Backing::Project(project) => Some(project),
+            Backing::Memory(_) => None,
+        }
     }
 
     /// Open a `.fant` snapshot, a design with its assets, in memory.

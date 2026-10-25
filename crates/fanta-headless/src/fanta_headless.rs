@@ -462,9 +462,15 @@ impl HeadlessProject {
         )
     }
 
-    pub fn render(&mut self, target: &RenderTarget) -> Result<RenderedImage> {
-        let page = self.resolve_page(&target.page)?;
-        let node = target.node.as_deref().map(parse_node_id).transpose()?;
+    /// The page `page` names, and the node `node` names (a prefixed id),
+    /// which must be on that page.
+    pub fn resolve_region(
+        &self,
+        page: &PageRef,
+        node: Option<&str>,
+    ) -> Result<(NodeId, Option<NodeId>)> {
+        let page = self.resolve_page(page)?;
+        let node = node.map(parse_node_id).transpose()?;
         if let Some(node) = node {
             anyhow::ensure!(
                 self.document.doc.scene.get(node).is_some(),
@@ -481,6 +487,11 @@ impl HeadlessProject {
                 "node {node} is not on page {page}"
             );
         }
+        Ok((page, node))
+    }
+
+    pub fn render(&mut self, target: &RenderTarget) -> Result<RenderedImage> {
+        let (page, node) = self.resolve_region(&target.page, target.node.as_deref())?;
         self.settle_layout()?;
         let screenshot = render::render_screenshot(
             &self.document.doc,
