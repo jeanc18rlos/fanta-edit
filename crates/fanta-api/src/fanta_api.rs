@@ -4,10 +4,11 @@
 //! [`DesignSession::add_undo_step`] commits. It runs without the app, over
 //! `fanta-headless`, and is the surface language bindings wrap.
 
+mod events;
 mod nodes;
 mod properties;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::Context as _;
@@ -15,6 +16,7 @@ use fanta_design_ops::DesignOp;
 use fanta_doc::{Doc, Operation};
 use fanta_headless::{HeadlessDocument, HeadlessProject};
 
+pub use events::{NodeEvent, NodeEventKind, NodeFilter, SubscriptionId};
 pub use fanta_doc::{AssetId, Color, ComponentId, NodeId};
 pub use fanta_doc::{BlurKind, ShadowKind};
 pub use nodes::{NodeKind, NodeType};
@@ -57,22 +59,23 @@ enum Backing {
 /// One open design and the edits made to it.
 pub struct DesignSession {
     backing: Backing,
+    events: events::EventHub,
 }
 
 impl DesignSession {
     /// A new design in memory with one empty page.
     pub fn new() -> Result<Self> {
-        Ok(Self {
-            backing: Backing::Memory(HeadlessDocument::empty()?),
-        })
+        Ok(Self::with_backing(Backing::Memory(
+            HeadlessDocument::empty()?,
+        )))
     }
 
     /// Open the Fanta project directory at `root`; [`save`](Self::save)
     /// writes the edits back to it.
     pub fn open_project(root: &Path) -> Result<Self> {
-        Ok(Self {
-            backing: Backing::Project(Box::new(HeadlessProject::open(root)?)),
-        })
+        Ok(Self::with_backing(Backing::Project(Box::new(
+            HeadlessProject::open(root)?,
+        ))))
     }
 
     /// Open a `.fant` snapshot, a design with its assets, in memory.
@@ -93,9 +96,9 @@ impl DesignSession {
                 .with_context(|| format!("reading asset {asset}"))?;
             assets.insert(asset, bytes);
         }
-        Ok(Self {
-            backing: Backing::Memory(HeadlessDocument::new(doc, assets)),
-        })
+        Ok(Self::with_backing(Backing::Memory(HeadlessDocument::new(
+            doc, assets,
+        ))))
     }
 
     /// Write the edits back to the project directory the session was opened
@@ -201,7 +204,23 @@ impl DesignSession {
     /// Undo the last step. Pending edits are committed first, so they are
     /// what is undone. Returns whether a step was undone.
     pub fn undo(&mut self) -> Result<bool> {
-        Ok(self.document_mut().undo()?)
+        let undone = (!self.events.is_empty())
+            .then(|| self.doc().history.next_undo_transaction().cloned())
+            .flatten();
+        let did = self.document_mut().undo()?;
+        if did && let Some(transaction) = undone {
+            let mut events = Vec::new();
+            for operation in transaction.ops.iter().rev() {
+                events::node_events(
+                    self.doc(),
+                    operation,
+                    events::Direction::Revert,
+                    &mut events,
+                );
+            }
+            self.events.record(&events);
+        }
+        Ok(did)
     }
 
     /// Redo the last undone step. Edits made since the undo branched the
@@ -217,7 +236,18 @@ impl DesignSession {
             Some(_) => return Ok(false),
             None => {}
         }
-        Ok(document.redo()?)
+        let redone = (!self.events.is_empty())
+            .then(|| self.doc().history.next_redo_transaction().cloned())
+            .flatten();
+        let did = self.document_mut().redo()?;
+        if did && let Some(transaction) = redone {
+            let mut events = Vec::new();
+            for operation in &transaction.ops {
+                events::node_events(self.doc(), operation, events::Direction::Apply, &mut events);
+            }
+            self.events.record(&events);
+        }
+        Ok(did)
     }
 
     pub fn can_undo(&self) -> bool {
@@ -228,6 +258,13 @@ impl DesignSession {
     pub fn can_redo(&self) -> bool {
         let history = &self.doc().history;
         history.open_len().is_none_or(|len| len == 0) && history.can_redo()
+    }
+
+    fn with_backing(backing: Backing) -> Self {
+        Self {
+            backing,
+            events: events::EventHub::default(),
+        }
     }
 
     pub(crate) fn document(&self) -> &HeadlessDocument {
@@ -263,7 +300,8 @@ impl DesignSession {
                     .into());
             }
         }
-        document.settle_layout()?;
+        let moved = document.settle_layout()?;
+        self.record_edit(savepoint, &moved);
         Ok(())
     }
 
@@ -272,7 +310,7 @@ impl DesignSession {
     pub(crate) fn edit_with_design_op(&mut self, operation: &DesignOp) -> Result<Option<NodeId>> {
         let document = self.document_mut();
         let default_container = document.doc().active_page();
-        let created = {
+        let (created, savepoint) = {
             let (doc, mut images) = document.doc_and_images();
             let savepoint = open_pending_step(doc);
             match fanta_headless::apply::apply_design_op(
@@ -281,7 +319,7 @@ impl DesignSession {
                 operation,
                 default_container,
             ) {
-                Ok(created) => created,
+                Ok(created) => (created, savepoint),
                 Err(error) => {
                     doc.rollback_open_transaction(savepoint)
                         .context("rolling back the failed edit")?;
@@ -289,8 +327,29 @@ impl DesignSession {
                 }
             }
         };
-        document.settle_layout()?;
+        let moved = document.settle_layout()?;
+        self.record_edit(savepoint, &moved);
         Ok(created)
+    }
+
+    /// Report the operations the pending step gained since `savepoint`, and
+    /// the nodes the layout solve moved, to the event subscribers.
+    fn record_edit(&mut self, savepoint: usize, moved: &BTreeSet<NodeId>) {
+        if self.events.is_empty() {
+            return;
+        }
+        let doc = self.doc();
+        let mut events = Vec::new();
+        if let Some(transaction) = doc.history.open_transaction() {
+            for operation in transaction.ops.get(savepoint..).unwrap_or_default() {
+                events::node_events(doc, operation, events::Direction::Apply, &mut events);
+            }
+        }
+        events.extend(moved.iter().map(|node| NodeEvent {
+            node: *node,
+            kind: NodeEventKind::Updated,
+        }));
+        self.events.record(&events);
     }
 }
 

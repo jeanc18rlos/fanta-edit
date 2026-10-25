@@ -189,6 +189,11 @@ impl History {
         self.open = Some(Transaction::new(label));
     }
 
+    /// The open transaction, with the ops applied into it so far.
+    pub fn open_transaction(&self) -> Option<&Transaction> {
+        self.open.as_ref()
+    }
+
     /// How many ops the open transaction holds, or `None` when none is open:
     /// a savepoint for [`rollback_open_to`](Self::rollback_open_to).
     pub fn open_len(&self) -> Option<usize> {
