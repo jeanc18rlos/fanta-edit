@@ -637,6 +637,27 @@ impl Doc {
         self.history.abort_with(&mut ctx)
     }
 
+    /// Revert the ops the open transaction applied after the savepoint `len`
+    /// (from [`History::open_len`]) against the whole document, as
+    /// [`abort_transaction`](Self::abort_transaction) does, and keep the
+    /// transaction open with the ops before it. A caller that applies several
+    /// edits into one undo step uses it to undo only the edit that failed.
+    pub fn rollback_open_transaction(&mut self, len: usize) -> Result<(), SceneError> {
+        let mut ctx = OpCtx {
+            scene: &mut self.scene,
+            pages: &mut self.pages,
+            active_page: &mut self.active_page,
+            components: &mut self.components,
+            variables: &mut self.variables,
+            active_modes: &mut self.active_modes,
+            motion: &mut self.motion,
+            flow_start: &mut self.flow_start,
+            flows: &mut self.flows,
+            presentation: &mut self.presentation,
+        };
+        self.history.rollback_open_to(len, &mut ctx)
+    }
+
     /// Install (or clear) the session-journal sink on this doc's history. The
     /// app calls this once it owns the live doc (and after any doc swap) so
     /// every committed edit is recorded; a cloned doc never inherits it.
@@ -2163,6 +2184,75 @@ mod tests {
             1,
             "only the frame's creation remains"
         );
+    }
+
+    #[test]
+    fn rolling_back_to_a_savepoint_keeps_earlier_ops_open() {
+        let mut doc = Doc::new();
+        let frame = add_root_group(&mut doc, "Card");
+        let original = doc.scene.get(frame).unwrap().transform;
+        let first = original.then(&crate::transform::Transform2D::translation(10.0, 0.0));
+        let second = first.then(&crate::transform::Transform2D::translation(0.0, 10.0));
+
+        doc.history.begin("Edits", &mut doc.scene);
+        doc.apply(Operation::SetTransform {
+            id: frame,
+            old: original,
+            new: first,
+        })
+        .unwrap();
+        let savepoint = doc.history.open_len().expect("an open transaction");
+        doc.apply(Operation::SetName {
+            id: frame,
+            old: "Card".into(),
+            new: "Hero".into(),
+        })
+        .unwrap();
+        doc.apply(Operation::SetTransform {
+            id: frame,
+            old: first,
+            new: second,
+        })
+        .unwrap();
+
+        doc.rollback_open_transaction(savepoint).unwrap();
+        assert_eq!(doc.history.open_len(), Some(savepoint));
+        assert_eq!(doc.scene.get(frame).unwrap().transform, first);
+        assert_eq!(doc.scene.get(frame).unwrap().name, "Card");
+
+        doc.history.commit(&mut doc.scene);
+        assert!(doc.undo().unwrap());
+        assert_eq!(doc.scene.get(frame).unwrap().transform, original);
+    }
+
+    #[test]
+    fn rollback_reverts_doc_level_ops() {
+        let mut doc = Doc::new();
+        let frame = add_root_group(&mut doc, "Card");
+        doc.history.begin("Edits", &mut doc.scene);
+        let savepoint = doc.history.open_len().expect("an open transaction");
+        doc.apply(Operation::DefineComponent {
+            def: Box::new(crate::component::ComponentDef::new(
+                crate::id::ComponentId::new(),
+                frame,
+                "Card",
+            )),
+        })
+        .unwrap();
+        assert!(doc.is_component_root(frame));
+        doc.rollback_open_transaction(savepoint).unwrap();
+        assert!(!doc.is_component_root(frame));
+    }
+
+    #[test]
+    fn relabeling_an_open_transaction_names_the_committed_step() {
+        let mut doc = Doc::new();
+        assert!(!doc.history.set_open_label("Nothing open"));
+        doc.history.begin("", &mut doc.scene);
+        add_root_group(&mut doc, "Card");
+        assert!(doc.history.set_open_label("Add a card"));
+        doc.history.commit(&mut doc.scene);
+        assert_eq!(doc.history.next_undo_label(), Some("Add a card"));
     }
 
     #[test]

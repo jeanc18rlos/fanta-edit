@@ -401,9 +401,13 @@ pub fn solve_pending(document: &mut Doc) -> Result<BTreeSet<NodeId>> {
 /// then catch it up. Geometry solved right after an edit joins that edit's
 /// transaction, so one undo restores both; otherwise it is written without
 /// history, like geometry solved at load.
-pub fn settle(document: &mut Doc, state: &mut LayoutState) -> Result<()> {
+pub fn settle(document: &mut Doc, state: &mut LayoutState) -> Result<BTreeSet<NodeId>> {
     let roots = state.changed_roots(document);
     let operations = geometry_operations(document, &roots);
+    let moved = operations
+        .iter()
+        .filter_map(Operation::primary_target)
+        .collect::<BTreeSet<_>>();
     if !operations.is_empty() {
         let generation = document.history.edit_generation();
         if generation != state.history_generation {
@@ -413,5 +417,5 @@ pub fn settle(document: &mut Doc, state: &mut LayoutState) -> Result<()> {
         }
     }
     state.catch_up(document);
-    Ok(())
+    Ok(moved)
 }

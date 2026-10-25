@@ -40,6 +40,7 @@ members = [
     "crates/extension",
     "crates/feature_flags",
     "crates/feature_flags_macros",
+    "crates/fanta-api",
     "crates/fanta-canvas",
     "crates/fanta-design-ops",
     "crates/fanta-doc",
@@ -255,6 +256,7 @@ fanta_languages = { path = "crates/fanta_languages" }
 fanta_ui = { path = "crates/fanta_ui" }
 fig_viewer = { path = "crates/fig_viewer" }
 file_icons = {package = "fanta-gpui-file-icons", version = "=0.5.0"}
+fanta-api = { path = "crates/fanta-api" }
 fanta-design-ops = { path = "crates/fanta-design-ops" }
 fanta-doc = { path = "crates/fanta-doc" }
 fanta-fig-interop = { path = "crates/fanta-fig-interop" }

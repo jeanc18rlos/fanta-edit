@@ -46,12 +46,12 @@ compatibility adapter is a separate, optional layer.
 | Area | CE.SDK | Fanta | Phase |
 | --- | --- | --- | --- |
 | Headless editing | edits in Node without a UI | ✅ `fanta-headless` applies design ops with the editor's applier, renders PNG and saves | 0 |
-| Design API | typed properties, lifecycle, hierarchy, find, metadata | ❌ only the coarse agent `DesignOp`s | 1 |
-| Events | per-block Created, Updated, Destroyed | ❌ pull-only journal | 1 |
-| Undo | explicit steps, several histories | 🟡 one history of transactions | 1 |
+| Design API | typed properties, lifecycle, hierarchy, find, metadata | ✅ `fanta-api`'s `DesignSession` | 1 |
+| Events | per-block Created, Updated, Destroyed | ✅ polled per-node events in `fanta-api` | 1 |
+| Undo | explicit steps, several histories | 🟡 explicit steps in `fanta-api`; one history | 1 |
 | Templating | text variables, placeholders, scopes, roles | ❌ whole-string variable bindings and the `LOCKED` flag | 1 (API), 2 (editor) |
-| Scene I/O | scenes in memory, strings, archives | 🟡 project folders and `.fant` snapshots | 1 |
-| Export | PNG, JPEG, WebP, TGA, PDF, SVG, target size | 🟡 the engine renders PNG; JPEG, SVG and PDF are editor-only | 1, 5 |
+| Scene I/O | scenes in memory, strings, archives | ✅ sessions in memory, from project folders or from `.fant` snapshots | 1 |
+| Export | PNG, JPEG, WebP, TGA, PDF, SVG, target size | 🟡 PNG, JPEG, SVG and PDF from the editor, the engine and `fanta-api`; no WebP or TGA | 5 |
 | Blocks and shapes | graphic, text, group, page, audio; six shapes; booleans | ✅ | — |
 | Fills | color, three gradients, image fit and crop, video | ✅ plus diamond, pattern and shader fills; 🟡 crop rotates in quarter turns | 3 |
 | Strokes | start, end and dash caps; dash offset; overprint | 🟡 none of these | 3, 5 |

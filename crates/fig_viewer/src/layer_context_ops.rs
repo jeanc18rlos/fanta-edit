@@ -16,23 +16,20 @@ pub(crate) fn replace_data(node: &CanvasNode, data: NodeData) -> Operation {
     }
 }
 
+pub(crate) use fanta_headless::structure::editable_layer as editable;
+#[cfg(test)]
+use fanta_headless::structure::release_components_with_limits;
+
+pub(crate) fn delete_layers(doc: &Doc, id: NodeId) -> Result<Vec<Operation>> {
+    fanta_headless::structure::delete_layers_operations(doc, &targets(doc, id))
+}
+
 pub(crate) fn targets(doc: &Doc, id: NodeId) -> Vec<NodeId> {
     if doc.selection.contains(id) {
         crate::clipboard::editable_selection_roots(doc)
     } else {
         vec![id]
     }
-}
-
-pub(crate) fn editable(doc: &Doc, id: NodeId) -> bool {
-    doc.scene
-        .get(id)
-        .is_some_and(|node| !node.flags.contains(fanta_doc::NodeFlags::LOCKED))
-        && !doc.pages().contains(&id)
-        && !doc
-            .scene
-            .ancestors_of(id)
-            .any(|node| node.flags.contains(fanta_doc::NodeFlags::LOCKED))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1229,173 +1226,6 @@ pub(crate) fn replace_media(
         return Err(error);
     }
     Ok(())
-}
-
-fn release_components(doc: &Doc, roots: &[NodeId]) -> Result<Vec<Operation>> {
-    release_components_with_limits(doc, roots, 64, 100_000)
-}
-
-fn release_components_with_limits(
-    doc: &Doc,
-    roots: &[NodeId],
-    maximum_depth: usize,
-    maximum_nodes: usize,
-) -> Result<Vec<Operation>> {
-    let removed: std::collections::HashSet<_> = roots
-        .iter()
-        .flat_map(|id| doc.scene.descendants_of(*id))
-        .collect();
-    let components: std::collections::HashSet<_> = doc
-        .components
-        .defs
-        .values()
-        .filter(|def| removed.contains(&def.root))
-        .map(|def| def.id)
-        .collect();
-    if components.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut operations = Vec::new();
-    let mut scratch = doc.clone();
-    let mut pending = doc
-        .scene
-        .roots()
-        .iter()
-        .flat_map(|id| doc.scene.descendants_of(*id))
-        .filter(|id| !removed.contains(id))
-        .filter(|id| {
-            doc.scene
-                .get(*id)
-                .is_some_and(|node| matches!(node.data, NodeData::Instance(_)))
-        })
-        .map(|id| (id, Vec::new()))
-        .collect::<Vec<_>>();
-    let mut detached_nodes = 0;
-    while let Some((id, mut path)) = pending.pop() {
-        let Some(node) = scratch.scene.get(id) else {
-            continue;
-        };
-        let NodeData::Instance(instance) = &node.data else {
-            continue;
-        };
-        for replacement in &instance.overrides {
-            if let fanta_doc::OverrideValue::SwapInstance { component } = &replacement.value {
-                let affected = components.contains(component)
-                    || scratch.components.sets.get(component).is_some_and(|set| {
-                        set.members.iter().any(|member| components.contains(member))
-                    });
-                ensure!(
-                    !affected,
-                    "A surviving instance uses this swapped component; detach or reset that swap before deleting its main component"
-                );
-            }
-        }
-        let Some(resolved) = fanta_doc::resolved_component_with_context(
-            &scratch.scene,
-            &scratch.components,
-            instance,
-            &fanta_doc::InstanceExpansionContext::new(
-                &scratch.variables,
-                &scratch.active_modes,
-                id,
-            ),
-        )
-        .filter(|resolved| components.contains(&resolved.resolved_component)) else {
-            continue;
-        };
-        ensure!(
-            !path.contains(&resolved.resolved_component),
-            "Cannot preserve a cyclic component dependency; no layers were deleted"
-        );
-        ensure!(
-            path.len() < maximum_depth,
-            "Cannot safely detach more than {maximum_depth} nested components; no layers were deleted"
-        );
-        let count = scratch
-            .scene
-            .descendants_of(resolved.resolved_root)
-            .take(maximum_nodes - detached_nodes + 1)
-            .count();
-        ensure!(
-            count <= maximum_nodes - detached_nodes,
-            "Cannot safely detach more than {maximum_nodes} component nodes at once; no layers were deleted"
-        );
-        detached_nodes += count;
-        path.push(resolved.resolved_component);
-        let detach = crate::properties_ops::detach_instance_operations(&scratch, id)?;
-        ensure!(
-            !detach.is_empty(),
-            "Cannot preserve an instance of this component"
-        );
-        for operation in &detach {
-            scratch.apply(operation.clone())?;
-        }
-        operations.extend(detach);
-        // Expansion preserves nested instances, so materialized descendants
-        // must be checked before their component definitions can be removed.
-        pending.extend(
-            scratch
-                .scene
-                .descendants_of(id)
-                .filter(|id| {
-                    scratch
-                        .scene
-                        .get(*id)
-                        .is_some_and(|node| matches!(node.data, NodeData::Instance(_)))
-                })
-                .map(|id| (id, path.clone())),
-        );
-    }
-    for set in doc
-        .components
-        .sets
-        .values()
-        .filter(|set| set.members.iter().any(|id| components.contains(id)))
-    {
-        let mut updated = set.clone();
-        updated.members.retain(|id| !components.contains(id));
-        if let Some(first) = updated.members.first().copied() {
-            if components.contains(&updated.default_variant) {
-                updated.default_variant = first;
-            }
-            operations.push(Operation::SetComponentSet {
-                id: set.id,
-                old: Box::new(set.clone()),
-                new: Box::new(updated),
-            });
-        } else {
-            operations.push(Operation::DeleteComponentSet {
-                id: set.id,
-                set: Box::new(set.clone()),
-            });
-        }
-    }
-    for id in components {
-        let def = doc
-            .components
-            .def(id)
-            .context("Missing component definition")?;
-        operations.push(Operation::DeleteComponent {
-            id,
-            def: Box::new(def.clone()),
-        });
-    }
-    Ok(operations)
-}
-
-pub(crate) fn delete_layers(doc: &Doc, id: NodeId) -> Result<Vec<Operation>> {
-    let roots = targets(doc, id);
-    for id in &roots {
-        ensure!(editable(doc, *id), "A selected layer is locked");
-    }
-    let mut operations = release_components(doc, &roots)?;
-    let mut scratch = doc.clone();
-    for operation in &operations {
-        scratch.apply(operation.clone())?;
-    }
-    scratch.selection.replace_with(roots);
-    operations.extend(crate::clipboard::delete_operations(&scratch));
-    Ok(operations)
 }
 
 pub(crate) fn stack(doc: &Doc, id: NodeId, front: bool) -> Result<Vec<Operation>> {

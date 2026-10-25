@@ -9,8 +9,9 @@ use fanta_canvas::{
     transform_angle,
 };
 use fanta_doc::{
-    Blur, BoundProp, Color, ComponentDef, ComponentId, Doc, ModeId, NodeData, NodeId, Operation,
-    Shadow, ShadowKind, Stroke, TextAutoResize, Transform2D, VarValue, VariableId,
+    Blur, BoundProp, CanvasNode, Color, ComponentDef, ComponentId, Doc, ModeId, NodeData, NodeId,
+    Operation, Shadow, ShadowKind, Stroke, TextAutoResize, Transform2D, UnitInterval, VarValue,
+    VariableId,
 };
 use glam::DVec2;
 use smallvec::SmallVec;
@@ -516,4 +517,105 @@ pub fn validate_alias(
         );
     }
     Ok(())
+}
+
+/// Detach an instance into a concrete subtree: the instance node becomes the
+/// resolved master-root frame and the expansion's descendants are materialized
+/// under it. The master root's own wrapper-level surface props (opacity,
+/// effects, blurs, blend) live outside `NodeData`, so the data swap alone would
+/// drop them — they are composed onto the detached node by the follow-up ops.
+pub fn detach_instance_operations(doc: &Doc, id: NodeId) -> anyhow::Result<Vec<Operation>> {
+    let Some(node) = doc.scene.get(id) else {
+        return Ok(Vec::new());
+    };
+    let NodeData::Instance(instance) = &node.data else {
+        return Ok(Vec::new());
+    };
+    let expanded = fanta_doc::expand_instance_with_context(
+        &doc.scene,
+        &doc.components,
+        instance,
+        &fanta_doc::InstanceExpansionContext::new(&doc.variables, &doc.active_modes, id),
+    );
+    // `expand_instance` yields the root first (empty def path), then its subtree
+    // parents-before-children, so this insertion order stays valid.
+    let Some(root) = expanded.iter().find(|entry| entry.def_path.is_empty()) else {
+        // A dangling master: nothing to materialize.
+        return Ok(Vec::new());
+    };
+    anyhow::ensure!(
+        !node.bindings.contains_key(&fanta_doc::BoundProp::Opacity)
+            || (root.node.opacity.get() - 1.0).abs() <= f32::EPSILON,
+        "Cannot detach bound opacity combined with the main component's opacity without changing its appearance"
+    );
+    anyhow::ensure!(
+        node.effects.is_empty() || root.node.effects.is_empty(),
+        "Cannot detach combined instance and main-component effects without changing their appearance"
+    );
+    anyhow::ensure!(
+        node.blurs.is_empty() || root.node.blurs.is_empty(),
+        "Cannot detach combined instance and main-component blurs without changing their appearance"
+    );
+    anyhow::ensure!(
+        node.blend_mode.is_normal() || root.node.blend_mode.is_normal(),
+        "Cannot detach combined instance and main-component blend modes without changing their appearance"
+    );
+    anyhow::ensure!(
+        root.node.blend_mode.is_normal()
+            || (node.opacity.get() == 1.0
+                && !node.bindings.contains_key(&fanta_doc::BoundProp::Opacity)
+                && node.effects.is_empty()
+                && node.blurs.is_empty()
+                && !node.flags.contains(fanta_doc::NodeFlags::ISOLATED_BLEND)),
+        "Cannot detach the main component's blend mode across the instance's opacity or isolation without changing its appearance"
+    );
+    let root_id = root.node.id;
+    let children: Vec<CanvasNode> = expanded
+        .iter()
+        .filter(|entry| !entry.def_path.is_empty())
+        .map(|entry| {
+            let mut child = entry.node.clone();
+            if child.parent == Some(root_id) {
+                child.parent = Some(id);
+            }
+            child
+        })
+        .collect();
+
+    let mut operations = vec![Operation::DetachInstance {
+        id,
+        old: Box::new(node.data.clone()),
+        new: Box::new(root.node.data.clone()),
+        expanded: children,
+    }];
+    let composed_opacity = UnitInterval::new(node.opacity.get() * root.node.opacity.get());
+    if (composed_opacity.get() - node.opacity.get()).abs() > f32::EPSILON {
+        operations.push(Operation::SetOpacity {
+            id,
+            old: node.opacity,
+            new: composed_opacity,
+        });
+    }
+    if node.effects.is_empty() && !root.node.effects.is_empty() {
+        operations.push(Operation::SetEffects {
+            id,
+            old: node.effects.clone(),
+            new: root.node.effects.clone(),
+        });
+    }
+    if node.blurs.is_empty() && !root.node.blurs.is_empty() {
+        operations.push(Operation::SetBlurs {
+            id,
+            old: node.blurs.clone(),
+            new: root.node.blurs.clone(),
+        });
+    }
+    if node.blend_mode.is_normal() && !root.node.blend_mode.is_normal() {
+        operations.push(Operation::SetBlendMode {
+            id,
+            old: node.blend_mode,
+            new: root.node.blend_mode,
+        });
+    }
+    Ok(operations)
 }

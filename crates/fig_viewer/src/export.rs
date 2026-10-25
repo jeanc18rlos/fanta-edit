@@ -1,20 +1,20 @@
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
-use fanta_doc::{Bounds, Doc, NodeId, Viewport, resolve_bound_value, resolve_effective_mode};
+use fanta_doc::{Bounds, Doc, NodeId};
 use fanta_render::{AssetResolver, RasterRenderer, visual_world_bounds};
-use image::codecs::jpeg::JpegEncoder;
 use tempfile::NamedTempFile;
 
 use crate::document::{FigPage, page_bounds};
+use fanta_headless::export::{
+    ExportRegion, checked_vector_dimension, detach_export_root, page_visual_bounds,
+};
+pub(crate) use fanta_headless::export::{ExportSizing, raster_dimensions, resolve_export_bindings};
 pub(crate) use fanta_headless::render::render_inputs;
 
-const MAX_EXPORT_PIXELS: u32 = 8192;
-const MAX_EXPORT_TOTAL_PIXELS: u64 = 16 * 1024 * 1024;
 const JPEG_QUALITY: u8 = 95;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -155,38 +155,9 @@ pub(crate) struct ExportBatch {
     output_directory: PathBuf,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum ExportSizing {
-    Scale(f64),
-    Width(f64),
-    Height(f64),
-}
-
 impl From<ExportScale> for ExportSizing {
     fn from(scale: ExportScale) -> Self {
         Self::Scale(scale.multiplier())
-    }
-}
-
-impl ExportSizing {
-    pub(crate) fn zoom(self, bounds: Bounds) -> Result<f64> {
-        let zoom = match self {
-            Self::Scale(scale) => scale,
-            Self::Width(width) => width / bounds.width(),
-            Self::Height(height) => height / bounds.height(),
-        };
-        if !zoom.is_finite() || zoom <= 0.0 {
-            bail!("export size must be a finite positive value");
-        }
-        Ok(zoom)
-    }
-
-    fn label(self) -> String {
-        match self {
-            Self::Scale(scale) => format!("{scale}x"),
-            Self::Width(width) => format!("{width}w"),
-            Self::Height(height) => format!("{height}h"),
-        }
     }
 }
 
@@ -201,6 +172,16 @@ struct ExportTarget {
     root: Option<NodeId>,
     name: String,
     bounds: Bounds,
+}
+
+impl ExportTarget {
+    fn region(&self) -> ExportRegion<'_> {
+        ExportRegion {
+            root: self.root,
+            bounds: self.bounds,
+            name: &self.name,
+        }
+    }
 }
 
 pub(crate) fn prepare_export_jobs(
@@ -297,46 +278,6 @@ pub(crate) fn prepare_export_requests(
         requests: requests.to_vec(),
         output_directory,
     })
-}
-
-pub(crate) fn resolve_export_bindings(document: &Doc) -> Cow<'_, Doc> {
-    let bound_nodes = document
-        .scene
-        .roots()
-        .iter()
-        .flat_map(|root| document.scene.descendants_of(*root))
-        .filter_map(|id| {
-            let node = document.scene.get(id)?;
-            (!node.bindings.is_empty()).then_some((id, node.bindings.clone()))
-        })
-        .collect::<Vec<_>>();
-    if bound_nodes.is_empty() {
-        return Cow::Borrowed(document);
-    }
-
-    let mut resolved = document.clone();
-    for (id, bindings) in bound_nodes {
-        let values = bindings
-            .into_iter()
-            .filter_map(|(property, variable)| {
-                resolve_bound_value(
-                    &document.variables,
-                    &document.scene,
-                    id,
-                    &document.active_modes,
-                    variable,
-                )
-                .map(|value| (property, value))
-            })
-            .collect::<Vec<_>>();
-        let Some(node) = resolved.scene.get_mut(id) else {
-            continue;
-        };
-        for (property, value) in values {
-            property.apply_resolved(node, value);
-        }
-    }
-    Cow::Owned(resolved)
 }
 
 impl ExportBatch {
@@ -439,7 +380,7 @@ pub(crate) fn run_export_jobs(batch: ExportBatch) -> Result<ExportOutcome> {
     let mut notes = Vec::new();
 
     for target in &batch.targets {
-        let document = render_document_for_target(&batch.doc, target)?;
+        let document = detach_export_root(&batch.doc, target.root, &target.name)?;
         for request in &batch.requests {
             let file_name = file_names
                 .next()
@@ -491,14 +432,29 @@ fn render_export(
     request: &ExportRequest,
 ) -> Result<ExportArtifact> {
     Ok(match request.format {
-        ExportFormat::Png => {
-            ExportArtifact::file(render_png(batch, document, target, request.sizing)?)
-        }
-        ExportFormat::Jpeg => {
-            ExportArtifact::file(render_jpeg(batch, document, target, request.sizing)?)
-        }
-        ExportFormat::Svg => ExportArtifact::file(render_svg(batch, document, target)?),
-        ExportFormat::Pdf => ExportArtifact::file(render_pdf(batch, document, target)?),
+        ExportFormat::Png => ExportArtifact::file(fanta_headless::export::render_png(
+            document,
+            batch.asset_resolver.clone(),
+            target.region(),
+            request.sizing,
+        )?),
+        ExportFormat::Jpeg => ExportArtifact::file(fanta_headless::export::render_jpeg(
+            document,
+            batch.asset_resolver.clone(),
+            target.region(),
+            request.sizing,
+            JPEG_QUALITY,
+        )?),
+        ExportFormat::Svg => ExportArtifact::file(fanta_headless::export::render_svg(
+            document,
+            batch.asset_resolver.clone(),
+            target.region(),
+        )?),
+        ExportFormat::Pdf => ExportArtifact::file(fanta_headless::export::render_pdf(
+            document,
+            batch.asset_resolver.clone(),
+            target.region(),
+        )?),
         ExportFormat::MotionJson => ExportArtifact::file(crate::motion_export::export_motion(
             &batch.doc,
             target.root,
@@ -522,183 +478,6 @@ fn render_export(
     })
 }
 
-fn render_png(
-    batch: &ExportBatch,
-    document: &Doc,
-    target: &ExportTarget,
-    sizing: ExportSizing,
-) -> Result<Vec<u8>> {
-    let mut renderer = render_raster(batch, document, target, sizing)?;
-    renderer
-        .encode_png()
-        .map_err(|error| anyhow::anyhow!("encoding export PNG: {error}"))
-}
-
-fn render_jpeg(
-    batch: &ExportBatch,
-    document: &Doc,
-    target: &ExportTarget,
-    sizing: ExportSizing,
-) -> Result<Vec<u8>> {
-    let mut renderer = render_raster(batch, document, target, sizing)?;
-    let (width, height) = raster_dimensions(target.bounds, sizing, &target.name)?;
-    let rgba = renderer.copy_rgba();
-    let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
-    for pixel in rgba.chunks_exact(4) {
-        let alpha = u16::from(pixel[3]);
-        for channel in &pixel[..3] {
-            let composited = (u16::from(*channel) * alpha + 255 * (255 - alpha) + 127) / 255;
-            rgb.push(composited as u8);
-        }
-    }
-
-    let mut jpeg = Vec::new();
-    JpegEncoder::new_with_quality(&mut jpeg, JPEG_QUALITY)
-        .encode(&rgb, width, height, image::ExtendedColorType::Rgb8)
-        .context("encoding export JPEG")?;
-    Ok(jpeg)
-}
-
-fn render_raster(
-    batch: &ExportBatch,
-    document: &Doc,
-    target: &ExportTarget,
-    sizing: ExportSizing,
-) -> Result<RasterRenderer> {
-    let (width, height) = raster_dimensions(target.bounds, sizing, &target.name)?;
-    let zoom = sizing.zoom(target.bounds)?;
-    let mut renderer = RasterRenderer::new(width, height)
-        .map_err(|error| anyhow::anyhow!("creating {width}x{height} export surface: {error}"))?;
-    if let Some(asset_resolver) = batch.asset_resolver.clone() {
-        renderer.set_asset_resolver(asset_resolver);
-    }
-    let viewport = target_viewport(target, zoom);
-    let inputs = render_inputs(document);
-    renderer.render_page_with(&document.scene, &viewport, target.root, &inputs);
-    Ok(renderer)
-}
-
-fn render_svg(batch: &ExportBatch, document: &Doc, target: &ExportTarget) -> Result<Vec<u8>> {
-    let width = checked_vector_dimension(target.bounds.width(), "SVG width")?;
-    let height = checked_vector_dimension(target.bounds.height(), "SVG height")?;
-    let mut renderer = RasterRenderer::new(width, height)
-        .map_err(|error| anyhow::anyhow!("creating SVG renderer: {error}"))?;
-    if let Some(asset_resolver) = batch.asset_resolver.clone() {
-        renderer.set_asset_resolver(asset_resolver);
-    }
-    let flags = skia_safe::svg::canvas::Flags::CONVERT_TEXT_TO_PATHS;
-    let canvas = skia_safe::svg::Canvas::new(
-        skia_safe::Rect::from_size((width as f32, height as f32)),
-        Some(flags),
-    );
-    let viewport = target_viewport(target, 1.0);
-    let inputs = render_inputs(document);
-    renderer.render_to_canvas(
-        &canvas,
-        width,
-        height,
-        &document.scene,
-        &viewport,
-        target.root,
-        &inputs,
-    );
-    Ok(canvas.end().as_bytes().to_vec())
-}
-
-fn render_pdf(batch: &ExportBatch, document: &Doc, target: &ExportTarget) -> Result<Vec<u8>> {
-    let width = checked_vector_dimension(target.bounds.width(), "PDF width")?;
-    let height = checked_vector_dimension(target.bounds.height(), "PDF height")?;
-    let mut renderer = RasterRenderer::new(width, height)
-        .map_err(|error| anyhow::anyhow!("creating PDF renderer: {error}"))?;
-    if let Some(asset_resolver) = batch.asset_resolver.clone() {
-        renderer.set_asset_resolver(asset_resolver);
-    }
-
-    let mut pdf = Vec::new();
-    {
-        let pdf_document = skia_safe::pdf::new_document(&mut pdf, None);
-        let mut page = pdf_document.begin_page((width as f32, height as f32), None);
-        let viewport = target_viewport(target, 1.0);
-        let inputs = render_inputs(document);
-        renderer.render_to_canvas(
-            page.canvas(),
-            width,
-            height,
-            &document.scene,
-            &viewport,
-            target.root,
-            &inputs,
-        );
-        page.end_page().close();
-    }
-    Ok(pdf)
-}
-
-fn target_viewport(target: &ExportTarget, zoom: f64) -> Viewport {
-    let center = target.bounds.center();
-    Viewport {
-        center: [center.x, center.y],
-        zoom,
-    }
-}
-
-fn render_document_for_target<'a>(
-    document: &'a Doc,
-    target: &ExportTarget,
-) -> Result<Cow<'a, Doc>> {
-    let Some(root) = target.root else {
-        return Ok(Cow::Borrowed(document));
-    };
-    let node = document
-        .scene
-        .get(root)
-        .with_context(|| format!("export target {} no longer exists", target.name))?;
-    if node.parent.is_none() {
-        return Ok(Cow::Borrowed(document));
-    }
-
-    let world_transform = document
-        .scene
-        .world_transform(root)
-        .with_context(|| format!("{} has no world transform", target.name))?;
-    let inherited_modes = document
-        .variables
-        .collections
-        .values()
-        .map(|collection| {
-            (
-                collection.id,
-                resolve_effective_mode(&document.scene, root, collection, &document.active_modes),
-            )
-        })
-        .collect();
-    let mut detached = document.clone();
-    detached.active_modes = inherited_modes;
-    let root_index = detached.scene.next_child_index(None);
-    detached
-        .scene
-        .set_parent(root, None, root_index)
-        .with_context(|| format!("detaching {} for export", target.name))?;
-    detached
-        .scene
-        .get_mut(root)
-        .with_context(|| format!("detached target {} disappeared", target.name))?
-        .transform = world_transform;
-    Ok(Cow::Owned(detached))
-}
-
-fn page_visual_bounds(document: &Doc, root: Option<NodeId>) -> Option<Bounds> {
-    match root {
-        Some(root) => visual_world_bounds(&document.scene, root, 0.0),
-        None => document
-            .scene
-            .roots()
-            .iter()
-            .filter_map(|root| visual_world_bounds(&document.scene, *root, 0.0))
-            .reduce(|left, right| left.union(&right)),
-    }
-}
-
 fn validate_export_requests(targets: &[ExportTarget], requests: &[ExportRequest]) -> Result<()> {
     for target in targets {
         for request in requests {
@@ -715,48 +494,6 @@ fn validate_export_requests(targets: &[ExportTarget], requests: &[ExportRequest]
         }
     }
     Ok(())
-}
-
-pub(crate) fn raster_dimensions(
-    bounds: Bounds,
-    sizing: impl Into<ExportSizing>,
-    name: &str,
-) -> Result<(u32, u32)> {
-    let sizing = sizing.into();
-    let multiplier = sizing.zoom(bounds)?;
-    let (width, height) = match sizing {
-        ExportSizing::Scale(_) => (
-            (bounds.width() * multiplier).ceil(),
-            (bounds.height() * multiplier).ceil(),
-        ),
-        ExportSizing::Width(width) => (width.ceil(), (bounds.height() * multiplier).ceil()),
-        ExportSizing::Height(height) => ((bounds.width() * multiplier).ceil(), height.ceil()),
-    };
-    let width = width.max(1.0);
-    let height = height.max(1.0);
-    if width > f64::from(MAX_EXPORT_PIXELS) || height > f64::from(MAX_EXPORT_PIXELS) {
-        bail!(
-            "{name} at {} would be {width:.0}×{height:.0} pixels; the per-side limit is {MAX_EXPORT_PIXELS}. Choose a smaller scale",
-            sizing.label()
-        );
-    }
-    let pixels = (width as u64)
-        .checked_mul(height as u64)
-        .context("export dimensions overflowed the pixel budget")?;
-    if pixels > MAX_EXPORT_TOTAL_PIXELS {
-        bail!(
-            "{name} at {} would contain {pixels} pixels; the safe limit is {MAX_EXPORT_TOTAL_PIXELS}. Choose a smaller scale",
-            sizing.label()
-        );
-    }
-    Ok((width as u32, height as u32))
-}
-
-fn checked_vector_dimension(value: f64, axis: &str) -> Result<u32> {
-    if value > f64::from(i32::MAX) {
-        bail!("{axis} is too large to export");
-    }
-    Ok((value.ceil() as u32).max(1))
 }
 
 pub(crate) fn write_export_atomically(
@@ -990,6 +727,7 @@ pub(crate) fn sanitize_file_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fanta_doc::Viewport;
     use fanta_doc::{
         Blur, BoundProp, CanvasNode, Color, Fill, GroupNode, Mode, ModeId, NodeData, Shadow,
         ShadowKind, Stroke, StrokeAlign, StrokeJoin, Transform2D, VarValue, Variable,
@@ -1517,7 +1255,7 @@ mod tests {
         )
         .expect("arrow has exportable bounds");
         let target = batch.targets.first().expect("arrow export target");
-        let export_viewport = target_viewport(target, 2.0);
+        let export_viewport = fanta_headless::export::region_viewport(target.region(), 2.0);
         let paths = run_export_jobs(batch).expect("export arrow").paths;
         let raster = image::open(paths.first().expect("PNG output"))
             .expect("decode exported arrow")
@@ -1954,7 +1692,8 @@ mod tests {
         )
         .expect("nested selection is exportable");
 
-        let detached = render_document_for_target(&batch.doc, &batch.targets[0])
+        let target = &batch.targets[0];
+        let detached = detach_export_root(&batch.doc, target.root, &target.name)
             .expect("target can be detached");
         let detached_node = detached.scene.get(child).expect("detached node exists");
         assert_eq!(detached_node.parent, None);
@@ -2234,7 +1973,7 @@ pub(crate) fn render_thumbnail(
     }
     renderer.render_page_with(
         &document.scene,
-        &target_viewport(&target, zoom),
+        &fanta_headless::export::region_viewport(target.region(), zoom),
         Some(id),
         &render_inputs(&document),
     );
