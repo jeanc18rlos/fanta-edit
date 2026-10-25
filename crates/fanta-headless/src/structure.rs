@@ -12,13 +12,13 @@ use fanta_doc::{
 };
 
 #[derive(Debug)]
-pub(crate) struct Grouped {
+pub struct Grouped {
     pub group: NodeId,
     pub operations: Vec<Operation>,
 }
 
 #[derive(Debug)]
-pub(crate) struct Ungrouped {
+pub struct Ungrouped {
     pub children: Vec<NodeId>,
     pub operations: Vec<Operation>,
 }
@@ -27,13 +27,13 @@ pub(crate) struct Ungrouped {
 /// dropped) in a new plain group. The group is parented where the topmost
 /// member lives and takes that member's slot in the z-order; members from
 /// other parents are reparented into it with their world transforms kept.
-pub(crate) fn group_operations(doc: &Doc, ids: &[NodeId], name: Option<&str>) -> Result<Grouped> {
+pub fn group_operations(doc: &Doc, ids: &[NodeId], name: Option<&str>) -> Result<Grouped> {
     wrap_operations(doc, ids, name.unwrap_or("Group"), false)
 }
 
 /// Same as [`group_operations`], but the wrapper is a frame: a group that
 /// clips to the union of its members' bounds and carries no background.
-pub(crate) fn frame_selection_operations(
+pub fn frame_selection_operations(
     doc: &Doc,
     ids: &[NodeId],
     name: Option<&str>,
@@ -174,7 +174,7 @@ fn wrap_operations(doc: &Doc, ids: &[NodeId], name: &str, clip: bool) -> Result<
 /// `SetIndex` naming a wrapper the first plan already deleted, which fails and
 /// aborts the whole transaction. Ungroup is not a hot path, so one clone per
 /// invocation is fine.
-pub(crate) fn ungroup_many_operations(
+pub fn ungroup_many_operations(
     doc: &Doc,
     groups: &[NodeId],
 ) -> Result<(Vec<Operation>, Vec<NodeId>)> {
@@ -195,7 +195,7 @@ pub(crate) fn ungroup_many_operations(
 /// Dissolve one group or frame: its children move to the group's parent in
 /// the group's slot with their world transforms kept, then the empty wrapper
 /// is deleted.
-pub(crate) fn ungroup_operations(doc: &Doc, group: NodeId) -> Result<Ungrouped> {
+pub fn ungroup_operations(doc: &Doc, group: NodeId) -> Result<Ungrouped> {
     let node = doc.scene.get(group).context("the layer is gone")?;
     if doc.pages().contains(&group) {
         bail!("a page cannot be ungrouped");
@@ -281,7 +281,7 @@ pub(crate) fn ungroup_operations(doc: &Doc, group: NodeId) -> Result<Ungrouped> 
 /// A bitmap layer for an already-ingested image asset, sized to `size` with
 /// its top-left corner at world `(x, y)` inside `parent` (the active page
 /// when `None`).
-pub(crate) fn image_layer_node(
+pub fn image_layer_node(
     doc: &Doc,
     asset: AssetId,
     natural_size: [u32; 2],

@@ -5,13 +5,19 @@
 //!
 //! The facade is frozen by `docs/cloud-engine-contracts.md`.
 
+pub mod clipboard;
 pub mod comments;
+pub mod component_properties;
+pub mod componentize;
+pub mod edit_operations;
 pub mod layout;
 pub mod pages;
 pub mod render;
 pub mod save;
 pub mod scene;
+pub mod structure;
 pub mod style;
+pub mod variant_sets;
 
 use std::{
     collections::{BTreeMap, BTreeSet},

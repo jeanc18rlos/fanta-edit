@@ -5240,6 +5240,7 @@ name = "fanta-headless"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fanta-canvas",
  "fanta-design-ops",
  "fanta-doc",
  "fanta-format",
@@ -5250,6 +5251,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "smallvec",
  "tempfile",
 ]
 

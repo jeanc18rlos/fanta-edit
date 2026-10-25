@@ -9,7 +9,7 @@ use fanta_doc::{
 /// chooses the first axis in the owning component set that is not already
 /// exposed, keeping the UI choice independent from document topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CreateComponentPropertyKind {
+pub enum CreateComponentPropertyKind {
     Text,
     Boolean,
     Number,
@@ -19,7 +19,7 @@ pub(crate) enum CreateComponentPropertyKind {
 }
 
 impl CreateComponentPropertyKind {
-    pub(crate) const ALL: [Self; 6] = [
+    pub const ALL: [Self; 6] = [
         Self::Text,
         Self::Boolean,
         Self::Number,
@@ -28,7 +28,7 @@ impl CreateComponentPropertyKind {
         Self::Variant,
     ];
 
-    pub(crate) const fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Text => "Text",
             Self::Boolean => "Boolean",
@@ -52,9 +52,9 @@ impl CreateComponentPropertyKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ComponentBindingCandidate {
-    pub(crate) prop: BoundProp,
-    pub(crate) label: String,
+pub struct ComponentBindingCandidate {
+    pub prop: BoundProp,
+    pub label: String,
 }
 
 /// Build the schema replacement needed to append one component property.
@@ -62,7 +62,7 @@ pub(crate) struct ComponentBindingCandidate {
 /// Variant properties are authored across every member of their component set
 /// with one shared property id. The resolver uses that shared id to select a
 /// member, while each member keeps its own axis value as the default.
-pub(crate) fn create_component_property_operations(
+pub fn create_component_property_operations(
     doc: &Doc,
     component: ComponentId,
     requested_kind: CreateComponentPropertyKind,
@@ -98,7 +98,7 @@ pub(crate) fn create_component_property_operations(
 /// Whether the selected component has another set axis that can be exposed as
 /// a variant property. Standalone components have no representable variant
 /// selector in the current engine and therefore return `false`.
-pub(crate) fn can_create_variant_property(doc: &Doc, component: ComponentId) -> bool {
+pub fn can_create_variant_property(doc: &Doc, component: ComponentId) -> bool {
     next_variant_axis(doc, component).is_some()
 }
 
@@ -191,7 +191,7 @@ fn unique_property_name(properties: &[ComponentPropDef], base: &str) -> String {
 
 /// Fields on one selected master descendant that can be driven by a component
 /// property in the current document model.
-pub(crate) fn component_binding_candidates(node: &CanvasNode) -> Vec<ComponentBindingCandidate> {
+pub fn component_binding_candidates(node: &CanvasNode) -> Vec<ComponentBindingCandidate> {
     let mut candidates = vec![
         ComponentBindingCandidate {
             prop: BoundProp::Visible,
@@ -248,10 +248,7 @@ pub(crate) fn component_binding_candidates(node: &CanvasNode) -> Vec<ComponentBi
     candidates
 }
 
-pub(crate) fn component_property_accepts_binding(
-    kind: &ComponentPropKind,
-    target: BoundProp,
-) -> bool {
+pub fn component_property_accepts_binding(kind: &ComponentPropKind, target: BoundProp) -> bool {
     match kind {
         ComponentPropKind::Bool => matches!(target, BoundProp::Visible),
         ComponentPropKind::Text => matches!(target, BoundProp::TextContent),
@@ -274,7 +271,7 @@ pub(crate) fn component_property_accepts_binding(
 /// Bind (or unbind) one selected descendant field. A target is owned by at
 /// most one component property: selecting a new property removes a stale
 /// binding to the same target from every other property first.
-pub(crate) fn set_component_property_binding_operations(
+pub fn set_component_property_binding_operations(
     doc: &Doc,
     component: ComponentId,
     target_node: NodeId,

@@ -32,7 +32,7 @@ const ROOT_ON_INSTANCE: [&str; 5] = [
 
 /// The overrides that make an instance of the master rooted at `master` look
 /// like `copy`. Fails, naming the layer, when the two differ in structure.
-pub(crate) fn overrides_for_copy(doc: &Doc, master: NodeId, copy: NodeId) -> Result<Vec<Override>> {
+pub fn overrides_for_copy(doc: &Doc, master: NodeId, copy: NodeId) -> Result<Vec<Override>> {
     let mut overrides = Vec::new();
     diff_node(doc, master, copy, &OverridePath::new(), &mut overrides)?;
     Ok(overrides)
