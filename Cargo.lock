@@ -4375,6 +4375,7 @@ dependencies = [
  "fanta-doc",
  "fanta-format",
  "fanta-headless",
+ "fanta-tools",
  "glam 0.32.1",
  "image",
  "serde",

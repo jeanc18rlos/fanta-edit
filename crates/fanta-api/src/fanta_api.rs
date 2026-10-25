@@ -26,7 +26,7 @@ pub use fanta_doc::{AssetId, Color, ComponentId, NodeId};
 pub use fanta_doc::{BlurKind, Placeholder, Scope, ShadowKind};
 pub use fanta_headless::export::{ExportEncoding, ExportSizing, ExportedImage};
 pub use nodes::{NodeKind, NodeType};
-pub use properties::{PropertyInfo, PropertyKind, PropertyValue};
+pub use properties::{PropertyInfo, PropertyKind, PropertyValue, ResizeMode};
 pub use templates::{DataUriFetcher, DirectoryFetcher, HttpFetcher, ImageFetcher};
 
 /// Why a call was refused or failed.
