@@ -12,7 +12,7 @@ use crate::context::ToolContext;
 use crate::event::ModifierKeys;
 use crate::tool::{CursorHint, MovingSelection, ToolOverlay, ToolResponse, bounds_from_corners};
 use fanta_canvas::{MarqueeMode, SnapResult};
-use fanta_doc::{NodeId, Operation, Transform2D};
+use fanta_doc::{NodeId, Operation, Scope, Transform2D};
 use glam::DVec2;
 use smallvec::SmallVec;
 use std::collections::HashSet;
@@ -124,6 +124,19 @@ impl SelectTool {
                     })
                     .filter_map(|id| ctx.doc.scene.get(id).map(|n| (id, n.transform)))
                     .collect();
+                // In Fill mode a template can pin layers in place. The press
+                // stays a click, so releasing still selects.
+                if moving
+                    .iter()
+                    .any(|(id, _)| !ctx.allows(*id, Scope::LayerMove))
+                {
+                    self.phase = Phase::PressedOnNode {
+                        screen_press,
+                        target,
+                        extending,
+                    };
+                    return ToolResponse::empty();
+                }
                 let press_world =
                     fanta_canvas::screen_to_world(screen_press, ctx.viewport, ctx.screen_size);
                 // Capture the first moved node's press-time world bounds for

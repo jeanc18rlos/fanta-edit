@@ -6,6 +6,8 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::CanvasNode;
+
 /// One kind of change a node can forbid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Scope {
@@ -158,6 +160,15 @@ impl EditingRules {
 
     pub fn allows(&self, scope: Scope) -> bool {
         !self.disabled_scopes.contains(&scope)
+    }
+}
+
+impl CanvasNode {
+    /// Whether the node's editing rules leave `scope` enabled.
+    pub fn editing_allows(&self, scope: Scope) -> bool {
+        self.editing
+            .as_ref()
+            .is_none_or(|rules| rules.allows(scope))
     }
 }
 

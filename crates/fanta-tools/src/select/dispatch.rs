@@ -15,7 +15,7 @@ use fanta_canvas::{
     hit_test_resize_handle_oriented, hit_test_rotate_handle, hit_test_rotate_handle_oriented,
     transform_angle,
 };
-use fanta_doc::{NodeId, Operation, Scene, Transform2D};
+use fanta_doc::{NodeId, Operation, Scene, Scope, Transform2D};
 use glam::DVec2;
 use smallvec::SmallVec;
 
@@ -359,7 +359,13 @@ impl SelectTool {
     }
 
     fn on_arrow(&mut self, ctx: &mut ToolContext, k: KeyEvent) -> ToolResponse {
-        if ctx.doc.selection.is_empty() {
+        if ctx.doc.selection.is_empty()
+            || ctx
+                .doc
+                .selection
+                .iter()
+                .any(|id| !ctx.allows(*id, Scope::LayerMove))
+        {
             return ToolResponse::empty();
         }
         let step = if k.modifiers.contains(ModifierKeys::SHIFT) {

@@ -6,7 +6,7 @@ use crate::tool::{CursorHint, Tool, ToolResponse};
 use fanta_canvas::{HitPrecision, ResizeHandle};
 use fanta_doc::{
     Blur, BoundProp, Bounds, CanvasNode, Doc, Fill, ImageFitMode, NodeData, NodeFlags, NodeId,
-    Operation, Shadow, Stroke, TextStyle, Transform2D, VariableId,
+    Operation, Scope, Shadow, Stroke, TextStyle, Transform2D, VariableId,
 };
 use glam::DVec2;
 use smallvec::SmallVec;
@@ -122,6 +122,12 @@ impl ScaleTool {
             return;
         };
         let roots = selection_roots(ctx.doc, ctx.scope());
+        if roots
+            .iter()
+            .any(|root| !ctx.allows(*root, Scope::LayerResize))
+        {
+            return;
+        }
         let Some(nodes) = scale_nodes(ctx.doc, &roots) else {
             return;
         };
