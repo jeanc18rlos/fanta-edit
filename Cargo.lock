@@ -4365,6 +4365,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanta-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fanta-canvas",
+ "fanta-design-ops",
+ "fanta-doc",
+ "fanta-format",
+ "fanta-headless",
+ "glam 0.32.1",
+ "image",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "fanta-bundle"
 version = "0.1.0"
 dependencies = [
@@ -5253,6 +5271,8 @@ name = "fanta-headless"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "fanta-canvas",
  "fanta-design-ops",
  "fanta-doc",
  "fanta-format",
@@ -5263,6 +5283,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "skia-safe",
+ "smallvec",
  "tempfile",
 ]
 

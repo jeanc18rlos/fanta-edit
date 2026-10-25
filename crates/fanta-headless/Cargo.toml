@@ -13,6 +13,8 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
+fanta-canvas.workspace = true
 fanta-design-ops.workspace = true
 fanta-doc.workspace = true
 fanta-format.workspace = true
@@ -23,6 +25,8 @@ log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+skia-safe.workspace = true
+smallvec.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

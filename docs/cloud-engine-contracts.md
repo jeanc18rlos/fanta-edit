@@ -40,8 +40,9 @@ Both checks apply to every route except `GET /healthz`.
 
 `schema_version` is the newest project schema the engine reads.
 `capabilities` lists `step:<name>` for each step this build runs; v2 checks it
-before it sends a step. Once `apply` runs, the list also carries
-`fanta_design_ops::DESIGN_OP_CAPABILITIES`.
+before it sends a step. The list also carries
+`fanta_design_ops::DESIGN_OP_CAPABILITIES`, the ops and query options `apply`
+accepts.
 
 ### `POST /v1/run`
 
@@ -158,6 +159,8 @@ engine produce the same document.
 ```rust
 HeadlessProject::open(root) -> Result<HeadlessProject>
     .doc() -> &Doc
+    .document() -> &HeadlessDocument
+    .document_mut() -> &mut HeadlessDocument
     .warnings() -> &[String]
     .font_families() -> BTreeSet<String>
     .inspect() -> Result<Value>

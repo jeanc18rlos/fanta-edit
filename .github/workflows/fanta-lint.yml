@@ -23,6 +23,7 @@ on:
       - 'crates/fanta-text/**'
       - 'crates/fanta-design-ops/**'
       - 'crates/fanta-headless/**'
+      - 'crates/fanta-api/**'
       - 'crates/fanta-engine/**'
       - 'crates/fig_viewer/**'
       - 'crates/workspace/**'

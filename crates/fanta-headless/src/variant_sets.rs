@@ -56,16 +56,16 @@ impl Plan {
 }
 
 /// The operations of a variant-set edit, plus what it made.
-pub(crate) struct SetEdit {
-    pub(crate) operations: Vec<Operation>,
-    pub(crate) set: ComponentId,
-    pub(crate) frame: Option<NodeId>,
+pub struct SetEdit {
+    pub operations: Vec<Operation>,
+    pub set: ComponentId,
+    pub frame: Option<NodeId>,
 }
 
 /// Combine standalone component masters (by root node) into a new variant
 /// set inside one frame. Members named `Axis=Value, …` become a set with those
 /// axes; otherwise each name is a value of one `Variant` axis.
-pub(crate) fn combine_variants(doc: &Doc, roots: &[NodeId], name: Option<&str>) -> Result<SetEdit> {
+pub fn combine_variants(doc: &Doc, roots: &[NodeId], name: Option<&str>) -> Result<SetEdit> {
     let members = standalone_masters(doc, roots)?;
     if members.len() < 2 {
         bail!("combine_variants needs at least two standalone component masters");
@@ -124,7 +124,7 @@ pub(crate) fn combine_variants(doc: &Doc, roots: &[NodeId], name: Option<&str>) 
 /// Add standalone masters (by root node) named `Axis=Value, …` to an existing
 /// set. New axes and values extend the set; a member without a value on an
 /// axis takes `Default`. The set's frame is re-laid out around them.
-pub(crate) fn add_variants(doc: &Doc, set_id: ComponentId, roots: &[NodeId]) -> Result<SetEdit> {
+pub fn add_variants(doc: &Doc, set_id: ComponentId, roots: &[NodeId]) -> Result<SetEdit> {
     let set = doc
         .components
         .sets
@@ -197,7 +197,7 @@ pub(crate) fn add_variants(doc: &Doc, set_id: ComponentId, roots: &[NodeId]) -> 
 /// Take one variant out of its set. It stays a standalone component, placed
 /// beside the set's frame. Unused axis values are dropped, and a set left
 /// empty is deleted with its frame.
-pub(crate) fn remove_variant(doc: &Doc, member: ComponentId) -> Result<SetEdit> {
+pub fn remove_variant(doc: &Doc, member: ComponentId) -> Result<SetEdit> {
     let def = doc
         .components
         .def(member)
@@ -294,7 +294,7 @@ pub(crate) fn remove_variant(doc: &Doc, member: ComponentId) -> Result<SetEdit> 
 /// Put every member of `set_id` in the set's frame (making one if it has
 /// none), name each after its values, and lay them out as a grid: one column
 /// per value of the last axis, one row per combination of the others.
-pub(crate) fn arrange_variants(doc: &Doc, set_id: ComponentId) -> Result<SetEdit> {
+pub fn arrange_variants(doc: &Doc, set_id: ComponentId) -> Result<SetEdit> {
     let mut plan = Plan::new(doc);
     let frame = arrange_in_plan(&mut plan, set_id)?;
     Ok(SetEdit {
@@ -306,7 +306,7 @@ pub(crate) fn arrange_variants(doc: &Doc, set_id: ComponentId) -> Result<SetEdit
 
 /// Rename a component or a variant set, keeping its master (or frame) layer
 /// name in step. Names must stay unique: pages name components.
-pub(crate) fn rename_component(doc: &Doc, id: ComponentId, name: &str) -> Result<Vec<Operation>> {
+pub fn rename_component(doc: &Doc, id: ComponentId, name: &str) -> Result<Vec<Operation>> {
     let name = name.trim();
     if name.is_empty() {
         bail!("the name is empty");
@@ -445,7 +445,7 @@ fn arrange_in_plan(plan: &mut Plan, set_id: ComponentId) -> Result<NodeId> {
         column_gap: SET_GAP,
         row_gap: SET_GAP,
     };
-    let operations = crate::properties_ops::replace_data_operation(&plan.doc, frame, |data| {
+    let operations = crate::edit_operations::replace_data_operation(&plan.doc, frame, |data| {
         if let NodeData::Group(group) = data {
             let layout = group.auto_layout.get_or_insert_with(AutoLayout::default);
             layout.mode = LayoutMode::Grid;

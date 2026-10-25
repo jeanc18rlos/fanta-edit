@@ -5,34 +5,42 @@
 //!
 //! The facade is frozen by `docs/cloud-engine-contracts.md`.
 
+pub mod apply;
+pub mod assets;
+pub mod clipboard;
 pub mod comments;
+pub mod component_properties;
+pub mod componentize;
+pub mod document;
+pub mod edit_operations;
+pub mod export;
 pub mod layout;
 pub mod pages;
 pub mod render;
 pub mod save;
 pub mod scene;
+pub mod structure;
 pub mod style;
+pub mod variant_sets;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::{Arc, mpsc},
 };
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow};
 use fanta_design_ops::{
     CommentDraft, DEFAULT_CHILD_LIMIT, DesignOp, DesignSystemQuery, ScreenshotTarget,
 };
-use fanta_doc::{
-    AssetId, Doc, JournalEvent, JournalSink, NodeData, NodeId, Operation, Transaction,
-};
+use fanta_doc::{Doc, NodeData, NodeId, Operation};
 use fanta_format::{ArtifactId, ProjectWriteCache, ScopedDesign, WorkspaceSession};
-use fanta_render::{AssetResolver, asset::LazyAssetResolver};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
+use apply::parse_node_id;
 pub use comments::agent_add_comments_op;
+pub use document::HeadlessDocument;
 
 /// The longest side a render may have: the most a vision model reads before
 /// it downscales.
@@ -110,7 +118,7 @@ const INSPECT_FRAME_LIMIT: usize = 200;
 /// An open project and the edits made to it since it was opened.
 pub struct HeadlessProject {
     root: PathBuf,
-    doc: Doc,
+    document: HeadlessDocument,
     /// The document as last read or saved: what a save compares against.
     baseline: Doc,
     /// The scene's instance and revision at `baseline`.
@@ -118,17 +126,10 @@ pub struct HeadlessProject {
     /// Nodes whose geometry was solved because the sources left it out. The
     /// next save writes it, as the editor's first save after opening does.
     pending_layout_output_nodes: BTreeSet<NodeId>,
-    raw_assets: Arc<BTreeMap<AssetId, Vec<u8>>>,
-    assets_changed: bool,
-    asset_resolver: Option<Arc<dyn AssetResolver>>,
     session: WorkspaceSession,
     write_cache: ProjectWriteCache,
-    layout: layout::LayoutState,
     pages: Vec<Option<NodeId>>,
     created_pages: Vec<NodeId>,
-    journal_events: mpsc::Receiver<JournalEvent>,
-    transactions: Vec<Transaction>,
-    journal: Vec<Operation>,
     loaded_hashes: BTreeMap<String, [u8; 32]>,
     warnings: Vec<String>,
 }
@@ -154,7 +155,6 @@ impl HeadlessProject {
             warnings.push(format!("computing omitted source geometry: {error:#}"));
             BTreeSet::new()
         });
-        let layout = layout::LayoutState::new(&doc);
         let page_roots = pages::editor_page_roots(&doc);
         // The active page is runtime state that the project does not store,
         // so pick the page the editor would open on, as it does.
@@ -172,35 +172,18 @@ impl HeadlessProject {
         {
             doc.set_active_page(page_roots.get(default_index).copied().flatten());
         }
-        let (sender, journal_events) = mpsc::channel();
-        doc.set_journal_sink(Some(JournalSink::new(sender)));
         let baseline = doc.clone_for_persist();
         let saved_scene = (doc.scene.instance_id(), doc.scene.revision());
-        let raw_assets = Arc::new(raw_assets);
-        let asset_resolver = (!raw_assets.is_empty()).then(|| {
-            Arc::new(LazyAssetResolver::with_size_reader(
-                raw_assets.clone(),
-                Arc::new(render::decode_embedded_image),
-                Arc::new(render::embedded_image_size),
-            )) as Arc<dyn AssetResolver>
-        });
         Ok(Self {
             root,
-            doc,
+            document: HeadlessDocument::new(doc, raw_assets),
             baseline,
             saved_scene,
             pending_layout_output_nodes,
-            raw_assets,
-            assets_changed: false,
-            asset_resolver,
             session,
             write_cache: ProjectWriteCache::default(),
-            layout,
             pages: page_roots,
             created_pages: Vec::new(),
-            journal_events,
-            transactions: Vec::new(),
-            journal: Vec::new(),
             loaded_hashes,
             warnings,
         })
@@ -211,7 +194,16 @@ impl HeadlessProject {
     }
 
     pub fn doc(&self) -> &Doc {
-        &self.doc
+        self.document.doc()
+    }
+
+    /// The open document, for edits beyond design ops and comments.
+    pub fn document(&self) -> &HeadlessDocument {
+        &self.document
+    }
+
+    pub fn document_mut(&mut self) -> &mut HeadlessDocument {
+        &mut self.document
     }
 
     /// Problems that did not stop the project from opening, worded for a
@@ -225,7 +217,7 @@ impl HeadlessProject {
     /// `fanta.md` rules, motion clips, prototype flows and the font families
     /// the text uses.
     pub fn inspect(&self) -> Result<Value> {
-        let doc = &self.doc;
+        let doc = &self.document.doc;
         let active = doc.active_page();
         let pages = self
             .pages
@@ -320,9 +312,9 @@ impl HeadlessProject {
     /// rich-text runs.
     pub fn font_families(&self) -> BTreeSet<String> {
         let mut families = BTreeSet::new();
-        for root in self.doc.scene.roots() {
-            for id in self.doc.scene.descendants_of(*root) {
-                let Some(node) = self.doc.scene.get(id) else {
+        for root in self.document.doc.scene.roots() {
+            for id in self.document.doc.scene.descendants_of(*root) {
+                let Some(node) = self.document.doc.scene.get(id) else {
                     continue;
                 };
                 let (style, runs) = match &node.data {
@@ -368,12 +360,12 @@ impl HeadlessProject {
             "a page name must contain 1–512 bytes"
         );
         anyhow::ensure!(
-            !self.doc.pages().is_empty(),
+            !self.document.doc.pages().is_empty(),
             "the project has no pages to add one beside"
         );
-        let (root, operations) = pages::add_page_operations(&self.doc, name.to_owned());
-        self.transaction("Add Page", operations)?;
-        self.pages = pages::editor_page_roots(&self.doc);
+        let (root, operations) = pages::add_page_operations(&self.document.doc, name.to_owned());
+        self.document.transaction("Add Page", operations)?;
+        self.pages = pages::editor_page_roots(&self.document.doc);
         self.created_pages.push(root);
         Ok(root)
     }
@@ -384,12 +376,21 @@ impl HeadlessProject {
     /// editor's `batch_design` does.
     pub fn apply(
         &mut self,
-        _page: Option<NodeId>,
+        page: Option<NodeId>,
         label: &str,
-        _ops: &[DesignOp],
-        _commit: bool,
+        ops: &[DesignOp],
+        commit: bool,
     ) -> Result<Value> {
-        bail!("applying {label:?} is not implemented yet: the op applier still lives in fig_viewer")
+        anyhow::ensure!(!ops.is_empty(), "the ops list is empty");
+        if let Some(page) = page {
+            anyhow::ensure!(self.pages.contains(&Some(page)), "{page} is not a page");
+        }
+        let default_container = page.or_else(|| self.document.doc().active_page());
+        let result = self
+            .document
+            .apply_design_ops(default_container, label, ops, commit)?;
+        self.pages = pages::editor_page_roots(self.document.doc());
+        Ok(result)
     }
 
     /// Place agent comments as one undo step labelled `label`. A draft without
@@ -433,21 +434,19 @@ impl HeadlessProject {
                 .map(|position| drafts[*position].clone())
                 .collect::<Vec<_>>();
             let (outcomes, operation) =
-                comments::agent_add_comments_op(&self.doc, root, &page_drafts);
+                comments::agent_add_comments_op(&self.document.doc, root, &page_drafts);
             operations.extend(operation);
             for (position, outcome) in positions.into_iter().zip(outcomes) {
                 results[position] = outcome;
             }
         }
-        self.transaction(label, operations)?;
+        self.document.transaction(label, operations)?;
         Ok(results)
     }
 
     /// Re-solve the auto layout and auto-sized text that edits invalidated.
     pub fn settle_layout(&mut self) -> Result<()> {
-        let result = layout::settle(&mut self.doc, &mut self.layout);
-        self.drain_journal();
-        result
+        self.document.settle_layout().map(|_moved| ())
     }
 
     /// `page`'s top-level layers, `depth` levels deep and at most `limit` of
@@ -455,7 +454,12 @@ impl HeadlessProject {
     /// `detail: "style"`.
     pub fn project_page(&self, page: NodeId, depth: u32, limit: usize) -> Result<Vec<Value>> {
         anyhow::ensure!(self.pages.contains(&Some(page)), "{page} is not a page");
-        scene::page_scene(&self.doc, page, depth, limit.clamp(1, DEFAULT_CHILD_LIMIT))
+        scene::page_scene(
+            &self.document.doc,
+            page,
+            depth,
+            limit.clamp(1, DEFAULT_CHILD_LIMIT),
+        )
     }
 
     pub fn render(&mut self, target: &RenderTarget) -> Result<RenderedImage> {
@@ -463,12 +467,13 @@ impl HeadlessProject {
         let node = target.node.as_deref().map(parse_node_id).transpose()?;
         if let Some(node) = node {
             anyhow::ensure!(
-                self.doc.scene.get(node).is_some(),
+                self.document.doc.scene.get(node).is_some(),
                 "node {node} does not exist"
             );
             anyhow::ensure!(
                 node == page
                     || self
+                        .document
                         .doc
                         .scene
                         .ancestors_of(node)
@@ -478,8 +483,8 @@ impl HeadlessProject {
         }
         self.settle_layout()?;
         let screenshot = render::render_screenshot(
-            &self.doc,
-            self.asset_resolver.clone(),
+            &self.document.doc,
+            self.document.asset_resolver.clone(),
             Some(page),
             node,
             ScreenshotTarget {
@@ -508,27 +513,33 @@ impl HeadlessProject {
     /// editor saves: sources the edits did not touch keep their bytes.
     pub fn save(&mut self) -> Result<()> {
         self.settle_layout()?;
-        let mut changed_artifacts =
-            save::changed_artifact_ids(&self.doc, Some(&self.baseline), Some(self.saved_scene));
+        let mut changed_artifacts = save::changed_artifact_ids(
+            &self.document.doc,
+            Some(&self.baseline),
+            Some(self.saved_scene),
+        );
         save::extend_artifact_owners(
-            &self.doc,
+            &self.document.doc,
             &mut changed_artifacts,
             self.pending_layout_output_nodes.iter().copied(),
         );
         save::save_project(
             &self.root,
             &mut self.session,
-            &self.doc,
+            &self.document.doc,
             &self.baseline,
-            &self.raw_assets,
-            self.assets_changed,
+            &self.document.raw_assets,
+            self.document.assets_changed,
             &changed_artifacts,
             &mut self.write_cache,
         )?;
-        self.baseline = self.doc.clone_for_persist();
-        self.saved_scene = (self.doc.scene.instance_id(), self.doc.scene.revision());
+        self.baseline = self.document.doc.clone_for_persist();
+        self.saved_scene = (
+            self.document.doc.scene.instance_id(),
+            self.document.doc.scene.revision(),
+        );
         self.pending_layout_output_nodes.clear();
-        self.assets_changed = false;
+        self.document.assets_changed = false;
         Ok(())
     }
 
@@ -536,7 +547,7 @@ impl HeadlessProject {
     /// the geometry each edit's layout solve added: the journal the editor
     /// replays to bring an open document up to date.
     pub fn journal(&self) -> &[Operation] {
-        &self.journal
+        self.document.journal()
     }
 
     /// The SHA-256 of every project file when it was opened, keyed by its
@@ -559,6 +570,7 @@ impl HeadlessProject {
 
     fn active_page_index(&self) -> Result<usize> {
         let active = self
+            .document
             .doc
             .active_page()
             .context("the project has no active page")?;
@@ -579,50 +591,6 @@ impl HeadlessProject {
             ScopedDesign::Component(_) => "master.fnx",
         };
         Some(self.root.join(&metadata.design_dir).join(file_name))
-    }
-
-    /// Apply `operations` as one undo step, then settle the layout it moved.
-    fn transaction(&mut self, label: &str, operations: Vec<Operation>) -> Result<()> {
-        if operations.is_empty() {
-            return Ok(());
-        }
-        self.doc.history.begin(label, &mut self.doc.scene);
-        for operation in operations {
-            if let Err(error) = self.doc.apply(operation) {
-                self.doc
-                    .abort_transaction()
-                    .context("rolling back the edit")?;
-                return Err(error).context("applying the edit");
-            }
-        }
-        self.doc.history.commit(&mut self.doc.scene);
-        self.settle_layout()
-    }
-
-    fn drain_journal(&mut self) {
-        let mut changed = false;
-        while let Ok(event) = self.journal_events.try_recv() {
-            changed = true;
-            match event {
-                JournalEvent::Commit(transaction) | JournalEvent::Redo(transaction) => {
-                    self.transactions.push(transaction);
-                }
-                JournalEvent::Amend(transaction) => match self.transactions.last_mut() {
-                    Some(last) => *last = transaction,
-                    None => self.transactions.push(transaction),
-                },
-                JournalEvent::Undo(_) => {
-                    self.transactions.pop();
-                }
-            }
-        }
-        if changed {
-            self.journal = self
-                .transactions
-                .iter()
-                .flat_map(|transaction| transaction.ops.iter().cloned())
-                .collect();
-        }
     }
 }
 
@@ -692,11 +660,6 @@ fn hash_project_files(root: &Path) -> Result<BTreeMap<String, [u8; 32]>> {
 
 fn hex_digest(hash: &[u8; 32]) -> String {
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn parse_node_id(raw: &str) -> Result<NodeId> {
-    raw.parse::<NodeId>()
-        .map_err(|_| anyhow!("`{raw}` is not a valid node id"))
 }
 
 #[cfg(test)]
@@ -942,6 +905,279 @@ mod tests {
         let summary = reopened.inspect().expect("inspect");
         assert_eq!(summary["pages"][2]["name"], "Review");
         assert_eq!(comments::read_comments(reopened.doc(), review).len(), 1);
+    }
+
+    fn design_ops(value: Value) -> Vec<DesignOp> {
+        serde_json::from_value(value).expect("ops JSON matches the DesignOp schema")
+    }
+
+    fn created(result: &Value, index: usize) -> NodeId {
+        result["created"][index]
+            .as_str()
+            .and_then(|id| id.parse().ok())
+            .expect("a created id")
+    }
+
+    fn tiny_png_base64() -> String {
+        use base64::Engine as _;
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 0, 0, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode the fixture PNG");
+        base64::engine::general_purpose::STANDARD.encode(png)
+    }
+
+    #[test]
+    fn apply_places_parentless_ops_on_the_requested_page_and_saves_only_its_source() {
+        let fixture = write_project();
+        let mut project = HeadlessProject::open(fixture.directory.path()).expect("open");
+        let (target, target_index) = if project.doc().active_page() == Some(fixture.home) {
+            (fixture.about, 1)
+        } else {
+            (fixture.home, 0)
+        };
+        let result = project
+            .apply(
+                Some(target),
+                "Add a frame",
+                &design_ops(json!([
+                    {"op": "create_node", "node_type": "frame", "name": "Hero",
+                     "x": 10, "y": 20, "width": 100, "height": 50},
+                ])),
+                true,
+            )
+            .expect("apply");
+        assert_eq!(result["applied"], json!(true), "{result}");
+        let frame = created(&result, 0);
+        assert_eq!(
+            project.doc().scene.get(frame).and_then(|node| node.parent),
+            Some(target),
+            "parentless ops land on the requested page, not the active one"
+        );
+        assert!(!project.journal().is_empty());
+
+        project.save().expect("save");
+        let changed = changeset(project.loaded_hashes(), project.root()).expect("changeset");
+        let sources: Vec<_> = changed
+            .iter()
+            .filter(|file| file.path != "doc/metadata.json")
+            .collect();
+        let reopened = HeadlessProject::open(project.root()).expect("reopen");
+        assert_eq!(
+            reopened
+                .doc()
+                .scene
+                .get(frame)
+                .map(|node| node.name.as_str()),
+            Some("Hero")
+        );
+        let target_source = reopened.inspect().expect("inspect")["pages"][target_index]["source"]
+            .as_str()
+            .expect("the page has a source")
+            .to_owned();
+        let target_directory = target_source
+            .strip_suffix("page.fnx")
+            .expect("a page source");
+        assert_eq!(
+            sources.len(),
+            2,
+            "the page source and its id sidecar: {changed:?}"
+        );
+        assert!(
+            sources
+                .iter()
+                .all(|file| file.status == FileStatus::Modified
+                    && file.path.starts_with(target_directory)),
+            "{changed:?}"
+        );
+    }
+
+    #[test]
+    fn apply_without_commit_checks_the_batch_and_changes_nothing() {
+        let fixture = write_project();
+        let mut project = HeadlessProject::open(fixture.directory.path()).expect("open");
+        let before = serde_json::to_value(project.doc().clone_for_persist()).expect("snapshot");
+        let result = project
+            .apply(
+                None,
+                "Check",
+                &design_ops(json!([
+                    {"op": "create_node", "node_type": "rectangle", "x": 0, "y": 0,
+                     "width": 10, "height": 10},
+                    {"op": "create_image", "source": tiny_png_base64(), "x": 0, "y": 0},
+                    {"op": "select", "ids": [fixture.card.to_string()]},
+                ])),
+                false,
+            )
+            .expect("check");
+        assert_eq!(result["applied"], json!(true), "{result}");
+        assert!(project.doc().scene.get(created(&result, 0)).is_none());
+        assert!(
+            project.doc().selection.is_empty(),
+            "the selection is restored"
+        );
+        assert!(project.journal().is_empty());
+        let after = serde_json::to_value(project.doc().clone_for_persist()).expect("snapshot");
+        assert_eq!(after, before);
+        project.save().expect("save");
+        let changed = changeset(project.loaded_hashes(), project.root()).expect("changeset");
+        assert!(
+            changed.iter().all(|file| file.path == "doc/metadata.json"),
+            "a checked batch writes nothing: {changed:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_apply_reports_the_failing_op_and_leaves_the_document_unchanged() {
+        let fixture = write_project();
+        let mut project = HeadlessProject::open(fixture.directory.path()).expect("open");
+        let before = serde_json::to_value(project.doc().clone_for_persist()).expect("snapshot");
+        let result = project
+            .apply(
+                None,
+                "Broken",
+                &design_ops(json!([
+                    {"op": "create_node", "node_type": "rectangle", "x": 0, "y": 0,
+                     "width": 10, "height": 10},
+                    {"op": "delete", "id": "n_not_a_node"},
+                    {"op": "rotate", "id": fixture.card.to_string(), "degrees": 45},
+                ])),
+                true,
+            )
+            .expect("a failed batch is still a result");
+        assert_eq!(result["applied"], json!(false));
+        assert_eq!(result["ops"][0]["status"], json!("ok"));
+        assert_eq!(result["ops"][1]["status"], json!("failed"));
+        assert_eq!(result["ops"][2]["status"], json!("skipped"));
+        assert!(project.journal().is_empty());
+        let after = serde_json::to_value(project.doc().clone_for_persist()).expect("snapshot");
+        assert_eq!(after, before);
+        assert!(
+            project
+                .apply(
+                    Some(fixture.card),
+                    "Not a page",
+                    &design_ops(json!([])),
+                    true
+                )
+                .is_err(),
+            "an empty batch is refused"
+        );
+        assert!(
+            project
+                .apply(
+                    Some(fixture.card),
+                    "Not a page",
+                    &design_ops(json!([{"op": "select", "ids": []}])),
+                    true
+                )
+                .is_err(),
+            "a layer is not a page"
+        );
+    }
+
+    #[test]
+    fn applied_images_are_saved_as_project_assets() {
+        let fixture = write_project();
+        let mut project = HeadlessProject::open(fixture.directory.path()).expect("open");
+        let result = project
+            .apply(
+                None,
+                "Place image",
+                &design_ops(json!([
+                    {"op": "create_image", "source": tiny_png_base64(), "name": "Pixel",
+                     "x": 0, "y": 0, "width": 20},
+                ])),
+                true,
+            )
+            .expect("apply");
+        assert_eq!(result["applied"], json!(true), "{result}");
+        let image = created(&result, 0);
+        let NodeData::Bitmap(bitmap) = &project.doc().scene.get(image).expect("image").data else {
+            panic!("create_image places a bitmap");
+        };
+        assert_eq!(bitmap.natural_size, [2, 1]);
+        let rendered = project
+            .render(&RenderTarget {
+                id: "image".into(),
+                page: PageRef::Id {
+                    id: project
+                        .doc()
+                        .active_page()
+                        .expect("active page")
+                        .to_string(),
+                },
+                node: Some(image.to_string()),
+                max_dimension: 64,
+                motion_clip: None,
+                playhead_ms: None,
+            })
+            .expect("render the placed image");
+        assert!(rendered.width > 0);
+
+        project.save().expect("save");
+        let changed = changeset(project.loaded_hashes(), project.root()).expect("changeset");
+        assert!(
+            changed.iter().any(|file| {
+                file.status == FileStatus::Added
+                    && file.path.starts_with("assets/")
+                    && file.path.ends_with(".png")
+            }),
+            "{changed:?}"
+        );
+        let reopened = HeadlessProject::open(project.root()).expect("reopen");
+        assert!(reopened.doc().scene.get(image).is_some());
+    }
+
+    #[test]
+    fn apply_settles_auto_layout_into_the_same_journal_entry() {
+        let fixture = write_project();
+        let mut project = HeadlessProject::open(fixture.directory.path()).expect("open");
+        let result = project
+            .apply(
+                None,
+                "Add a row",
+                &design_ops(json!([
+                    {"op": "create_node", "node_type": "frame", "x": 0, "y": 200,
+                     "width": 10, "height": 10},
+                ])),
+                true,
+            )
+            .expect("create the row");
+        let row = created(&result, 0);
+        let result = project
+            .apply(
+                None,
+                "Fill the row",
+                &design_ops(json!([
+                    {"op": "set_auto_layout", "id": row.to_string(), "direction": "horizontal",
+                     "gap": 8, "padding": [4], "primary_sizing": "hug", "counter_sizing": "hug"},
+                    {"op": "create_node", "node_type": "rectangle", "parent": row.to_string(),
+                     "x": 0, "y": 0, "width": 30, "height": 20},
+                    {"op": "create_node", "node_type": "rectangle", "parent": row.to_string(),
+                     "x": 0, "y": 0, "width": 30, "height": 20},
+                ])),
+                true,
+            )
+            .expect("fill the row");
+        assert_eq!(result["applied"], json!(true), "{result}");
+        let bounds = project.doc().scene.world_bounds(row).expect("row bounds");
+        assert_eq!((bounds.width(), bounds.height()), (76.0, 28.0));
+
+        // Replaying the journal onto the project as it was opened reproduces
+        // the solved layout, so the derived geometry is part of the record.
+        let opened = HeadlessProject::open(fixture.directory.path()).expect("reopen");
+        let mut replayed = opened.doc().clone();
+        for operation in project.journal() {
+            replayed.apply(operation.clone()).expect("replay");
+        }
+        for id in std::iter::once(row).chain([created(&result, 0), created(&result, 1)]) {
+            assert_eq!(
+                replayed.scene.world_bounds(id),
+                project.doc().scene.world_bounds(id),
+                "{id}"
+            );
+        }
     }
 
     #[test]
