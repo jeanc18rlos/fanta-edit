@@ -3595,6 +3595,9 @@ impl FigView {
         {
             return;
         }
+        if !self.design_action_allowed(action, cx) {
+            return;
+        }
         match action {
             DesignPanelAction::PropertyCopyRequested {
                 target,
@@ -5034,6 +5037,28 @@ impl FigView {
 
     /// One Begin/Preview/Commit/Cancel gesture over a single node property,
     /// using the same snapshot-restore staging as the legacy panel scrubs.
+    /// Whether Fill mode lets the inspector make the change `action` asks
+    /// for. Says why not, except on a gesture's preview frames, which arrive
+    /// on every frame of a drag.
+    fn design_action_allowed(&self, action: &DesignPanelAction, cx: &mut Context<Self>) -> bool {
+        let Some((node, scope, phase)) = design_action_scope(action) else {
+            return true;
+        };
+        let Some(id) = node_id(node) else {
+            return true;
+        };
+        if phase == Some(DesignPanelEditPhase::Preview) {
+            return !self.template_fill
+                || self
+                    .item()
+                    .read(cx)
+                    .doc()
+                    .and_then(|doc| doc.scene.get(id))
+                    .is_none_or(|node| node.editing_allows(scope));
+        }
+        self.template_allows_node(id, scope, "change that here", cx)
+    }
+
     /// Whether Fill mode lets the inspector change `property` on every node
     /// in `ids`. Says why not.
     fn design_property_allowed(
@@ -8388,6 +8413,165 @@ fn current_prop_kind(
             EnginePropKind::Other
         }
     })
+}
+
+/// The node an inspector action changes, the template scope the change needs
+/// and, for a gesture, its phase. Actions left out change nothing a template
+/// locks: component authoring, styles and variables, layout grids, exports,
+/// copying and navigation.
+#[allow(deprecated)]
+fn design_action_scope(
+    action: &DesignPanelAction,
+) -> Option<(&SharedString, Scope, Option<DesignPanelEditPhase>)> {
+    use DesignPanelAction as A;
+    let list_scope = |collection: &DesignPanelCollection| match collection {
+        DesignPanelCollection::Fill => Some(Scope::FillChange),
+        DesignPanelCollection::Stroke => Some(Scope::StrokeChange),
+        DesignPanelCollection::Effect => Some(Scope::AppearanceEffect),
+        DesignPanelCollection::LayoutGrid | DesignPanelCollection::Export => None,
+    };
+    match action {
+        A::PropertyChangeRequested {
+            node_id, property, ..
+        }
+        | A::TypographyPropertyChangeRequested {
+            node_id, property, ..
+        } => Some((node_id, design_property_scope(*property)?, None)),
+        A::PropertyEditRequested {
+            node_id,
+            property,
+            phase,
+            ..
+        }
+        | A::TypographyPropertyEditRequested {
+            node_id,
+            property,
+            phase,
+            ..
+        }
+        | A::EffectEditRequested {
+            node_id,
+            property,
+            phase,
+            ..
+        } => Some((node_id, design_property_scope(*property)?, Some(*phase))),
+        A::TypographyVariableAxisEditRequested { node_id, phase, .. }
+        | A::TextPathPlacementChangeRequested { node_id, phase, .. }
+        | A::TextPathStartChangeRequested { node_id, phase, .. } => {
+            Some((node_id, Scope::TextCharacter, Some(*phase)))
+        }
+        A::TypographyStyleApplyRequested { node_id, .. }
+        | A::TypographyStyleDetachRequested { node_id, .. }
+        | A::TypographyFontApplyRequested { node_id, .. }
+        | A::TypographyOpenTypeFeatureChangeRequested { node_id, .. }
+        | A::TextPathFlipOrientationRequested { node_id }
+        | A::TextPathDirectionChangeRequested { node_id, .. } => {
+            Some((node_id, Scope::TextCharacter, None))
+        }
+        A::VectorVertexPositionEditRequested { node_id, phase, .. }
+        | A::VectorVertexCornerRadiusEditRequested { node_id, phase, .. }
+        | A::VectorHandleMirroringEditRequested { node_id, phase, .. }
+        | A::TransformModifierChangeRequested { node_id, phase, .. } => {
+            Some((node_id, Scope::ShapeChange, Some(*phase)))
+        }
+        A::TransformModifierAddRequested { node_id, .. }
+        | A::TransformModifierRemoveRequested { node_id, .. }
+        | A::ApplyTransformModifiersRequested { node_id } => {
+            Some((node_id, Scope::ShapeChange, None))
+        }
+        A::GridDimensionsEditRequested { node_id, phase, .. } => {
+            Some((node_id, Scope::LayerResize, Some(*phase)))
+        }
+        A::GridTrackAddRequested { node_id, .. }
+        | A::GridTrackDeleteRequested { node_id, .. }
+        | A::GridTracksReorderRequested { node_id, .. }
+        | A::FramePresetApplyRequested { node_id, .. } => Some((node_id, Scope::LayerResize, None)),
+        A::EffectAddRequested { node_id, .. }
+        | A::EffectRemoveRequested { node_id, .. }
+        | A::EffectReorderRequested { node_id, .. }
+        | A::EffectShaderChooseRequested { node_id, .. }
+        | A::EffectStyleApplyRequested { node_id, .. }
+        | A::EffectStyleDetachRequested { node_id, .. }
+        | A::EffectVariableApplyRequested { node_id, .. }
+        | A::EffectVariableDetachRequested { node_id, .. } => {
+            Some((node_id, Scope::AppearanceEffect, None))
+        }
+        A::PaintEditRequested {
+            node_id,
+            collection,
+            phase,
+            ..
+        } => Some((node_id, list_scope(collection)?, Some(*phase))),
+        A::PaintMediaCropActionRequested { node_id, .. } => Some((node_id, Scope::LayerCrop, None)),
+        A::CollectionItemAddRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::CollectionItemRemoveRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintChangeRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintReorderRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintStyleApplyRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintStyleDetachRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintSourceReplaceRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintMediaSourceActionRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintMediaSourceDropRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintShaderApplyRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintColorVariableApplyRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintColorVariableDetachRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintColorStyleApplyRequested {
+            node_id,
+            collection,
+            ..
+        } => Some((node_id, list_scope(collection)?, None)),
+        A::SwapStrokeEndpointsRequested { node_id } => Some((node_id, Scope::StrokeChange, None)),
+        A::ReplaceMediaRequested { node_id } => Some((node_id, Scope::FillChange, None)),
+        _ => None,
+    }
 }
 
 /// The template scope an inspector property belongs to, which Fill mode

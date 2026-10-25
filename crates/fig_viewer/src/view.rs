@@ -542,7 +542,7 @@ pub struct FigView {
     /// Fill mode for this window: the user is filling a template in, so
     /// canvas gestures and selection commands keep to what each layer's
     /// editing rules allow. Off while authoring, and never saved.
-    template_fill: bool,
+    pub(crate) template_fill: bool,
     #[cfg(feature = "fanta-gpui-ui")]
     gpui_toolbar: Option<crate::gpui_adapters::toolbar::ToolbarAdapter>,
     /// The DesignPanel inspector adapter, mounted for Design mode when the
