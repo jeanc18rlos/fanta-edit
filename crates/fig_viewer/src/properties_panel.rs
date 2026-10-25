@@ -801,24 +801,27 @@ impl FantaPropertiesPanel {
         if let Some(view) = self.active_view(cx) {
             view.update(cx, |view, cx| view.commit_text_edit(cx));
         }
-        self.update_node_data(
-            id,
-            move |data| {
-                let NodeData::Text(text) = data else {
-                    return;
-                };
-                let Some(path) = fanta_render::text_node_outline(text) else {
-                    return;
-                };
-                let fill = Fill::solid(text.style.color);
+        // Outline the text as it is drawn: bound content and style, with its
+        // text variables filled in.
+        self.apply_document_ops(cx, move |doc| {
+            let Some(NodeData::Text(text)) =
+                fanta_doc::displayed_text_node(&doc.scene, &doc.variables, &doc.active_modes, id)
+                    .map(|node| node.data)
+            else {
+                return Vec::new();
+            };
+            let Some(path) = fanta_render::text_node_outline(&text) else {
+                return Vec::new();
+            };
+            let fill = Fill::solid(text.style.color);
+            replace_data_operation(doc, id, move |data| {
                 *data = NodeData::Vector(VectorNode {
                     path,
                     fills: smallvec::smallvec![fill],
                     ..VectorNode::default()
                 });
-            },
-            cx,
-        );
+            })
+        });
     }
 
     pub(crate) fn toggle_flag(&mut self, id: NodeId, flag: NodeFlags, cx: &mut Context<Self>) {
