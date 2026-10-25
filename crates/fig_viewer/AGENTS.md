@@ -33,6 +33,10 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 - Derive macOS video duration from native playback preparation. Raw MP4 track duration can include samples an edit list excludes. (#4)
 - Ingest and roll back images through `document::AssetStores`, never the same-named `fanta_headless::assets::AssetStores` it wraps. Only the wrapper keeps the asset panel's GPUI thumbnail cache in step, so the headless store alone leaves new images without thumbnails and removed ones with stale ones. (#160)
 
+## Templates
+
+- A command or gesture that changes layers checks Fill mode before it builds operations: `ToolContext::allows` in fanta-tools, `template_allows_selection` or `template_allows_node` here. Nothing else catches a missing check, so the template's user could then change what the template locks. (#165)
+
 ## Input, focus and keymaps
 
 - Canvas keymap blocks use contexts like `FigViewer && !Editor && !Input`. Toolbar search and inspector fields are `gpui_component::Input`, so excluding only `Editor` fires single-key shortcuts while the user types. (#1)
