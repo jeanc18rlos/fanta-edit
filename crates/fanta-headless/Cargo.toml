@@ -25,6 +25,7 @@ log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+skia-safe.workspace = true
 smallvec.workspace = true
 
 [dev-dependencies]

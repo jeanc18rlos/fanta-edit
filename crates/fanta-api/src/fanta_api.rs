@@ -19,6 +19,7 @@ use fanta_headless::{HeadlessDocument, HeadlessProject};
 pub use events::{NodeEvent, NodeEventKind, NodeFilter, SubscriptionId};
 pub use fanta_doc::{AssetId, Color, ComponentId, NodeId};
 pub use fanta_doc::{BlurKind, ShadowKind};
+pub use fanta_headless::export::{ExportEncoding, ExportSizing, ExportedImage};
 pub use nodes::{NodeKind, NodeType};
 pub use properties::{PropertyInfo, PropertyKind, PropertyValue};
 
@@ -141,6 +142,26 @@ impl DesignSession {
                 .with_context(|| format!("writing asset {asset}"))?;
         }
         Ok(())
+    }
+
+    /// Export `node` as `encoding`; a page root exports the page. The image
+    /// covers what the node draws, with variable values applied. `sizing`
+    /// sets the pixel size of PNG and JPEG; SVG and PDF use the design's own
+    /// size.
+    pub fn export(
+        &self,
+        node: NodeId,
+        encoding: ExportEncoding,
+        sizing: ExportSizing,
+    ) -> Result<ExportedImage> {
+        self.node(node)?;
+        Ok(fanta_headless::export::export_node(
+            self.doc(),
+            self.document().asset_resolver(),
+            node,
+            encoding,
+            sizing,
+        )?)
     }
 
     /// The document, read-only. Edit it through the session's calls.
@@ -425,6 +446,38 @@ mod tests {
         );
         assert!(!session.is_valid(frame));
         assert!(session.is_valid(ellipse));
+    }
+
+    #[test]
+    fn export_renders_a_node_at_a_target_size() {
+        let mut session = DesignSession::new().expect("session");
+        let page = session.active_page().expect("page");
+        let mut pixels = Vec::new();
+        image::RgbaImage::from_pixel(4, 2, image::Rgba([0, 0, 255, 255]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut pixels),
+                image::ImageFormat::Png,
+            )
+            .expect("encode png");
+        let photo = session
+            .create_node(page, NodeKind::Image(pixels))
+            .expect("image");
+        let exported = session
+            .export(photo, ExportEncoding::Png, ExportSizing::Height(20.0))
+            .expect("export");
+        assert_eq!((exported.width, exported.height), (40, 20));
+        let decoded = image::load_from_memory(&exported.bytes)
+            .expect("decode")
+            .to_rgba8();
+        assert_eq!(
+            decoded.get_pixel(20, 10).0,
+            [0, 0, 255, 255],
+            "the ingested asset renders"
+        );
+        let page_export = session
+            .export(page, ExportEncoding::Pdf, ExportSizing::Scale(1.0))
+            .expect("page");
+        assert!(page_export.bytes.starts_with(b"%PDF"));
     }
 
     #[test]

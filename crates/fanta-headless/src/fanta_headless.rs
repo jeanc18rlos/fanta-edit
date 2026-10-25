@@ -13,6 +13,7 @@ pub mod component_properties;
 pub mod componentize;
 pub mod document;
 pub mod edit_operations;
+pub mod export;
 pub mod layout;
 pub mod pages;
 pub mod render;
