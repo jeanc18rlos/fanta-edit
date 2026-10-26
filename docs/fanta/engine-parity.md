@@ -49,7 +49,7 @@ compatibility adapter is a separate, optional layer.
 | Design API | typed properties, lifecycle, hierarchy, find, metadata | ✅ `fanta-api`'s `DesignSession` | 1 |
 | Events | per-block Created, Updated, Destroyed | ✅ polled per-node events in `fanta-api` | 1 |
 | Undo | explicit steps, several histories | 🟡 explicit steps in `fanta-api`; one history | 1 |
-| Templating | text variables, placeholders, scopes, roles | ✅ in `fanta-api`: `{{name}}` text variables, placeholders, 25 scopes and three roles. 🟡 The editor's Fill mode keeps canvas gestures, Delete, Duplicate and text editing to the scopes; the inspector neither enforces nor edits them yet, and placeholders have no overlay | 2 (editor) |
+| Templating | text variables, placeholders, scopes, roles | ✅ in `fanta-api`: `{{name}}` text variables, placeholders, 25 scopes and three roles. 🟡 The editor's Fill mode keeps canvas gestures, Delete, Duplicate, text editing and the Design inspector's edits to the scopes, but not yet arranging or transforming a multi-selection, variable bindings or grouping. The inspector cannot show or edit the scopes, and placeholders have no overlay | 2 (editor) |
 | Scene I/O | scenes in memory, strings, archives | ✅ sessions in memory, from project folders or from `.fant` snapshots | 1 |
 | Export | PNG, JPEG, WebP, TGA, PDF, SVG, target size | 🟡 PNG, JPEG, SVG and PDF from the editor, the engine and `fanta-api`; no WebP or TGA | 5 |
 | Blocks and shapes | graphic, text, group, page, audio; six shapes; booleans | ✅ | — |
