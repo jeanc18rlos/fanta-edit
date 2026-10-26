@@ -16,6 +16,7 @@ use fanta_headless::edit_operations::{
     authored_local_bounds, blurs_operations, default_shadow, effects_operations,
     replace_data_operation, set_corner_radius,
 };
+use glam::DVec2;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{ApiError, DesignSession, Result};
@@ -62,6 +63,18 @@ pub struct PropertyInfo {
     pub path: String,
     pub kind: PropertyKind,
     pub writable: bool,
+}
+
+/// How [`DesignSession::resize_frame`] fits a frame's content to its new
+/// size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeMode {
+    /// The children follow their constraints and auto layout reflows, as
+    /// when the frame is resized in the editor.
+    Constraints,
+    /// The content scales uniformly to the largest size that fits, centered,
+    /// the way the scale tool scales it: text, strokes and effects too.
+    Fit,
 }
 
 /// How a property write reaches the document.
@@ -478,6 +491,89 @@ impl DesignSession {
         self.edit(vec![Operation::SetTransform { id: node, old, new }])
     }
 
+    /// Resize the frame `frame` to `width` × `height`, fitting its content as
+    /// `mode` says.
+    pub fn resize_frame(
+        &mut self,
+        frame: NodeId,
+        width: f64,
+        height: f64,
+        mode: ResizeMode,
+    ) -> Result<()> {
+        self.permit(Some(frame), Scope::LayerResize)?;
+        if !(width.is_finite() && width > 0.0 && height.is_finite() && height > 0.0) {
+            return Err(ApiError::InvalidArgument(
+                "a frame's size must be positive".into(),
+            ));
+        }
+        let Some([old_width, old_height]) = frame_box(&self.node(frame)?.data) else {
+            return Err(ApiError::InvalidArgument(format!("{frame} is not a frame")));
+        };
+        if mode == ResizeMode::Constraints {
+            let new_width = (!unchanged(old_width, width)).then_some(width);
+            let new_height = (!unchanged(old_height, height)).then_some(height);
+            if new_width.is_none() && new_height.is_none() {
+                return Ok(());
+            }
+            let mut operation = set_props(frame);
+            if let DesignOp::SetProps {
+                width: set_width,
+                height: set_height,
+                ..
+            } = &mut operation
+            {
+                *set_width = new_width;
+                *set_height = new_height;
+            }
+            return self.edit_with_design_op(&operation).map(|_| ());
+        }
+        let factor = (width / old_width).min(height / old_height);
+        let mut operations = Vec::new();
+        if (factor - 1.0).abs() > f64::EPSILON {
+            let origin = self
+                .doc()
+                .scene
+                .world_transform(frame)
+                .ok_or(ApiError::NodeNotFound(frame))?
+                .transform_point(DVec2::ZERO);
+            operations = fanta_tools::scale::scale_operations(self.doc(), &[frame], factor, origin)
+                .ok_or_else(|| ApiError::InvalidArgument(format!("{frame} cannot be scaled")))?;
+        }
+        // The scale sized the frame by the factor; give it the exact box.
+        let scaled_frame = operations.iter_mut().find_map(|operation| match operation {
+            Operation::ReplaceData { id, new, .. } if *id == frame => Some(new),
+            _ => None,
+        });
+        match scaled_frame {
+            Some(data) => set_frame_box(data, width, height),
+            None => operations.extend(replace_data_operation(self.doc(), frame, |data| {
+                set_frame_box(data, width, height)
+            })),
+        }
+        let shift = Transform2D::translation(
+            (width - old_width * factor) / 2.0,
+            (height - old_height * factor) / 2.0,
+        );
+        for child in self.doc().scene.children_of(Some(frame)).to_vec() {
+            let moved = operations.iter_mut().find_map(|operation| match operation {
+                Operation::SetTransform { id, new, .. } if *id == child => Some(new),
+                _ => None,
+            });
+            match moved {
+                Some(transform) => *transform = transform.then(&shift),
+                None => {
+                    let old = self.node(child)?.transform;
+                    operations.push(Operation::SetTransform {
+                        id: child,
+                        old,
+                        new: old.then(&shift),
+                    });
+                }
+            }
+        }
+        self.edit(operations)
+    }
+
     /// The property definition `path` names on `node`, and its list index.
     fn resolve(&self, node: NodeId, path: &str) -> Result<(&'static PropertyDef, usize)> {
         let canvas_node = self.node(node)?;
@@ -682,6 +778,30 @@ fn oriented_size(doc: &Doc, node: &CanvasNode) -> Option<[f64; 2]> {
     Some([bounds.width(), bounds.height()])
 }
 
+/// Whether a resize from `old` to `new` changes nothing. The design-op
+/// applier refuses such a resize as one it cannot make, so callers skip it.
+fn unchanged(old: f64, new: f64) -> bool {
+    (new - old).abs() <= f64::EPSILON
+}
+
+/// A frame's box: its clip size, or its size when it has no clip.
+fn frame_box(data: &NodeData) -> Option<[f64; 2]> {
+    match data {
+        NodeData::Group(group) => group.clip_size.or(group.local_size),
+        _ => None,
+    }
+}
+
+fn set_frame_box(data: &mut NodeData, width: f64, height: f64) {
+    if let NodeData::Group(group) = data {
+        if group.clip_size.is_some() || group.local_size.is_none() {
+            group.clip_size = Some([width, height]);
+        } else {
+            group.local_size = Some([width, height]);
+        }
+    }
+}
+
 fn set_props(id: NodeId) -> DesignOp {
     DesignOp::SetProps {
         id: id.to_string(),
@@ -849,10 +969,14 @@ fn property_table() -> Vec<PropertyDef> {
             get: |doc, node, _| {
                 oriented_size(doc, node).map(|[width, _]| PropertyValue::Float(width))
             },
-            set: Some(|_, node, _, value| {
+            set: Some(|doc, node, _, value| {
+                let new = float(value)?;
+                if oriented_size(doc, node).is_some_and(|[width, _]| unchanged(width, new)) {
+                    return Ok(Write::Operations(Vec::new()));
+                }
                 let mut operation = set_props(node.id);
                 if let DesignOp::SetProps { width, .. } = &mut operation {
-                    *width = Some(float(value)?);
+                    *width = Some(new);
                 }
                 Ok(Write::DesignOp(operation))
             }),
@@ -867,10 +991,14 @@ fn property_table() -> Vec<PropertyDef> {
             get: |doc, node, _| {
                 oriented_size(doc, node).map(|[_, height]| PropertyValue::Float(height))
             },
-            set: Some(|_, node, _, value| {
+            set: Some(|doc, node, _, value| {
+                let new = float(value)?;
+                if oriented_size(doc, node).is_some_and(|[_, height]| unchanged(height, new)) {
+                    return Ok(Write::Operations(Vec::new()));
+                }
                 let mut operation = set_props(node.id);
                 if let DesignOp::SetProps { height, .. } = &mut operation {
-                    *height = Some(float(value)?);
+                    *height = Some(new);
                 }
                 Ok(Write::DesignOp(operation))
             }),
@@ -2147,5 +2275,82 @@ mod tests {
         }
         assert_eq!(match_pattern("fills/#/color", "fills/x/color"), None);
         assert_eq!(match_pattern("fills/#/color", "fills/0/color/extra"), None);
+    }
+
+    fn near(session: &DesignSession, node: NodeId, path: &str, expected: f64) {
+        let actual = session.get_float(node, path).expect(path);
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "{path}: expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn resizing_a_frame_by_constraints_keeps_pinned_children_in_place() {
+        let mut session = DesignSession::new().expect("session");
+        let page = session.active_page().expect("page");
+        let frame = session.create_node(page, NodeKind::Frame).expect("frame");
+        let badge = session
+            .create_node(frame, NodeKind::Rectangle)
+            .expect("badge");
+        session.set_float(badge, "size/width", 20.0).expect("width");
+        session.set_float(badge, "position/x", 80.0).expect("x");
+        let old = session.node(badge).expect("badge").constraints;
+        session
+            .edit(vec![Operation::SetConstraints {
+                id: badge,
+                old,
+                new: Some(fanta_doc::Constraints {
+                    horizontal: fanta_doc::ConstraintH::Right,
+                    vertical: fanta_doc::ConstraintV::Top,
+                }),
+            }])
+            .expect("pin to the right");
+        session
+            .resize_frame(frame, 200.0, 100.0, ResizeMode::Constraints)
+            .expect("resize");
+        near(&session, frame, "size/width", 200.0);
+        near(&session, badge, "position/x", 180.0);
+        near(&session, badge, "size/width", 20.0);
+        session
+            .set_float(frame, "size/width", 200.0)
+            .expect("writing the current size changes nothing");
+    }
+
+    #[test]
+    fn fitting_a_frame_scales_and_centers_its_content() {
+        let mut session = DesignSession::new().expect("session");
+        let page = session.active_page().expect("page");
+        let frame = session.create_node(page, NodeKind::Frame).expect("frame");
+        let card = session
+            .create_node(frame, NodeKind::Rectangle)
+            .expect("card");
+        session.add_stroke(card, Color::BLACK, 2.0).expect("stroke");
+        session
+            .resize_frame(frame, 50.0, 100.0, ResizeMode::Fit)
+            .expect("fit");
+        near(&session, frame, "size/width", 50.0);
+        near(&session, frame, "size/height", 100.0);
+        near(&session, card, "size/width", 50.0);
+        near(&session, card, "size/height", 50.0);
+        near(&session, card, "position/x", 0.0);
+        near(&session, card, "position/y", 25.0);
+        near(&session, card, "strokes/0/width", 1.0);
+
+        session
+            .resize_frame(frame, 100.0, 100.0, ResizeMode::Fit)
+            .expect("widen");
+        near(&session, card, "size/width", 50.0);
+        near(&session, card, "position/x", 25.0);
+        near(&session, card, "position/y", 25.0);
+        assert!(matches!(
+            session.resize_frame(card, 10.0, 10.0, ResizeMode::Fit),
+            Err(ApiError::InvalidArgument(_))
+        ));
+        assert!(
+            session
+                .resize_frame(frame, 0.0, 10.0, ResizeMode::Fit)
+                .is_err()
+        );
     }
 }

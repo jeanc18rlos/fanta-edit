@@ -61,8 +61,8 @@ compatibility adapter is a separate, optional layer.
 | Animation | 25 in, out and loop presets, per-letter text animation | 🟡 keyframe clips; no presets or per-glyph animation | 4 |
 | Video timeline | page duration, offsets, trim, tracks, split, 21 transitions, captions | 🟡 trim, speed and volume on video layers | 4 |
 | Media I/O | MP4 and MOV decode; MP4 export with audio | 🟡 decode on macOS only; MP4 through an external `ffmpeg`, editor-only, silent | 4 |
-| Assets | asset sources, queries, URI resolver, buffers | ❌ project assets addressed by content hash | 2 |
-| Automation | data merge, auto-resize, batch generation | ❌ | 2 |
+| Assets | asset sources, queries, URI resolver, buffers | 🟡 project assets addressed by content hash; `fanta-api` fetches template images from `data:` URIs, a directory or https, as the caller allows; no asset sources or queries | 2 |
+| Automation | data merge, auto-resize, batch generation | 🟡 `fanta-api` fills a template from a data row, batch-exports one image per row, and resizes a frame by its constraints or by fitting its content; no engine steps yet | 2 |
 | Color and print | CMYK, spot colors, ICC, mm and inches, DPI, bleed, underlayer, cutouts, crop marks | ❌ 8-bit sRGB and pixels only | 5 |
 | Distribution | native Node package, engine plugins | ❌ engine bindings (the web runtime only plays prototypes); the engine is GPL-3.0 | 6 |
 | Importers and extras | PSD, IDML, PDF, PPTX, Lottie; background removal, QR codes, dominant colors, validation | ❌ (✅ `.fig`, limited SVG; cloud segmentation) | 7 |

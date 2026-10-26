@@ -18,12 +18,15 @@ fanta-design-ops.workspace = true
 fanta-doc.workspace = true
 fanta-format.workspace = true
 fanta-headless.workspace = true
+fanta-tools.workspace = true
 glam.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+ureq.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 image.workspace = true
 tempfile.workspace = true
 

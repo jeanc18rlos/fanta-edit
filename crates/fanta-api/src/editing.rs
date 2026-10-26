@@ -46,7 +46,7 @@ pub enum ScopeRule {
 }
 
 /// The session's role and the rules set over its defaults.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Permissions {
     role: Role,
     overrides: BTreeMap<Scope, ScopeRule>,
@@ -140,6 +140,17 @@ impl DesignSession {
     /// bitmap's own image, or its first image fill. The node keeps its box
     /// and image fit; a crop is dropped, since it framed the old image.
     pub fn replace_placeholder_image(&mut self, node: NodeId, bytes: Vec<u8>) -> Result<()> {
+        self.swap_placeholder_image(node, bytes).map(|_| ())
+    }
+
+    /// [`replace_placeholder_image`](Self::replace_placeholder_image),
+    /// returning the image asset when this call added it, so a caller that
+    /// rolls back can remove it again.
+    pub(crate) fn swap_placeholder_image(
+        &mut self,
+        node: NodeId,
+        bytes: Vec<u8>,
+    ) -> Result<Option<AssetId>> {
         if self.placeholder(node)?.is_none() {
             return Err(ApiError::InvalidArgument(format!(
                 "{node} is not a placeholder"
@@ -158,11 +169,15 @@ impl DesignSession {
         let operations = replace_data_operation(self.doc(), node, |data| {
             replace_image(data, asset, natural_size)
         });
-        let result = self.edit(operations);
-        if result.is_err() && inserted {
-            self.document_mut().remove_image(asset);
+        match self.edit(operations) {
+            Ok(()) => Ok(inserted.then_some(asset)),
+            Err(error) => {
+                if inserted {
+                    self.document_mut().remove_image(asset);
+                }
+                Err(error)
+            }
         }
-        result
     }
 
     /// Refuse a change of `scope` to `node`, or to the document when there
