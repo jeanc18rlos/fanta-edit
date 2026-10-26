@@ -56,7 +56,7 @@ compatibility adapter is a separate, optional layer.
 | Fills | color, three gradients, image fit and crop, video | ✅ plus diamond, pattern and shader fills; 🟡 crop rotates in quarter turns | 3 |
 | Strokes | start, end and dash caps; dash offset; overprint | 🟡 none of these | 3, 5 |
 | Effects | a 22-effect stack: 12-knob adjustments, LUT, duotone, chroma key, recolor, vignette, pixelize, posterize, glow, tilt-shift… | ❌ 7-knob adjustments on image and video fills only | 3 |
-| Blur and blend | 4 blur kinds, 27 blend modes | 🟡 layer and background blur, 18 blend modes | 3 |
+| Blur and blend | 4 blur kinds, 27 blend modes | 🟡 layer and background blur. ✅ 26 blend modes plus Pass through on groups; PDF has no Linear Burn, Darker or Lighter Color, Vivid, Linear or Pin Light, Hard Mix, Subtract or Divide, so PDF export draws those as Normal, and SVG export draws every mode as Normal | 3 |
 | Text | ranged case, super- and subscript, lists, per-paragraph styles, emoji, fonts by URI | 🟡 rich runs, variable fonts, auto-resize, text on a path; Linux has no emoji font and project fonts are not registered | 3 |
 | Animation | 25 in, out and loop presets, per-letter text animation | 🟡 keyframe clips; no presets or per-glyph animation | 4 |
 | Video timeline | page duration, offsets, trim, tracks, split, 21 transitions, captions | 🟡 trim, speed and volume on video layers | 4 |
@@ -84,10 +84,10 @@ over MCP and cloud review. The plan keeps all of them.
 2. **Templates in the editor, and automation.** The editor honours scopes,
    placeholders and roles. Asset sources, a URI resolver and remote fetch.
    Data merge, batch export and content-aware resize as engine steps.
-3. **Effects and text.** A node-level effect stack of SkSL runtime effects, the
-   missing blend modes as SkSL blenders, progressive blurs, free crop rotation
-   and flip; text case, scripts, lists, per-paragraph styles, a bundled emoji
-   font and the project's own fonts.
+3. **Effects and text.** A node-level effect stack of SkSL runtime effects,
+   progressive blurs, free crop rotation and flip; text case, scripts, lists,
+   per-paragraph styles, a bundled emoji font and the project's own fonts. The
+   missing blend modes are done, as SkSL blenders.
 4. **Timeline and video.** Page duration, offsets, trim, tracks, split and clip
    transitions; animation presets compiled to motion tracks; captions; a media
    crate (AVFoundation on macOS, GStreamer or FFmpeg libraries on Linux) and

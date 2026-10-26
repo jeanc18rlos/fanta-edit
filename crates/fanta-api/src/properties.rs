@@ -104,7 +104,7 @@ struct PropertyDef {
     values: fn() -> Vec<String>,
 }
 
-const BLEND_MODES: [BlendMode; 18] = [
+const BLEND_MODES: [BlendMode; 26] = [
     BlendMode::Normal,
     BlendMode::Multiply,
     BlendMode::Screen,
@@ -123,6 +123,14 @@ const BLEND_MODES: [BlendMode; 18] = [
     BlendMode::Luminosity,
     BlendMode::LinearBurn,
     BlendMode::LinearDodge,
+    BlendMode::DarkerColor,
+    BlendMode::LighterColor,
+    BlendMode::VividLight,
+    BlendMode::LinearLight,
+    BlendMode::PinLight,
+    BlendMode::HardMix,
+    BlendMode::Subtract,
+    BlendMode::Divide,
 ];
 const FIT_MODES: [ImageFitMode; 4] = [
     ImageFitMode::Fill,
@@ -2061,6 +2069,22 @@ mod tests {
         assert!((session.get_float(rectangle, "opacity").expect("opacity") - 0.5).abs() < 1e-6);
         session.set_bool(rectangle, "visible", false).expect("hide");
         assert!(!session.get_bool(rectangle, "visible").expect("visible"));
+    }
+
+    #[test]
+    fn every_blend_mode_is_settable_by_name_on_layers_and_paints() {
+        let (mut session, rectangle) = session_with_rectangle();
+        let names = session
+            .enum_values(rectangle, "blend_mode")
+            .expect("blend modes");
+        assert_eq!(names.len(), 26);
+        assert!(names.iter().any(|name| name == "vivid_light"));
+        for path in ["blend_mode", "fills/0/blend_mode"] {
+            for name in &names {
+                session.set_enum(rectangle, path, name).expect(path);
+                assert_eq!(&session.get_enum(rectangle, path).expect(path), name);
+            }
+        }
     }
 
     #[test]
