@@ -96,7 +96,9 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.text_preview_mutation_allowed(cx) {
+        if !self.text_preview_mutation_allowed(cx)
+            || !self.template_allows_node(node, fanta_doc::Scope::TextEdit, "edit this text", cx)
+        {
             return;
         }
         if let Some(edit) = self.text_edit.as_ref() {

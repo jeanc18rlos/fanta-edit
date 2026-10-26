@@ -269,6 +269,7 @@ fn motion_bound_property_overrides_the_resolved_variable_value() {
         playback: None,
         video_fill_frames: None,
         dark_ui: false,
+        raw_text_node: None,
     };
 
     let mut renderer = RasterRenderer::new(64, 64).unwrap();

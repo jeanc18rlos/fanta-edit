@@ -12,7 +12,7 @@ use crate::context::ToolContext;
 use crate::event::ModifierKeys;
 use crate::tool::{CursorHint, ToolResponse};
 use fanta_canvas::{RotateHandle, rotate_about, rotation_delta};
-use fanta_doc::{Bounds, NodeId, Operation};
+use fanta_doc::{Bounds, NodeId, Operation, Scope};
 use glam::DVec2;
 
 impl SelectTool {
@@ -28,6 +28,9 @@ impl SelectTool {
         original_world: Bounds,
         screen_press: DVec2,
     ) -> ToolResponse {
+        if !ctx.allows(node_id, Scope::LayerRotate) {
+            return ToolResponse::empty();
+        }
         let Some(node) = ctx.doc.scene.get(node_id) else {
             return ToolResponse::empty();
         };

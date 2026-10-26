@@ -1,6 +1,10 @@
 use std::rc::Rc;
 
-use fanta_doc::{BoundProp, CanvasNode, Doc, NodeData, NodeId, Operation, VariableId};
+pub(crate) use fanta_headless::edit_operations::{
+    unbind_property_operation, variable_binding_operation,
+};
+
+use fanta_doc::{BoundProp, CanvasNode, Doc, NodeData, NodeId, VariableId};
 use gpui::{Anchor, App, ElementId, IntoElement, RenderOnce, SharedString, Window, div};
 use ui::{ContextMenu, ContextMenuEntry, IconPosition, PopoverMenu, Tooltip, prelude::*};
 
@@ -242,18 +246,6 @@ pub(crate) fn bindable_properties(node: &CanvasNode) -> Vec<BindableProperty> {
     properties
 }
 
-pub(crate) fn variable_binding_operation(
-    doc: &Doc,
-    node_id: NodeId,
-    prop: BoundProp,
-    variable: Option<VariableId>,
-) -> Result<Option<Operation>, &'static str> {
-    match variable {
-        Some(variable) => bind_property_operation(doc, node_id, prop, variable),
-        None => unbind_property_operation(doc, node_id, prop),
-    }
-}
-
 fn bindable(prop: BoundProp, label: impl Into<SharedString>) -> BindableProperty {
     BindableProperty {
         prop,
@@ -265,80 +257,6 @@ fn variable_label(doc: &Doc, variable_id: VariableId) -> Option<SharedString> {
     let variable = doc.variables.variables.get(&variable_id)?;
     let collection = doc.variables.collections.get(&variable.collection)?;
     Some(format!("{} / {}", collection.name, variable.name).into())
-}
-
-fn bind_property_operation(
-    doc: &Doc,
-    node_id: NodeId,
-    prop: BoundProp,
-    variable_id: VariableId,
-) -> Result<Option<Operation>, &'static str> {
-    let node = doc
-        .scene
-        .get(node_id)
-        .ok_or("The selected layer no longer exists")?;
-    if !prop.applies_to(node) {
-        return Err("The property does not apply to the selected layer");
-    }
-    let variable = doc
-        .variables
-        .variables
-        .get(&variable_id)
-        .ok_or("The variable no longer exists")?;
-    if !doc.variables.collections.contains_key(&variable.collection) {
-        return Err("The variable's collection no longer exists");
-    }
-    if !prop.accepts_variable_type(variable.ty) {
-        return Err("The variable type is not compatible with this property");
-    }
-    let old = node.bindings.get(&prop).copied();
-    if old == Some(variable_id) {
-        return Ok(None);
-    }
-    Ok(Some(Operation::BindProperty {
-        node: node_id,
-        prop,
-        old,
-        new: variable_id,
-    }))
-}
-
-pub(crate) fn unbind_property_operation(
-    doc: &Doc,
-    node_id: NodeId,
-    prop: BoundProp,
-) -> Result<Option<Operation>, &'static str> {
-    let node = doc
-        .scene
-        .get(node_id)
-        .ok_or("The selected layer no longer exists")?;
-    let Some(variable) = node.bindings.get(&prop).copied() else {
-        return Ok(None);
-    };
-    let old_data = node.data.clone();
-    let old_opacity = node.opacity;
-    let old_flags = node.flags;
-    let mut baked = node.clone();
-    if let Some(value) = fanta_doc::resolve_bound_value(
-        &doc.variables,
-        &doc.scene,
-        node_id,
-        &doc.active_modes,
-        variable,
-    ) {
-        prop.apply_resolved(&mut baked, value);
-    }
-    Ok(Some(Operation::UnbindProperty {
-        node: node_id,
-        prop,
-        variable,
-        old_data: Box::new(old_data),
-        new_data: Box::new(baked.data),
-        old_opacity,
-        new_opacity: baked.opacity,
-        old_flags,
-        new_flags: baked.flags,
-    }))
 }
 
 #[cfg(test)]

@@ -276,7 +276,7 @@ fn metric_measure(t: &crate::node::TextNode) -> (f64, f64) {
 /// Reads `scene` (the laid-out scratch clone) for the ancestor frame-pin walk —
 /// structurally identical to `doc.scene`, so mode resolution is unaffected.
 fn resolve_overlay(doc: &Doc, scene: &Scene, id: NodeId, node: &CanvasNode) -> Option<CanvasNode> {
-    if node.bindings.is_empty() {
+    if node.bindings.is_empty() && !crate::has_text_tokens(node) {
         return None;
     }
     let mut scratch = node.clone();
@@ -296,6 +296,7 @@ fn resolve_overlay(doc: &Doc, scene: &Scene, id: NodeId, node: &CanvasNode) -> O
             prop.apply_resolved(&mut scratch, resolved);
         }
     }
+    crate::apply_text_tokens(&mut scratch, &doc.variables, scene, id, &doc.active_modes);
     Some(scratch)
 }
 

@@ -11,7 +11,7 @@ use crate::context::ToolContext;
 use crate::event::ModifierKeys;
 use crate::tool::{CursorHint, ToolResponse};
 use fanta_canvas::{ResizeHandle, SnapResult};
-use fanta_doc::{Bounds, NodeData, NodeId, Operation, TextAutoResize};
+use fanta_doc::{Bounds, NodeData, NodeId, Operation, Scope, TextAutoResize};
 use glam::DVec2;
 
 /// The authored box used by resize handles. Non-clipping groups may have
@@ -36,6 +36,9 @@ impl SelectTool {
         node_id: NodeId,
         handle: ResizeHandle,
     ) -> ToolResponse {
+        if !ctx.allows(node_id, Scope::LayerResize) {
+            return ToolResponse::empty();
+        }
         let Some(node) = ctx.doc.scene.get(node_id) else {
             return ToolResponse::empty();
         };

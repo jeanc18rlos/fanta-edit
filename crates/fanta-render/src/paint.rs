@@ -57,9 +57,9 @@ pub fn fill_to_paint(fill: &Fill, local_bounds: [f32; 4]) -> Paint {
 
 /// Composite `paint` with `mode`. The CSS Compositing Level 1 modes map to
 /// their exact `SkBlendMode` (`Normal` is `SrcOver`), Linear Dodge to Skia's
-/// `Plus`, and Linear Burn, which has no `SkBlendMode`, to an SkSL blender.
-/// Owned here so the node-level effects layer and the per-paint fill/image
-/// blends share one mapping.
+/// `Plus`, and the modes Skia lacks to SkSL blenders. Owned here so the
+/// node-level effects layer and the per-paint fill/image blends share one
+/// mapping.
 pub(crate) fn apply_blend_mode(paint: &mut Paint, mode: BlendMode) {
     use skia_safe::BlendMode as Sk;
     let sk = match mode {
@@ -80,35 +80,117 @@ pub(crate) fn apply_blend_mode(paint: &mut Paint, mode: BlendMode) {
         BlendMode::Color => Sk::Color,
         BlendMode::Luminosity => Sk::Luminosity,
         BlendMode::LinearDodge => Sk::Plus,
-        BlendMode::LinearBurn => {
-            paint.set_blender(LINEAR_BURN.with(Clone::clone));
+        BlendMode::LinearBurn
+        | BlendMode::DarkerColor
+        | BlendMode::LighterColor
+        | BlendMode::VividLight
+        | BlendMode::LinearLight
+        | BlendMode::PinLight
+        | BlendMode::HardMix
+        | BlendMode::Subtract
+        | BlendMode::Divide => {
+            if let Some(blender) = runtime_blender(mode) {
+                paint.set_blender(blender);
+            }
             return;
         }
     };
     paint.set_blend_mode(sk);
 }
 
-thread_local! {
-    /// Linear Burn as a separable blend, composited with the W3C formula on
-    /// Skia's premultiplied inputs: `B(cs, cb) = max(0, cs + cb - 1)` on
-    /// unpremultiplied colors, then
-    /// `co = cs·(1 - ab) + cb·(1 - as) + as·ab·B`, `ao = as + ab·(1 - as)`.
-    static LINEAR_BURN: skia_safe::Blender = skia_safe::RuntimeEffect::make_for_blender(
-        r#"
-        half4 main(half4 src, half4 dst) {
-            half3 cs = src.a > 0.0 ? src.rgb / src.a : half3(0.0);
-            half3 cb = dst.a > 0.0 ? dst.rgb / dst.a : half3(0.0);
-            half3 burned = max(cs + cb - 1.0, half3(0.0));
-            return half4(
-                src.rgb * (1.0 - dst.a) + dst.rgb * (1.0 - src.a) + src.a * dst.a * burned,
-                src.a + dst.a * (1.0 - src.a));
-        }
-        "#,
-        None,
-    )
-    .expect("the Linear Burn blender compiles")
-    .make_blender(skia_safe::Data::new_empty(), None)
-    .expect("the Linear Burn blender instantiates");
+/// SkSL helpers for [`runtime_blender`]'s blend functions, which take the
+/// source `s` before the backdrop `b`. The burn and dodge edge cases follow the
+/// W3C `color-burn` and `color-dodge` definitions.
+const BLEND_HELPERS: &str = r#"
+    half channel_sum(half3 c) { return c.r + c.g + c.b; }
+    half color_burn(half s, half b) {
+        if (b >= 1.0) { return 1.0; }
+        if (s <= 0.0) { return 0.0; }
+        return 1.0 - min(1.0, (1.0 - b) / s);
+    }
+    half color_dodge(half s, half b) {
+        if (b <= 0.0) { return 0.0; }
+        if (s >= 1.0) { return 1.0; }
+        return min(1.0, b / (1.0 - s));
+    }
+    half vivid_light_channel(half s, half b) {
+        return s <= 0.5 ? color_burn(2.0 * s, b) : color_dodge(2.0 * s - 1.0, b);
+    }
+    half pin_light_channel(half s, half b) {
+        return s <= 0.5 ? min(b, 2.0 * s) : max(b, 2.0 * s - 1.0);
+    }
+    half divide_channel(half s, half b) {
+        if (s > 0.0) { return min(1.0, b / s); }
+        return b > 0.0 ? 1.0 : 0.0;
+    }
+    half3 vivid_light(half3 s, half3 b) {
+        return half3(vivid_light_channel(s.r, b.r), vivid_light_channel(s.g, b.g),
+            vivid_light_channel(s.b, b.b));
+    }
+    half3 pin_light(half3 s, half3 b) {
+        return half3(pin_light_channel(s.r, b.r), pin_light_channel(s.g, b.g),
+            pin_light_channel(s.b, b.b));
+    }
+    half3 divide(half3 s, half3 b) {
+        return half3(divide_channel(s.r, b.r), divide_channel(s.g, b.g),
+            divide_channel(s.b, b.b));
+    }
+"#;
+
+/// The SkSL blender for a mode Skia has no `SkBlendMode` for. Each mode's
+/// function `B(cs, cb)` takes unpremultiplied source and backdrop colors, and
+/// the result composites with the W3C formula on Skia's premultiplied inputs:
+/// `co = cs·(1 - ab) + cb·(1 - as) + as·ab·B`, `ao = as + ab·(1 - as)`.
+/// `None` when the effect fails to build, which leaves the paint Normal.
+fn runtime_blender(mode: BlendMode) -> Option<skia_safe::Blender> {
+    thread_local! {
+        static BLENDERS: RefCell<HashMap<BlendMode, Option<skia_safe::Blender>>> =
+            RefCell::new(HashMap::new());
+    }
+    let function = match mode {
+        BlendMode::LinearBurn => "return max(cs + cb - 1.0, half3(0.0));",
+        BlendMode::DarkerColor => "return channel_sum(cs) < channel_sum(cb) ? cs : cb;",
+        BlendMode::LighterColor => "return channel_sum(cs) > channel_sum(cb) ? cs : cb;",
+        BlendMode::VividLight => "return vivid_light(cs, cb);",
+        BlendMode::LinearLight => "return clamp(cb + 2.0 * cs - 1.0, 0.0, 1.0);",
+        BlendMode::PinLight => "return pin_light(cs, cb);",
+        BlendMode::HardMix => "return step(half3(1.0), cs + cb);",
+        BlendMode::Subtract => "return max(cb - cs, half3(0.0));",
+        BlendMode::Divide => "return divide(cs, cb);",
+        _ => return None,
+    };
+    BLENDERS.with(|blenders| {
+        blenders
+            .borrow_mut()
+            .entry(mode)
+            .or_insert_with(|| {
+                let source = format!(
+                    r#"{BLEND_HELPERS}
+                    half3 blend_colors(half3 cs, half3 cb) {{ {function} }}
+                    half4 main(half4 src, half4 dst) {{
+                        half3 cs = src.a > 0.0 ? clamp(src.rgb / src.a, 0.0, 1.0) : half3(0.0);
+                        half3 cb = dst.a > 0.0 ? clamp(dst.rgb / dst.a, 0.0, 1.0) : half3(0.0);
+                        return half4(
+                            src.rgb * (1.0 - dst.a) + dst.rgb * (1.0 - src.a)
+                                + src.a * dst.a * blend_colors(cs, cb),
+                            src.a + dst.a * (1.0 - src.a));
+                    }}"#
+                );
+                let effect = match skia_safe::RuntimeEffect::make_for_blender(source, None) {
+                    Ok(effect) => effect,
+                    Err(error) => {
+                        tracing::error!(?mode, %error, "a blend mode's SkSL failed to compile");
+                        return None;
+                    }
+                };
+                let blender = effect.make_blender(skia_safe::Data::new_empty(), None);
+                if blender.is_none() {
+                    tracing::error!(?mode, "a blend mode's blender failed to instantiate");
+                }
+                blender
+            })
+            .clone()
+    })
 }
 
 /// Multiply `alpha` into a fill/stroke paint's own alpha. Skia modulates a

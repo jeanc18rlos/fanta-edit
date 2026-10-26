@@ -189,6 +189,50 @@ impl History {
         self.open = Some(Transaction::new(label));
     }
 
+    /// The open transaction, with the ops applied into it so far.
+    pub fn open_transaction(&self) -> Option<&Transaction> {
+        self.open.as_ref()
+    }
+
+    /// How many ops the open transaction holds, or `None` when none is open:
+    /// a savepoint for [`rollback_open_to`](Self::rollback_open_to).
+    pub fn open_len(&self) -> Option<usize> {
+        self.open.as_ref().map(|transaction| transaction.ops.len())
+    }
+
+    /// Rename the open transaction: the label its undo step will carry.
+    /// Returns `false` when no transaction is open.
+    pub fn set_open_label(&mut self, label: impl Into<String>) -> bool {
+        match self.open.as_mut() {
+            Some(transaction) => {
+                transaction.label = label.into();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Revert the ops the open transaction applied after it held `len` of
+    /// them, through `ctx` like [`abort_with`](Self::abort_with), and keep the
+    /// transaction open with its first `len` ops. No-op without an open
+    /// transaction.
+    pub fn rollback_open_to(&mut self, len: usize, ctx: &mut OpCtx) -> Result<(), SceneError> {
+        let Some(transaction) = self.open.as_mut() else {
+            return Ok(());
+        };
+        if transaction.ops.len() > len {
+            self.edit_generation = self.edit_generation.wrapping_add(1);
+        }
+        while transaction.ops.len() > len {
+            let Some(op) = transaction.ops.pop() else {
+                break;
+            };
+            op.revert(ctx)?;
+            ctx.bump_revs(&op);
+        }
+        Ok(())
+    }
+
     /// Commit the open transaction. No-op if no transaction is open. Empty
     /// transactions (begin-with-no-ops) are silently discarded.
     ///

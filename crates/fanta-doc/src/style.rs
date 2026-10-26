@@ -586,9 +586,12 @@ pub enum BlurKind {
     Background,
 }
 
-/// Blend modes: the CSS Compositing Level 1 set (Skia's `SkBlendMode`) plus
-/// Figma's Linear Burn and Linear Dodge. The doc only stores the enum;
-/// conversion to Skia happens in `fanta-render`.
+/// Blend modes: the CSS Compositing Level 1 set (Skia's `SkBlendMode`),
+/// Figma's Linear Burn and Linear Dodge, and the photo editors' Darker and
+/// Lighter Color, Vivid, Linear and Pin Light, Hard Mix, Subtract and Divide.
+/// The doc only stores the enum; conversion to Skia happens in `fanta-render`.
+/// The formulas below take `src` and `dst` as unpremultiplied channels in
+/// `0..=1`, with `dst` the backdrop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlendMode {
@@ -614,6 +617,24 @@ pub enum BlendMode {
     LinearBurn,
     /// Figma's Linear Dodge (Add): `min(1, src + dst)`, Skia's `Plus`.
     LinearDodge,
+    /// Whichever of the two colors has the lower sum of channels.
+    DarkerColor,
+    /// Whichever of the two colors has the higher sum of channels.
+    LighterColor,
+    /// Color Burn by `2·src` where `src <= 0.5`, else Color Dodge by
+    /// `2·src - 1`.
+    VividLight,
+    /// `clamp(dst + 2·src - 1, 0, 1)`: Linear Burn where `src <= 0.5`, else
+    /// Linear Dodge.
+    LinearLight,
+    /// `min(dst, 2·src)` where `src <= 0.5`, else `max(dst, 2·src - 1)`.
+    PinLight,
+    /// 1 where `src + dst >= 1`, else 0.
+    HardMix,
+    /// `max(0, dst - src)`.
+    Subtract,
+    /// `min(1, dst / src)`; a zero `src` gives 1 unless `dst` is also zero.
+    Divide,
 }
 
 impl BlendMode {
@@ -976,6 +997,22 @@ mod tests {
         let bm = BlendMode::ColorDodge;
         let j = serde_json::to_string(&bm).unwrap();
         assert_eq!(j, "\"color_dodge\"");
+        for (mode, name) in [
+            (BlendMode::DarkerColor, "darker_color"),
+            (BlendMode::LighterColor, "lighter_color"),
+            (BlendMode::VividLight, "vivid_light"),
+            (BlendMode::LinearLight, "linear_light"),
+            (BlendMode::PinLight, "pin_light"),
+            (BlendMode::HardMix, "hard_mix"),
+            (BlendMode::Subtract, "subtract"),
+            (BlendMode::Divide, "divide"),
+        ] {
+            assert_eq!(serde_json::to_value(mode).unwrap(), name);
+            assert_eq!(
+                serde_json::from_value::<BlendMode>(serde_json::json!(name)).unwrap(),
+                mode
+            );
+        }
     }
 
     #[test]

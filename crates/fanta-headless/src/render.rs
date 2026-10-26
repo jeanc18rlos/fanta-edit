@@ -30,6 +30,7 @@ pub fn render_inputs(document: &Doc) -> RenderInputs<'_> {
         playback: None,
         video_fill_frames: None,
         dark_ui: false,
+        raw_text_node: None,
     }
 }
 

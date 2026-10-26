@@ -52,6 +52,7 @@ fn bound_text_color_is_applied_after_composite_typography() -> Result<(), Box<dy
         playback: None,
         video_fill_frames: None,
         dark_ui: false,
+        raw_text_node: None,
     };
     let mut renderer = RasterRenderer::new(64, 64)?;
     renderer.render_with(&document.scene, &document.viewport, &inputs);
@@ -164,6 +165,7 @@ fn bound_fill_paints_dark_color_when_active_mode_is_dark() {
         playback: None,
         video_fill_frames: None,
         dark_ui: false,
+        raw_text_node: None,
     };
 
     let mut r = RasterRenderer::new(64, 64).unwrap();
@@ -220,6 +222,7 @@ fn bound_fill_paints_default_mode_color_when_no_active_mode() {
         playback: None,
         video_fill_frames: None,
         dark_ui: false,
+        raw_text_node: None,
     };
 
     let mut r = RasterRenderer::new(64, 64).unwrap();
@@ -263,6 +266,7 @@ fn bound_frame_background_paints_dark_color_when_active_mode_is_dark() {
         playback: None,
         video_fill_frames: None,
         dark_ui: false,
+        raw_text_node: None,
     };
 
     let mut r = RasterRenderer::new(64, 64).unwrap();
@@ -339,6 +343,7 @@ fn component_alias_reexpands_on_mode_change() -> Result<(), Box<dyn std::error::
             playback: None,
             video_fill_frames: None,
             dark_ui: false,
+            raw_text_node: None,
         },
     );
     let light_pixel = rgba_at(&renderer.copy_rgba(), 64, 32, 32);
@@ -360,6 +365,7 @@ fn component_alias_reexpands_on_mode_change() -> Result<(), Box<dyn std::error::
             playback: None,
             video_fill_frames: None,
             dark_ui: false,
+            raw_text_node: None,
         },
     );
     let dark_pixel = rgba_at(&renderer.copy_rgba(), 64, 32, 32);
@@ -368,5 +374,94 @@ fn component_alias_reexpands_on_mode_change() -> Result<(), Box<dyn std::error::
         "changed mode generation should re-expand the alias-backed property, got {dark_pixel:?}"
     );
 
+    Ok(())
+}
+
+/// A registry whose one String variable, `word`, holds `word`.
+fn word_registry(word: &str) -> VariableRegistry {
+    let mut registry = VariableRegistry::default();
+    let collection = VariableCollectionId::new();
+    let mode = ModeId::new();
+    let variable = VariableId::new();
+    registry.collections.insert(
+        collection,
+        VariableCollection {
+            id: collection,
+            name: "Copy".into(),
+            modes: vec![fanta_doc::Mode {
+                id: mode,
+                name: "Default".into(),
+            }],
+            default_mode: mode,
+            variable_order: vec![variable],
+        },
+    );
+    registry.variables.insert(
+        variable,
+        Variable {
+            id: variable,
+            collection,
+            name: "word".into(),
+            ty: fanta_doc::VariableType::String,
+            values_by_mode: BTreeMap::from([(
+                mode,
+                fanta_doc::VarValue::String { value: word.into() },
+            )]),
+            scopes: Vec::new(),
+            options: Vec::new(),
+        },
+    );
+    registry
+}
+
+fn render_text(
+    content: &str,
+    registry: &VariableRegistry,
+    raw: bool,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut node = CanvasNode::new(NodeData::Text(fanta_doc::TextNode::new(
+        content, 120.0, 40.0,
+    )));
+    node.transform = Transform2D::translation(-50.0, -12.0);
+    let id = node.id;
+    let mut document = Doc::new();
+    document.scene.insert(node)?;
+    let library = ComponentLibrary::new();
+    let modes = BTreeMap::new();
+    let inputs = RenderInputs {
+        components: &library,
+        variables: registry,
+        active_modes: &modes,
+        mode_generation: 1,
+        motion: None,
+        playback: None,
+        video_fill_frames: None,
+        dark_ui: false,
+        raw_text_node: raw.then_some(id),
+    };
+    let mut renderer = RasterRenderer::new(128, 48)?;
+    renderer.render_with(&document.scene, &document.viewport, &inputs);
+    Ok(renderer.copy_rgba())
+}
+
+#[test]
+fn rendered_text_shows_the_variable_value() -> Result<(), Box<dyn std::error::Error>> {
+    let registry = word_registry("MMMM");
+    assert_eq!(
+        render_text("{{word}}", &registry, false)?,
+        render_text("MMMM", &registry, false)?
+    );
+    Ok(())
+}
+
+#[test]
+fn the_raw_text_node_renders_its_tokens() -> Result<(), Box<dyn std::error::Error>> {
+    let registry = word_registry("MMMM");
+    let raw = render_text("{{word}}", &registry, true)?;
+    assert_eq!(
+        raw,
+        render_text("{{word}}", &VariableRegistry::default(), false)?
+    );
+    assert_ne!(raw, render_text("MMMM", &registry, false)?);
     Ok(())
 }

@@ -234,6 +234,7 @@ fn export_node(
         playback: None,
         video_fill_frames: None,
         dark_ui: false,
+        raw_text_node: None,
     };
     renderer.render_page_with(&doc.scene, &viewport, page_for_node(doc, node), &inputs);
 

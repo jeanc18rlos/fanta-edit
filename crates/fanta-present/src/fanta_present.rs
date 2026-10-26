@@ -1622,6 +1622,7 @@ impl PresentSession {
                     playback: None,
                     video_fill_frames: None,
                     dark_ui: false,
+                    raw_text_node: None,
                 };
                 self.renderer.render_page_with_camera(
                     &scene,
@@ -1670,6 +1671,7 @@ impl PresentSession {
             playback: None,
             video_fill_frames: None,
             dark_ui: false,
+            raw_text_node: None,
         };
         let previous_background = std::mem::replace(&mut self.renderer.background, background);
         self.renderer
@@ -1724,6 +1726,7 @@ impl PresentSession {
             playback: None,
             video_fill_frames: None,
             dark_ui: false,
+            raw_text_node: None,
         };
         let previous_background = std::mem::replace(&mut self.renderer.background, background);
         self.renderer
@@ -1751,6 +1754,7 @@ impl PresentSession {
             playback: None,
             video_fill_frames: None,
             dark_ui: false,
+            raw_text_node: None,
         };
         let previous_background =
             std::mem::replace(&mut self.renderer.background, Color::TRANSPARENT);
@@ -1783,6 +1787,7 @@ impl PresentSession {
             playback: Some(&playback),
             video_fill_frames: None,
             dark_ui: false,
+            raw_text_node: None,
         };
         self.renderer.render_page_with_camera(
             &resolved.scene,

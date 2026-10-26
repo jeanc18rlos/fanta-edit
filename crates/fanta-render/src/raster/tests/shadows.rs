@@ -418,6 +418,7 @@ fn instance_inner_shadow_uses_its_box_silhouette() {
         playback: None,
         video_fill_frames: None,
         dark_ui: false,
+        raw_text_node: None,
     };
     let mut r = RasterRenderer::new(64, 64).unwrap();
     r.render_with(&doc.scene, &doc.viewport, &inputs);

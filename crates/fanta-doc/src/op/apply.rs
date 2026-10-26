@@ -206,6 +206,11 @@ impl Operation {
                 n.constraints = *dir.pick(old, new);
                 Ok(())
             }
+            Self::SetEditingRules { id, old, new } => {
+                let n = ctx.scene.get_mut(*id).ok_or(SceneError::NotFound(*id))?;
+                n.editing = dir.pick(old, new).clone();
+                Ok(())
+            }
             Self::ReplaceData { id, old, new } => {
                 let n = ctx.scene.get_mut(*id).ok_or(SceneError::NotFound(*id))?;
                 n.data = (**dir.pick(old, new)).clone();

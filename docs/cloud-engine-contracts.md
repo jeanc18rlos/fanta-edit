@@ -40,8 +40,9 @@ Both checks apply to every route except `GET /healthz`.
 
 `schema_version` is the newest project schema the engine reads.
 `capabilities` lists `step:<name>` for each step this build runs; v2 checks it
-before it sends a step. Once `apply` runs, the list also carries
-`fanta_design_ops::DESIGN_OP_CAPABILITIES`.
+before it sends a step. The list also carries
+`fanta_design_ops::DESIGN_OP_CAPABILITIES`, the ops and query options `apply`
+accepts.
 
 ### `POST /v1/run`
 
@@ -103,6 +104,8 @@ position in the editor's page list, which `inspect` reports and
 | `add_comments` | `label`, `comments` (`CommentDraft[]`; a draft without `page` goes on the active page) | `{"comments": [{"ok": true, "id": "…"} \| {"ok": false, "error": "…"}]}`, one entry per draft. The accepted drafts land as one undo step. |
 | `project` | `page` (`PageRef`), `depth` (default 8), `limit` (default 50) | `{"nodes": […]}`: the page's top-level layers in the style projection of `batch_get` with `detail: "style"`. |
 | `render` | `targets`: 1 to 8 of `{id, page, node?, max_dimension (default and maximum 1568), motion_clip?, playhead_ms?}` | `{"images": [{"target_id", "png_b64", "width", "height", "bounds": [x, y, width, height]}]}` |
+| `fill_template` | `label`, `row` (an object of strings) | `{"filled": n}`, the number of keys. Each key sets the text variable it names; failing that, the placeholders named after the key show the image its value names; failing that, the key becomes a new text variable. Image values are base64 `data:` URIs or paths inside the project folder; the engine fetches nothing from the network. The row lands as one undo step, or fails whole. |
+| `export_batch` | `page` (`PageRef`), `node?` (on that page), `rows` (1 to 8 objects of strings), `max_dimension` (default and maximum 1568) | `{"images": [{"row", "ok": true, "png_b64", "width", "height", "bounds": [x, y, width, height]} \| {"row", "ok": false, "error": "…"}]}`, one entry per row: a copy of the project filled as `fill_template` fills it, exported as the editor exports a node. The project itself does not change. |
 | `changeset` | `contents` (default `false`), `ops` (default `false`) | Saves the document, then `{"files": [{"path", "status": "added" \| "modified" \| "deleted", "sha256" (hex, `null` when deleted), "content_b64"?}], "ops"?: Operation[]}`. `ops` is the `fanta_doc::Operation` journal the app replays. Every edit stamps `doc/metadata.json` with its time, as the editor does, so that file is usually listed too. |
 
 #### Response
@@ -158,10 +161,13 @@ engine produce the same document.
 ```rust
 HeadlessProject::open(root) -> Result<HeadlessProject>
     .doc() -> &Doc
+    .document() -> &HeadlessDocument
+    .document_mut() -> &mut HeadlessDocument
     .warnings() -> &[String]
     .font_families() -> BTreeSet<String>
     .inspect() -> Result<Value>
     .resolve_page(&PageRef) -> Result<NodeId>
+    .resolve_region(&PageRef, node) -> Result<(NodeId, Option<NodeId>)>
     .create_page(name) -> Result<NodeId>
     .apply(page, label, &[DesignOp], commit) -> Result<Value>
     .add_comments(label, &[CommentDraft]) -> Result<Vec<Result<String>>>
@@ -177,6 +183,9 @@ agent_add_comments_op(&Doc, page, &[CommentDraft]) -> (Vec<Result<String>>, Opti
 
 `DesignOp`, `CommentDraft` and the query types live in `crates/fanta-design-ops`.
 Their serde form is the wire form of `apply` and `add_comments`.
+
+`fill_template` and `export_batch` run through `fanta_api::DesignSession`,
+which wraps the same `HeadlessProject` (`DesignSession::from_project`).
 
 ## v2 API: reviews
 

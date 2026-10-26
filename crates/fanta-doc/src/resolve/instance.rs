@@ -199,6 +199,13 @@ fn expand_instance_inner(
                     entry.node.bindings.remove(&property);
                 }
             }
+            crate::apply_text_tokens(
+                &mut entry.node,
+                context.variables,
+                scene,
+                context.mode_anchor,
+                context.active_modes,
+            );
         }
     }
     out

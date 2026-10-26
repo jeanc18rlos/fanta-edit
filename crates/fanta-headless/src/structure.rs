@@ -5,20 +5,20 @@
 
 use std::collections::HashSet;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use fanta_doc::{
     AssetId, BitmapNode, Bounds, CanvasNode, Doc, GroupNode, ImageFitMode, IndexKey, NodeData,
     NodeId, Operation, Transform2D,
 };
 
 #[derive(Debug)]
-pub(crate) struct Grouped {
+pub struct Grouped {
     pub group: NodeId,
     pub operations: Vec<Operation>,
 }
 
 #[derive(Debug)]
-pub(crate) struct Ungrouped {
+pub struct Ungrouped {
     pub children: Vec<NodeId>,
     pub operations: Vec<Operation>,
 }
@@ -27,13 +27,13 @@ pub(crate) struct Ungrouped {
 /// dropped) in a new plain group. The group is parented where the topmost
 /// member lives and takes that member's slot in the z-order; members from
 /// other parents are reparented into it with their world transforms kept.
-pub(crate) fn group_operations(doc: &Doc, ids: &[NodeId], name: Option<&str>) -> Result<Grouped> {
+pub fn group_operations(doc: &Doc, ids: &[NodeId], name: Option<&str>) -> Result<Grouped> {
     wrap_operations(doc, ids, name.unwrap_or("Group"), false)
 }
 
 /// Same as [`group_operations`], but the wrapper is a frame: a group that
 /// clips to the union of its members' bounds and carries no background.
-pub(crate) fn frame_selection_operations(
+pub fn frame_selection_operations(
     doc: &Doc,
     ids: &[NodeId],
     name: Option<&str>,
@@ -174,7 +174,7 @@ fn wrap_operations(doc: &Doc, ids: &[NodeId], name: &str, clip: bool) -> Result<
 /// `SetIndex` naming a wrapper the first plan already deleted, which fails and
 /// aborts the whole transaction. Ungroup is not a hot path, so one clone per
 /// invocation is fine.
-pub(crate) fn ungroup_many_operations(
+pub fn ungroup_many_operations(
     doc: &Doc,
     groups: &[NodeId],
 ) -> Result<(Vec<Operation>, Vec<NodeId>)> {
@@ -195,7 +195,7 @@ pub(crate) fn ungroup_many_operations(
 /// Dissolve one group or frame: its children move to the group's parent in
 /// the group's slot with their world transforms kept, then the empty wrapper
 /// is deleted.
-pub(crate) fn ungroup_operations(doc: &Doc, group: NodeId) -> Result<Ungrouped> {
+pub fn ungroup_operations(doc: &Doc, group: NodeId) -> Result<Ungrouped> {
     let node = doc.scene.get(group).context("the layer is gone")?;
     if doc.pages().contains(&group) {
         bail!("a page cannot be ungrouped");
@@ -281,7 +281,7 @@ pub(crate) fn ungroup_operations(doc: &Doc, group: NodeId) -> Result<Ungrouped> 
 /// A bitmap layer for an already-ingested image asset, sized to `size` with
 /// its top-left corner at world `(x, y)` inside `parent` (the active page
 /// when `None`).
-pub(crate) fn image_layer_node(
+pub fn image_layer_node(
     doc: &Doc,
     asset: AssetId,
     natural_size: [u32; 2],
@@ -482,6 +482,191 @@ fn renumber(doc: &Doc, order: &[Slot]) -> Result<Renumbered> {
         operations,
         incoming,
     })
+}
+
+/// Whether a layer can be edited: it exists, is not a page, and neither it
+/// nor an ancestor is locked.
+pub fn editable_layer(doc: &Doc, id: NodeId) -> bool {
+    doc.scene
+        .get(id)
+        .is_some_and(|node| !node.flags.contains(fanta_doc::NodeFlags::LOCKED))
+        && !doc.pages().contains(&id)
+        && !doc
+            .scene
+            .ancestors_of(id)
+            .any(|node| node.flags.contains(fanta_doc::NodeFlags::LOCKED))
+}
+
+fn release_components(doc: &Doc, roots: &[NodeId]) -> Result<Vec<Operation>> {
+    release_components_with_limits(doc, roots, 64, 100_000)
+}
+
+/// The operations that keep surviving instances usable when `roots` are
+/// removed: detach every instance of a component the removal deletes, within
+/// the given nesting depth and node budget, then drop those components.
+pub fn release_components_with_limits(
+    doc: &Doc,
+    roots: &[NodeId],
+    maximum_depth: usize,
+    maximum_nodes: usize,
+) -> Result<Vec<Operation>> {
+    let removed: std::collections::HashSet<_> = roots
+        .iter()
+        .flat_map(|id| doc.scene.descendants_of(*id))
+        .collect();
+    let components: std::collections::HashSet<_> = doc
+        .components
+        .defs
+        .values()
+        .filter(|def| removed.contains(&def.root))
+        .map(|def| def.id)
+        .collect();
+    if components.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut operations = Vec::new();
+    let mut scratch = doc.clone();
+    let mut pending = doc
+        .scene
+        .roots()
+        .iter()
+        .flat_map(|id| doc.scene.descendants_of(*id))
+        .filter(|id| !removed.contains(id))
+        .filter(|id| {
+            doc.scene
+                .get(*id)
+                .is_some_and(|node| matches!(node.data, NodeData::Instance(_)))
+        })
+        .map(|id| (id, Vec::new()))
+        .collect::<Vec<_>>();
+    let mut detached_nodes = 0;
+    while let Some((id, mut path)) = pending.pop() {
+        let Some(node) = scratch.scene.get(id) else {
+            continue;
+        };
+        let NodeData::Instance(instance) = &node.data else {
+            continue;
+        };
+        for replacement in &instance.overrides {
+            if let fanta_doc::OverrideValue::SwapInstance { component } = &replacement.value {
+                let affected = components.contains(component)
+                    || scratch.components.sets.get(component).is_some_and(|set| {
+                        set.members.iter().any(|member| components.contains(member))
+                    });
+                ensure!(
+                    !affected,
+                    "A surviving instance uses this swapped component; detach or reset that swap before deleting its main component"
+                );
+            }
+        }
+        let Some(resolved) = fanta_doc::resolved_component_with_context(
+            &scratch.scene,
+            &scratch.components,
+            instance,
+            &fanta_doc::InstanceExpansionContext::new(
+                &scratch.variables,
+                &scratch.active_modes,
+                id,
+            ),
+        )
+        .filter(|resolved| components.contains(&resolved.resolved_component)) else {
+            continue;
+        };
+        ensure!(
+            !path.contains(&resolved.resolved_component),
+            "Cannot preserve a cyclic component dependency; no layers were deleted"
+        );
+        ensure!(
+            path.len() < maximum_depth,
+            "Cannot safely detach more than {maximum_depth} nested components; no layers were deleted"
+        );
+        let count = scratch
+            .scene
+            .descendants_of(resolved.resolved_root)
+            .take(maximum_nodes - detached_nodes + 1)
+            .count();
+        ensure!(
+            count <= maximum_nodes - detached_nodes,
+            "Cannot safely detach more than {maximum_nodes} component nodes at once; no layers were deleted"
+        );
+        detached_nodes += count;
+        path.push(resolved.resolved_component);
+        let detach = crate::edit_operations::detach_instance_operations(&scratch, id)?;
+        ensure!(
+            !detach.is_empty(),
+            "Cannot preserve an instance of this component"
+        );
+        for operation in &detach {
+            scratch.apply(operation.clone())?;
+        }
+        operations.extend(detach);
+        // Expansion preserves nested instances, so materialized descendants
+        // must be checked before their component definitions can be removed.
+        pending.extend(
+            scratch
+                .scene
+                .descendants_of(id)
+                .filter(|id| {
+                    scratch
+                        .scene
+                        .get(*id)
+                        .is_some_and(|node| matches!(node.data, NodeData::Instance(_)))
+                })
+                .map(|id| (id, path.clone())),
+        );
+    }
+    for set in doc
+        .components
+        .sets
+        .values()
+        .filter(|set| set.members.iter().any(|id| components.contains(id)))
+    {
+        let mut updated = set.clone();
+        updated.members.retain(|id| !components.contains(id));
+        if let Some(first) = updated.members.first().copied() {
+            if components.contains(&updated.default_variant) {
+                updated.default_variant = first;
+            }
+            operations.push(Operation::SetComponentSet {
+                id: set.id,
+                old: Box::new(set.clone()),
+                new: Box::new(updated),
+            });
+        } else {
+            operations.push(Operation::DeleteComponentSet {
+                id: set.id,
+                set: Box::new(set.clone()),
+            });
+        }
+    }
+    for id in components {
+        let def = doc
+            .components
+            .def(id)
+            .context("Missing component definition")?;
+        operations.push(Operation::DeleteComponent {
+            id,
+            def: Box::new(def.clone()),
+        });
+    }
+    Ok(operations)
+}
+
+/// Delete the layers rooted at `roots` together with the components they
+/// hold: instances that survive are detached first, so no reference dangles.
+pub fn delete_layers_operations(doc: &Doc, roots: &[NodeId]) -> Result<Vec<Operation>> {
+    let roots = roots.to_vec();
+    for id in &roots {
+        ensure!(editable_layer(doc, *id), "A selected layer is locked");
+    }
+    let mut operations = release_components(doc, &roots)?;
+    let mut scratch = doc.clone();
+    for operation in &operations {
+        scratch.apply(operation.clone())?;
+    }
+    scratch.selection.replace_with(roots);
+    operations.extend(crate::clipboard::delete_operations(&scratch));
+    Ok(operations)
 }
 
 #[cfg(test)]

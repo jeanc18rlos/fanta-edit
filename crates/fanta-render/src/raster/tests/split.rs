@@ -3001,6 +3001,14 @@ fn split_atomic_blends_match_normal_across_every_phase_and_all_supported_modes()
         BlendMode::Luminosity,
         BlendMode::LinearBurn,
         BlendMode::LinearDodge,
+        BlendMode::DarkerColor,
+        BlendMode::LighterColor,
+        BlendMode::VividLight,
+        BlendMode::LinearLight,
+        BlendMode::PinLight,
+        BlendMode::HardMix,
+        BlendMode::Subtract,
+        BlendMode::Divide,
     ] {
         for per_paint in [false, true] {
             for target in 0..3 {

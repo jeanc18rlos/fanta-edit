@@ -41,6 +41,8 @@ step: read the files here, or on GitHub.
 - [`cloud-engine-contracts.md`](./cloud-engine-contracts.md) — the frozen
   interfaces between the app, the v2 API and the cloud engine worker for cloud
   review and generation.
+- [`fanta/engine-parity.md`](./fanta/engine-parity.md) — how Fanta's engine
+  compares with IMG.LY's CE.SDK, and the phased roadmap to close the gaps.
 
 The inherited mdBook (`docs/src`, `docs/theme`, `book.toml`) was removed: none
 of it described Fanta.

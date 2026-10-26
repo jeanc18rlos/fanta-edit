@@ -6,7 +6,7 @@ use crate::tool::{CursorHint, Tool, ToolResponse};
 use fanta_canvas::{HitPrecision, ResizeHandle};
 use fanta_doc::{
     Blur, BoundProp, Bounds, CanvasNode, Doc, Fill, ImageFitMode, NodeData, NodeFlags, NodeId,
-    Operation, Shadow, Stroke, TextStyle, Transform2D, VariableId,
+    Operation, Scope, Shadow, Stroke, TextStyle, Transform2D, VariableId,
 };
 use glam::DVec2;
 use smallvec::SmallVec;
@@ -122,33 +122,15 @@ impl ScaleTool {
             return;
         };
         let roots = selection_roots(ctx.doc, ctx.scope());
-        let mut nodes = Vec::new();
-        for &root in &roots {
-            let Some(root_world) = ctx.doc.scene.world_transform(root) else {
-                return;
-            };
-            let parent = ctx.doc.scene.get(root).and_then(|node| node.parent);
-            let parent_world = parent
-                .and_then(|id| ctx.doc.scene.world_transform(id))
-                .unwrap_or(Transform2D::IDENTITY);
-            if !invertible(parent_world) {
-                return;
-            }
-            for id in ctx.doc.scene.descendants_of(root) {
-                let Some(node) = ctx.doc.scene.get(id) else {
-                    return;
-                };
-                let original = ScaleProperties::read(node);
-                let resolved_data = resolve_scale_data(ctx.doc, node);
-                nodes.push(ScaleNode {
-                    id,
-                    parent: node.parent,
-                    original,
-                    resolved_data,
-                    root_transform: (id == root).then_some((root_world, parent_world.inverse())),
-                });
-            }
+        if roots
+            .iter()
+            .any(|root| !ctx.allows(*root, Scope::LayerResize))
+        {
+            return;
         }
+        let Some(nodes) = scale_nodes(ctx.doc, &roots) else {
+            return;
+        };
         self.gesture = Some(ScaleGesture {
             scene_id: ctx.doc.scene.instance_id(),
             scope: ctx.scope(),
@@ -232,51 +214,7 @@ impl ScaleTool {
                 self.restore(ctx);
                 return;
             };
-            let final_state = ScaleProperties::read(node);
-            let old = &saved.original;
-            for (&property, &variable) in &old.bindings {
-                if !final_state.bindings.contains_key(&property) {
-                    operations.push(Operation::UnbindProperty {
-                        node: saved.id,
-                        prop: property,
-                        variable,
-                        old_data: Box::new(old.data.clone()),
-                        new_data: Box::new(old.data.clone()),
-                        old_opacity: node.opacity,
-                        new_opacity: node.opacity,
-                        old_flags: node.flags,
-                        new_flags: node.flags,
-                    });
-                }
-            }
-            if old.transform != final_state.transform {
-                operations.push(Operation::SetTransform {
-                    id: saved.id,
-                    old: old.transform,
-                    new: final_state.transform,
-                });
-            }
-            if old.data != final_state.data {
-                operations.push(Operation::ReplaceData {
-                    id: saved.id,
-                    old: Box::new(old.data.clone()),
-                    new: Box::new(final_state.data),
-                });
-            }
-            if old.effects != final_state.effects {
-                operations.push(Operation::SetEffects {
-                    id: saved.id,
-                    old: old.effects.clone(),
-                    new: final_state.effects,
-                });
-            }
-            if old.blurs != final_state.blurs {
-                operations.push(Operation::SetBlurs {
-                    id: saved.id,
-                    old: old.blurs.clone(),
-                    new: final_state.blurs,
-                });
-            }
+            push_scale_operations(&mut operations, node, saved, ScaleProperties::read(node));
         }
         for saved in &gesture.nodes {
             if let Some(node) = ctx.doc.scene.get_mut(saved.id) {
@@ -376,6 +314,105 @@ impl Tool for ScaleTool {
 
     fn deactivate(&mut self, ctx: &mut ToolContext) {
         self.restore(ctx);
+    }
+}
+
+/// The operations that scale `roots`, and everything inside them, by
+/// `factor` about the world point `pivot`, as the scale tool does: geometry,
+/// strokes, text, corner radii and effects scale together, and bindings that
+/// drive a scaled value are released. `None` when a root's parent cannot be
+/// inverted or a scaled value would not be finite.
+pub fn scale_operations(
+    doc: &Doc,
+    roots: &[NodeId],
+    factor: f64,
+    pivot: DVec2,
+) -> Option<Vec<Operation>> {
+    let mut operations = Vec::new();
+    for saved in scale_nodes(doc, roots)? {
+        let node = doc.scene.get(saved.id)?;
+        let scaled = scaled_properties(&saved, factor, pivot)?;
+        push_scale_operations(&mut operations, node, &saved, scaled);
+    }
+    Some(operations)
+}
+
+/// Every root and its descendants as a scale reads them before it starts.
+fn scale_nodes(doc: &Doc, roots: &[NodeId]) -> Option<Vec<ScaleNode>> {
+    let mut nodes = Vec::new();
+    for &root in roots {
+        let root_world = doc.scene.world_transform(root)?;
+        let parent = doc.scene.get(root)?.parent;
+        let parent_world = parent
+            .and_then(|id| doc.scene.world_transform(id))
+            .unwrap_or(Transform2D::IDENTITY);
+        if !invertible(parent_world) {
+            return None;
+        }
+        for id in doc.scene.descendants_of(root) {
+            let node = doc.scene.get(id)?;
+            nodes.push(ScaleNode {
+                id,
+                parent: node.parent,
+                original: ScaleProperties::read(node),
+                resolved_data: resolve_scale_data(doc, node),
+                root_transform: (id == root).then_some((root_world, parent_world.inverse())),
+            });
+        }
+    }
+    Some(nodes)
+}
+
+/// The operations that take `node` from its saved state to `scaled`.
+fn push_scale_operations(
+    operations: &mut Vec<Operation>,
+    node: &CanvasNode,
+    saved: &ScaleNode,
+    scaled: ScaleProperties,
+) {
+    let old = &saved.original;
+    for (&property, &variable) in &old.bindings {
+        if !scaled.bindings.contains_key(&property) {
+            operations.push(Operation::UnbindProperty {
+                node: saved.id,
+                prop: property,
+                variable,
+                old_data: Box::new(old.data.clone()),
+                new_data: Box::new(old.data.clone()),
+                old_opacity: node.opacity,
+                new_opacity: node.opacity,
+                old_flags: node.flags,
+                new_flags: node.flags,
+            });
+        }
+    }
+    if old.transform != scaled.transform {
+        operations.push(Operation::SetTransform {
+            id: saved.id,
+            old: old.transform,
+            new: scaled.transform,
+        });
+    }
+    if old.data != scaled.data {
+        operations.push(Operation::ReplaceData {
+            id: saved.id,
+            old: Box::new(old.data.clone()),
+            new: Box::new(scaled.data),
+        });
+    }
+    if old.effects != scaled.effects {
+        operations.push(Operation::SetEffects {
+            id: saved.id,
+            old: old.effects.clone(),
+            new: scaled.effects,
+        });
+    }
+    if old.blurs != scaled.blurs {
+        operations.push(Operation::SetBlurs {
+            id: saved.id,
+            old: old.blurs.clone(),
+            new: scaled.blurs,
+        });
     }
 }
 
@@ -826,6 +863,44 @@ mod tests {
     fn near_point(actual: DVec2, expected: DVec2) {
         near(actual.x, expected.x);
         near(actual.y, expected.y);
+    }
+
+    #[test]
+    fn scale_operations_scale_geometry_strokes_and_text_about_the_pivot() {
+        let mut doc = Doc::new();
+        let mut card = rectangle(20., 10.);
+        card.transform = Transform2D::translation(10., 0.);
+        if let NodeData::Vector(vector) = &mut card.data {
+            vector.strokes.push(Stroke::solid(Color::BLACK, 2.));
+        }
+        let card = insert(&mut doc, card, None);
+        let mut label = CanvasNode::new(NodeData::Text(TextNode::new("Hi", 40., 12.)));
+        label.transform = Transform2D::translation(0., 20.);
+        if let NodeData::Text(text) = &mut label.data {
+            text.style.size_px = 12.;
+        }
+        let label = insert(&mut doc, label, None);
+
+        let operations = crate::scale::scale_operations(&doc, &[card, label], 2., DVec2::ZERO)
+            .expect("scalable roots");
+        for operation in operations {
+            doc.apply(operation).expect("apply");
+        }
+        let bounds = doc.scene.world_bounds(card).expect("card bounds");
+        near_point(DVec2::new(bounds.min_x, bounds.min_y), DVec2::new(20., 0.));
+        near(bounds.width(), 40.);
+        let NodeData::Vector(vector) = &node(&doc, card).data else {
+            panic!("a vector");
+        };
+        near(vector.strokes[0].width, 4.);
+        let NodeData::Text(text) = &node(&doc, label).data else {
+            panic!("a text node");
+        };
+        near(text.style.size_px, 24.);
+        near_point(
+            node(&doc, label).transform.transform_point(DVec2::ZERO),
+            DVec2::new(0., 40.),
+        );
     }
 
     #[test]

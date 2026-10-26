@@ -11,8 +11,8 @@ use fanta_doc::{
     AssetId, BlendMode, Blur, BlurKind, BooleanOp, BoundProp, Color as FantaColor, ComponentId,
     ComponentPropKind, CounterAlign, Doc, Fill, Gradient, GridTrack, ImageFitMode, LayoutChild,
     LayoutMode, MaskType, NodeData, NodeFlags, NodeId, Operation, ParametricShape, PatternFill,
-    PatternHorizontalAlignment, PatternSpacing, PatternTileType, PrimaryAlign, Shadow, ShadowKind,
-    StrokeAlign, StrokeCap, StrokeJoin, TextAlign, TextAutoResize, TextPathAlignment,
+    PatternHorizontalAlignment, PatternSpacing, PatternTileType, PrimaryAlign, Scope, Shadow,
+    ShadowKind, StrokeAlign, StrokeCap, StrokeJoin, TextAlign, TextAutoResize, TextPathAlignment,
     TextPathDirection, TextPathSide, TextPathStart, Transform2D, VAlign as TextVAlign, VarValue,
 };
 #[cfg(target_os = "macos")]
@@ -158,6 +158,14 @@ pub(crate) fn design_blend_mode(mode: BlendMode) -> DesignBlendMode {
         BlendMode::Luminosity => DesignBlendMode::Luminosity,
         BlendMode::LinearBurn => DesignBlendMode::LinearBurn,
         BlendMode::LinearDodge => DesignBlendMode::LinearDodge,
+        BlendMode::DarkerColor => DesignBlendMode::DarkerColor,
+        BlendMode::LighterColor => DesignBlendMode::LighterColor,
+        BlendMode::VividLight => DesignBlendMode::VividLight,
+        BlendMode::LinearLight => DesignBlendMode::LinearLight,
+        BlendMode::PinLight => DesignBlendMode::PinLight,
+        BlendMode::HardMix => DesignBlendMode::HardMix,
+        BlendMode::Subtract => DesignBlendMode::Subtract,
+        BlendMode::Divide => DesignBlendMode::Divide,
     }
 }
 
@@ -183,6 +191,14 @@ pub(crate) fn engine_blend_mode(mode: DesignBlendMode) -> Option<BlendMode> {
         DesignBlendMode::Luminosity => BlendMode::Luminosity,
         DesignBlendMode::LinearBurn => BlendMode::LinearBurn,
         DesignBlendMode::LinearDodge => BlendMode::LinearDodge,
+        DesignBlendMode::DarkerColor => BlendMode::DarkerColor,
+        DesignBlendMode::LighterColor => BlendMode::LighterColor,
+        DesignBlendMode::VividLight => BlendMode::VividLight,
+        DesignBlendMode::LinearLight => BlendMode::LinearLight,
+        DesignBlendMode::PinLight => BlendMode::PinLight,
+        DesignBlendMode::HardMix => BlendMode::HardMix,
+        DesignBlendMode::Subtract => BlendMode::Subtract,
+        DesignBlendMode::Divide => BlendMode::Divide,
         DesignBlendMode::PassThrough => return None,
     })
 }
@@ -3595,6 +3611,9 @@ impl FigView {
         {
             return;
         }
+        if !self.design_action_allowed(action, cx) {
+            return;
+        }
         match action {
             DesignPanelAction::PropertyCopyRequested {
                 target,
@@ -4340,6 +4359,9 @@ impl FigView {
                 let Some(id) = node_id(id) else {
                     return;
                 };
+                if !self.design_property_allowed(&[id], *property, cx) {
+                    return;
+                }
                 self.finish_document_edits_for_external_change(cx);
                 let mut unhandled = false;
                 let ops = self.design_ops(cx, |doc| {
@@ -4653,6 +4675,9 @@ impl FigView {
                 return;
             }
         };
+        if !self.design_property_allowed(&ids, property, cx) {
+            return;
+        }
         self.finish_document_edits_for_external_change(cx);
         let mut unsupported = false;
         let ops = self.design_ops(cx, |doc| {
@@ -5028,6 +5053,43 @@ impl FigView {
 
     /// One Begin/Preview/Commit/Cancel gesture over a single node property,
     /// using the same snapshot-restore staging as the legacy panel scrubs.
+    /// Whether Fill mode lets the inspector make the change `action` asks
+    /// for. Says why not, except on a gesture's preview frames, which arrive
+    /// on every frame of a drag.
+    fn design_action_allowed(&self, action: &DesignPanelAction, cx: &mut Context<Self>) -> bool {
+        let Some((node, scope, phase)) = design_action_scope(action) else {
+            return true;
+        };
+        let Some(id) = node_id(node) else {
+            return true;
+        };
+        if phase == Some(DesignPanelEditPhase::Preview) {
+            return !self.template_fill
+                || self
+                    .item()
+                    .read(cx)
+                    .doc()
+                    .and_then(|doc| doc.scene.get(id))
+                    .is_none_or(|node| node.editing_allows(scope));
+        }
+        self.template_allows_node(id, scope, "change that here", cx)
+    }
+
+    /// Whether Fill mode lets the inspector change `property` on every node
+    /// in `ids`. Says why not.
+    fn design_property_allowed(
+        &self,
+        ids: &[NodeId],
+        property: DesignPanelProperty,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(scope) = design_property_scope(property) else {
+            return true;
+        };
+        ids.iter()
+            .all(|id| self.template_allows_node(*id, scope, "change that here", cx))
+    }
+
     fn handle_design_phased_edit(
         &mut self,
         id: NodeId,
@@ -5040,6 +5102,11 @@ impl FigView {
         let preview_owner = cx.entity_id();
         match phase {
             DesignPanelEditPhase::Begin => {
+                // Refused here, the gesture opens no session, so its preview
+                // frames change nothing.
+                if !self.design_property_allowed(&[id], property, cx) {
+                    return;
+                }
                 self.finish_document_edits_for_external_change(cx);
                 let item = self.item().clone();
                 let (scene_instance, snapshot) = {
@@ -5098,6 +5165,9 @@ impl FigView {
                 });
             }
             DesignPanelEditPhase::Commit => {
+                if !self.design_property_allowed(&[id], property, cx) {
+                    return;
+                }
                 let session = self
                     .gpui_design
                     .as_mut()
@@ -8359,6 +8429,398 @@ fn current_prop_kind(
             EnginePropKind::Other
         }
     })
+}
+
+/// The node an inspector action changes, the template scope the change needs
+/// and, for a gesture, its phase. Actions left out change nothing a template
+/// locks: component authoring, styles and variables, layout grids, exports,
+/// copying and navigation.
+#[allow(deprecated)]
+fn design_action_scope(
+    action: &DesignPanelAction,
+) -> Option<(&SharedString, Scope, Option<DesignPanelEditPhase>)> {
+    use DesignPanelAction as A;
+    let list_scope = |collection: &DesignPanelCollection| match collection {
+        DesignPanelCollection::Fill => Some(Scope::FillChange),
+        DesignPanelCollection::Stroke => Some(Scope::StrokeChange),
+        DesignPanelCollection::Effect => Some(Scope::AppearanceEffect),
+        DesignPanelCollection::LayoutGrid | DesignPanelCollection::Export => None,
+    };
+    match action {
+        A::PropertyChangeRequested {
+            node_id, property, ..
+        }
+        | A::TypographyPropertyChangeRequested {
+            node_id, property, ..
+        } => Some((node_id, design_property_scope(*property)?, None)),
+        A::PropertyEditRequested {
+            node_id,
+            property,
+            phase,
+            ..
+        }
+        | A::TypographyPropertyEditRequested {
+            node_id,
+            property,
+            phase,
+            ..
+        }
+        | A::EffectEditRequested {
+            node_id,
+            property,
+            phase,
+            ..
+        } => Some((node_id, design_property_scope(*property)?, Some(*phase))),
+        A::TypographyVariableAxisEditRequested { node_id, phase, .. }
+        | A::TextPathPlacementChangeRequested { node_id, phase, .. }
+        | A::TextPathStartChangeRequested { node_id, phase, .. } => {
+            Some((node_id, Scope::TextCharacter, Some(*phase)))
+        }
+        A::TypographyStyleApplyRequested { node_id, .. }
+        | A::TypographyStyleDetachRequested { node_id, .. }
+        | A::TypographyFontApplyRequested { node_id, .. }
+        | A::TypographyOpenTypeFeatureChangeRequested { node_id, .. }
+        | A::TextPathFlipOrientationRequested { node_id }
+        | A::TextPathDirectionChangeRequested { node_id, .. } => {
+            Some((node_id, Scope::TextCharacter, None))
+        }
+        A::VectorVertexPositionEditRequested { node_id, phase, .. }
+        | A::VectorVertexCornerRadiusEditRequested { node_id, phase, .. }
+        | A::VectorHandleMirroringEditRequested { node_id, phase, .. }
+        | A::TransformModifierChangeRequested { node_id, phase, .. } => {
+            Some((node_id, Scope::ShapeChange, Some(*phase)))
+        }
+        A::TransformModifierAddRequested { node_id, .. }
+        | A::TransformModifierRemoveRequested { node_id, .. }
+        | A::ApplyTransformModifiersRequested { node_id } => {
+            Some((node_id, Scope::ShapeChange, None))
+        }
+        A::GridDimensionsEditRequested { node_id, phase, .. } => {
+            Some((node_id, Scope::LayerResize, Some(*phase)))
+        }
+        A::GridTrackAddRequested { node_id, .. }
+        | A::GridTrackDeleteRequested { node_id, .. }
+        | A::GridTracksReorderRequested { node_id, .. }
+        | A::FramePresetApplyRequested { node_id, .. } => Some((node_id, Scope::LayerResize, None)),
+        A::EffectAddRequested { node_id, .. }
+        | A::EffectRemoveRequested { node_id, .. }
+        | A::EffectReorderRequested { node_id, .. }
+        | A::EffectShaderChooseRequested { node_id, .. }
+        | A::EffectStyleApplyRequested { node_id, .. }
+        | A::EffectStyleDetachRequested { node_id, .. }
+        | A::EffectVariableApplyRequested { node_id, .. }
+        | A::EffectVariableDetachRequested { node_id, .. } => {
+            Some((node_id, Scope::AppearanceEffect, None))
+        }
+        A::PaintEditRequested {
+            node_id,
+            collection,
+            phase,
+            ..
+        } => Some((node_id, list_scope(collection)?, Some(*phase))),
+        A::PaintMediaCropActionRequested { node_id, .. } => Some((node_id, Scope::LayerCrop, None)),
+        A::CollectionItemAddRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::CollectionItemRemoveRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintChangeRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintReorderRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintStyleApplyRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintStyleDetachRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintSourceReplaceRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintMediaSourceActionRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintMediaSourceDropRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintShaderApplyRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintColorVariableApplyRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintColorVariableDetachRequested {
+            node_id,
+            collection,
+            ..
+        }
+        | A::PaintColorStyleApplyRequested {
+            node_id,
+            collection,
+            ..
+        } => Some((node_id, list_scope(collection)?, None)),
+        A::SwapStrokeEndpointsRequested { node_id } => Some((node_id, Scope::StrokeChange, None)),
+        A::ReplaceMediaRequested { node_id } => Some((node_id, Scope::FillChange, None)),
+        _ => None,
+    }
+}
+
+/// The template scope an inspector property belongs to, which Fill mode
+/// checks before the property changes; `None` for settings no template locks,
+/// such as export settings and layout grids. Paint opacity and visibility
+/// count as fill changes, since the property does not say which list it
+/// targets. Every property is listed, so a new one does not compile until
+/// it is classified.
+#[allow(deprecated)]
+fn design_property_scope(property: DesignPanelProperty) -> Option<Scope> {
+    use DesignPanelProperty as P;
+    let scope = match property {
+        P::Visible => Scope::LayerVisibility,
+        P::X
+        | P::Y
+        | P::SmartSelectionHorizontalSpacing
+        | P::SmartSelectionVerticalSpacing
+        | P::StackingOrder
+        | P::LayoutPositioning
+        | P::AlignSelection
+        | P::DistributeSelection => Scope::LayerMove,
+        P::Width
+        | P::Height
+        | P::LockAspectRatio
+        | P::HorizontalConstraint
+        | P::VerticalConstraint
+        | P::LayoutMode
+        | P::HorizontalSizing
+        | P::VerticalSizing
+        | P::AutoLayoutAlignment
+        | P::AlignmentX
+        | P::AlignmentY
+        | P::Wrap
+        | P::Gap
+        | P::ItemSpacingMode
+        | P::CounterAxisAlignContent
+        | P::CounterAxisGap
+        | P::PaddingVertical
+        | P::PaddingHorizontal
+        | P::PaddingShorthand
+        | P::PaddingTop
+        | P::PaddingRight
+        | P::PaddingBottom
+        | P::PaddingLeft
+        | P::IncludeStrokes
+        | P::BaselineAlignment
+        | P::MinWidth
+        | P::MaxWidth
+        | P::MinHeight
+        | P::MaxHeight
+        | P::LayoutAlignSelf
+        | P::LayoutGrow
+        | P::GridAutoTracks
+        | P::GridItemsPositioning
+        | P::GridColumnCount
+        | P::GridRowCount
+        | P::GridColumnTrack(_)
+        | P::GridRowTrack(_)
+        | P::GridColumnTrackValue(_)
+        | P::GridRowTrackValue(_)
+        | P::GridRowIndex
+        | P::GridColumnIndex
+        | P::GridRowSpan
+        | P::GridColumnSpan
+        | P::GridHorizontalAlignment
+        | P::GridVerticalAlignment
+        | P::TextResize => Scope::LayerResize,
+        P::Rotation => Scope::LayerRotate,
+        P::ClipContent | P::IsMask | P::MaskType => Scope::LayerClipping,
+        P::Opacity => Scope::LayerOpacity,
+        P::BlendMode => Scope::LayerBlendMode,
+        P::VectorVertexX
+        | P::VectorVertexY
+        | P::VectorVertexCornerRadius
+        | P::VectorHandleMirroring
+        | P::CornerRadius
+        | P::CornerRadiusTopLeft
+        | P::CornerRadiusTopRight
+        | P::CornerRadiusBottomRight
+        | P::CornerRadiusBottomLeft
+        | P::IndependentCorners
+        | P::CornerSmoothing
+        | P::PolygonCount
+        | P::StarPointCount
+        | P::StarInnerRadius
+        | P::ArcStartingAngle
+        | P::ArcSweep
+        | P::ArcEndingAngle
+        | P::ArcInnerRadius
+        | P::BooleanOperation
+        | P::TableRows
+        | P::TableColumns
+        | P::TransformRepeatType(_)
+        | P::TransformRepeatAxis(_)
+        | P::TransformRepeatCount(_)
+        | P::TransformRepeatUnit(_)
+        | P::TransformRepeatOffset(_) => Scope::ShapeChange,
+        P::FillShowsInExports
+        | P::PaintOpacity { .. }
+        | P::PaintVisible { .. }
+        | P::SelectionColor(_) => Scope::FillChange,
+        P::TypographyStyle
+        | P::FontFamily
+        | P::FontStyle
+        | P::FontWeight
+        | P::FontSize
+        | P::LineHeight
+        | P::LetterSpacing
+        | P::TextLeadingTrim
+        | P::ParagraphSpacing
+        | P::ParagraphIndent
+        | P::ListSpacing
+        | P::TextHangingPunctuation
+        | P::TextHangingLists
+        | P::HorizontalTextAlignment
+        | P::VerticalTextAlignment
+        | P::TextTruncate
+        | P::TextMaxLines
+        | P::TextDecoration
+        | P::TextDecorationStyle
+        | P::TextDecorationOffset
+        | P::TextDecorationThickness
+        | P::TextDecorationColor
+        | P::TextDecorationSkipInk
+        | P::TextCase
+        | P::TextList
+        | P::TextPathStartSegment
+        | P::TextPathStartPosition
+        | P::TextPathOffset => Scope::TextCharacter,
+        P::MediaCropMode => Scope::LayerCrop,
+        P::MediaExposure
+        | P::MediaContrast
+        | P::MediaSaturation
+        | P::MediaTemperature
+        | P::MediaTint
+        | P::MediaHighlights
+        | P::MediaShadows => Scope::AppearanceAdjustments,
+        P::StrokeWeight
+        | P::StrokeWeightMode
+        | P::StrokeWeightTop
+        | P::StrokeWeightRight
+        | P::StrokeWeightBottom
+        | P::StrokeWeightLeft
+        | P::StrokeAlign
+        | P::StrokeStartCap
+        | P::StrokeEndCap
+        | P::StrokeEndpointCap
+        | P::StrokeDashMode
+        | P::StrokeDashPattern
+        | P::StrokeDashCap
+        | P::StrokeJoin
+        | P::StrokeMiterAngle
+        | P::StrokeVariableWidth
+        | P::StrokeVariableWidthPointPosition(_)
+        | P::StrokeVariableWidthPointWidth(_)
+        | P::StrokeType
+        | P::StrokeStretchBrush
+        | P::StrokeBrushDirection
+        | P::StrokeScatterBrush
+        | P::StrokeScatterGap
+        | P::StrokeScatterWiggle
+        | P::StrokeScatterSizeJitter
+        | P::StrokeScatterAngularJitter
+        | P::StrokeScatterRotation
+        | P::StrokeDynamicFrequency
+        | P::StrokeDynamicWiggle
+        | P::StrokeDynamicSmoothen => Scope::StrokeChange,
+        P::EffectShadowColor(_)
+        | P::EffectShadowBlendMode(_)
+        | P::EffectShadowBlur(_)
+        | P::EffectShadowSpread(_)
+        | P::EffectShadowOffsetX(_)
+        | P::EffectShadowOffsetY(_)
+        | P::EffectDropShadowShowBehindNode(_)
+        | P::EffectBlur(_)
+        | P::EffectSpread(_)
+        | P::EffectOffsetX(_)
+        | P::EffectOffsetY(_) => Scope::AppearanceShadow,
+        P::EffectBlurType(_)
+        | P::EffectBlurRadius(_)
+        | P::EffectProgressiveBlurStartRadius(_)
+        | P::EffectProgressiveBlurEndRadius(_)
+        | P::EffectProgressiveBlurStartOffsetX(_)
+        | P::EffectProgressiveBlurStartOffsetY(_)
+        | P::EffectProgressiveBlurEndOffsetX(_)
+        | P::EffectProgressiveBlurEndOffsetY(_) => Scope::AppearanceBlur,
+        P::EffectKind(_)
+        | P::EffectVisible(_)
+        | P::EffectSettings(_)
+        | P::EffectNoiseType(_)
+        | P::EffectNoisePrimaryColor(_)
+        | P::EffectNoiseSecondaryColor(_)
+        | P::EffectNoiseOpacity(_)
+        | P::EffectNoiseBlendMode(_)
+        | P::EffectNoiseSizeX(_)
+        | P::EffectNoiseSizeY(_)
+        | P::EffectNoiseDensity(_)
+        | P::EffectTextureSizeX(_)
+        | P::EffectTextureSizeY(_)
+        | P::EffectTextureRadius(_)
+        | P::EffectTextureClipToShape(_)
+        | P::EffectGlassLightIntensity(_)
+        | P::EffectGlassLightAngle(_)
+        | P::EffectGlassRefraction(_)
+        | P::EffectGlassDepth(_)
+        | P::EffectGlassDispersion(_)
+        | P::EffectGlassFrost(_)
+        | P::EffectGlassSplay(_)
+        | P::EffectShaderProperty(_, _) => Scope::AppearanceEffect,
+        P::ComponentProperty(_)
+        | P::SlotStretchChildOnInsert(_)
+        | P::SlotDisplayEmpty(_)
+        | P::SlotMinimumInstances(_)
+        | P::SlotMaximumInstances(_)
+        | P::SlotPreferredValuesOnly(_)
+        | P::SectionContentsHidden
+        | P::SectionDevStatus
+        | P::LayoutGridKind(_)
+        | P::LayoutGridVisible(_)
+        | P::LayoutGridAlignment(_)
+        | P::LayoutGridCount(_)
+        | P::LayoutGridSize(_)
+        | P::LayoutGridOffset(_)
+        | P::LayoutGridGutter(_)
+        | P::LayoutGridMargin(_)
+        | P::LayoutGridColor(_)
+        | P::LayoutGridOpacity(_)
+        | P::ExportSizing(_)
+        | P::ExportScale(_)
+        | P::ExportSuffix(_)
+        | P::ExportFormat(_) => return None,
+    };
+    Some(scope)
 }
 
 /// Committed operations for one node property edit. `None` marks a property
@@ -15925,6 +16387,16 @@ mod tests {
             doc.scene.get(id).expect("text exists").blend_mode,
             BlendMode::Normal
         );
+    }
+
+    #[test]
+    fn every_blend_mode_round_trips_through_the_panel() {
+        for (mode, _) in crate::properties_snapshot::BLEND_MODES {
+            assert_eq!(engine_blend_mode(design_blend_mode(mode)), Some(mode));
+        }
+        for mode in DesignBlendMode::NON_PASS_THROUGH {
+            assert_eq!(engine_blend_mode(mode).map(design_blend_mode), Some(mode));
+        }
     }
 
     #[test]

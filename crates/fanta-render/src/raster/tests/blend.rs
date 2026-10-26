@@ -32,26 +32,36 @@ fn solid_rect(
 /// Render a bottom orange rect with a top light-blue rect over it, using
 /// `top_blend` for the top rect's fill. Returns the RGBA of the overlap pixel.
 fn overlap_pixel(top_blend: BlendMode) -> [u8; 4] {
+    blended_pixel(
+        Color::rgb(200, 100, 50),
+        Color::rgb(100, 200, 255),
+        top_blend,
+    )
+}
+
+/// The overlap pixel of a `top` rect blended by `top_blend` over an opaque
+/// `bottom` rect that covers the canvas.
+fn blended_pixel(bottom: Color, top: Color, top_blend: BlendMode) -> [u8; 4] {
     const N: u32 = 64;
     let mut doc = Doc::new();
-    // Bottom: opaque orange covering the whole canvas (world (0,0) → center).
+    // Bottom: covers the whole canvas (world (0,0) → center).
     doc.apply(Operation::create_node(solid_rect(
         -32.0,
         -32.0,
         64.0,
         64.0,
-        Color::rgb(200, 100, 50),
+        bottom,
         BlendMode::Normal,
         IndexKey::FIRST,
     )))
     .unwrap();
-    // Top: light blue over the same region (higher z), blended per `top_blend`.
+    // Top: over the same region (higher z), blended per `top_blend`.
     doc.apply(Operation::create_node(solid_rect(
         -16.0,
         -16.0,
         32.0,
         32.0,
-        Color::rgb(100, 200, 255),
+        top,
         top_blend,
         IndexKey::after(IndexKey::FIRST),
     )))
@@ -146,4 +156,48 @@ fn linear_burn_composites_a_translucent_source_by_its_alpha() {
         );
     }
     assert_eq!(pixel[3], 255);
+}
+
+#[test]
+fn photo_editor_modes_follow_their_formulas() {
+    let orange = Color::rgb(200, 100, 50);
+    let light_blue = Color::rgb(100, 200, 255);
+    let violet = Color::rgb(100, 50, 200);
+    let green = Color::rgb(0, 200, 0);
+    let blue = Color::rgb(0, 0, 255);
+    let magenta = Color::rgb(200, 0, 50);
+    for (mode, bottom, top, expected) in [
+        // Every expected pixel differs from the source color, so a mode drawn
+        // as Normal fails; these four keep the backdrop. The color with the
+        // lower channel sum (350 < 555), unlike Darken's per-channel minimum
+        // (100, 100, 50).
+        (BlendMode::DarkerColor, orange, light_blue, [200, 100, 50]),
+        // The higher channel sum, unlike Lighten's (200, 200, 255).
+        (BlendMode::LighterColor, light_blue, orange, [100, 200, 255]),
+        // By channel sum (200 < 255), not luminosity, which ranks blue darker.
+        (BlendMode::DarkerColor, green, blue, [0, 200, 0]),
+        (BlendMode::LighterColor, blue, green, [0, 0, 255]),
+        // Red burns by 2·s (1 - 55/200), green dodges by 2·s - 1
+        // (100/110), and blue dodges by 1.
+        (BlendMode::VividLight, orange, light_blue, [185, 232, 255]),
+        // d + 2·s - 1, clamped.
+        (BlendMode::LinearLight, orange, light_blue, [145, 245, 255]),
+        // min(d, 2·s) for red, max(d, 2·s - 1) for green and blue.
+        (BlendMode::PinLight, orange, light_blue, [200, 145, 255]),
+        // 1 where s + d reaches 1: only red (300 of 255).
+        (BlendMode::HardMix, orange, violet, [255, 0, 0]),
+        (BlendMode::Subtract, orange, light_blue, [100, 0, 0]),
+        (BlendMode::Divide, orange, light_blue, [255, 128, 50]),
+        // A black source turns a lit backdrop channel white and keeps a black one.
+        (BlendMode::Divide, magenta, Color::BLACK, [255, 0, 255]),
+    ] {
+        let pixel = blended_pixel(bottom, top, mode);
+        for (channel, expected) in expected.into_iter().enumerate() {
+            assert!(
+                (i32::from(pixel[channel]) - expected).abs() <= 3,
+                "{mode:?} channel {channel}: expected ≈{expected}, got {pixel:?}"
+            );
+        }
+        assert_eq!(pixel[3], 255, "{mode:?}");
+    }
 }

@@ -3,6 +3,7 @@
 //! panels and the floating canvas toolbar.
 
 use fanta_headless::style as agent_style;
+use fanta_headless::{component_properties, structure, variant_sets};
 mod agent_surface;
 mod annotations;
 mod canvas;
@@ -13,8 +14,6 @@ mod comments;
 mod comments_panel;
 mod comments_ui;
 mod component_actions;
-mod component_properties;
-mod componentize;
 mod design_panel;
 mod dev_history;
 mod document;
@@ -49,7 +48,6 @@ mod properties_snapshot;
 mod prototype_panel;
 mod prototype_player;
 mod review;
-mod structure;
 mod text_edit;
 #[cfg(feature = "fanta-gpui-ui")]
 mod theme_bridge;
@@ -57,7 +55,6 @@ mod timeline;
 mod tools;
 mod variable_binding;
 mod variables_workspace;
-mod variant_sets;
 #[cfg(target_os = "macos")]
 mod video_playback;
 mod view;

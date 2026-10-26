@@ -33,4 +33,5 @@ mod rectangle;
 mod reparent;
 mod resize;
 mod rotate;
+mod template_fill;
 mod transient;

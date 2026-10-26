@@ -17,7 +17,9 @@ use fanta_canvas::{
     HitPrecision, MarqueeMode, SnapEngine, hit_test_deep, hit_test_within_screen, screen_to_world,
     world_to_screen,
 };
-use fanta_doc::{BlendMode, Bounds, CanvasNode, Color, Doc, NodeId, Scene, Transform2D, Viewport};
+use fanta_doc::{
+    BlendMode, Bounds, CanvasNode, Color, Doc, NodeId, Scene, Scope, Transform2D, Viewport,
+};
 use glam::DVec2;
 use smallvec::SmallVec;
 
@@ -93,6 +95,10 @@ pub struct ToolContext<'a> {
 
     pub hit_test_refiner: Option<HitTestRefiner>,
     pub interaction_bounds_resolver: Option<InteractionBoundsResolver>,
+
+    /// Fill mode: the user is filling a template in, so the scopes a node's
+    /// editing rules disable are off limits to gestures. Off while authoring.
+    pub template_fill: bool,
 }
 
 impl<'a> ToolContext<'a> {
@@ -126,6 +132,7 @@ impl<'a> ToolContext<'a> {
             scope_root: None,
             hit_test_refiner: None,
             interaction_bounds_resolver: None,
+            template_fill: false,
         }
     }
 
@@ -153,6 +160,22 @@ impl<'a> ToolContext<'a> {
     pub fn with_interaction_bounds_resolver(mut self, resolver: InteractionBoundsResolver) -> Self {
         self.interaction_bounds_resolver = Some(resolver);
         self
+    }
+
+    pub fn with_template_fill(mut self, template_fill: bool) -> Self {
+        self.template_fill = template_fill;
+        self
+    }
+
+    /// Whether a gesture may make a change of `scope` to `id`: always while
+    /// authoring, and in Fill mode unless the node's editing rules disable it.
+    pub fn allows(&self, id: NodeId, scope: Scope) -> bool {
+        !self.template_fill
+            || self
+                .doc
+                .scene
+                .get(id)
+                .is_none_or(|node| node.editing_allows(scope))
     }
 
     /// The subtree root the gesture is scoped to: the explicit `scope_root`, else
@@ -184,8 +207,10 @@ impl<'a> ToolContext<'a> {
         hit_test_deep(&self.doc.scene, world_point, precision, scope)
             .into_iter()
             .find(|&id| {
-                self.hit_test_refiner
-                    .is_none_or(|refiner| refiner(&self.doc.scene, id, world_point))
+                self.allows(id, Scope::EditorSelect)
+                    && self
+                        .hit_test_refiner
+                        .is_none_or(|refiner| refiner(&self.doc.scene, id, world_point))
             })
     }
 
@@ -206,7 +231,7 @@ impl<'a> ToolContext<'a> {
         } else {
             mode
         };
-        let hits = hit_test_within_screen(
+        let mut hits = hit_test_within_screen(
             &self.doc.scene,
             self.viewport,
             self.screen_size,
@@ -214,6 +239,7 @@ impl<'a> ToolContext<'a> {
             query_mode,
             self.scope(),
         );
+        hits.retain(|id| self.allows(*id, Scope::EditorSelect));
         if self.interaction_bounds_resolver.is_none() {
             return hits;
         }

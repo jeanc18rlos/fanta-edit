@@ -30,7 +30,7 @@ use fanta_canvas::HitPrecision;
 use fanta_doc::{
     AnimationClip, AnimationClipId, AssetId, BoundProp, CanvasNode, Doc, Easing, Fill, IndexKey,
     Interpolation, Keyframe, KeyframeId, MotionEvaluation, MotionProperty, NodeData, NodeId,
-    Operation, ProjectAssetKind, ResolvedVarValue, Transaction, Viewport,
+    Operation, ProjectAssetKind, ResolvedVarValue, Scope, Transaction, Viewport,
 };
 use fanta_tools::{Button as ToolButton, LogicalKey, ToolEvent};
 use file_icons::FileIcons;
@@ -143,6 +143,8 @@ actions!(
         UngroupSelection,
         /// Wrap the selected layers in a frame.
         FrameSelection,
+        /// Switch between authoring a template and filling it in.
+        ToggleTemplateFill,
         /// Present the authored prototype from its configured starting frame.
         PlayPrototype,
         /// Leave prototype presentation and return to the editor.
@@ -498,6 +500,8 @@ pub struct FigView {
     /// paint with only `&App`. Cleared with the rendered-canvas cache: a
     /// reload restarts the scene revision counter, which could collide.
     pub(crate) chrome_cache: std::cell::RefCell<Option<crate::canvas::ChromeCache>>,
+    /// The text node the last paint drew with its text variables as typed.
+    pub(crate) painted_raw_text_node: Option<NodeId>,
     /// The Metal render thread and its newest frame; created on first paint.
     /// `pub(crate)` because the canvas element drives it during paint.
     #[cfg(target_os = "macos")]
@@ -533,6 +537,10 @@ pub struct FigView {
     /// The last-used tool per toolbar group, so each group's button keeps
     /// showing the member you last picked (Figma behavior). Indexed by group.
     group_faces: Vec<ToolKind>,
+    /// Fill mode for this window: the user is filling a template in, so
+    /// canvas gestures and selection commands keep to what each layer's
+    /// editing rules allow. Off while authoring, and never saved.
+    pub(crate) template_fill: bool,
     #[cfg(feature = "fanta-gpui-ui")]
     gpui_toolbar: Option<crate::gpui_adapters::toolbar::ToolbarAdapter>,
     /// The DesignPanel inspector adapter, mounted for Design mode when the
@@ -904,6 +912,7 @@ impl FigView {
             container_bounds: None,
             rendered_canvas: None,
             chrome_cache: std::cell::RefCell::new(None),
+            painted_raw_text_node: None,
             #[cfg(target_os = "macos")]
             gpu_canvas: None,
             #[cfg(target_os = "macos")]
@@ -935,6 +944,7 @@ impl FigView {
             wand_override: None,
             comment_state: crate::comments_ui::CommentState::default(),
             group_faces: crate::tools::initial_group_faces(),
+            template_fill: false,
             #[cfg(feature = "fanta-gpui-ui")]
             gpui_toolbar: crate::gpui_adapters::runtime_enabled(cx)
                 .then(|| crate::gpui_adapters::toolbar::ToolbarAdapter::new(window, cx)),
@@ -3311,6 +3321,7 @@ impl FigView {
             })
             .flatten();
         let wand_override = self.wand_override.take();
+        let template_fill = self.template_fill;
         let tools = &mut self.tools;
         let mut wants_exit = false;
         let mut content_changed = false;
@@ -3325,6 +3336,7 @@ impl FigView {
                     tool_context(&mut document.doc, &mut viewport, screen_size, active_tool);
                 ctx.draw_content_only = draw_content_only;
                 ctx.bitmap_wand_override = wand_override;
+                ctx.template_fill = template_fill;
                 #[cfg(feature = "fanta-gpui-ui")]
                 if let Some((color, width, smoothing, blend, hardness, flow, brush_style)) =
                     draw_stroke
@@ -5127,6 +5139,14 @@ impl FigView {
         if !self.selected_nodes_are_editable(cx) {
             return;
         }
+        let action = if cut {
+            "cut these layers"
+        } else {
+            "delete these layers"
+        };
+        if !self.template_allows_selection(Scope::LifecycleDestroy, true, action, cx) {
+            return;
+        }
         self.finish_document_edits(cx);
         let label = if cut { "Cut" } else { "Delete" };
         let result: Result<Option<CanvasClipboard>> = self.item.update(cx, |item, cx| {
@@ -5563,6 +5583,14 @@ impl FigView {
         if !self.selected_nodes_are_editable(cx) {
             return;
         }
+        if !self.template_allows_selection(
+            Scope::LifecycleDuplicate,
+            false,
+            "duplicate these layers",
+            cx,
+        ) {
+            return;
+        }
         self.finish_document_edits(cx);
         let payload = self
             .item
@@ -5655,6 +5683,79 @@ impl FigView {
 
     pub(crate) fn is_presenting_prototype(&self) -> bool {
         self.prototype_player.is_some()
+    }
+
+    fn toggle_template_fill(
+        &mut self,
+        _: &ToggleTemplateFill,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.template_fill = !self.template_fill;
+        let message = if self.template_fill {
+            "Filling in the template: layers keep to what it allows."
+        } else {
+            "Editing the template."
+        };
+        show_canvas_notice_deferred(message.into(), cx);
+        cx.notify();
+    }
+
+    /// Whether Fill mode lets a command change, in `scope`, every selected
+    /// layer and, with `inside`, every layer within them. Says why not.
+    fn template_allows_selection(
+        &self,
+        scope: Scope,
+        inside: bool,
+        action: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.template_fill {
+            return true;
+        }
+        let allowed = self.item.read(cx).document().is_none_or(|document| {
+            let doc = &document.doc;
+            let allows = |id: NodeId| {
+                doc.scene
+                    .get(id)
+                    .is_none_or(|node| node.editing_allows(scope))
+            };
+            doc.selection.iter().all(|selected| {
+                if inside {
+                    doc.scene.descendants_of(*selected).all(allows)
+                } else {
+                    allows(*selected)
+                }
+            })
+        });
+        if !allowed {
+            show_canvas_notice_deferred(format!("The template doesn't let you {action}."), cx);
+        }
+        allowed
+    }
+
+    /// Whether Fill mode lets a command change `node` in `scope`. Says why
+    /// not.
+    pub(crate) fn template_allows_node(
+        &self,
+        node: NodeId,
+        scope: Scope,
+        action: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.template_fill {
+            return true;
+        }
+        let allowed = self
+            .item
+            .read(cx)
+            .doc()
+            .and_then(|doc| doc.scene.get(node))
+            .is_none_or(|node| node.editing_allows(scope));
+        if !allowed {
+            show_canvas_notice_deferred(format!("The template doesn't let you {action}."), cx);
+        }
+        allowed
     }
 
     fn play_prototype(&mut self, _: &PlayPrototype, window: &mut Window, cx: &mut Context<Self>) {
@@ -6738,6 +6839,21 @@ impl FigView {
                         })),
                 )
             })
+            .child(
+                IconButton::new("inspector-template-fill", IconName::Lock)
+                    .toggle_state(self.template_fill)
+                    .tooltip(Tooltip::for_action_title(
+                        if self.template_fill {
+                            "Edit Template"
+                        } else {
+                            "Fill In Template"
+                        },
+                        &ToggleTemplateFill,
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_template_fill(&ToggleTemplateFill, window, cx);
+                    })),
+            )
             .child(
                 div()
                     .debug_selector(|| "properties-inspector-toggle".to_owned())
@@ -8788,6 +8904,7 @@ impl Render for FigView {
                 }),
             )
             .on_action(cx.listener(Self::play_prototype))
+            .on_action(cx.listener(Self::toggle_template_fill))
             .on_action(cx.listener(Self::exit_prototype))
             .on_action(cx.listener(Self::restart_prototype))
             .on_action(cx.listener(Self::prototype_previous_frame))
@@ -10132,6 +10249,7 @@ impl Item for FigView {
                 container_bounds: None,
                 rendered_canvas: None,
                 chrome_cache: std::cell::RefCell::new(None),
+                painted_raw_text_node: None,
                 #[cfg(target_os = "macos")]
                 gpu_canvas: None,
                 #[cfg(target_os = "macos")]
@@ -10163,6 +10281,7 @@ impl Item for FigView {
                 wand_override: None,
                 comment_state: crate::comments_ui::CommentState::default(),
                 group_faces: crate::tools::initial_group_faces(),
+                template_fill: false,
                 #[cfg(feature = "fanta-gpui-ui")]
                 gpui_toolbar: crate::gpui_adapters::runtime_enabled(cx)
                     .then(|| crate::gpui_adapters::toolbar::ToolbarAdapter::new(window, cx)),
@@ -14352,6 +14471,71 @@ mod tests {
             )
         });
         assert!(root.join("fanta.json").is_file());
+    }
+
+    #[gpui::test]
+    async fn fill_mode_keeps_what_the_template_locks_against_delete_and_duplicate(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let page = doc.active_page().expect("page");
+        let mut logo = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+            Color::BLACK,
+        )));
+        logo.parent = Some(page);
+        logo.editing = Some(Box::new(fanta_doc::EditingRules {
+            disabled_scopes: [Scope::LifecycleDestroy, Scope::LifecycleDuplicate].into(),
+            placeholder: None,
+        }));
+        let logo_id = logo.id;
+        doc.apply(Operation::create_node(logo)).expect("logo");
+        doc.selection.select_only(logo_id);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Template.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+        let layers =
+            |cx: &mut TestAppContext| item.read_with(cx, |item, _| item.doc().unwrap().scene.len());
+        let before = layers(cx);
+
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.toggle_template_fill(&ToggleTemplateFill, window, cx)
+                })
+            })
+            .expect("fill mode");
+        view.update(cx, |view, cx| {
+            assert!(view.template_fill);
+            view.duplicate_selected_nodes(cx);
+            view.delete_selected_nodes(cx);
+        });
+        assert_eq!(layers(cx), before, "the template keeps its locked logo");
+
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.toggle_template_fill(&ToggleTemplateFill, window, cx)
+                })
+            })
+            .expect("authoring");
+        view.update(cx, |view, cx| view.delete_selected_nodes(cx));
+        assert_eq!(layers(cx), before - 1, "authoring deletes it");
     }
 
     /// A bare `.fig` has no project directory; the first save would scaffold
