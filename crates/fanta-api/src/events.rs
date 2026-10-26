@@ -4,7 +4,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use fanta_doc::{Doc, ModeScope, NodeId, Operation};
+use fanta_doc::{
+    CanvasNode, Doc, ModeScope, NodeData, NodeId, Operation, VarValue, VariableCollectionId,
+    VariableId,
+};
 
 use crate::{ApiError, DesignSession, Result};
 
@@ -215,6 +218,7 @@ pub(crate) fn node_events(
         | Operation::SetMaskType { id, .. }
         | Operation::SetLayoutChild { id, .. }
         | Operation::SetConstraints { id, .. }
+        | Operation::SetEditingRules { id, .. }
         | Operation::ReplaceData { id, .. }
         | Operation::SetInstanceOverride { id, .. }
         | Operation::SwapInstance { id, .. }
@@ -242,41 +246,65 @@ pub(crate) fn node_events(
             .chain(new.root.iter())
             .for_each(|root| updated(*root)),
         Operation::SetVariableValue { variable, .. } => {
-            for root in doc.scene.roots() {
-                for id in doc.scene.descendants_of(*root) {
-                    if doc
-                        .scene
-                        .get(id)
-                        .is_some_and(|node| node.bindings.values().any(|bound| bound == variable))
-                    {
-                        updated(id);
-                    }
+            mark_showing(doc, &with_aliases(doc, [*variable]), None, &mut updated)
+        }
+        Operation::SetActiveMode {
+            scope, collection, ..
+        } => {
+            let within = match scope {
+                ModeScope::Frame { node } => {
+                    updated(*node);
+                    Some(*node)
                 }
-            }
+                ModeScope::Doc => None,
+            };
+            mark_showing(
+                doc,
+                &with_aliases(doc, collection_variables(doc, *collection)),
+                within,
+                &mut updated,
+            );
         }
-        Operation::SetActiveMode {
-            scope: ModeScope::Frame { node },
-            ..
-        } => updated(*node),
-        // Pages, the variable registry, motion clips and prototype flows are
-        // document-level state, not node changes. A page's root is created
-        // and destroyed by its own node operations.
-        Operation::SetActiveMode {
-            scope: ModeScope::Doc,
-            ..
+        Operation::SetCollectionDefaultMode { collection, .. } => mark_showing(
+            doc,
+            &with_aliases(doc, collection_variables(doc, *collection)),
+            None,
+            &mut updated,
+        ),
+        // The variable may be gone, so its tokens are found by the name the
+        // operation carries.
+        Operation::CreateVariable { variable } | Operation::DeleteVariable { variable, .. } => {
+            mark_tokens(
+                doc,
+                |token| names_variable(token, &variable.name),
+                &mut updated,
+            )
         }
-        | Operation::SetPages { .. }
+        Operation::RenameVariable { old, new, .. } => mark_tokens(
+            doc,
+            |token| names_variable(token, old) || names_variable(token, new),
+            &mut updated,
+        ),
+        Operation::CreateVariableCollection { collection }
+        | Operation::DeleteVariableCollection { collection, .. } => mark_tokens(
+            doc,
+            |token| in_collection(token, &collection.name),
+            &mut updated,
+        ),
+        Operation::RenameVariableCollection { old, new, .. } => mark_tokens(
+            doc,
+            |token| in_collection(token, old) || in_collection(token, new),
+            &mut updated,
+        ),
+        // Pages, the set of modes, enum options, motion clips and prototype
+        // flows are document-level state, not node changes; removing a mode
+        // clears its values through `SetVariableValue`. A page's root is
+        // created and destroyed by its own node operations.
+        Operation::SetPages { .. }
         | Operation::SetPageRegistry { .. }
-        | Operation::CreateVariableCollection { .. }
-        | Operation::DeleteVariableCollection { .. }
         | Operation::AddMode { .. }
         | Operation::RemoveMode { .. }
-        | Operation::SetCollectionDefaultMode { .. }
-        | Operation::CreateVariable { .. }
-        | Operation::DeleteVariable { .. }
-        | Operation::RenameVariable { .. }
         | Operation::SetVariableOptions { .. }
-        | Operation::RenameVariableCollection { .. }
         | Operation::RenameMode { .. }
         | Operation::CreateAnimationClip { .. }
         | Operation::DeleteAnimationClip { .. }
@@ -289,6 +317,126 @@ pub(crate) fn node_events(
         | Operation::SetFlows { .. }
         | Operation::SetPresentation { .. } => {}
     }
+}
+
+/// `variables` and every variable that aliases one of them, directly or
+/// through other aliases: the variables whose values change with theirs.
+fn with_aliases(
+    doc: &Doc,
+    variables: impl IntoIterator<Item = VariableId>,
+) -> BTreeSet<VariableId> {
+    let mut found: BTreeSet<VariableId> = variables.into_iter().collect();
+    loop {
+        let aliases: Vec<VariableId> = doc
+            .variables
+            .variables
+            .values()
+            .filter(|variable| {
+                !found.contains(&variable.id)
+                    && variable.values_by_mode.values().any(|value| {
+                        matches!(value, VarValue::Alias { variable } if found.contains(variable))
+                    })
+            })
+            .map(|variable| variable.id)
+            .collect();
+        if aliases.is_empty() {
+            return found;
+        }
+        found.extend(aliases);
+    }
+}
+
+fn collection_variables(
+    doc: &Doc,
+    collection: VariableCollectionId,
+) -> impl Iterator<Item = VariableId> + '_ {
+    doc.variables
+        .variables
+        .values()
+        .filter(move |variable| variable.collection == collection)
+        .map(|variable| variable.id)
+}
+
+/// Report the nodes in `within`'s subtree, or anywhere, that are bound to one
+/// of `variables` or show one through a text token.
+fn mark_showing(
+    doc: &Doc,
+    variables: &BTreeSet<VariableId>,
+    within: Option<NodeId>,
+    updated: &mut impl FnMut(NodeId),
+) {
+    if variables.is_empty() {
+        return;
+    }
+    let names: Vec<&str> = variables
+        .iter()
+        .filter_map(|variable| doc.variables.variables.get(variable))
+        .map(|variable| variable.name.as_str())
+        .collect();
+    for id in scene_nodes(doc, within) {
+        let Some(node) = doc.scene.get(id) else {
+            continue;
+        };
+        if node
+            .bindings
+            .values()
+            .any(|bound| variables.contains(bound))
+            || has_token(node, |token| {
+                names.iter().any(|name| names_variable(token, name))
+            })
+        {
+            updated(id);
+        }
+    }
+}
+
+/// Report the text nodes with a token `accepts` matches.
+fn mark_tokens(doc: &Doc, accepts: impl Fn(&str) -> bool, updated: &mut impl FnMut(NodeId)) {
+    for id in scene_nodes(doc, None) {
+        if doc
+            .scene
+            .get(id)
+            .is_some_and(|node| has_token(node, &accepts))
+        {
+            updated(id);
+        }
+    }
+}
+
+fn has_token(node: &CanvasNode, accepts: impl Fn(&str) -> bool) -> bool {
+    let content = match &node.data {
+        NodeData::Text(text) => &text.content,
+        NodeData::TextPath(text) => &text.content,
+        _ => return false,
+    };
+    fanta_doc::text_tokens(content).any(|(_, token)| accepts(token))
+}
+
+/// `within` and its descendants, or every node.
+fn scene_nodes(doc: &Doc, within: Option<NodeId>) -> impl Iterator<Item = NodeId> + '_ {
+    let roots = match within {
+        Some(node) => vec![node],
+        None => doc.scene.roots().to_vec(),
+    };
+    roots
+        .into_iter()
+        .flat_map(|root| doc.scene.descendants_of(root))
+}
+
+/// Whether `token` may name the variable called `name`: by that bare name, or
+/// by a `Collection/Name` path ending in it.
+fn names_variable(token: &str, name: &str) -> bool {
+    token == name
+        || token
+            .strip_suffix(name)
+            .is_some_and(|collection| collection.ends_with('/'))
+}
+
+/// Whether `token` is a `Collection/Name` path into `collection`.
+fn in_collection(token: &str, collection: &str) -> bool {
+    token
+        .strip_prefix(collection)
+        .is_some_and(|name| name.starts_with('/'))
 }
 
 #[cfg(test)]
@@ -401,6 +549,48 @@ mod tests {
                     node: card,
                     kind: NodeEventKind::Created
                 })
+        );
+    }
+
+    #[test]
+    fn changing_a_variable_updates_text_that_names_an_alias_of_it() {
+        let mut session = DesignSession::new().expect("session");
+        let page = session.active_page().expect("page");
+        session.set_text_variable("brand", "Fanta").expect("brand");
+        session.set_text_variable("product", "").expect("product");
+        let doc = session.doc();
+        let brand = fanta_doc::text_token_variable(&doc.variables, "brand").expect("brand");
+        let product = fanta_doc::text_token_variable(&doc.variables, "product").expect("product");
+        let mode = doc
+            .variables
+            .collections
+            .values()
+            .next()
+            .expect("the Text collection")
+            .default_mode;
+        let alias = fanta_headless::edit_operations::set_variable_value_operation(
+            doc,
+            product,
+            mode,
+            VarValue::Alias { variable: brand },
+        )
+        .expect("a valid alias")
+        .expect("a change");
+        session.edit(vec![alias]).expect("alias");
+        let label = session
+            .create_node(page, NodeKind::Text("{{product}}".into()))
+            .expect("label");
+        let subscription = session.subscribe(NodeFilter::Nodes(BTreeSet::from([label])));
+        session
+            .set_text_variable("brand", "Sprite")
+            .expect("rebrand");
+        assert_eq!(session.text_variable("product"), Some("Sprite".into()));
+        assert_eq!(
+            session.poll_events(subscription).expect("poll"),
+            vec![NodeEvent {
+                node: label,
+                kind: NodeEventKind::Updated
+            }]
         );
     }
 

@@ -49,7 +49,7 @@ compatibility adapter is a separate, optional layer.
 | Design API | typed properties, lifecycle, hierarchy, find, metadata | ✅ `fanta-api`'s `DesignSession` | 1 |
 | Events | per-block Created, Updated, Destroyed | ✅ polled per-node events in `fanta-api` | 1 |
 | Undo | explicit steps, several histories | 🟡 explicit steps in `fanta-api`; one history | 1 |
-| Templating | text variables, placeholders, scopes, roles | ❌ whole-string variable bindings and the `LOCKED` flag | 1 (API), 2 (editor) |
+| Templating | text variables, placeholders, scopes, roles | ✅ in `fanta-api`: `{{name}}` text variables, placeholders, 25 scopes and three roles; the editor shows tokens but does not enforce scopes yet | 2 (editor) |
 | Scene I/O | scenes in memory, strings, archives | ✅ sessions in memory, from project folders or from `.fant` snapshots | 1 |
 | Export | PNG, JPEG, WebP, TGA, PDF, SVG, target size | 🟡 PNG, JPEG, SVG and PDF from the editor, the engine and `fanta-api`; no WebP or TGA | 5 |
 | Blocks and shapes | graphic, text, group, page, audio; six shapes; booleans | ✅ | — |
@@ -77,7 +77,7 @@ over MCP and cloud review. The plan keeps all of them.
 0. **Engine apply** (done). The design-op applier lives in `fanta-headless`,
    so the engine and the editor apply the same ops and the cloud worker's
    `apply` step works.
-1. **Design API** (`crates/fanta-api`). Scenes in memory or on disk, typed
+1. **Design API** (done, `crates/fanta-api`). Scenes in memory or on disk, typed
    property reflection, node lifecycle, explicit undo steps, polled change
    events, `{{name}}` text variables, placeholders and permission scopes, and
    PNG, JPEG, SVG and PDF export.

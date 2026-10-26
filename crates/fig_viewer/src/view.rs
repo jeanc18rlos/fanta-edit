@@ -500,6 +500,8 @@ pub struct FigView {
     /// paint with only `&App`. Cleared with the rendered-canvas cache: a
     /// reload restarts the scene revision counter, which could collide.
     pub(crate) chrome_cache: std::cell::RefCell<Option<crate::canvas::ChromeCache>>,
+    /// The text node the last paint drew with its text variables as typed.
+    pub(crate) painted_raw_text_node: Option<NodeId>,
     /// The Metal render thread and its newest frame; created on first paint.
     /// `pub(crate)` because the canvas element drives it during paint.
     #[cfg(target_os = "macos")]
@@ -904,6 +906,7 @@ impl FigView {
             container_bounds: None,
             rendered_canvas: None,
             chrome_cache: std::cell::RefCell::new(None),
+            painted_raw_text_node: None,
             #[cfg(target_os = "macos")]
             gpu_canvas: None,
             #[cfg(target_os = "macos")]
@@ -10072,6 +10075,7 @@ impl Item for FigView {
                 container_bounds: None,
                 rendered_canvas: None,
                 chrome_cache: std::cell::RefCell::new(None),
+                painted_raw_text_node: None,
                 #[cfg(target_os = "macos")]
                 gpu_canvas: None,
                 #[cfg(target_os = "macos")]

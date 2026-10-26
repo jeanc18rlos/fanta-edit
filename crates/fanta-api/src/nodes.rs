@@ -4,7 +4,7 @@
 
 use anyhow::anyhow;
 use fanta_design_ops::{DesignNodeType, DesignOp, DesignShape};
-use fanta_doc::{CanvasNode, Doc, NodeData, NodeId, Operation};
+use fanta_doc::{CanvasNode, Doc, NodeData, NodeId, Operation, Scope};
 use glam::DVec2;
 use serde_json::{Map, Value};
 
@@ -87,6 +87,7 @@ impl NodeType {
 impl DesignSession {
     /// Create a node of `kind` inside `parent`, at the parent's origin.
     pub fn create_node(&mut self, parent: NodeId, kind: NodeKind) -> Result<NodeId> {
+        self.permit(Some(parent), Scope::EditorAdd)?;
         let origin = self.child_origin(parent)?;
         let operation = match kind {
             NodeKind::Image(bytes) => return self.create_image(parent, bytes, origin),
@@ -159,7 +160,7 @@ impl DesignSession {
     /// Copy `node` and its subtree into the same parent, one slot above it,
     /// and return the copy.
     pub fn duplicate(&mut self, node: NodeId) -> Result<NodeId> {
-        self.node(node)?;
+        self.permit(Some(node), Scope::LifecycleDuplicate)?;
         self.edit_with_design_op(&DesignOp::Duplicate {
             id: node.to_string(),
             dx: Some(0.0),
@@ -170,9 +171,12 @@ impl DesignSession {
 
     /// Delete `node` and its subtree. Components defined inside it are
     /// deleted too, and instances of them elsewhere are detached first, as the
-    /// editor's Delete does.
+    /// editor's Delete does. Every node in the subtree must allow it.
     pub fn destroy(&mut self, node: NodeId) -> Result<()> {
         self.node(node)?;
+        for id in self.doc().scene.descendants_of(node) {
+            self.permit(Some(id), Scope::LifecycleDestroy)?;
+        }
         let operations = fanta_headless::structure::delete_layers_operations(self.doc(), &[node])?;
         self.edit(operations)?;
         let doc = self.document_mut().doc_mut();
@@ -189,7 +193,7 @@ impl DesignSession {
     /// Wrap `nodes` in a new group and return it.
     pub fn group(&mut self, nodes: &[NodeId]) -> Result<NodeId> {
         for node in nodes {
-            self.node(*node)?;
+            self.permit(Some(*node), Scope::LayerMove)?;
         }
         self.edit_with_design_op(&DesignOp::Group {
             ids: nodes.iter().map(ToString::to_string).collect(),
@@ -201,7 +205,10 @@ impl DesignSession {
     /// Replace the group `node` with its children, which keep their place on
     /// the canvas.
     pub fn ungroup(&mut self, node: NodeId) -> Result<()> {
-        self.node(node)?;
+        self.permit(Some(node), Scope::LayerMove)?;
+        for child in self.doc().scene.children_of(Some(node)) {
+            self.permit(Some(*child), Scope::LayerMove)?;
+        }
         self.edit_with_design_op(&DesignOp::Ungroup {
             id: node.to_string(),
         })?;
@@ -344,7 +351,7 @@ impl DesignSession {
     /// Replace the selection. Selection is not part of undo history.
     pub fn select(&mut self, nodes: &[NodeId]) -> Result<()> {
         for node in nodes {
-            self.node(*node)?;
+            self.permit(Some(*node), Scope::EditorSelect)?;
         }
         self.document_mut()
             .doc_mut()
@@ -412,7 +419,7 @@ impl DesignSession {
     }
 
     fn reparent(&mut self, parent: NodeId, child: NodeId, index: Option<usize>) -> Result<()> {
-        self.node(child)?;
+        self.permit(Some(child), Scope::LayerMove)?;
         if !self.node(parent)?.can_have_children() {
             return Err(ApiError::InvalidArgument(format!(
                 "{parent} cannot contain other nodes"
@@ -426,7 +433,7 @@ impl DesignSession {
         Ok(())
     }
 
-    fn find(&self, matches: impl Fn(&Doc, &CanvasNode) -> bool) -> Vec<NodeId> {
+    pub(crate) fn find(&self, matches: impl Fn(&Doc, &CanvasNode) -> bool) -> Vec<NodeId> {
         let doc = self.doc();
         doc.scene
             .roots()

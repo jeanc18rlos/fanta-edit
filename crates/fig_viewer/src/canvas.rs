@@ -1751,6 +1751,9 @@ struct RenderRequest {
     /// `RenderInputs::mode_generation` for this frame: the variables/modes
     /// half of the document's [`InputsFingerprint`].
     mode_generation: u64,
+    /// `RenderInputs::raw_text_node`: the text being edited, drawn with its
+    /// text variables as typed.
+    raw_text_node: Option<NodeId>,
     translation: Option<TranslationGesture>,
     perf_tag: Option<crate::gesture_perf::RequestTag>,
     camera: Option<CameraTicket>,
@@ -2529,6 +2532,7 @@ impl MacGpuRenderer {
             playback: playback.as_ref(),
             video_fill_frames: (!video_fill_frames.is_empty()).then_some(&video_fill_frames),
             dark_ui: false,
+            raw_text_node: request.raw_text_node,
         };
         let render_started = Instant::now();
         let resolver = inputs.asset_resolver.map(|resolver| resolver.as_ref());
@@ -3106,6 +3110,8 @@ pub(crate) struct GpuCanvas {
     normal_cost_key: Option<SurfaceKey>,
     cost: RenderCost,
     epoch: u64,
+    /// The text node frames draw with its text variables as typed.
+    raw_text_node: Option<NodeId>,
     presentation: PresentationTracker,
     /// Raised when an image decode lands; the reply task waits on it.
     decode_listener: Arc<WakeSignal>,
@@ -3211,6 +3217,7 @@ impl GpuCanvas {
             normal_cost_key: None,
             cost: RenderCost::Unknown,
             epoch: 0,
+            raw_text_node: None,
             presentation: PresentationTracker::new(presentation),
             decode_listener,
             decode_source: None,
@@ -3258,6 +3265,12 @@ impl GpuCanvas {
         self.decode_source = Some(Arc::downgrade(resolver));
         let listener: Arc<dyn fanta_render::DecodeListener> = self.decode_listener.clone();
         resolver.subscribe_decodes(Arc::downgrade(&listener));
+    }
+
+    /// The text node the next frames draw with its text variables as typed.
+    /// The caller invalidates the canvas when it changes.
+    pub(crate) fn set_raw_text_node(&mut self, node: Option<NodeId>) {
+        self.raw_text_node = node;
     }
 
     /// Force the next paint to render anew even if nothing else changed.
@@ -3870,6 +3883,7 @@ impl GpuCanvas {
                         .map(RenderVideoFillFrame::from)
                         .collect(),
                     mode_generation: self.inputs_fingerprint(document).variables,
+                    raw_text_node: self.raw_text_node,
                     translation: None,
                     perf_tag: None,
                     camera: None,
@@ -3892,6 +3906,7 @@ impl GpuCanvas {
                         .map(RenderVideoFillFrame::from)
                         .collect(),
                     mode_generation: fingerprint.variables,
+                    raw_text_node: self.raw_text_node,
                     translation,
                     perf_tag: None,
                     camera: None,
@@ -4456,6 +4471,7 @@ fn render_fig_canvas(
     motion: Option<&MotionEvaluation>,
     playback: Option<&HashMap<NodeId, MediaPlayback>>,
     video_fill_frames: Option<&HashMap<AssetId, skia_safe::Image>>,
+    raw_text_node: Option<NodeId>,
 ) -> Result<Arc<RenderImage>> {
     let mut renderer =
         RasterRenderer::new(width, height).context("creating Skia raster surface")?;
@@ -4479,6 +4495,7 @@ fn render_fig_canvas(
         playback,
         video_fill_frames,
         dark_ui: false,
+        raw_text_node,
     };
     renderer.render_page_with(&document.doc.scene, &render_viewport, page_root, &inputs);
     render_image_from_rgba(width, height, renderer.copy_rgba(), scale_factor)
@@ -4501,6 +4518,16 @@ pub(crate) fn render_image_from_rgba(
 }
 
 impl FigView {
+    /// The text node to draw with its `{{name}}` text variables as typed:
+    /// the one being edited, while its content holds a token, so the canvas
+    /// shows the characters the caret moves through.
+    pub(crate) fn raw_text_node(&self, doc: &fanta_doc::Doc) -> Option<NodeId> {
+        self.text_edit
+            .as_ref()
+            .map(|edit| edit.session.node_id())
+            .filter(|id| doc.scene.get(*id).is_some_and(fanta_doc::has_text_tokens))
+    }
+
     pub(crate) fn render_cpu_canvas(
         &mut self,
         document: &FigDocument,
@@ -4606,6 +4633,7 @@ impl FigView {
             Some(&video_fill_frames),
             #[cfg(not(target_os = "macos"))]
             None,
+            self.raw_text_node(&document.doc),
         )?;
         self.rendered_canvas = Some(RenderedCanvas {
             image: image.clone(),
@@ -4867,6 +4895,11 @@ impl Element for CanvasElement {
                 .or_else(|| document.page(this.selected_page_index()).map(|page| page.root))
                 .ok_or_else(|| anyhow!("Figma document has no renderable pages"))?;
             let motion = this.motion_evaluation(document, cx);
+            let raw_text_node = this.raw_text_node(&document.doc);
+            if this.painted_raw_text_node != raw_text_node {
+                this.painted_raw_text_node = raw_text_node;
+                this.invalidate_canvas_cache();
+            }
 
             #[cfg(target_os = "macos")]
             let translation = (this.editor_mode(cx) == EditorMode::Design)
@@ -4875,6 +4908,7 @@ impl Element for CanvasElement {
             if gpu_available
                 && let Some(gpu) = this.gpu_canvas.as_mut()
             {
+                gpu.set_raw_text_node(raw_text_node);
                 match gpu.paint_frame(
                     document,
                     page_root,
@@ -7053,6 +7087,7 @@ mod geometry_tests {
                 None,
                 None,
                 None,
+                None,
             )?;
             assert!(
                 image
@@ -8392,6 +8427,7 @@ mod tests {
             video: None,
             video_fills: Vec::new(),
             mode_generation: 0,
+            raw_text_node: None,
             translation: None,
             perf_tag: None,
             camera: Some(mailbox.publish(key, 2.0)),
@@ -9950,6 +9986,7 @@ mod tests {
                 video: None,
                 video_fills: Vec::new(),
                 mode_generation: 0,
+                raw_text_node: None,
                 translation: Some(gesture),
                 perf_tag: None,
                 camera: None,

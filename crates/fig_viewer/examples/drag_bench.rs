@@ -215,6 +215,7 @@ fn main() -> Result<()> {
             playback: None,
             video_fill_frames: None,
             dark_ui: false,
+            raw_text_node: None,
         };
         for _ in 0..3 {
             renderer.render_page_with(&doc.scene, &viewport, Some(page), &inputs);

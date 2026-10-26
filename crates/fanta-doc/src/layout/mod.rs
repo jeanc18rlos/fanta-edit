@@ -281,6 +281,18 @@ pub fn solve_auto_layout_with_variables(
                     property.apply_resolved(scratch.get_or_insert_with(|| node.clone()), value);
                 }
             }
+            if crate::has_text_tokens(node) {
+                let mut interpolated = scratch.clone().unwrap_or_else(|| node.clone());
+                if crate::apply_text_tokens(
+                    &mut interpolated,
+                    variables,
+                    scene,
+                    node.id,
+                    active_modes,
+                ) {
+                    scratch = Some(interpolated);
+                }
+            }
             scratch.map(|scratch| (node.id, scratch))
         })
         .collect::<crate::IdHashMap<_, _>>();

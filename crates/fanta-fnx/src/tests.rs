@@ -2544,6 +2544,21 @@ fn grid_layout_and_cells_round_trip() {
 }
 
 #[test]
+fn editing_rules_round_trip() {
+    let nodes = vec![json!({
+        "type": "vector", "id": "PHOTO000000000000000000000", "parent": null, "index": 1.0,
+        "name": "Photo",
+        "editing": {
+            "disabled_scopes": ["layer/move", "lifecycle/destroy"],
+            "placeholder": { "show_overlay": true }
+        }
+    })];
+    let printed = print_doc("Card", &tree_from_nodes(&nodes).expect("decompose").root);
+    assert!(printed.contains("editing="), "{printed}");
+    assert_same_nodes(&round_trip(&nodes), &nodes);
+}
+
+#[test]
 fn a_variant_source_one_folder_deeper_imports_fnx_from_the_root() {
     let printed = print_doc("Primary", &parse_doc("<Frame />").unwrap());
     let nested = crate::with_module_depth(printed.clone(), 3);

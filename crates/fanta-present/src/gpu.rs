@@ -520,6 +520,7 @@ fn render_scene(
         playback: None,
         video_fill_frames: None,
         dark_ui: false,
+        raw_text_node: None,
     };
     let previous_background = std::mem::replace(&mut session.renderer.background, background);
     let rendered = session.renderer.render_to_canvas_with_camera(
@@ -579,6 +580,7 @@ fn render_frame(
         playback: None,
         video_fill_frames: None,
         dark_ui: false,
+        raw_text_node: None,
     };
     let previous_background = std::mem::replace(&mut session.renderer.background, background);
     let rendered = session.renderer.render_to_canvas_with_camera(

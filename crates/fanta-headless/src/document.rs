@@ -278,6 +278,116 @@ mod tests {
         assert!(document.raw_assets().is_empty());
     }
 
+    fn design_ops(value: serde_json::Value) -> Vec<DesignOp> {
+        serde_json::from_value(value).expect("ops JSON matches the DesignOp schema")
+    }
+
+    fn text_width(document: &HeadlessDocument, id: NodeId) -> f64 {
+        match &document.doc().scene.get(id).expect("text").data {
+            NodeData::Text(text) => text.local_size[0],
+            _ => panic!("a text node"),
+        }
+    }
+
+    #[test]
+    fn auto_width_text_is_measured_with_variable_values() {
+        let mut document = HeadlessDocument::empty().expect("empty document");
+        let page = document.doc().active_page();
+        document
+            .apply_design_ops(
+                page,
+                "Copy",
+                &design_ops(serde_json::json!([
+                    {"op": "create_variable_collection", "name": "Copy", "modes": ["Default"]},
+                ])),
+                true,
+            )
+            .expect("collection");
+        let collection = document
+            .doc()
+            .variables
+            .collections
+            .values()
+            .next()
+            .map(|collection| collection.id)
+            .expect("collection id");
+        document
+            .apply_design_ops(
+                page,
+                "Word",
+                &design_ops(serde_json::json!([
+                    {"op": "create_variable", "collection": collection.to_string(),
+                     "name": "word", "kind": "string", "value": "Wide wide wide"},
+                ])),
+                true,
+            )
+            .expect("variable");
+        let labels = document
+            .apply_design_ops(
+                page,
+                "Labels",
+                &design_ops(serde_json::json!([
+                    {"op": "create_node", "node_type": "text", "text": "{{word}}",
+                     "x": 0, "y": 0, "width": 10, "height": 10},
+                    {"op": "create_node", "node_type": "text", "text": "Wide wide wide",
+                     "x": 0, "y": 100, "width": 10, "height": 10},
+                ])),
+                true,
+            )
+            .expect("labels");
+        let created = |index: usize| -> NodeId {
+            labels["created"][index]
+                .as_str()
+                .and_then(|id| id.parse().ok())
+                .expect("created id")
+        };
+        let (token, literal) = (created(0), created(1));
+        document
+            .apply_design_ops(
+                page,
+                "Hug",
+                &design_ops(serde_json::json!([
+                    {"op": "set_text_style", "id": token.to_string(), "sizing": "auto_width"},
+                    {"op": "set_text_style", "id": literal.to_string(), "sizing": "auto_width"},
+                ])),
+                true,
+            )
+            .expect("auto width");
+        assert!(text_width(&document, literal) > 50.0);
+        assert_eq!(text_width(&document, token), text_width(&document, literal));
+
+        let variable = document
+            .doc()
+            .variables
+            .variables
+            .values()
+            .next()
+            .map(|variable| variable.id)
+            .expect("variable id");
+        document
+            .apply_design_ops(
+                page,
+                "Shorter",
+                &design_ops(serde_json::json!([
+                    {"op": "set_variable_value", "variable": variable.to_string(),
+                     "mode": "Default", "value": "Hi"},
+                ])),
+                true,
+            )
+            .expect("set the value");
+        assert!(
+            text_width(&document, token) < text_width(&document, literal),
+            "changing the variable re-measures the text"
+        );
+        let NodeData::Text(text) = &document.doc().scene.get(token).expect("token").data else {
+            panic!("a text node");
+        };
+        assert_eq!(
+            text.content, "{{word}}",
+            "the stored content keeps its token"
+        );
+    }
+
     #[test]
     fn settle_layout_reports_the_nodes_it_moved() {
         let mut document = HeadlessDocument::empty().expect("empty document");

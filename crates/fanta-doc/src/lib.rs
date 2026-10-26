@@ -35,6 +35,7 @@ pub use boolean::{
 pub mod color;
 pub mod component;
 pub mod doc;
+pub mod editing;
 pub mod history;
 pub mod id;
 pub mod index;
@@ -54,6 +55,7 @@ pub mod snapshot;
 pub mod spatial;
 pub mod style;
 pub mod stylesheet;
+pub mod text_tokens;
 pub mod transform;
 pub mod value;
 pub mod variables;
@@ -71,6 +73,7 @@ pub use doc::{
     ProjectAssetKind, SCHEMA_VERSION, Viewport, migrate_doc_json, migrate_doc_json_to,
     prepare_doc_json,
 };
+pub use editing::{EditingRules, Placeholder, Scope};
 pub use history::{History, Transaction};
 pub use id::{
     AnimationClipId, AnimationTrackId, AssetId, ComponentId, ComponentPropId, DocId, IdBuildHasher,
@@ -121,6 +124,10 @@ pub use resolve::{
     resolved_component_rev_with_context, resolved_component_root,
     resolved_component_root_with_context, resolved_component_with_context,
     strip_redundant_instance_overrides,
+};
+pub use text_tokens::{
+    apply_text_tokens, displayed_text_node, has_text_tokens, interpolate_text, resolve_text_token,
+    text_token_variable, text_tokens,
 };
 pub use scene::{Ancestors, Descendants, Scene, SceneError};
 pub use selection::Selection;

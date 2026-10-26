@@ -165,6 +165,41 @@ declare global {
     grid?: FnxGridCell;
   }
 
+  /** A kind of change a template can deny its users on a node. */
+  type FnxScope =
+    | "layer/move"
+    | "layer/resize"
+    | "layer/rotate"
+    | "layer/flip"
+    | "layer/crop"
+    | "layer/opacity"
+    | "layer/blend_mode"
+    | "layer/visibility"
+    | "layer/clipping"
+    | "appearance/adjustments"
+    | "appearance/filter"
+    | "appearance/effect"
+    | "appearance/blur"
+    | "appearance/shadow"
+    | "appearance/animation"
+    | "lifecycle/destroy"
+    | "lifecycle/duplicate"
+    | "editor/add"
+    | "editor/select"
+    | "fill/change"
+    | "fill/change_type"
+    | "stroke/change"
+    | "shape/change"
+    | "text/edit"
+    | "text/character";
+
+  interface FnxEditingRules {
+    /** Scopes the node forbids wherever the editing session defers to it. */
+    disabled_scopes?: readonly FnxScope[];
+    /** Present when the node is a placeholder the template's user fills in. */
+    placeholder?: { show_overlay?: boolean; show_button?: boolean };
+  }
+
   type FnxGridTrack =
     | { kind: "fixed"; size: number }
     | { kind: "flex"; fr: number }
@@ -255,6 +290,8 @@ declare global {
     effects?: readonly FnxShadow[];
     blurs?: readonly FnxBlur[];
     layout_child?: FnxLayoutChild;
+    /** What a template's users may change here; absent ⇒ nothing is denied. */
+    editing?: FnxEditingRules;
     corner_radius?: number;
     corner_radii?: readonly [number, number, number, number];
     /** iOS-squircle amount, 0..=1. */

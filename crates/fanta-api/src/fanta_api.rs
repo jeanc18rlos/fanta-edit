@@ -4,9 +4,11 @@
 //! [`DesignSession::add_undo_step`] commits. It runs without the app, over
 //! `fanta-headless`, and is the surface language bindings wrap.
 
+mod editing;
 mod events;
 mod nodes;
 mod properties;
+mod variables;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -16,9 +18,10 @@ use fanta_design_ops::DesignOp;
 use fanta_doc::{Doc, Operation};
 use fanta_headless::{HeadlessDocument, HeadlessProject};
 
+pub use editing::{Role, ScopeRule};
 pub use events::{NodeEvent, NodeEventKind, NodeFilter, SubscriptionId};
 pub use fanta_doc::{AssetId, Color, ComponentId, NodeId};
-pub use fanta_doc::{BlurKind, ShadowKind};
+pub use fanta_doc::{BlurKind, Placeholder, Scope, ShadowKind};
 pub use fanta_headless::export::{ExportEncoding, ExportSizing, ExportedImage};
 pub use nodes::{NodeKind, NodeType};
 pub use properties::{PropertyInfo, PropertyKind, PropertyValue};
@@ -46,6 +49,15 @@ pub enum ApiError {
     ReadOnly(String),
     #[error("`{0}` is bound to a variable; unbind it before writing a value")]
     PropertyBound(String),
+    #[error(
+        "`{scope}` is not allowed{}",
+        .node.map(|node| format!(" on {node}")).unwrap_or_default()
+    )]
+    NotAllowed { scope: Scope, node: Option<NodeId> },
+    #[error("only a creator can change editing rules")]
+    CreatorOnly,
+    #[error("a viewer cannot change the design")]
+    ViewOnly,
     #[error(transparent)]
     Engine(#[from] anyhow::Error),
 }
@@ -61,6 +73,7 @@ enum Backing {
 pub struct DesignSession {
     backing: Backing,
     events: events::EventHub,
+    permissions: editing::Permissions,
 }
 
 impl DesignSession {
@@ -190,6 +203,7 @@ impl DesignSession {
     /// Add an empty page named `name` after the last page and return its
     /// root.
     pub fn create_page(&mut self, name: &str) -> Result<NodeId> {
+        self.permit(None, Scope::EditorAdd)?;
         let name = name.trim();
         if name.is_empty() || name.len() > 512 {
             return Err(ApiError::InvalidArgument(
@@ -285,6 +299,7 @@ impl DesignSession {
         Self {
             backing,
             events: events::EventHub::default(),
+            permissions: editing::Permissions::default(),
         }
     }
 
@@ -306,6 +321,9 @@ impl DesignSession {
     /// they moved. When an operation fails, only this call's operations are
     /// rolled back.
     pub(crate) fn edit(&mut self, operations: Vec<Operation>) -> Result<()> {
+        if self.role() == Role::Viewer {
+            return Err(ApiError::ViewOnly);
+        }
         if operations.is_empty() {
             return Ok(());
         }
@@ -329,6 +347,9 @@ impl DesignSession {
     /// Apply one design op into the pending undo step, with parentless ops
     /// placed on the active page. Returns the node it created, if any.
     pub(crate) fn edit_with_design_op(&mut self, operation: &DesignOp) -> Result<Option<NodeId>> {
+        if self.role() == Role::Viewer {
+            return Err(ApiError::ViewOnly);
+        }
         let document = self.document_mut();
         let default_container = document.doc().active_page();
         let (created, savepoint) = {

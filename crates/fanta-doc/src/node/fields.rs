@@ -98,6 +98,10 @@ fn maximal_node(data: NodeData) -> CanvasNode {
         absolute: true,
         align_self: Some(super::CounterAlign::Center),
     });
+    node.editing = Some(Box::new(crate::editing::EditingRules {
+        disabled_scopes: [crate::editing::Scope::LayerMove].into(),
+        placeholder: Some(crate::editing::Placeholder::default()),
+    }));
     node
 }
 

@@ -196,6 +196,10 @@ pub struct RenderInputs<'a> {
     /// active theme instead of a hardcoded dark pill. Defaults to `false`
     /// (light) for headless/legacy renders.
     pub dark_ui: bool,
+    /// A text node to draw with its `{{name}}` text variables as typed rather
+    /// than resolved: the one the user is editing, whose caret and selection
+    /// index the authored content.
+    pub raw_text_node: Option<NodeId>,
 }
 
 impl<'a> RenderInputs<'a> {
@@ -226,6 +230,7 @@ impl<'a> RenderInputs<'a> {
             playback: None,
             video_fill_frames: None,
             dark_ui: false,
+            raw_text_node: None,
         }
     }
 
@@ -247,6 +252,7 @@ impl<'a> RenderInputs<'a> {
             playback: None,
             video_fill_frames: None,
             dark_ui: false,
+            raw_text_node: None,
         }
     }
 }
