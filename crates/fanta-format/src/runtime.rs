@@ -145,17 +145,16 @@ impl RuntimeProgram {
             if !path.starts_with("assets/") || path == "assets/index.json" {
                 continue;
             }
-            let filename = path
-                .rsplit('/')
-                .next()
-                .ok_or_else(|| source_error(path, "missing asset filename"))?;
-            let stem = filename
-                .split('.')
-                .next()
-                .ok_or_else(|| source_error(path, "missing asset id"))?;
-            let id = stem
-                .parse::<AssetId>()
-                .map_err(|error| source_error(path, error))?;
+            // Like the native project reader, take the id from the file stem
+            // and skip files that name no asset, such as Finder's `.DS_Store`.
+            let Some(id) = std::path::Path::new(path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<AssetId>().ok())
+            else {
+                tracing::warn!(path, "skipping non-asset file in assets/");
+                continue;
+            };
             if resources.insert(id, bytes.clone()).is_some() {
                 return Err(source_error(path, "duplicate asset identity"));
             }
@@ -347,19 +346,12 @@ impl RuntimeProgram {
             return Err(RuntimeError::Bundle("archive exceeds size limit".into()));
         }
         let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
-        let mut entries = BTreeMap::new();
-        let mut total_size = 0u64;
-        for index in 0..archive.len() {
-            let entry = archive.by_index(index)?;
-            total_size = total_size
-                .checked_add(entry.size())
-                .ok_or_else(|| RuntimeError::Bundle("archive size overflows".into()))?;
-            if total_size > maximum_bytes {
-                return Err(RuntimeError::Bundle(
-                    "expanded archive exceeds size limit".into(),
-                ));
-            }
+        if expanded_size(&mut archive)? > maximum_bytes {
+            return Err(RuntimeError::Bundle(
+                "expanded archive exceeds size limit".into(),
+            ));
         }
+        let mut entries = BTreeMap::new();
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index)?;
             let path = entry.name().to_owned();
@@ -462,6 +454,22 @@ impl RuntimeProgram {
         }
         Self::from_parts(document, resources, fonts, manifest.font_substitutions)
     }
+}
+
+/// The uncompressed size of a runtime bundle's entries. Loading holds both
+/// this and the archive's own length to its limit.
+pub fn expanded_bundle_size(bytes: &[u8]) -> Result<u64, RuntimeError> {
+    expanded_size(&mut zip::ZipArchive::new(Cursor::new(bytes))?)
+}
+
+fn expanded_size(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<u64, RuntimeError> {
+    let mut total_size = 0u64;
+    for index in 0..archive.len() {
+        total_size = total_size
+            .checked_add(archive.by_index(index)?.size())
+            .ok_or_else(|| RuntimeError::Bundle("archive size overflows".into()))?;
+    }
+    Ok(total_size)
 }
 
 fn verified<'a>(
@@ -783,23 +791,26 @@ fn compile_project(source: &SourceBundle) -> Result<Doc, RuntimeError> {
                 }
             }
         }
-        let tree = fanta_fnx::parse_doc_with(source_text, &refs)
-            .map_err(|error| source_error(path, error))?;
+        let mut tree =
+            fanta_fnx::parse_doc(source_text).map_err(|error| source_error(path, error))?;
         let sidecar_path = path
             .strip_suffix(".fnx")
             .map(|base| format!("{base}.ids.json"))
             .ok_or_else(|| source_error(path, "invalid FNX path"))?;
         let sidecar = match files.get(&sidecar_path) {
-            Some(bytes) => {
-                let persisted: FnxSidecar = serde_json::from_value(
-                    strict_json(bytes).map_err(|error| source_error(&sidecar_path, error))?,
-                )
-                .map_err(|error| source_error(&sidecar_path, error))?;
-                validate_sidecar(&tree, &persisted, path)?;
-                persisted
-            }
+            // Source edited outside Fanta outgrows its sidecar. Reconcile it as
+            // the editor's open does, so new nodes get the same minted ids.
+            Some(bytes) => crate::sidecar::persisted_fnx_sidecar_from_tree(
+                source_text,
+                &tree,
+                Some(bytes),
+                None,
+            )
+            .map_err(|error| source_error(path, error))?,
             None => explicit_sidecar(&tree, path)?,
         };
+        // References resolve after identity reconciliation, as in the editor.
+        fanta_fnx::desugar_refs(&mut tree, &refs).map_err(|error| source_error(path, error))?;
         let mut decoded =
             fanta_fnx::nodes_from_tree(&tree, &sidecar.ids, sidecar.root_parent.as_deref())
                 .map_err(|error| source_error(path, error))?;
@@ -1035,24 +1046,6 @@ fn explicit_sidecar(tree: &FnxElement, path: &str) -> Result<FnxSidecar, Runtime
         root_parent: None,
         ids,
     })
-}
-
-fn validate_sidecar(
-    tree: &FnxElement,
-    sidecar: &FnxSidecar,
-    path: &str,
-) -> Result<(), RuntimeError> {
-    let mut seen = BTreeSet::new();
-    for entry in &sidecar.ids {
-        let id: NodeId = serde_json::from_value(Value::String(entry.id.clone()))
-            .map_err(|error| source_error(path, error))?;
-        if !seen.insert(id) {
-            return Err(source_error(path, "duplicate sidecar identity"));
-        }
-    }
-    fanta_fnx::nodes_from_tree(tree, &sidecar.ids, sidecar.root_parent.as_deref())
-        .map_err(|error| source_error(path, error))?;
-    Ok(())
 }
 
 fn resolve_variable_reference(

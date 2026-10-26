@@ -20,6 +20,10 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 - Geometry signatures stored in project data use the source format's numeric normalization and stable object ordering. Otherwise a save, or a change in serde feature unification, invalidates preserved imported artwork. (#41)
 - Move owned JSON fragments as `Value::Object`/`Value::Array`. `json!` serializes its arguments by reference and copies large geometry. (#126)
 
+## Portable runtime compiler
+
+- `RuntimeProgram::compile` (`src/runtime.rs`) reads the project tree a second time, without `std::fs`, for website export and the browser runtime. Whatever the native reader tolerates must compile there too, or projects that open in Fanta fail to export. Share the native logic through modules outside the `native` feature, as `src/sidecar.rs` does, rather than reimplementing it. Finder's `.DS_Store` in `assets/` and `.ids.json` sidecars outgrown by edited source both broke export this way. (#153)
+
 ## Seeded project guide
 
 - `AGENTS_MD` in `src/project/layout.rs` is written into every project. Only the exact previous seed is upgraded, so when you change `AGENTS_MD`, add the SHA-256 of the text you are replacing to `previous_seeds` in `seed_agents_md`. Otherwise existing projects keep the old guide, because any other content counts as user-customized. See `crates/design_surface/AGENTS.md` for the other places agent guidance lives.

@@ -36,6 +36,8 @@ const PROJECT_DIRECTORIES: [&str; 9] = [
 /// Creating a player validates a page's fonts and resources; layout does not
 /// depend on the surface size, so any positive size proves the page renders.
 const VALIDATION_SIZE: f64 = 1024.0;
+/// Resources an oversized-bundle report names before summing the rest.
+const LISTED_RESOURCES: usize = 10;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SiteError {
@@ -49,6 +51,8 @@ pub enum SiteError {
     Bundle(#[from] fanta_format::runtime::RuntimeError),
     #[error("the runtime rejected the bundle: {0}")]
     Runtime(#[from] fanta_runtime::RuntimeError),
+    #[error("{0}")]
+    BundleTooLarge(OversizedBundle),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("the document has no pages to export")]
@@ -143,6 +147,95 @@ pub struct SiteReport {
     pub pages: Vec<SitePage>,
     pub fonts: Vec<EmbeddedFace>,
     pub bundle_bytes: usize,
+}
+
+/// A runtime bundle larger than the web runtime loads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OversizedBundle {
+    /// The larger of the archive and its expanded entries, as the runtime
+    /// measures them.
+    pub bytes: u64,
+    pub limit: u64,
+    /// Everything in the bundle with its expanded size, largest first.
+    pub resources: Vec<(BundleResource, u64)>,
+}
+
+impl std::fmt::Display for OversizedBundle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the runtime bundle is {}, {} more than the {} the Fanta web runtime loads. Its largest resources:",
+            mebibytes(self.bytes),
+            mebibytes(self.bytes.saturating_sub(self.limit)),
+            mebibytes(self.limit)
+        )?;
+        for (resource, bytes) in self.resources.iter().take(LISTED_RESOURCES) {
+            write!(formatter, "\n  {:>9}  {resource}", mebibytes(*bytes))?;
+        }
+        if let Some(rest) = self
+            .resources
+            .get(LISTED_RESOURCES..)
+            .filter(|rest| !rest.is_empty())
+        {
+            let bytes = rest.iter().map(|(_, bytes)| bytes).sum();
+            write!(
+                formatter,
+                "\n  {:>9}  {} more resources",
+                mebibytes(bytes),
+                rest.len()
+            )?;
+        }
+        formatter.write_str(
+            "\nThe bundle holds every asset in the project at its full size, including assets no page uses. Smaller image files (fewer pixels or lossy compression) make it fit.",
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BundleResource {
+    /// A project asset, with its library name and pixel size when known.
+    Asset {
+        id: AssetId,
+        name: Option<String>,
+        pixels: Option<[u32; 2]>,
+    },
+    Font {
+        family: String,
+        weight: u16,
+        italic: bool,
+    },
+    /// The document and the bundle's manifest.
+    Document,
+}
+
+impl std::fmt::Display for BundleResource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Asset { id, name, pixels } => {
+                write!(formatter, "asset {id}")?;
+                if let Some(name) = name {
+                    write!(formatter, " {name:?}")?;
+                }
+                if let Some([width, height]) = pixels {
+                    write!(formatter, ", {width}×{height} px")?;
+                }
+                Ok(())
+            }
+            Self::Font {
+                family,
+                weight,
+                italic,
+            } => {
+                let style = if *italic { " italic" } else { "" };
+                write!(formatter, "font {family:?} {weight}{style}")
+            }
+            Self::Document => formatter.write_str("document"),
+        }
+    }
+}
+
+fn mebibytes(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
 #[derive(Debug, Serialize)]
@@ -288,6 +381,7 @@ pub fn export_document(
     let program =
         RuntimeProgram::from_document(document, resources, registrations, BTreeMap::new())?;
     let bundle = program.to_bundle()?;
+    check_bundle_size(&program, &bundle, fanta_runtime::MAX_PROGRAM_INPUT_BYTES)?;
     validate_pages(&bundle, &pages)?;
     let document = program.document();
     let manifest = Manifest {
@@ -640,6 +734,49 @@ fn scan_fonts(
     Ok(())
 }
 
+/// Refuse a bundle the runtime would not load, naming what fills it. The
+/// runtime's own refusal says only that a size limit was exceeded.
+fn check_bundle_size(program: &RuntimeProgram, bundle: &[u8], limit: u64) -> Result<(), SiteError> {
+    let expanded = fanta_format::runtime::expanded_bundle_size(bundle)?;
+    let bytes = expanded.max(bundle.len() as u64);
+    if bytes <= limit {
+        return Ok(());
+    }
+    let library = &program.document().asset_library;
+    let mut resources: Vec<_> = program
+        .resources()
+        .iter()
+        .map(|(id, encoded)| {
+            (
+                BundleResource::Asset {
+                    id: *id,
+                    name: library.get(id).map(|asset| asset.name.clone()),
+                    pixels: fanta_render::encoded_image_dimensions(encoded),
+                },
+                encoded.len() as u64,
+            )
+        })
+        .chain(program.fonts().iter().map(|font| {
+            (
+                BundleResource::Font {
+                    family: font.family.clone(),
+                    weight: font.weight,
+                    italic: font.italic,
+                },
+                font.bytes.len() as u64,
+            )
+        }))
+        .collect();
+    let contents: u64 = resources.iter().map(|(_, bytes)| bytes).sum();
+    resources.push((BundleResource::Document, expanded.saturating_sub(contents)));
+    resources.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
+    Err(SiteError::BundleTooLarge(OversizedBundle {
+        bytes,
+        limit,
+        resources,
+    }))
+}
+
 fn validate_pages(bundle: &[u8], pages: &[SitePage]) -> Result<(), SiteError> {
     let mut runtime = Runtime::default();
     let program = runtime.load_bundle(bundle)?;
@@ -882,7 +1019,10 @@ mountPage({{page:{identity}}});
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fanta_doc::{CanvasNode, GroupNode, NodeData, TextNode};
+    use fanta_doc::{
+        BitmapNode, CanvasNode, GroupNode, ImageFitMode, NodeData, ProjectAsset, ProjectAssetKind,
+        TextNode,
+    };
 
     fn assets() -> RuntimeAssets {
         RuntimeAssets {
@@ -1121,6 +1261,173 @@ mod tests {
             "{message}"
         );
         assert!(!output.path().join("index.html").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn projects_with_finder_metadata_and_outgrown_sidecars_export()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut document = Doc::new();
+        let home = page(&mut document, "Home")?;
+        text(&mut document, home, "Welcome", "Inter", 400)?;
+        let source = project(&document)?;
+        for folder in ["assets", "pages"] {
+            let folder = source.path().join(folder);
+            std::fs::create_dir_all(&folder)?;
+            std::fs::write(folder.join(".DS_Store"), b"\0\0\0\x01Bud1")?;
+        }
+        // A layer added to the source outside Fanta has no id, so the sidecar
+        // written with the project no longer matches the tree.
+        let page_source =
+            fanta_format::locate_page_source(source.path(), home).ok_or("page source")?;
+        let page_text = std::fs::read_to_string(&page_source)?;
+        let root_end = page_text.rfind("</Frame>").ok_or("page root")?;
+        std::fs::write(
+            &page_source,
+            format!(
+                "{}<Frame name=\"Added\" x={{0}} y={{0}} width={{10}} height={{10}} />{}",
+                &page_text[..root_end],
+                &page_text[root_end..]
+            ),
+        )?;
+        let output = tempfile::tempdir()?;
+        let report = export_project(source.path(), output.path(), &assets(), &options())?;
+        assert_eq!(report.pages.len(), 1);
+        let program = RuntimeProgram::load_bundle(&std::fs::read(
+            output.path().join("fanta/program.fanta"),
+        )?)?;
+        assert!(
+            program
+                .document()
+                .scene
+                .descendants_of(home)
+                .filter_map(|id| program.document().scene.get(id))
+                .any(|node| node.name == "Added")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_bundles_name_their_size_the_limit_and_the_largest_resources()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A 3×2 RGB PNG.
+        const SWATCH: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x03\x00\x00\x00\x02\x08\x02\x00\x00\x00\x12\x16\xf1\x4d\x00\x00\x00\x10IDAT\x78\xda\x63\xf8\xdf\xc0\x00\x41\x0c\x70\x16\x00\x5f\xd2\x08\xfb\x66\x81\xa5\xda\x00\x00\x00\x00IEND\xae\x42\x60\x82";
+        let mut document = Doc::new();
+        let home = page(&mut document, "Home")?;
+        let mut resources = BTreeMap::new();
+        for index in 1..=13u8 {
+            let asset = AssetId::from_u128(u128::from(index));
+            // Repeated bytes deflate well, so the expanded size is what overflows.
+            let bytes = if index == 13 {
+                SWATCH.to_vec()
+            } else {
+                vec![index; 100_000 * usize::from(index)]
+            };
+            resources.insert(asset, bytes);
+            let mut node = CanvasNode::new(NodeData::Bitmap(BitmapNode {
+                asset,
+                natural_size: [1, 1],
+                local_size: [10.0, 10.0],
+                crop: None,
+                fit: ImageFitMode::Fill,
+                tint: None,
+            }));
+            node.parent = Some(home);
+            document.scene.insert(node)?;
+        }
+        let hero = AssetId::from_u128(12);
+        let swatch = AssetId::from_u128(13);
+        for (asset, name) in [(hero, "Hero photo"), (swatch, "Swatch")] {
+            document.asset_library.insert(
+                asset,
+                ProjectAsset {
+                    name: name.into(),
+                    kind: ProjectAssetKind::Image,
+                },
+            );
+        }
+        let program =
+            RuntimeProgram::from_document(document, resources, Vec::new(), BTreeMap::new())?;
+        let bundle = program.to_bundle()?;
+        let expanded = fanta_format::runtime::expanded_bundle_size(&bundle)?;
+        check_bundle_size(&program, &bundle, expanded)?;
+        let limit = 1024 * 1024;
+        assert!(RuntimeProgram::load_bundle_with_limit(&bundle, limit).is_err());
+        let error = check_bundle_size(&program, &bundle, limit).expect_err("over the limit");
+        let message = error.to_string();
+        let SiteError::BundleTooLarge(report) = error else {
+            panic!("expected an oversized bundle, got {message}");
+        };
+        assert_eq!((report.bytes, report.limit), (expanded, limit));
+        assert_eq!(
+            report.resources.first(),
+            Some(&(
+                BundleResource::Asset {
+                    id: hero,
+                    name: Some("Hero photo".into()),
+                    pixels: None,
+                },
+                1_200_000
+            ))
+        );
+        assert!(
+            report
+                .resources
+                .windows(2)
+                .all(|pair| pair[0].1 >= pair[1].1)
+        );
+        assert!(report.resources.contains(&(
+            BundleResource::Asset {
+                id: swatch,
+                name: Some("Swatch".into()),
+                pixels: Some([3, 2]),
+            },
+            SWATCH.len() as u64
+        )));
+        assert!(report.resources.contains(&(
+            BundleResource::Asset {
+                id: AssetId::from_u128(1),
+                name: None,
+                pixels: None,
+            },
+            100_000
+        )));
+        assert_eq!(
+            report.resources.iter().map(|(_, bytes)| bytes).sum::<u64>(),
+            expanded
+        );
+        assert!(
+            message.starts_with(&format!(
+                "the runtime bundle is {}, {} more than the 1.0 MiB the Fanta web runtime loads.",
+                mebibytes(expanded),
+                mebibytes(expanded - limit)
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("asset {hero} \"Hero photo\"\n")),
+            "{message}"
+        );
+        assert!(message.contains("4 more resources\n"), "{message}");
+        assert_eq!(message.lines().count(), 1 + LISTED_RESOURCES + 2);
+        assert_eq!(
+            BundleResource::Asset {
+                id: swatch,
+                name: Some("Swatch".into()),
+                pixels: Some([3, 2]),
+            }
+            .to_string(),
+            format!("asset {swatch} \"Swatch\", 3×2 px")
+        );
+        assert_eq!(
+            BundleResource::Font {
+                family: "Inter".into(),
+                weight: 700,
+                italic: true,
+            }
+            .to_string(),
+            "font \"Inter\" 700 italic"
+        );
         Ok(())
     }
 

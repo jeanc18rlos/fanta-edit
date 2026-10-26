@@ -5337,6 +5337,7 @@ dependencies = [
  "clap",
  "fanta-doc",
  "fanta-format",
+ "fanta-render",
  "fanta-runtime",
  "fanta-text",
  "serde",
