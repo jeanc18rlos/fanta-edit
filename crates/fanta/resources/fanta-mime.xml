@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The file types fanta.desktop.in opens. script/install.sh copies this file into
+     ~/.local/share/mime/packages and runs update-mime-database. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="text/x-fanta-fnx">
+    <comment>Fanta design source</comment>
+    <sub-class-of type="text/plain"/>
+    <glob pattern="*.fnx"/>
+  </mime-type>
+  <!-- XFig drawings also end in .fig. They start with "#FIG", so the magic below and the
+       zip parent type tell the two apart. -->
+  <mime-type type="application/x-figma">
+    <comment>Figma design</comment>
+    <sub-class-of type="application/zip"/>
+    <magic priority="60">
+      <match type="string" value="fig-kiwi" offset="0"/>
+    </magic>
+    <glob pattern="*.fig"/>
+  </mime-type>
+</mime-info>

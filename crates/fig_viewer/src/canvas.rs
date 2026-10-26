@@ -4792,13 +4792,16 @@ impl Element for CanvasElement {
             });
             match image {
                 Ok(image) => {
-                    if let Err(error) = window
-                        .with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-                            window.paint_image(bounds, Default::default(), image, 0, false)
+                    if let Err(error) =
+                        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                            window.paint_image(bounds, Default::default(), image.clone(), 0, false)
                         })
                     {
                         log::warn!("failed to paint prototype presentation: {error:#}");
                     }
+                    self.view.update(cx, |view, cx| {
+                        view.replace_painted_canvas_image(&image, window, cx)
+                    });
                 }
                 Err(error) => log::warn!("failed to render prototype presentation: {error:#}"),
             }
@@ -4995,13 +4998,22 @@ impl Element for CanvasElement {
                 }
             }
             Ok((PaintCanvas::Image(image), _)) => {
-                if let Err(error) = window
-                    .with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-                        window.paint_image(frame_bounds, Default::default(), image, 0, false)
+                if let Err(error) =
+                    window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                        window.paint_image(
+                            frame_bounds,
+                            Default::default(),
+                            image.clone(),
+                            0,
+                            false,
+                        )
                     })
                 {
                     log::warn!("failed to paint .fig CPU canvas: {error:#}");
                 }
+                self.view.update(cx, |view, cx| {
+                    view.replace_painted_canvas_image(&image, window, cx)
+                });
             }
             Err(error) => {
                 log::warn!("failed to render .fig canvas: {error:#}");
