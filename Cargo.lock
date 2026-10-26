@@ -4428,6 +4428,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "clap",
+ "fanta-api",
  "fanta-design-ops",
  "fanta-doc",
  "fanta-format",

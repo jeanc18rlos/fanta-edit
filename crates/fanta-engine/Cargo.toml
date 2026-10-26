@@ -19,6 +19,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
+fanta-api.workspace = true
 fanta-design-ops.workspace = true
 fanta-doc.workspace = true
 fanta-headless.workspace = true

@@ -4,20 +4,25 @@
 //! --request` runs the same path on a request file.
 
 use std::{
+    collections::BTreeMap,
     fmt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
+use anyhow::Context as _;
 use base64::Engine as _;
+use fanta_api::{DesignSession, DirectoryFetcher, ExportEncoding, ExportSizing};
 use fanta_design_ops::{CommentDraft, DesignOp};
-use fanta_headless::{HeadlessProject, PageRef, RenderTarget};
+use fanta_headless::{HeadlessProject, MAX_RENDER_DIMENSION, PageRef, RenderTarget};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// The longest a run may take; Cloud Run ends the request at 300 s.
 pub const MAX_DEADLINE_MS: u64 = 280_000;
 pub const MAX_RENDER_TARGETS: usize = 8;
+/// The most data rows one `export_batch` step renders.
+pub const MAX_BATCH_ROWS: usize = 8;
 /// The most the overlay's decoded files may add up to.
 pub const MAX_OVERLAY_BYTES: usize = 8 * 1024 * 1024;
 
@@ -122,6 +127,25 @@ pub enum Step {
     Render {
         targets: Vec<RenderTarget>,
     },
+    /// Fill the project's template with one row of data as one undo step:
+    /// text variables by key, placeholder images by name.
+    FillTemplate {
+        label: String,
+        row: BTreeMap<String, String>,
+    },
+    /// Fill a copy of the project for each row and export a page, or one node
+    /// of it, as PNG. The project itself does not change.
+    ExportBatch {
+        page: PageRef,
+        /// Export only this node of the page (prefixed id).
+        #[serde(default)]
+        node: Option<String>,
+        rows: Vec<BTreeMap<String, String>>,
+        /// Cap on the longer output side in pixels, at most
+        /// [`MAX_RENDER_DIMENSION`].
+        #[serde(default = "default_export_dimension")]
+        max_dimension: u32,
+    },
     Changeset {
         /// Include each changed file's content.
         #[serde(default)]
@@ -144,6 +168,10 @@ fn default_project_limit() -> usize {
     50
 }
 
+fn default_export_dimension() -> u32 {
+    MAX_RENDER_DIMENSION
+}
+
 impl Step {
     pub fn name(&self) -> &'static str {
         match self {
@@ -153,6 +181,8 @@ impl Step {
             Self::AddComments { .. } => "add_comments",
             Self::Project { .. } => "project",
             Self::Render { .. } => "render",
+            Self::FillTemplate { .. } => "fill_template",
+            Self::ExportBatch { .. } => "export_batch",
             Self::Changeset { .. } => "changeset",
         }
     }
@@ -184,6 +214,8 @@ impl EngineInfo {
                 "add_comments",
                 "project",
                 "render",
+                "fill_template",
+                "export_batch",
                 "changeset",
             ]
             .into_iter()
@@ -336,6 +368,14 @@ pub fn validate(request: &RunRequest) -> Result<(), EngineError> {
                 targets.len()
             ));
         }
+        if let Step::ExportBatch { rows, .. } = step
+            && (rows.is_empty() || rows.len() > MAX_BATCH_ROWS)
+        {
+            return bad_request(format!(
+                "step {index} exports {} rows; an export_batch step takes 1 to {MAX_BATCH_ROWS}",
+                rows.len()
+            ));
+        }
     }
     if let Source::Github {
         overlay: Some(overlay),
@@ -373,8 +413,15 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
     validate(request)?;
     let started = Instant::now();
     let deadline = Duration::from_millis(request.deadline_ms);
-    let mut project = HeadlessProject::open(work_dir)
+    let project = HeadlessProject::open(work_dir)
         .map_err(|error| EngineError::new(ErrorCode::ProjectLoadFailed, format!("{error:#}")))?;
+    let mut session = DesignSession::from_project(project);
+    // Template images come from data: URIs or this checkout's own files,
+    // never from the network.
+    session.set_image_fetcher(
+        DirectoryFetcher::new(work_dir)
+            .map_err(|error| EngineError::new(ErrorCode::Internal, format!("{error:#}")))?,
+    );
     let mut results = Vec::with_capacity(request.steps.len());
     for step in &request.steps {
         if started.elapsed() >= deadline {
@@ -389,7 +436,7 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
             });
             break;
         }
-        match run_step(&mut project, step) {
+        match run_step(&mut session, step) {
             Ok(result) => results.push(StepResult {
                 step: step.name().into(),
                 ok: true,
@@ -410,24 +457,27 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
             }
         }
     }
+    let project = session.project();
     Ok(RunResponse {
         request_id: request.request_id.clone(),
         engine: EngineInfo::current(),
         source: SourceInfo {
             sha: None,
-            project_id: Some(project.doc().id.to_string()),
-            warnings: project.warnings().to_vec(),
+            project_id: project.map(|project| project.doc().id.to_string()),
+            warnings: project
+                .map(|project| project.warnings().to_vec())
+                .unwrap_or_default(),
             fonts: FontReport::default(),
         },
         results,
     })
 }
 
-fn run_step(project: &mut HeadlessProject, step: &Step) -> anyhow::Result<serde_json::Value> {
+fn run_step(session: &mut DesignSession, step: &Step) -> anyhow::Result<serde_json::Value> {
     match step {
-        Step::Inspect {} => project.inspect(),
+        Step::Inspect {} => session_project(session)?.inspect(),
         Step::CreatePage { name } => {
-            let root = project.create_page(name)?;
+            let root = session_project(session)?.create_page(name)?;
             Ok(json!({ "page": { "id": root.to_string() } }))
         }
         Step::Apply {
@@ -436,6 +486,7 @@ fn run_step(project: &mut HeadlessProject, step: &Step) -> anyhow::Result<serde_
             ops,
             commit,
         } => {
+            let project = session_project(session)?;
             let page = page
                 .as_ref()
                 .map(|page| project.resolve_page(page))
@@ -443,7 +494,7 @@ fn run_step(project: &mut HeadlessProject, step: &Step) -> anyhow::Result<serde_
             project.apply(page, label, ops, *commit)
         }
         Step::AddComments { label, comments } => {
-            let outcomes = project.add_comments(label, comments)?;
+            let outcomes = session_project(session)?.add_comments(label, comments)?;
             Ok(json!({
                 "comments": outcomes
                     .into_iter()
@@ -455,10 +506,12 @@ fn run_step(project: &mut HeadlessProject, step: &Step) -> anyhow::Result<serde_
             }))
         }
         Step::Project { page, depth, limit } => {
+            let project = session_project(session)?;
             let root = project.resolve_page(page)?;
             Ok(json!({ "nodes": project.project_page(root, *depth, *limit)? }))
         }
         Step::Render { targets } => {
+            let project = session_project(session)?;
             let mut images = Vec::with_capacity(targets.len());
             for target in targets {
                 let image = project.render(target)?;
@@ -472,7 +525,45 @@ fn run_step(project: &mut HeadlessProject, step: &Step) -> anyhow::Result<serde_
             }
             Ok(json!({ "images": images }))
         }
+        Step::FillTemplate { label, row } => {
+            session.fill_template(row)?;
+            session.add_undo_step(label)?;
+            Ok(json!({ "filled": row.len() }))
+        }
+        Step::ExportBatch {
+            page,
+            node,
+            rows,
+            max_dimension,
+        } => {
+            let (page, node) = session_project(session)?.resolve_region(page, node.as_deref())?;
+            let sizing =
+                ExportSizing::MaxDimension(f64::from((*max_dimension).min(MAX_RENDER_DIMENSION)));
+            let images: Vec<_> = session
+                .batch_export(rows, node.unwrap_or(page), ExportEncoding::Png, sizing)
+                .into_iter()
+                .enumerate()
+                .map(|(row, image)| match image {
+                    Ok(image) => json!({
+                        "row": row,
+                        "ok": true,
+                        "png_b64": base64::engine::general_purpose::STANDARD.encode(&image.bytes),
+                        "width": image.width,
+                        "height": image.height,
+                        "bounds": [
+                            image.bounds.min_x,
+                            image.bounds.min_y,
+                            image.bounds.width(),
+                            image.bounds.height(),
+                        ],
+                    }),
+                    Err(error) => json!({ "row": row, "ok": false, "error": format!("{error:#}") }),
+                })
+                .collect();
+            Ok(json!({ "images": images }))
+        }
         Step::Changeset { contents, ops } => {
+            let project = session_project(session)?;
             project.save()?;
             let files = fanta_headless::changeset(project.loaded_hashes(), project.root())?;
             let mut listed = Vec::with_capacity(files.len());
@@ -492,6 +583,12 @@ fn run_step(project: &mut HeadlessProject, step: &Step) -> anyhow::Result<serde_
             Ok(result)
         }
     }
+}
+
+fn session_project(session: &mut DesignSession) -> anyhow::Result<&mut HeadlessProject> {
+    session
+        .project_mut()
+        .context("the run's session holds no project")
 }
 
 #[cfg(test)]
@@ -530,6 +627,8 @@ mod tests {
                 ]},
                 {"step": "project", "page": {"index": 0}},
                 {"step": "render", "targets": [{"id": "home", "page": {"index": 0}}]},
+                {"step": "fill_template", "label": "Fill in", "row": {"name": "Ada", "photo": "assets/ada.png"}},
+                {"step": "export_batch", "page": {"index": 0}, "rows": [{"name": "Ada"}, {"name": "Grace"}]},
                 {"step": "changeset", "contents": true, "ops": true}
             ]
         }));
@@ -543,10 +642,20 @@ mod tests {
                 "add_comments",
                 "project",
                 "render",
+                "fill_template",
+                "export_batch",
                 "changeset"
             ]
         );
         assert!(matches!(parsed.steps[2], Step::Apply { commit: true, .. }));
+        assert!(matches!(
+            parsed.steps[7],
+            Step::ExportBatch {
+                max_dimension: MAX_RENDER_DIMENSION,
+                node: None,
+                ..
+            }
+        ));
         assert!(matches!(
             parsed.steps[4],
             Step::Project {
@@ -785,6 +894,116 @@ mod tests {
                 info.capabilities.iter().any(|listed| listed == capability),
                 "{capability}"
             );
+        }
+    }
+
+    #[test]
+    fn a_template_run_fills_a_row_and_exports_one_image_per_row() {
+        use fanta_doc::{CanvasNode, Doc, GroupNode, NodeData, Operation};
+        let mut doc = Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = "Card".into();
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page)).expect("page");
+        doc.add_page(page_id);
+        let directory = tempfile::tempdir().expect("project directory");
+        fanta_format::write_project_tree(directory.path(), &doc, &Default::default())
+            .expect("write the project");
+
+        let response = run_in(
+            &request(json!({
+                "request_id": "tpl_1",
+                "deadline_ms": 60000,
+                "source": {"kind": "dir", "dir": directory.path()},
+                "steps": [
+                    {"step": "apply", "label": "Greeting", "ops": [
+                        {"op": "create_node", "node_type": "text", "text": "Hi {{name}}",
+                         "x": 0, "y": 0, "width": 200, "height": 40}
+                    ]},
+                    {"step": "export_batch", "page": {"index": 0}, "max_dimension": 256,
+                     "rows": [{"name": "Ada"}, {"name": "Grace Hopper"}, {"": "no key"}]},
+                    {"step": "fill_template", "label": "Fill in", "row": {"name": "Ada"}},
+                    {"step": "changeset", "contents": true, "ops": true}
+                ]
+            })),
+            directory.path(),
+        )
+        .expect("the run answers");
+        assert!(
+            response.results.iter().all(|result| result.ok),
+            "{:?}",
+            response.results
+        );
+        let result = |index: usize| {
+            response.results[index]
+                .result
+                .clone()
+                .expect("a successful step has a result")
+        };
+        let batch = result(1);
+        let images = batch["images"].as_array().expect("images");
+        assert_eq!(images.len(), 3);
+        assert_eq!(images[0]["ok"], true, "{}", images[0]);
+        assert_eq!(images[1]["ok"], true, "{}", images[1]);
+        assert_eq!(images[2]["ok"], false, "an empty key fails only its row");
+        assert_ne!(images[0]["png_b64"], images[1]["png_b64"]);
+        assert!(
+            images[0]["width"]
+                .as_u64()
+                .is_some_and(|width| width <= 256)
+        );
+
+        assert_eq!(result(2)["filled"], 1);
+        let changeset = result(3);
+        let operations = changeset["ops"].as_array().expect("ops");
+        assert!(
+            operations
+                .iter()
+                .any(|operation| operation["op"] == "create_variable"),
+            "the filled row is in the journal the app replays"
+        );
+        let page_source = changeset["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .find(|file| {
+                file["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("/page.fnx"))
+            })
+            .and_then(|file| file["content_b64"].as_str())
+            .map(|content| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(content)
+                    .expect("base64")
+            })
+            .expect("the page source");
+        assert!(
+            String::from_utf8_lossy(&page_source).contains("{{name}}"),
+            "the source keeps its token"
+        );
+        let capabilities = EngineInfo::current().capabilities;
+        for step in ["step:fill_template", "step:export_batch"] {
+            assert!(capabilities.iter().any(|listed| listed == step), "{step}");
+        }
+    }
+
+    #[test]
+    fn an_export_batch_takes_one_to_eight_rows() {
+        let batch = |rows: usize| {
+            request(json!({
+                "request_id": "tpl_2",
+                "deadline_ms": 60000,
+                "source": {"kind": "dir", "dir": "/tmp/project"},
+                "steps": [{"step": "export_batch", "page": {"index": 0},
+                           "rows": vec![json!({"name": "Ada"}); rows]}]
+            }))
+        };
+        assert!(validate(&batch(1)).is_ok());
+        assert!(validate(&batch(MAX_BATCH_ROWS)).is_ok());
+        for rows in [0, MAX_BATCH_ROWS + 1] {
+            let error = validate(&batch(rows)).expect_err("out of range");
+            assert_eq!(error.error.code, ErrorCode::BadRequest);
         }
     }
 
