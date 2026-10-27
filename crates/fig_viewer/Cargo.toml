@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 license = "GPL-3.0-or-later"
+description = "Fanta's canvas editor inside the app: the workspace item for .fig files and Fanta projects, its dock panels, toolbar, agent surface and live MCP server."
 
 [lints]
 workspace = true

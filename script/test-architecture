@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""Unit tests for script/architecture. Run: python3 script/test-architecture"""
+
+import importlib.machinery
+import importlib.util
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+loader = importlib.machinery.SourceFileLoader('architecture', str(ROOT / 'script/architecture'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+architecture = importlib.util.module_from_spec(spec)
+loader.exec_module(architecture)
+
+LAYERS = textwrap.dedent('''
+    [[group]]
+    id = "engine"
+    title = "Engine"
+    dev_dependencies = "group"
+    forbid = ["ui"]
+
+    [[group]]
+    id = "outer"
+    title = "Outer"
+
+    [[layer]]
+    id = "core"
+    group = "engine"
+    title = "Core"
+    crates = ["doc"]
+    forbid = ["skia"]
+
+    [[layer]]
+    id = "drawing"
+    group = "engine"
+    title = "Drawing"
+    crates = ["render"]
+    may_use = ["core"]
+
+    [[layer]]
+    id = "use-cases"
+    group = "engine"
+    title = "Use cases"
+    crates = ["headless"]
+    may_use = ["drawing"]
+
+    [[layer]]
+    id = "desktop"
+    group = "outer"
+    title = "Desktop"
+    crates = ["viewer"]
+    may_use = ["use-cases", "shell"]
+
+    [[layer]]
+    id = "shell"
+    group = "outer"
+    title = "Shell"
+    crates = "rest"
+
+    [[seam]]
+    from = "shell"
+    to = "viewer"
+    reason = "The workspace opens the viewer."
+
+    [[external]]
+    id = "skia"
+    title = "Skia"
+    packages = ["skia-safe"]
+
+    [[external]]
+    id = "ui"
+    title = "UI"
+    packages = ["gpui*"]
+''')
+
+
+def package(name, dependencies=(), description='A crate.'):
+    return {
+        'id': f'{name} 0.1.0',
+        'name': name,
+        'description': description,
+        'license': 'GPL-3.0-or-later',
+        'manifest_path': f'/repo/crates/{name}/Cargo.toml',
+        'dependencies': [
+            {
+                'name': dependency,
+                'kind': None if kind == 'normal' else kind,
+                **({'path': f'/repo/crates/{dependency}'} if workspace else {}),
+            }
+            for dependency, kind, workspace in dependencies
+        ],
+    }
+
+
+def workspace_of(*packages):
+    metadata = {
+        'packages': list(packages),
+        'workspace_members': [entry['id'] for entry in packages],
+    }
+    return architecture.load_workspace(metadata, Path('/repo'))
+
+
+def healthy_packages(**overrides):
+    packages = {
+        'doc': package('doc'),
+        'render': package('render', [('doc', 'normal', True), ('skia-safe', 'normal', False)]),
+        'headless': package('headless', [('render', 'normal', True)]),
+        'viewer': package('viewer', [('headless', 'normal', True), ('workspace', 'normal', True), ('gpui-core', 'normal', False)]),
+        'workspace': package('workspace', [('viewer', 'normal', True)], description=''),
+    }
+    packages.update(overrides)
+    return list(packages.values())
+
+
+class CheckTests(unittest.TestCase):
+    def setUp(self):
+        self.architecture = architecture.load_architecture(LAYERS)
+
+    def check(self, *packages):
+        return architecture.check_architecture(self.architecture, workspace_of(*packages))
+
+    def test_a_healthy_workspace_passes(self):
+        self.assertEqual(self.check(*healthy_packages()), [])
+
+    def test_use_is_transitive(self):
+        packages = healthy_packages(headless=package('headless', [('render', 'normal', True), ('doc', 'normal', True)]))
+        self.assertEqual(self.check(*packages), [])
+
+    def test_an_inner_layer_cannot_use_an_outer_one(self):
+        packages = healthy_packages(doc=package('doc', [('headless', 'normal', True)]))
+        problems = self.check(*packages)
+        self.assertEqual(len(problems), 2)
+        self.assertIn('doc (core) depends on headless (use-cases)', problems[0])
+        self.assertEqual(problems[1], 'doc (core) must not reach Skia, but does: doc -> headless -> render -> skia-safe')
+
+    def test_a_seam_allows_a_dependency_and_an_unused_seam_fails(self):
+        packages = healthy_packages(workspace=package('workspace', description=''))
+        problems = self.check(*packages)
+        self.assertEqual(problems, [f'{architecture.LAYERS_FILE}: the seam shell -> viewer is no longer used; delete it'])
+
+    def test_engine_dev_dependencies_stay_in_the_group(self):
+        inside = healthy_packages(doc=package('doc', [('headless', 'dev', True)]))
+        self.assertEqual(self.check(*inside), [])
+        outside = healthy_packages(doc=package('doc', [('viewer', 'dev', True)]))
+        problems = self.check(*outside)
+        self.assertEqual(len(problems), 1)
+        self.assertIn('dev-dependency on viewer', problems[0])
+
+    def test_outer_dev_dependencies_are_free(self):
+        packages = healthy_packages(viewer=package('viewer', [
+            ('headless', 'normal', True), ('workspace', 'normal', True), ('doc', 'dev', True),
+        ]))
+        self.assertEqual(self.check(*packages), [])
+
+    def test_a_forbidden_external_is_found_through_a_workspace_crate(self):
+        packages = healthy_packages(doc=package('doc', [('helper', 'normal', True)]))
+        packages.append(package('helper', [('skia-safe', 'normal', False)]))
+        problems = self.check(*packages)
+        self.assertIn('doc (core) must not reach Skia, but does: doc -> helper -> skia-safe', problems)
+
+    def test_a_group_forbid_covers_dev_dependencies_of_a_self_contained_group(self):
+        packages = healthy_packages(render=package('render', [
+            ('doc', 'normal', True), ('skia-safe', 'normal', False), ('gpui-core', 'dev', False),
+        ]))
+        problems = self.check(*packages)
+        self.assertEqual(problems, ['render (drawing) has a dev-dependency on gpui-core; Engine tests must build without UI'])
+
+    def test_mapped_crates_need_a_description(self):
+        packages = healthy_packages(render=package('render', [('doc', 'normal', True)], description=''))
+        problems = self.check(*packages)
+        self.assertEqual(len(problems), 1)
+        self.assertIn('render: add a `description`', problems[0])
+
+    def test_a_stale_or_duplicate_listing_fails(self):
+        layers = LAYERS.replace('crates = ["render"]', 'crates = ["render", "doc", "gone"]')
+        problems = architecture.check_architecture(
+            architecture.load_architecture(layers), workspace_of(*healthy_packages())
+        )
+        self.assertIn(f'{architecture.LAYERS_FILE}: layer "drawing" lists "gone", which is not a workspace crate', problems)
+        self.assertIn(f'{architecture.LAYERS_FILE}: "doc" is listed in layers "core" and "drawing"', problems)
+
+    def test_a_layer_named_like_a_crate_fails(self):
+        layers = LAYERS.replace('id = "desktop"', 'id = "viewer"').replace('"use-cases", "shell"]', '"use-cases", "shell"]')
+        problems = architecture.check_architecture(
+            architecture.load_architecture(layers), workspace_of(*healthy_packages())
+        )
+        self.assertTrue(any('layer "viewer" has the name of a workspace crate' in problem for problem in problems))
+
+
+class MapTests(unittest.TestCase):
+    def test_the_map_reduces_edges_and_collapses_the_rest(self):
+        packages = healthy_packages(headless=package('headless', [('render', 'normal', True), ('doc', 'normal', True)]))
+        workspace = workspace_of(*packages)
+        layers = architecture.load_architecture(LAYERS)
+        assignment, problems = architecture.assign_layers(layers, workspace)
+        self.assertEqual(problems, [])
+        text = architecture.render_crate_map(layers, workspace, assignment)
+        self.assertIn('crate_headless --> crate_render', text)
+        self.assertNotIn('crate_headless --> crate_doc', text)
+        self.assertIn('rest_crates[["1 shell crates"]]', text)
+        self.assertIn('crate_viewer --> rest_crates', text)
+        self.assertIn('rest_crates --> crate_viewer', text)
+        self.assertIn('crate_render -.-> external_skia', text)
+        self.assertIn('layer_shell -. seam .-> layer_desktop', text)
+        self.assertEqual(text, architecture.render_crate_map(layers, workspace, assignment))
+
+    def test_transitive_reduction(self):
+        edges = {('a', 'b'), ('b', 'c'), ('a', 'c'), ('a', 'd')}
+        self.assertEqual(architecture.transitive_reduction(edges), [('a', 'b'), ('a', 'd'), ('b', 'c')])
+
+
+DECISION = textwrap.dedent('''\
+    ---
+    status: {status}
+    date: 2026-07-07
+    decision-makers: Jean Rojas
+    {extra}
+    ---
+
+    # {title}
+
+    Body.
+''')
+
+SPEC = textwrap.dedent('''\
+    ---
+    status: {status}
+    date: 2026-10-27
+    owner: Jean Rojas
+    decisions: [{decisions}]
+    ---
+
+    # {title}
+''')
+
+
+class RecordTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        (self.root / 'docs/decisions').mkdir(parents=True)
+        (self.root / 'specs/templates').mkdir(parents=True)
+        (self.root / 'docs/decisions/README.md').write_text('# Decisions\n\n<!-- decisions:start -->\n<!-- decisions:end -->\n')
+        (self.root / 'specs/README.md').write_text('# Specs\n\n<!-- specs:start -->\n<!-- specs:end -->\n')
+        (self.root / 'docs/decisions/template.md').write_text(DECISION.format(status='proposed', extra='', title='{{title}}'))
+        for name in ('spec.md', 'design.md', 'tasks.md'):
+            (self.root / 'specs/templates' / name).write_text(SPEC.format(status='draft', decisions='', title='{{title}}'))
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def decision(self, name, status='accepted', extra='', title='A decision'):
+        (self.root / 'docs/decisions' / name).write_text(DECISION.format(status=status, extra=extra, title=title))
+
+    def spec(self, name, status='draft', decisions='', tasks=None):
+        folder = self.root / 'specs' / name
+        folder.mkdir()
+        (folder / 'spec.md').write_text(SPEC.format(status=status, decisions=decisions, title='A spec'))
+        if tasks is not None:
+            (folder / 'design.md').write_text('# Design\n')
+            (folder / 'tasks.md').write_text(tasks)
+
+    def problems(self):
+        return architecture.build_indexes(self.root)[1]
+
+    def test_superseding_must_agree_in_both_records(self):
+        self.decision('0001-old.md', status='superseded', extra='superseded-by: 0002')
+        self.decision('0002-new.md', extra='supersedes: [0001]')
+        self.assertEqual(self.problems(), [])
+        self.decision('0002-new.md', status='proposed', extra='supersedes: [0001]')
+        self.assertIn('docs/decisions/0001-old.md: is superseded by 0002, which is not accepted', self.problems())
+
+    def test_an_accepted_successor_needs_its_predecessor_marked(self):
+        self.decision('0001-old.md')
+        self.decision('0002-new.md', extra='supersedes: [0001]')
+        self.assertIn(
+            'docs/decisions/0002-new.md: is accepted, so 0001 must be "superseded" with "superseded-by: 0002"',
+            self.problems(),
+        )
+
+    def test_a_proposed_successor_leaves_its_predecessor_alone(self):
+        self.decision('0001-old.md')
+        self.decision('0002-new.md', status='proposed', extra='supersedes: [0001]')
+        self.assertEqual(self.problems(), [])
+
+    def test_bad_status_dates_and_keys_are_reported(self):
+        self.decision('0001-a.md', status='maybe')
+        self.assertTrue(any('status must be one of' in problem for problem in self.problems()))
+        (self.root / 'docs/decisions/0001-a.md').write_text(DECISION.format(status='accepted', extra='owner: me', title='A'))
+        with self.assertRaises(architecture.InputError):
+            self.problems()
+
+    def test_specs_reference_real_decisions_and_close_their_tasks(self):
+        self.decision('0001-a.md')
+        self.spec('0001-good', status='implemented', decisions='0001', tasks='- [x] Done\n')
+        self.assertEqual(self.problems(), [])
+        self.spec('0002-open', status='implemented', decisions='0009', tasks='- [x] Done\n- [ ] Not done\n')
+        problems = self.problems()
+        self.assertIn('specs/0002-open/spec.md: "decisions" names 0009, which is not in docs/decisions', problems)
+        self.assertIn('specs/0002-open/tasks.md: an implemented spec cannot have open tasks; still open: - [ ] Not done', problems)
+
+    def test_an_accepted_spec_needs_design_and_tasks(self):
+        self.spec('0001-bare', status='accepted')
+        self.assertIn('specs/0001-bare: add design.md; a spec that is accepted needs one', self.problems())
+
+    def test_indexes_list_records_and_link_successors(self):
+        self.decision('0001-old.md', status='superseded', extra='superseded-by: 0002', title='Old way')
+        self.decision('0002-new.md', extra='supersedes: [0001]', title='New way')
+        self.spec('0001-thing', decisions='0002')
+        outputs, problems = architecture.build_indexes(self.root)
+        self.assertEqual(problems, [])
+        decisions = outputs[self.root / 'docs/decisions/README.md']
+        self.assertIn('| [0001](0001-old.md) | Old way | superseded by [0002](0002-new.md) | 2026-07-07 |', decisions)
+        specs = outputs[self.root / 'specs/README.md']
+        self.assertIn('| [0001](0001-thing/spec.md) | A spec | draft | 2026-10-27 | 0002 |', specs)
+
+    def test_new_records_take_the_next_number(self):
+        self.decision('0007-something.md')
+        created = architecture.create_record(self.root, 'adr', 'Use a Better Thing!', '2026-10-27')
+        self.assertEqual([path.name for path in created], ['0008-use-a-better-thing.md'])
+        self.assertIn('# Use a Better Thing!', created[0].read_text())
+        created = architecture.create_record(self.root, 'spec', 'First spec', '2026-10-27')
+        self.assertEqual([path.relative_to(self.root).as_posix() for path in created], [
+            'specs/0001-first-spec/spec.md', 'specs/0001-first-spec/design.md', 'specs/0001-first-spec/tasks.md',
+        ])
+
+    def test_markers_are_required(self):
+        (self.root / 'specs/README.md').write_text('# Specs\n')
+        with self.assertRaises(architecture.InputError):
+            architecture.build_indexes(self.root)
+
+
+if __name__ == '__main__':
+    unittest.main()

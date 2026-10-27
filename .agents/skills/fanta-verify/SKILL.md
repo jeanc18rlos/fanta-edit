@@ -23,6 +23,7 @@ Run the narrowest check that exercises the change, then the release stage that c
 | Lints | `./script/clippy -p <crate>`; stage `lint` covers the release crates |
 | Platform-specific code (`cfg(target_os)`, `std::os::unix`, per-OS keymaps) | the `Windows` workflow (`.github/workflows/windows.yml`). On Windows, run `.\script\clippy.ps1` and the `cargo` commands directly; the other scripts are Bash ([guide](../../../docs/fanta/windows-development.md)) |
 | Packaging scripts | `bash -n <script>`, `python3 script/test-macos-release`, `./script/check-licenses` |
+| Crate dependencies, a new crate, `docs/architecture`, `docs/decisions`, `specs`, `script/architecture` | `script/architecture verify` (no build); `python3 script/test-architecture` when the script changed |
 | `mac_app_store` code paths | `cargo check --locked -p fanta --features mac_app_store`, plus the matching tests in the `mac-app-store-runtime` job of `check.yml` |
 
 `./script/verify-fanta-release --list` prints each stage's exact command. `--stage <name>` (repeatable) runs stages and writes logs plus `results.tsv` under `target/release-verification`. The script does not validate an installer, drive the full app, contact production services or run ignored benchmarks, and it refuses to run while golden-regeneration variables are set.

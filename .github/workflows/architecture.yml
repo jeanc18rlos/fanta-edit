@@ -1,0 +1,35 @@
+name: Architecture
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: architecture-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  architecture:
+    name: Crate boundaries, crate map and records
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Test the architecture script
+        run: python3 script/test-architecture
+
+      - name: Check boundaries, the generated map and the record indexes
+        env:
+          # `cargo metadata --no-deps` reads manifests only, so the runner's
+          # stable toolchain is enough and the pinned one need not install.
+          RUSTUP_TOOLCHAIN: stable
+          CARGO_NET_OFFLINE: 'true'
+        run: python3 script/architecture verify

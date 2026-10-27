@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 license = "GPL-3.0-or-later"
+description = "The seam between agents and the design editor: the DesignSurface trait the editor registers as a GPUI global, plus the design-op vocabulary re-exported from fanta-design-ops."
 
 [lints]
 workspace = true

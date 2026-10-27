@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+description = "Fanta's portable playback runtime: compiles project sources into runtime programs and plays them natively, over a C JSON bridge or as WebAssembly."
 
 [lib]
 path = "src/runtime.rs"

@@ -1,0 +1,164 @@
+# Fanta's architecture map.
+#
+# Every workspace crate belongs to exactly one layer. A crate may depend on
+# crates in its own layer, in the layers its layer lists under `may_use`, and in
+# whatever those layers may use in turn. Anything else needs a `[[seam]]` below,
+# with the reason it exists. `forbid` names external package families a layer
+# must never reach, directly or through another workspace crate.
+#
+# `script/architecture check` enforces this file in CI, and
+# `script/architecture map` draws docs/architecture/crate-map.md from it.
+# Changing a rule here is an architecture decision: record it in
+# docs/decisions (see 0023-enforce-layered-crate-boundaries.md).
+
+[[group]]
+id = "engine"
+title = "Engine"
+summary = "Runs without the editor: the document model, its codecs and renderer, the headless use cases and the hosts built on them. ADR 0024 proposes moving this group to the fanta-engine repository."
+# Dev-dependencies must stay inside the group, so the group's tests build on
+# their own once it has its own repository.
+dev_dependencies = "group"
+forbid = ["fanta-ui"]
+
+[[group]]
+id = "editor"
+title = "Editor"
+summary = "Fanta's code inside the desktop app: the canvas, its panels and the agent seam."
+dev_dependencies = "any"
+
+[[group]]
+id = "app"
+title = "App"
+summary = "The composition root that links the editor, the shell and the engine into one binary."
+dev_dependencies = "any"
+
+[[group]]
+id = "shell"
+title = "Inherited shell"
+summary = "Crates inherited from Zed: workspace, project, text editor, agent, settings and platform services."
+dev_dependencies = "any"
+
+[[layer]]
+id = "model"
+group = "engine"
+title = "Model"
+role = "Domain"
+summary = "The design document: scene graph, operations and undo, components, variables, layout, motion and prototype data."
+crates = ["fanta-doc"]
+may_use = []
+forbid = ["skia"]
+
+[[layer]]
+id = "vocabulary"
+group = "engine"
+title = "Design-op vocabulary"
+role = "Inbound port contract"
+summary = "The ops, queries and comment drafts that agents and the cloud send, shared by the editor and the headless engine."
+crates = ["fanta-design-ops"]
+may_use = []
+forbid = ["skia"]
+
+[[layer]]
+id = "interaction"
+group = "engine"
+title = "Interaction"
+role = "Domain services"
+summary = "Pure logic over the model: viewport math, hit testing, snapping and tool state machines."
+crates = ["fanta-canvas", "fanta-tools"]
+may_use = ["model"]
+forbid = ["skia"]
+
+[[layer]]
+id = "persistence"
+group = "engine"
+title = "Source and import"
+role = "Driven adapters"
+summary = "The FNX source codec, the project directory format and .fig import."
+crates = ["fanta-fnx", "fanta-format", "fanta-fig-interop"]
+may_use = ["model"]
+forbid = ["skia"]
+
+[[layer]]
+id = "rendering"
+group = "engine"
+title = "Rendering"
+role = "Driven adapters"
+summary = "Text layout and the renderer, both on Skia."
+crates = ["fanta-text", "fanta-render"]
+may_use = ["interaction"]
+
+[[layer]]
+id = "playback"
+group = "engine"
+title = "Playback"
+role = "Domain services over the renderer"
+summary = "Prototype and motion playback over an immutable document."
+crates = ["fanta-present"]
+may_use = ["rendering"]
+
+[[layer]]
+id = "application"
+group = "engine"
+title = "Application"
+role = "Use cases"
+summary = "Open, edit, settle, render and save a project without the app, and the programmatic design API over it."
+crates = ["fanta-headless", "fanta-api"]
+may_use = ["vocabulary", "persistence", "playback"]
+
+[[layer]]
+id = "hosts"
+group = "engine"
+title = "Engine hosts"
+role = "Driving adapters"
+summary = "Deliverables built on the engine without the editor: the cloud worker, the portable runtime and the website exporter."
+crates = ["fanta-engine", "fanta-runtime", "fanta-site"]
+may_use = ["application"]
+
+[[layer]]
+id = "desktop"
+group = "editor"
+title = "Desktop editor"
+role = "Driving adapter: the desktop host"
+summary = "The GPUI canvas, inspector, panels, live MCP server and the DesignSurface seam."
+crates = ["fig_viewer", "design_surface", "fanta_ui", "fanta_languages"]
+may_use = ["application", "shell"]
+
+[[layer]]
+id = "app"
+group = "app"
+title = "App"
+role = "Composition root"
+summary = "The `fanta` binary."
+crates = ["fanta"]
+may_use = ["desktop", "hosts"]
+
+[[layer]]
+id = "shell"
+group = "shell"
+title = "Inherited shell"
+role = "Platform inherited from Zed"
+summary = "Every workspace crate that no other layer lists."
+crates = "rest"
+may_use = []
+
+[[seam]]
+from = "shell"
+to = "design_surface"
+reason = "Zed's agent, agent UI, workspace and project panel reach the canvas only through the DesignSurface trait (ADR 0007)."
+
+[[seam]]
+from = "workspace"
+to = "fanta-format"
+reason = "The workspace recognizes Fanta project folders and page sources when it opens paths (`is_project_dir`, `page_scope_of_source`)."
+
+[[external]]
+id = "skia"
+title = "Skia"
+summary = "skia-safe over the vendored skia-bindings with Fanta's Graphite shim (vendor/skia-bindings-0.153.3)."
+packages = ["skia-safe", "skia-bindings"]
+
+[[external]]
+id = "fanta-ui"
+title = "fanta-ui"
+summary = "GPUI and the shared UI packages from squidred-dev/fanta-ui, pinned by git revision (ADR 0011)."
+packages = ["fanta-gpui*"]

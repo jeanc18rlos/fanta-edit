@@ -38,6 +38,11 @@ Crate rules record traps that earlier changes hit. Claude Code loads them when i
 - CI (`.github/workflows/check.yml`) requires 51 editor and workspace regressions by exact test name. If you rename or delete one of those tests, update the list in `check.yml` in the same change.
 - Regenerate golden images (`FANTA_REGEN_GOLDEN`, `UPDATE_BASELINE`) only when the user asks: a regenerated baseline turns a visual regression into a pass.
 
+## Specs and decisions
+
+- Before a feature, a contract, file-format or API change, a new or moved crate, or work spanning repositories, load the `spec-driven-development` skill. Check `specs/README.md` and `docs/decisions/README.md`; when nothing covers the change, write a draft spec or a proposed ADR and stop for review. Only the founder accepts specs and ADRs ([process](docs/process/spec-driven-development.md)).
+- `docs/architecture/layers.toml` says which crate may depend on which. `script/architecture verify` enforces it in CI, together with the generated crate map and record indexes, and needs no build. A new rule or seam needs an ADR; after changing crate dependencies, a crate or a record, run `script/architecture map` or `index` and commit the result.
+
 ## Fanta traps
 
 - Ids have two spellings. Persisted maps (scene nodes, component maps, sidecars) key ids by their serde form, a bare ULID. `Display` and `FromStr` add a type prefix (`n_`, `c_`, `a_`, …), which is what file names, logs, agents and MCP input use. Derive persisted keys through serde (`serde_json::to_value(id)`, or `json_key`/`id_from_key` in fanta-format), never `to_string()`/`from_str`. Four separate PRs hit this. (#85, #102, #110, #128)

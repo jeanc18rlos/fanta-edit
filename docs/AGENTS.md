@@ -7,6 +7,11 @@ it from [`README.md`](./README.md).
 - Put alpha-release material in [`alpha/`](./alpha) — anything a tester or a
   release needs: smoke steps, release notes, known issues.
 - Put notes about how the app works in [`fanta/`](./fanta).
+- Put the system's structure in [`architecture/`](./architecture), decision
+  records in [`decisions/`](./decisions) and how we work in
+  [`process/`](./process). Specs live in [`/specs`](../specs). Never edit
+  `architecture/crate-map.md` or the index tables between `<!-- …:start -->`
+  markers by hand: `script/architecture map` and `index` generate them.
 - Keep pages short and current. A stale page is worse than a missing one: if a
   change makes a page wrong, fix or delete it in the same commit.
 - Do not document inherited Fanta behaviour that Fanta does not ship. When a
