@@ -89,10 +89,11 @@ check and `script/architecture verify`, on Linux and macOS. The editor keeps
 5. The editor switch pull request.
 6. Consumers switch: `fanta-sdk` (`fetch-engine` and its pin file) and the
    backend's worker image.
-7. Push the never-pushed July and August history (local branch
-   `feature/artifact-ir-workspace-session`) as an archive branch, run the
-   secret scan, then make the repository public; archive `fantaisa-engine`
-   and delete the empty `squidred-dev/fanta-engine` placeholder.
+7. Copy the July and August history (`fantaisa-engine`'s
+   `feature/artifact-ir-workspace-session`) into the new repository as an
+   archive branch, run the secret scan, then make the repository public;
+   archive `fantaisa-engine` and delete the empty `squidred-dev/fanta-engine`
+   placeholder.
 
 ## Interfaces and data
 

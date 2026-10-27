@@ -44,8 +44,9 @@ repository.
   stopped at the vendored commit, and its importers for `.psd` and Illustrator
   files, its harness and its facade crate were left behind. That branch,
   `feature/artifact-ir-workspace-session` with 109 commits from July and
-  August, was never pushed: on 2026-10-27 it existed only in the founder's
-  local checkout, and `9370fa2` is not on GitHub.
+  August, lived only in the founder's local checkout until 2026-10-27, when
+  it and `codex/migrate-fanta-engine-crates` were pushed to
+  `squidred-dev/fantaisa-engine` as private branches.
 - Follow-up: [0024](0024-move-the-engine-into-its-own-repository.md) proposes
   moving the engine out again, without the problems of 0006.
 

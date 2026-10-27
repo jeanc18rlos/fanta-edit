@@ -38,9 +38,9 @@ proposes a third attempt; this spec says what it must achieve.
 
 - **R1.** The engine repository must contain the engine group of
   `layers.toml` with its history since 2026-07-07. The July and August
-  history, 109 commits that exist only on the local, never-pushed
-  `feature/artifact-ir-workspace-session` branch, must be preserved there as
-  an archive branch and linked from the README.
+  history, the 109 commits of `squidred-dev/fantaisa-engine`'s
+  `feature/artifact-ir-workspace-session` branch, must be copied there as an
+  archive branch and linked from the README.
 - **R2.** It must build and test from a clean clone without the editor,
   `fanta-ui` or sibling checkouts, in CI on Linux and on macOS (Metal and
   Graphite).

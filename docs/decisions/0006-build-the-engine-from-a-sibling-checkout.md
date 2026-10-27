@@ -39,7 +39,7 @@ pattern through `../fanta-gpui`.
   checkout pointed back at this repository, a circular path reference.
 - Superseded on 2026-09-08 ([0008](0008-vendor-the-engine-into-this-repository.md)).
   The engine repository's working branch kept moving until 2026-08-16 and was
-  never pushed (see 0008).
+  only pushed on 2026-10-27 (see 0008).
 
 ## Confirmation
 

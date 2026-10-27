@@ -51,5 +51,5 @@ of their crates reaches `skia-safe` or `skia-bindings`.
 
 ## References
 
-- The engine repository's `ARCHITECTURE.md` §2, added in commit `3f65e68` (2026-07-09) with the original `cargo tree` tripwire. That commit is on the never-pushed local branch described in [0008](0008-vendor-the-engine-into-this-repository.md).
+- The engine repository's `ARCHITECTURE.md` §2, added in commit `3f65e68` (2026-07-09) with the original `cargo tree` tripwire, on the `feature/artifact-ir-workspace-session` branch of `squidred-dev/fantaisa-engine` ([0008](0008-vendor-the-engine-into-this-repository.md))
 - [`layers.toml`](../architecture/layers.toml)

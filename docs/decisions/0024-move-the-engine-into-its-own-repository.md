@@ -65,10 +65,11 @@ Proposed:
    repository. `fig_viewer` stays in the editor: it depends on 98 Zed crates.
    Its GPUI-free logic moves into the engine over time
    ([0023](0023-enforce-layered-crate-boundaries.md)).
-6. Preserve the July and August history first. It is the local branch
-   `feature/artifact-ir-workspace-session` (109 commits, ending at `9370fa2`)
-   that was never pushed. Push it to the new repository as an archive branch,
-   link it from the README, then archive `squidred-dev/fantaisa-engine`.
+6. Keep the July and August history reachable. It is the
+   `feature/artifact-ir-workspace-session` branch of
+   `squidred-dev/fantaisa-engine` (109 commits, ending at `9370fa2`), pushed
+   on 2026-10-27. Copy it into the new repository as an archive branch, link
+   it from the README, then archive `squidred-dev/fantaisa-engine`.
 
 ## Options considered
 
