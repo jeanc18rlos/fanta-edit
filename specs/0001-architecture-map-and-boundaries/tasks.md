@@ -11,5 +11,7 @@ All in the pull request that introduced the process.
 - [x] **T4.** Add the record templates, indexes and the first records (R7,
   R8). Verify: `script/architecture index --check`.
 - [x] **T5.** Add the Architecture workflow (R9).
-- [ ] **T6.** Measure the workflow's duration on its first runs and record
-  it here (A8).
+- [x] **T6.** Measure the workflow's duration on its first runs and record
+  it here (A8). Done 2026-10-29: each of its first four runs, three on #168
+  and one on `main` after it merged, took 11 to 12 s from start to finish,
+  7 to 9 s of it in the job.
