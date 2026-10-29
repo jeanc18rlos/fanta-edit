@@ -73,8 +73,8 @@ id = "persistence"
 group = "engine"
 title = "Source and import"
 role = "Driven adapters"
-summary = "The FNX source codec, the project directory format and .fig import."
-crates = ["fanta-fnx", "fanta-format", "fanta-fig-interop"]
+summary = "The FNX source codec, the project directory format, runtime bundles and .fig import."
+crates = ["fanta-fnx", "fanta-format", "fanta-bundle", "fanta-fig-interop"]
 may_use = ["model"]
 forbid = ["skia"]
 

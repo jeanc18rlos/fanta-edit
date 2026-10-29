@@ -84,8 +84,9 @@ In short, from the inside out:
   agents and the cloud send.
 - **Interaction** (`fanta-canvas`, `fanta-tools`): viewport math, hit
   testing, snapping and tool state machines. Pure logic.
-- **Source and import** (`fanta-fnx`, `fanta-format`, `fanta-fig-interop`):
-  the FNX language, the project folder format and `.fig` import.
+- **Source and import** (`fanta-fnx`, `fanta-format`, `fanta-bundle`,
+  `fanta-fig-interop`): the FNX language, the project folder format, the
+  parser-free runtime bundles and `.fig` import.
 - **Rendering** (`fanta-text`, `fanta-render`): text layout and the renderer
   on Skia.
 - **Playback** (`fanta-present`): prototypes and motion over an immutable
@@ -97,7 +98,9 @@ In short, from the inside out:
 - **Desktop editor** (`fig_viewer`, `design_surface`, `fanta_ui`,
   `fanta_languages`): the GPUI host.
 - **App** (`fanta`): the binary that wires the editor into the shell.
-- **Inherited shell**: 128 crates from Zed ([0002](../decisions/0002-build-fanta-on-a-fork-of-zed.md)).
+- **Inherited shell**: every other crate, inherited from Zed
+  ([0002](../decisions/0002-build-fanta-on-a-fork-of-zed.md)); the crate map
+  counts them.
 
 Three rules carry most of the weight ([0023](../decisions/0023-enforce-layered-crate-boundaries.md)):
 the engine never depends on the editor, the shell or `fanta-ui`; the model,
@@ -228,7 +231,8 @@ fix cites [ADR 0023](../decisions/0023-enforce-layered-crate-boundaries.md).
   `component_actions`, `prototype_player` and `draw_wand`.
 - `fanta-present` depends on `fanta-render`, which ties playback to one
   renderer, and `fanta-text` mixes the rich-text model with Skia layout.
-- Engine licence fields disagree: twelve crates say `GPL-3.0`, three say
+- Engine licence fields disagree: most crates inherit the workspace's
+  `GPL-3.0`, while `fanta-design-ops`, `fanta-headless` and `fanta-api` say
   `GPL-3.0-or-later` ([0026](../decisions/0026-choose-the-engine-and-sdk-licence.md)).
 - The engine can only be reached through this repository
   ([0024](../decisions/0024-move-the-engine-into-its-own-repository.md)).

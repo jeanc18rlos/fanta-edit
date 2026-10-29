@@ -44,7 +44,7 @@ Proposed:
 1. Create `fanta-engine` in the organization
    ([0025](0025-organize-the-repositories-under-one-github-organization.md))
    by a history-preserving extraction of the engine group in
-   [`layers.toml`](../architecture/layers.toml): the 15 crates,
+   [`layers.toml`](../architecture/layers.toml): its crates,
    `vendor/skia-bindings-0.153.3`, the Skia source preparation (action and
    script), `fixtures/ink` and the engine docs (the cloud contract, the
    project schema and the parity matrix).
@@ -88,7 +88,7 @@ Proposed:
 
 ## Consequences
 
-- Good: SDKs and the cloud depend on a 15-crate repository. Engine CI runs
+- Good: SDKs and the cloud depend on a repository of engine crates only. Engine CI runs
   without Zed. The engine can carry its own licence, versions, changelog and
   outside contributors. The boundary becomes a published API.
 - Bad: a change that crosses the boundary takes two merges and a pin bump.

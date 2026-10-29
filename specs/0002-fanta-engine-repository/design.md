@@ -6,9 +6,10 @@
 
 The engine group in [`layers.toml`](../../docs/architecture/layers.toml):
 `fanta-doc`, `fanta-design-ops`, `fanta-canvas`, `fanta-tools`, `fanta-fnx`,
-`fanta-format`, `fanta-fig-interop`, `fanta-text`, `fanta-render`,
-`fanta-present`, `fanta-headless`, `fanta-api`, `fanta-engine`,
-`fanta-runtime` and `fanta-site`. With them go
+`fanta-format`, `fanta-bundle` (added by #158 after the dry run below),
+`fanta-fig-interop`, `fanta-text`, `fanta-render`, `fanta-present`,
+`fanta-headless`, `fanta-api`, `fanta-engine`, `fanta-runtime` and
+`fanta-site`. With them go
 `vendor/skia-bindings-0.153.3`, `.github/actions/prepare-skia-source`,
 `script/prepare-skia-source`, `fixtures/ink` (used by `fanta-tools`),
 `crates/VENDORED.md`, and the cloud contract, project schema and parity docs.
