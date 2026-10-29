@@ -37,7 +37,7 @@ these rules or when the index below is stale.
 <!-- decisions:start -->
 | ADR | Decision | Status | Date |
 | --- | --- | --- | --- |
-| [0001](0001-record-decisions-and-plan-changes-in-specs.md) | Record decisions in ADRs and plan changes in specs | proposed | 2026-10-27 |
+| [0001](0001-record-decisions-and-plan-changes-in-specs.md) | Record decisions in ADRs and plan changes in specs | accepted | 2026-10-29 |
 | [0002](0002-build-fanta-on-a-fork-of-zed.md) | Build Fanta on a fork of Zed | accepted | 2026-07-07 |
 | [0003](0003-keep-skia-out-of-the-document-model.md) | Keep Skia out of the document model | accepted | 2026-07-09 |
 | [0004](0004-store-designs-as-project-folders-of-fnx-source.md) | Store designs as project folders of FNX source | accepted | 2026-07-07 |
@@ -59,7 +59,7 @@ these rules or when the index below is stale.
 | [0020](0020-share-one-headless-engine-between-the-editor-and-the-cloud.md) | Share one headless engine between the editor and the cloud | accepted | 2026-10-21 |
 | [0021](0021-run-cloud-work-in-a-stateless-engine-worker.md) | Run cloud work in a stateless engine worker behind a frozen contract | accepted | 2026-10-21 |
 | [0022](0022-offer-a-fanta-native-design-api.md) | Offer a Fanta-native design API, built clean-room | accepted | 2026-10-24 |
-| [0023](0023-enforce-layered-crate-boundaries.md) | Enforce layered crate boundaries | proposed | 2026-10-27 |
+| [0023](0023-enforce-layered-crate-boundaries.md) | Enforce layered crate boundaries | accepted | 2026-10-29 |
 | [0024](0024-move-the-engine-into-its-own-repository.md) | Move the engine into its own repository | proposed | 2026-10-27 |
 | [0025](0025-organize-the-repositories-under-one-github-organization.md) | Organize the repositories under one GitHub organization | proposed | 2026-10-27 |
 | [0026](0026-choose-the-engine-and-sdk-licence.md) | Choose the engine and SDK licence | proposed | 2026-10-27 |
