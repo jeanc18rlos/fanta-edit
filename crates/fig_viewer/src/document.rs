@@ -345,7 +345,7 @@ pub(crate) fn take_pending_view_descriptor(cx: &mut App) -> Option<FigViewDescri
     cx.default_global::<PendingViewDescriptor>().0.take()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FigItemEvent {
     /// The document content changed through an operation, undo, or redo.
     Edited,
@@ -390,6 +390,13 @@ pub enum FigItemEvent {
     /// viewport to the new root and switch workspaces (Variables ↔ Canvas)
     /// accordingly.
     ScopeApplied(FigScope, ScopeRequester),
+    /// Select these layers and bring them into view, as clicking an Agent
+    /// mention of them asks. Only `view` follows, or the focused view when
+    /// `None`.
+    RevealNodes {
+        nodes: Vec<NodeId>,
+        view: Option<EntityId>,
+    },
 }
 
 /// Who initiated a scope change, carried on [`FigItemEvent::ScopeApplied`] so
@@ -9023,7 +9030,7 @@ mod tests {
         let _subscription = cx.update(|cx| {
             cx.subscribe(&fixture.item, {
                 let events = events.clone();
-                move |_, event: &FigItemEvent, _| events.borrow_mut().push(*event)
+                move |_, event: &FigItemEvent, _| events.borrow_mut().push(event.clone())
             })
         });
 
@@ -10586,7 +10593,7 @@ mod tests {
         let _subscription = cx.update(|cx| {
             cx.subscribe(&item, {
                 let events = events.clone();
-                move |_, event: &FigItemEvent, _| events.borrow_mut().push(*event)
+                move |_, event: &FigItemEvent, _| events.borrow_mut().push(event.clone())
             })
         });
 

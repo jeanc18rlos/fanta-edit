@@ -62,9 +62,9 @@ use crate::clipboard::{
     CanvasClipboard, ClipboardPlacement, apply_transaction as apply_canvas_transaction,
     clone_component_operations, paste_operations,
 };
-use crate::code_workspace::FantaCodeWorkspace;
+use crate::code_workspace::{CodeWorkspaceFile, FantaCodeWorkspace};
 use crate::comments::MotionCommentAnchor;
-use crate::comments_panel::{FantaCommentsPanel, document_comment_rows};
+use crate::comments_panel::CommentsPanel;
 use crate::design_panel::{FantaDesignPanel, FileInspectorVisibilityChanged};
 use crate::document::{
     AssetStores, DocChange, FigDocument, FigItem, FigItemEvent, FigScope, MAX_IMAGE_SOURCE_BYTES,
@@ -230,10 +230,8 @@ actions!(
         ActivateTextPathTool,
         /// Activate the comment tool (click the canvas to pin a comment).
         ActivateCommentTool,
-        /// Prepare an AI design review of the active page.
-        RunAiReview,
-        /// Prepare a multi-pass AI review of every page.
-        RunUltraReview,
+        /// Post the comment or reply being composed on the canvas.
+        SubmitComment,
         /// Export the selected animation as portable Motion JSON.
         ExportMotionJson,
         /// Export the selected animation as Figma Motion JSON.
@@ -429,7 +427,7 @@ pub struct FigView {
     _file_inspector_subscription: Subscription,
     inspector_sidebar: Entity<FantaPropertiesPanel>,
     prototype_sidebar: Entity<FantaPrototypePanel>,
-    plan_build_sidebar: Entity<crate::plan_build::PlanBuildPanel>,
+    comments_sidebar: Entity<CommentsPanel>,
     motion_sidebar: Entity<FantaMotionPanel>,
     variables_workspace: Entity<FantaVariablesWorkspace>,
     code_workspace: Entity<FantaCodeWorkspace>,
@@ -810,8 +808,10 @@ impl FigView {
             },
         );
         let prototype_sidebar = cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx));
-        let plan_build_sidebar =
-            cx.new(|cx| crate::plan_build::PlanBuildPanel::new(item.downgrade(), cx));
+        let comments_sidebar = {
+            let view = cx.weak_entity();
+            cx.new(|cx| CommentsPanel::new(item.clone(), view, cx))
+        };
         let timeline_shell = cx.new(|cx| {
             let mut timeline = TimelineShell::new();
             timeline.set_authoring_enabled(false, cx);
@@ -872,7 +872,7 @@ impl FigView {
             _file_inspector_subscription: file_inspector_subscription,
             inspector_sidebar,
             prototype_sidebar,
-            plan_build_sidebar,
+            comments_sidebar,
             motion_sidebar,
             variables_workspace,
             code_workspace,
@@ -1286,6 +1286,15 @@ impl FigView {
                         cx.notify();
                     }
                 }
+                FigItemEvent::RevealNodes { nodes, view } => {
+                    let follows = match view {
+                        Some(view) => *view == cx.entity_id(),
+                        None => this.is_focused,
+                    };
+                    if follows {
+                        this.reveal_nodes(nodes, cx);
+                    }
+                }
             }
             cx.notify();
         })
@@ -1546,6 +1555,11 @@ impl FigView {
         self.code_workspace.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn space_pan_for_test(&self) -> bool {
+        self.space_pan
+    }
+
     pub fn set_editor_workspace(&mut self, workspace: EditorWorkspace, cx: &mut Context<Self>) {
         if self.is_dev_mode(cx) {
             self.set_dev_workspace(workspace, cx);
@@ -1575,11 +1589,29 @@ impl FigView {
             self.timeline_shell
                 .update(cx, |timeline, cx| timeline.pause(cx));
         }
+        if workspace == EditorWorkspace::Code {
+            self.prefer_code_source(cx);
+        }
         self.editor_session
             .update(cx, |session, cx| session.set_workspace(workspace, cx));
         self.sync_motion_timeline(cx);
         self.invalidate_canvas_cache();
         cx.notify();
+    }
+
+    /// The Code tab shows what the user came from: `variables.json` from the
+    /// Variables workspace (or a view opened on it), otherwise the design's
+    /// own source.
+    fn prefer_code_source(&mut self, cx: &mut Context<Self>) {
+        let file = if self.editor_workspace(cx) == EditorWorkspace::Variables
+            || self.scope == Some(FigScope::Variables)
+        {
+            CodeWorkspaceFile::Variables
+        } else {
+            CodeWorkspaceFile::Fnx
+        };
+        self.code_workspace
+            .update(cx, |workspace, cx| workspace.prefer_source(file, cx));
     }
 
     pub fn set_editor_mode(&mut self, mode: EditorMode, cx: &mut Context<Self>) {
@@ -2888,6 +2920,52 @@ impl FigView {
         );
     }
 
+    /// Select `nodes` and frame them, switching to their page first: what
+    /// clicking an Agent mention of them does. Nodes that no longer exist are
+    /// skipped.
+    pub(crate) fn reveal_nodes(&mut self, nodes: &[NodeId], cx: &mut Context<Self>) {
+        let selected_page = self.selected_page_index();
+        let target = self.item.read(cx).document().and_then(|document| {
+            let nodes = nodes
+                .iter()
+                .copied()
+                .filter(|node| document.doc.scene.contains(*node))
+                .collect::<Vec<_>>();
+            let page = document.page_index_of_node(*nodes.first()?);
+            Some((nodes, page, document.page_index(selected_page)))
+        });
+        let Some((nodes, page, current_page)) = target else {
+            show_canvas_notice_deferred(
+                "These layers are no longer in this design.".to_string(),
+                cx,
+            );
+            return;
+        };
+        if let Some(page) = page
+            && Some(page) != current_page
+        {
+            if self.item.read(cx).source_edit_locked() {
+                show_canvas_notice_deferred(
+                    "Save or discard source edits before showing layers on another page."
+                        .to_string(),
+                    cx,
+                );
+                return;
+            }
+            self.select_page(page, cx);
+        }
+        self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with(nodes.clone());
+                ((), DocChange::Selection)
+            });
+        });
+        match nodes.as_slice() {
+            [node] => self.focus_node(*node, cx),
+            _ => self.zoom_to_selection(cx),
+        }
+    }
+
     // === Tool routing =====================================================
 
     fn defer_bitmap_wand_press(
@@ -4001,14 +4079,21 @@ impl FigView {
     fn handle_canvas_key_down(
         &mut self,
         event: &gpui::KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.prototype_player.is_some() {
             self.trigger_prototype_key(&event.keystroke.key, cx);
             return;
         }
-        if event.keystroke.key == "space" && self.text_edit.is_none() && !self.space_pan {
+        // Text fields on the canvas (comment composers, annotation notes)
+        // bubble their keys here; a typed space must stay a character.
+        let typing = window
+            .context_stack()
+            .iter()
+            .any(|context| context.contains("Editor") || context.contains("Input"));
+        if event.keystroke.key == "space" && self.text_edit.is_none() && !typing && !self.space_pan
+        {
             self.space_pan = true;
             cx.notify();
         }
@@ -6284,7 +6369,7 @@ impl FigView {
                 && self.revealed_compact_sidebar == Some(SidebarKind::Layers))
     }
 
-    fn inspector_sidebar_expanded(&self, _cx: &App) -> bool {
+    pub(crate) fn inspector_sidebar_expanded(&self, _cx: &App) -> bool {
         let keep_draft = self.inspector_has_focus;
         #[cfg(feature = "fanta-gpui-ui")]
         let keep_draft = keep_draft
@@ -6446,7 +6531,15 @@ impl FigView {
         sidebar.into_any_element()
     }
 
-    fn render_inspector_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Whether the inspector shows the annotation panel in place of the
+    /// mode's own panel.
+    pub(crate) fn annotation_panel_active(&self, cx: &App) -> bool {
+        self.annotation_state.controller.has_pending_authoring()
+            || self.selected_annotation(cx).is_some()
+            || self.tools.kind() == ToolKind::Annotation
+    }
+
+    fn render_inspector_sidebar(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let mode = self.editor_mode(cx);
         let view = cx.weak_entity();
         let tabs = EditorModeTabs::new(mode, move |mode, window, cx| {
@@ -6455,16 +6548,14 @@ impl FigView {
             })
             .log_err();
         });
-        if self.annotation_state.controller.has_pending_authoring()
-            || self.selected_annotation(cx).is_some()
-            || self.tools.kind() == ToolKind::Annotation
-        {
+        if self.annotation_panel_active(cx) {
             return self.render_inspector_body(self.render_annotation_panel(cx), tabs, cx);
         }
         let body = match mode {
             EditorMode::Prototype => self.prototype_sidebar.clone().into_any_element(),
-            EditorMode::Comments => self.render_comments_sidebar(cx),
-            EditorMode::Build => self.plan_build_sidebar.clone().into_any_element(),
+            EditorMode::Comments => self
+                .render_comment_thread_page(window, cx)
+                .unwrap_or_else(|| self.comments_sidebar.clone().into_any_element()),
             EditorMode::Motion => self.motion_sidebar.clone().into_any_element(),
             EditorMode::Design | EditorMode::Draw | EditorMode::Code | EditorMode::Dev => {
                 let records = self.page_measurements(cx);
@@ -6818,35 +6909,6 @@ impl FigView {
             })
             .justify_center()
             .child(div().occlude().child(tabs))
-            .into_any_element()
-    }
-
-    fn render_comments_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let rows = self
-            .item
-            .read(cx)
-            .document()
-            .map(|document| document_comment_rows(&document.doc, &document.pages))
-            .unwrap_or_default();
-        let view = cx.weak_entity();
-        v_flex()
-            .size_full()
-            .child(
-                Button::new("comments-ai-review", "AI Review…").on_click(cx.listener(
-                    |this, _, window, cx| {
-                        this.run_ai_review(crate::review::ReviewDepth::Standard, window, cx);
-                    },
-                )),
-            )
-            .child(FantaCommentsPanel::new(
-                rows,
-                move |page_root, comment_id, window, cx| {
-                    view.update(cx, |view, cx| {
-                        view.show_comment_thread_on_page(page_root, comment_id, window, cx);
-                    })
-                    .log_err();
-                },
-            ))
             .into_any_element()
     }
 
@@ -8988,12 +9050,6 @@ impl Render for FigView {
             .on_action(cx.listener(|this, _: &ExportMotionFrames, _, cx| {
                 this.export_selected_motion(crate::export::ExportFormat::MotionFrames, cx);
             }))
-            .on_action(cx.listener(|this, _: &RunAiReview, window, cx| {
-                this.run_ai_review(crate::review::ReviewDepth::Standard, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &RunUltraReview, window, cx| {
-                this.run_ai_review(crate::review::ReviewDepth::Ultra, window, cx);
-            }))
             .on_action(cx.listener(|this, _: &ApplySuggestedFix, _, cx| {
                 this.apply_open_comment_suggested_fix(cx);
             }))
@@ -9145,8 +9201,10 @@ impl Render for FigView {
                                                             {
                                                                 c.push(ov);
                                                             }
-                                                            if let Some(comments) =
-                                                                self.render_comment_overlay(cx)
+                                                            if let Some(comments) = self
+                                                                .render_comment_overlay(
+                                                                    window, cx,
+                                                                )
                                                             {
                                                                 c.push(comments);
                                                             }
@@ -9204,7 +9262,7 @@ impl Render for FigView {
                                         )
                                         .children(
                                             self.pane_sidebar_layout().inspector
-                                                .map(|_| self.render_inspector_sidebar(cx)),
+                                                .map(|_| self.render_inspector_sidebar(window, cx)),
                                         ),
                                 )
                                 .children((editor_mode == EditorMode::Motion).then(|| {
@@ -9258,7 +9316,7 @@ impl Render for FigView {
                                         .min(self.displayed_sidebar_width(SidebarKind::Inspector)))
                                     .overflow_x_scroll()
                                     .bg(cx.theme().colors().panel_background).occlude()
-                                    .child(self.render_inspector_sidebar(cx)),
+                                    .child(self.render_inspector_sidebar(window, cx)),
                             ).with_priority(4)
                         }))
                         .children(
@@ -10105,8 +10163,10 @@ impl Item for FigView {
                 },
             );
             let prototype_sidebar = cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx));
-            let plan_build_sidebar =
-                cx.new(|cx| crate::plan_build::PlanBuildPanel::new(item.downgrade(), cx));
+            let comments_sidebar = {
+                let view = cx.weak_entity();
+                cx.new(|cx| CommentsPanel::new(item.clone(), view, cx))
+            };
             let timeline_shell = cx.new(|cx| {
                 let mut timeline = TimelineShell::new();
                 timeline.set_authoring_enabled(timeline_authoring_enabled, cx);
@@ -10149,7 +10209,7 @@ impl Item for FigView {
                 _file_inspector_subscription: file_inspector_subscription,
                 inspector_sidebar,
                 prototype_sidebar,
-                plan_build_sidebar,
+                comments_sidebar,
                 motion_sidebar,
                 variables_workspace,
                 code_workspace,
@@ -21350,7 +21410,7 @@ mod tests {
             view.read_with(&visual, |view, _| {
                 assert!(view.canvas_context_menu.is_some());
             });
-            visual.simulate_keystrokes("home down down down down down enter");
+            visual.simulate_keystrokes("home down down down down down down enter");
         } else {
             mounted_canvas_click(&mut visual, position, 1);
             mounted_canvas_click(&mut visual, position, 2);
@@ -21954,7 +22014,7 @@ mod tests {
             view.read_with(&visual, |view, _| {
                 assert!(view.canvas_context_menu.is_some())
             });
-            visual.simulate_keystrokes("home down down down down down enter");
+            visual.simulate_keystrokes("home down down down down down down enter");
             view.read_with(&visual, |view, _| assert_anchors(view));
         } else {
             mounted_canvas_click(&mut visual, position, 1);
@@ -22809,7 +22869,7 @@ impl FigView {
         match id {
             CHROME_ADD_CANVAS_CONTEXT => self.open_toolbar_agent_attachment(window, cx),
             CHROME_RUN_AI_REVIEW => {
-                self.run_ai_review(crate::review::ReviewDepth::Standard, window, cx)
+                window.dispatch_action(Box::new(fanta_actions::agent::ReviewDesign), cx)
             }
             CHROME_FIT_TO_VIEW => self.fit_to_view(&FitToView, window, cx),
             CHROME_TOGGLE_LAYERS_SIDEBAR => {
@@ -23366,41 +23426,37 @@ impl FigView {
     /// trip.
     #[cfg(feature = "fanta-gpui-ui")]
     fn open_toolbar_agent_attachment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let workspace = window
+        if self.add_selection_to_agent(window, cx) {
+            return;
+        }
+        let Some(workspace) = window
             .root::<MultiWorkspace>()
             .flatten()
-            .map(|multi_workspace| multi_workspace.read(cx).workspace().clone());
-        let Some(workspace) = workspace else {
+            .map(|multi_workspace| multi_workspace.read(cx).workspace().clone())
+        else {
+            return;
+        };
+        if let Err(error) = agent_ui::open_agent_add_context_menu(workspace, window, cx) {
+            log::error!("opening the toolbar Agent attachment workflow failed: {error:#}");
             show_canvas_notice(
-                "This window has no workspace for the Agent Panel.".to_string(),
+                format!("The Agent attachment workflow could not be opened: {error:#}"),
                 window,
                 cx,
             );
-            return;
-        };
-        match self.agent_canvas_selection_snapshot(cx) {
-            Ok(Some((name, content))) => {
-                if let Err(error) = agent_ui::attach_canvas_selection_for_review(
-                    workspace, name, content, window, cx,
-                ) {
-                    log::error!("attaching the canvas selection failed: {error:#}");
-                    show_canvas_notice(
-                        format!("The canvas selection could not be attached: {error:#}"),
-                        window,
-                        cx,
-                    );
-                }
-            }
-            Ok(None) => {
-                if let Err(error) = agent_ui::open_agent_add_context_menu(workspace, window, cx) {
-                    log::error!("opening the toolbar Agent attachment workflow failed: {error:#}");
-                    show_canvas_notice(
-                        format!("The Agent attachment workflow could not be opened: {error:#}"),
-                        window,
-                        cx,
-                    );
-                }
-            }
+        }
+    }
+
+    /// Mention the selected layers in the Agent Panel's draft: a link that
+    /// selects them again when clicked, carrying a snapshot the agent reads.
+    /// Returns false, having done nothing, when nothing is selected.
+    pub(crate) fn add_selection_to_agent(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let selection = match self.agent_canvas_selection_snapshot(cx) {
+            Ok(Some(selection)) => selection,
+            Ok(None) => return false,
             Err(error) => {
                 log::error!("snapshotting the canvas selection failed: {error:#}");
                 show_canvas_notice(
@@ -23408,15 +23464,43 @@ impl FigView {
                     window,
                     cx,
                 );
+                return true;
             }
+        };
+        let Some(workspace) = window
+            .root::<MultiWorkspace>()
+            .flatten()
+            .map(|multi_workspace| multi_workspace.read(cx).workspace().clone())
+        else {
+            show_canvas_notice(
+                "This window has no workspace for the Agent Panel.".to_string(),
+                window,
+                cx,
+            );
+            return true;
+        };
+        if let Err(error) = agent_ui::attach_canvas_selection_for_review(
+            workspace,
+            selection.name,
+            selection.nodes,
+            selection.content,
+            window,
+            cx,
+        ) {
+            log::error!("attaching the canvas selection failed: {error:#}");
+            show_canvas_notice(
+                format!("The canvas selection could not be attached: {error:#}"),
+                window,
+                cx,
+            );
         }
+        true
     }
 
-    #[cfg(feature = "fanta-gpui-ui")]
-    fn agent_canvas_selection_snapshot(
+    pub(crate) fn agent_canvas_selection_snapshot(
         &self,
         cx: &App,
-    ) -> anyhow::Result<Option<(String, String)>> {
+    ) -> anyhow::Result<Option<AgentCanvasSelection>> {
         let item = self.item.read(cx);
         let Some(document) = item.document() else {
             return Ok(None);
@@ -23523,13 +23607,35 @@ impl FigView {
                 );
             }
         };
-        let noun = if selected_count == 1 {
-            "layer"
-        } else {
-            "layers"
+        let name = match doc.selection.as_slice() {
+            [node] => doc
+                .scene
+                .get(*node)
+                .map(|node| node.name.trim())
+                .filter(|name| !name.is_empty())
+                .map_or_else(
+                    || "Untitled layer".to_string(),
+                    |name| {
+                        crate::agent_surface::truncate_summary_string(
+                            name,
+                            crate::agent_surface::SUMMARY_LABEL_CHARS,
+                        )
+                    },
+                ),
+            _ => format!("{selected_count} layers on {scope_name}"),
         };
-        let name = format!("Canvas selection — {scope_name} ({selected_count} {noun})");
-        Ok(Some((name, content)))
+        let included = nodes.len();
+        let nodes = doc
+            .selection
+            .iter()
+            .take(included)
+            .map(|node| node.to_string())
+            .collect();
+        Ok(Some(AgentCanvasSelection {
+            name,
+            nodes,
+            content,
+        }))
     }
 
     #[cfg(feature = "fanta-gpui-ui")]
@@ -23727,10 +23833,16 @@ pub(crate) const CANVAS_NOTICE_ID: &str = "fanta-canvas-notice";
 /// How many selected layers a toolbar Agent prompt lists by id.
 #[cfg(feature = "fanta-gpui-ui")]
 const AGENT_PROMPT_CONTEXT_LAYERS: usize = 8;
-#[cfg(feature = "fanta-gpui-ui")]
 const AGENT_ATTACHMENT_CONTEXT_LAYERS: usize = 64;
-#[cfg(feature = "fanta-gpui-ui")]
 const AGENT_ATTACHMENT_MAX_BYTES: usize = 128 * 1024;
+
+/// The selection the Agent Panel's draft mentions: its label, the layers a
+/// click on the mention reveals, and the snapshot the agent reads.
+pub(crate) struct AgentCanvasSelection {
+    pub(crate) name: String,
+    pub(crate) nodes: Vec<String>,
+    pub(crate) content: String,
+}
 
 /// The draft prompt a text-editing toolbar command opens in the Agent Panel.
 /// Generation commands open the dedicated generation workspace.

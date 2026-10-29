@@ -1519,6 +1519,13 @@
     },
   },
   {
+    "context": "FantaCommentComposer > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "enter": "fig_viewer::SubmitComment",
+    },
+  },
+  {
     "context": "FigViewerTextEdit && !Editor && !Input",
     "use_key_equivalents": true,
     "bindings": {

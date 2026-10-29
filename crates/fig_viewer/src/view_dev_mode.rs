@@ -85,6 +85,9 @@ impl FigView {
         self.annotation_state.selection = None;
         self.tools.activate_without_context(ToolKind::Inspect);
         self.remember_tool_face(ToolKind::Inspect);
+        if workspace == EditorWorkspace::Code {
+            self.prefer_code_source(cx);
+        }
         self.editor_session
             .update(cx, |session, cx| session.set_workspace(workspace, cx));
         self.hovered_node = None;
@@ -248,7 +251,7 @@ mod tests {
         cx.run_until_parked();
     }
 
-    const MODE_TAB_SELECTORS: [&str; 8] = [
+    const MODE_TAB_SELECTORS: [&str; 7] = [
         "fanta-collapsible-tab-fanta-editor-mode-0",
         "fanta-collapsible-tab-fanta-editor-mode-1",
         "fanta-collapsible-tab-fanta-editor-mode-2",
@@ -256,7 +259,6 @@ mod tests {
         "fanta-collapsible-tab-fanta-editor-mode-4",
         "fanta-collapsible-tab-fanta-editor-mode-5",
         "fanta-collapsible-tab-fanta-editor-mode-6",
-        "fanta-collapsible-tab-fanta-editor-mode-7",
     ];
 
     fn visible_native_mode_tab(

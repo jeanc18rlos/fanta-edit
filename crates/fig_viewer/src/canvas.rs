@@ -6310,6 +6310,9 @@ impl CanvasElement {
             // and a message-count chip. Screen-fixed size across zoom.
             for pin in &data.comment_pins {
                 let anchor = project(pin.world);
+                if !comment_pin_visible(anchor, bounds) {
+                    continue;
+                }
                 // Review findings read by weight before by author: red for a
                 // blocker, orange for major, amber for minor, the accent for info.
                 let fill = match pin.severity {
@@ -6324,7 +6327,7 @@ impl CanvasElement {
                     }
                     Some(crate::comments::CommentSeverity::Info) => accent,
                     None if pin.from_agent => accent,
-                    None => avatar_color(&pin.author),
+                    None => crate::comments_ui::comment_author_color(&pin.author),
                 };
                 let fill = if pin.resolved {
                     fill.opacity(0.5)
@@ -6768,93 +6771,29 @@ fn edge_gaps(selected: fanta_doc::Bounds, hovered: fanta_doc::Bounds) -> Vec<Gap
 /// Screen-fixed comment pin size, constant across zoom (matches the original).
 const COMMENT_PIN_SIZE: f32 = 30.0;
 
-/// The teardrop outline the original fanta uses: a 24-unit circle with three
-/// rounded corners and a SQUARED bottom-left tail (the anchor point). Cubics
-/// sampled at 10 steps each and normalized into the unit square, cached.
-fn pin_unit_polygon() -> &'static [(f32, f32)] {
-    use std::sync::OnceLock;
-    static POLY: OnceLock<Vec<(f32, f32)>> = OnceLock::new();
-    POLY.get_or_init(|| {
-        fn cubic(
-            points: &mut Vec<(f32, f32)>,
-            p0: (f32, f32),
-            p1: (f32, f32),
-            p2: (f32, f32),
-            p3: (f32, f32),
-        ) {
-            for step in 1..=10 {
-                let t = step as f32 / 10.0;
-                let u = 1.0 - t;
-                let x = u * u * u * p0.0
-                    + 3.0 * u * u * t * p1.0
-                    + 3.0 * u * t * t * p2.0
-                    + t * t * t * p3.0;
-                let y = u * u * u * p0.1
-                    + 3.0 * u * u * t * p1.1
-                    + 3.0 * u * t * t * p2.1
-                    + t * t * t * p3.1;
-                points.push((x, y));
-            }
-        }
-        let mut points: Vec<(f32, f32)> = Vec::with_capacity(44);
-        points.push((24.0, 12.098));
-        cubic(
-            &mut points,
-            (24.0, 12.098),
-            (24.0, 18.725),
-            (18.627, 24.098),
-            (12.0, 24.098),
-        );
-        points.push((1.146, 24.098));
-        cubic(
-            &mut points,
-            (1.146, 24.098),
-            (0.513, 24.098),
-            (0.0, 23.585),
-            (0.0, 22.952),
-        );
-        points.push((0.0, 12.098));
-        cubic(
-            &mut points,
-            (0.0, 12.098),
-            (0.0, 5.471),
-            (5.373, 0.098),
-            (12.0, 0.098),
-        );
-        cubic(
-            &mut points,
-            (12.0, 0.098),
-            (18.627, 0.098),
-            (24.0, 5.471),
-            (24.0, 12.098),
-        );
-        points
-            .into_iter()
-            .map(|(x, y)| (x / 24.0, (y - 0.098) / 24.0))
-            .collect()
-    })
+/// The teardrop's corner radii: a 24-unit circle whose bottom-left corner,
+/// the anchor, is squared off to a 1.146-unit radius (the original fanta's
+/// outline). Quads draw it on the GPU; tessellating the outline as paths cost
+/// three CPU tessellations per pin on every frame, which made each keystroke
+/// in a comment composer re-tessellate every pin on the page.
+fn comment_pin_corner_radii(size: Pixels) -> gpui::Corners<Pixels> {
+    gpui::Corners {
+        top_left: size / 2.,
+        top_right: size / 2.,
+        bottom_right: size / 2.,
+        bottom_left: size * (1.146 / 24.0),
+    }
 }
 
-/// Deterministic per-author pin/avatar color: FNV-1a over the normalized name
-/// hashed onto the hue wheel at the original's fixed saturation/value.
-fn avatar_color(author: &str) -> Hsla {
-    let normalized = author.trim().to_lowercase();
-    let mut hash: u32 = 0x811c_9dc5;
-    for byte in normalized.bytes() {
-        hash ^= u32::from(byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    let hue = (hash % 360) as f32 / 360.0;
-    // HSV(h, 0.52, 0.72) converted to HSL.
-    let value = 0.72;
-    let saturation_v = 0.52;
-    let lightness = value * (1.0 - saturation_v / 2.0);
-    let saturation = if lightness <= 0.0 || lightness >= 1.0 {
-        0.0
-    } else {
-        (value - lightness) / f32::min(lightness, 1.0 - lightness)
+/// Whether any part of the pin anchored at `anchor` (with its count chip and
+/// shadow) can land inside `bounds`.
+fn comment_pin_visible(anchor: Point<Pixels>, bounds: Bounds<Pixels>) -> bool {
+    let size = px(COMMENT_PIN_SIZE);
+    let reach = Bounds {
+        origin: point(anchor.x - px(2.), anchor.y - size * 1.35),
+        size: gpui::size(size * 1.35 + px(4.), size * 1.35 + px(4.)),
     };
-    gpui::hsla(hue, saturation, lightness, 1.0)
+    reach.intersects(&bounds)
 }
 
 /// One teardrop comment pin: drop shadow, author-colored body, hairline white
@@ -6871,43 +6810,29 @@ fn paint_comment_pin(
     let size = COMMENT_PIN_SIZE;
     // The anchor is the squared tail: the pin rect's bottom-left corner.
     let origin = point(anchor.x, anchor.y - px(size));
-    let polygon = pin_unit_polygon();
-    let build = |offset_y: f32| -> Option<gpui::Path<Pixels>> {
-        let mut points = polygon
-            .iter()
-            .map(|(x, y)| point(origin.x + px(x * size), origin.y + px(y * size + offset_y)));
-        let first = points.next()?;
-        let mut builder = PathBuilder::fill();
-        builder.move_to(first);
-        for p in points {
-            builder.line_to(p);
-        }
-        builder.close();
-        builder.build().ok()
+    let body = Bounds {
+        origin,
+        size: gpui::size(px(size), px(size)),
     };
-    if let Some(shadow) = build(1.5) {
-        window.paint_path(shadow, gpui::black().opacity(0.18));
-    }
-    if let Some(body) = build(0.0) {
-        window.paint_path(body, fill);
-    }
-    // Hairline outline: re-trace the polygon as a stroke path.
-    {
-        let mut points = polygon
-            .iter()
-            .map(|(x, y)| point(origin.x + px(x * size), origin.y + px(y * size)));
-        if let Some(first) = points.next() {
-            let mut builder = PathBuilder::stroke(px(1.));
-            builder.move_to(first);
-            for p in points {
-                builder.line_to(p);
-            }
-            builder.close();
-            if let Ok(path) = builder.build() {
-                window.paint_path(path, gpui::white().opacity(0.86));
-            }
-        }
-    }
+    let corner_radii = comment_pin_corner_radii(px(size));
+    window.paint_quad(
+        gpui::fill(
+            Bounds {
+                origin: point(origin.x, origin.y + px(1.5)),
+                ..body
+            },
+            gpui::black().opacity(0.18),
+        )
+        .corner_radii(corner_radii),
+    );
+    window.paint_quad(gpui::quad(
+        body,
+        corner_radii,
+        fill,
+        px(1.),
+        gpui::white().opacity(0.86),
+        BorderStyle::Solid,
+    ));
     // Monogram: first grapheme of the author, uppercased; nudged up because
     // the tail eats the bottom-left.
     let monogram: String = author

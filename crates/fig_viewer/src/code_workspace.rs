@@ -18,8 +18,8 @@ use search::{
     buffer_search::{Deploy, DivRegistrar},
 };
 use serde::Deserialize;
-use ui::Tooltip;
 use ui::prelude::*;
+use ui::{Divider, Tooltip};
 
 use crate::document::{FigItem, FigItemEvent};
 use workspace::{FollowableItem as _, ItemHandle, ToolbarItemView as _};
@@ -71,25 +71,68 @@ struct OpeningTag {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CodeWorkspaceFile {
+    /// The page's or component master's FNX source.
     #[default]
     Fnx,
+    /// The page's `page.json` or the component's `def.json`.
     Json,
+    /// `doc/variables.json`: the project's variable collections and modes.
+    Variables,
+    /// `fanta.json`: the project manifest.
+    Manifest,
+    /// `workspace.fnx`, which older projects keep beside the manifest.
+    Workspace,
 }
 
 impl CodeWorkspaceFile {
+    const PROJECT_FILES: [Self; 3] = [Self::Variables, Self::Manifest, Self::Workspace];
+
     fn label(self) -> &'static str {
         match self {
             Self::Fnx => "FNX",
             Self::Json => "JSON",
+            Self::Variables => "variables.json",
+            Self::Manifest => "fanta.json",
+            Self::Workspace => "workspace.fnx",
         }
     }
 
     fn icon(self) -> IconName {
         match self {
-            Self::Fnx => IconName::FileCode,
-            Self::Json => IconName::FileGeneric,
+            Self::Fnx | Self::Workspace => IconName::FileCode,
+            Self::Json | Self::Manifest => IconName::FileGeneric,
+            Self::Variables => IconName::DatabaseZap,
         }
     }
+
+    /// The file's path inside the project, for files outside the design pair.
+    fn project_path(self) -> Option<PathBuf> {
+        match self {
+            Self::Fnx | Self::Json => None,
+            Self::Variables => Some(Path::new("doc").join("variables.json")),
+            Self::Manifest => Some(PathBuf::from("fanta.json")),
+            Self::Workspace => Some(PathBuf::from("workspace.fnx")),
+        }
+    }
+
+    /// Fanta manages these files and has no source apply path for them, so
+    /// the pane shows them read-only.
+    fn managed(self) -> bool {
+        matches!(self, Self::Manifest | Self::Workspace)
+    }
+}
+
+/// A project-wide source file, opened into the pane the first time it is
+/// selected.
+#[derive(Default)]
+struct ProjectSource {
+    path: Option<PathBuf>,
+    editor: Option<Entity<Editor>>,
+    buffer: Option<Entity<Buffer>>,
+    observation: Option<Subscription>,
+    version: Option<clock::Global>,
+    loading: bool,
+    _load_task: Option<Task<()>>,
 }
 
 pub struct FantaCodeWorkspace {
@@ -131,6 +174,12 @@ pub struct FantaCodeWorkspace {
     error_message: Option<SharedString>,
     fnx_load_task: Option<Task<()>>,
     json_load_task: Option<Task<()>>,
+    variables_source: ProjectSource,
+    manifest_source: ProjectSource,
+    workspace_source: ProjectSource,
+    /// Whether the project has a `workspace.fnx`, probed when the project
+    /// sources refresh rather than on every render.
+    workspace_fnx_present: bool,
     _item_subscription: Subscription,
     _project_subscription: Subscription,
 }
@@ -226,6 +275,10 @@ impl FantaCodeWorkspace {
             error_message: None,
             fnx_load_task: None,
             json_load_task: None,
+            variables_source: ProjectSource::default(),
+            manifest_source: ProjectSource::default(),
+            workspace_source: ProjectSource::default(),
+            workspace_fnx_present: false,
             _item_subscription: item_subscription,
             _project_subscription: project_subscription,
         }
@@ -253,6 +306,9 @@ impl FantaCodeWorkspace {
         } else if active_page != self.requested_page {
             self.error_message =
                 Some("Save or discard the source edit before switching pages.".into());
+        }
+        if self.selected_file.project_path().is_some() {
+            self.open_project_source(self.selected_file, window, cx);
         }
         self.update_fnx_editability(cx);
         self.last_synced_selection = None;
@@ -329,6 +385,88 @@ impl FantaCodeWorkspace {
         self.selected_file
     }
 
+    /// Choose what the pane shows the next time it opens: a project file is
+    /// selected as asked (the Variables workspace shows `variables.json`),
+    /// while the design source replaces a project file but keeps the user's
+    /// FNX or JSON choice.
+    pub(crate) fn prefer_source(&mut self, file: CodeWorkspaceFile, cx: &mut Context<Self>) {
+        if self.visible {
+            return;
+        }
+        let selected = if file.project_path().is_some() {
+            file
+        } else if self.selected_file.project_path().is_some() {
+            CodeWorkspaceFile::Fnx
+        } else {
+            self.selected_file
+        };
+        if selected != self.selected_file {
+            self.selected_file = selected;
+            self.last_synced_selection = None;
+            cx.notify();
+        }
+    }
+
+    fn project_source(&self, file: CodeWorkspaceFile) -> Option<&ProjectSource> {
+        match file {
+            CodeWorkspaceFile::Fnx | CodeWorkspaceFile::Json => None,
+            CodeWorkspaceFile::Variables => Some(&self.variables_source),
+            CodeWorkspaceFile::Manifest => Some(&self.manifest_source),
+            CodeWorkspaceFile::Workspace => Some(&self.workspace_source),
+        }
+    }
+
+    fn project_source_mut(&mut self, file: CodeWorkspaceFile) -> Option<&mut ProjectSource> {
+        match file {
+            CodeWorkspaceFile::Fnx | CodeWorkspaceFile::Json => None,
+            CodeWorkspaceFile::Variables => Some(&mut self.variables_source),
+            CodeWorkspaceFile::Manifest => Some(&mut self.manifest_source),
+            CodeWorkspaceFile::Workspace => Some(&mut self.workspace_source),
+        }
+    }
+
+    fn file_buffer(&self, file: CodeWorkspaceFile) -> Option<&Entity<Buffer>> {
+        match file {
+            CodeWorkspaceFile::Fnx => self.fnx_source_buffer.as_ref(),
+            CodeWorkspaceFile::Json => self.json_source_buffer.as_ref(),
+            file => self.project_source(file)?.buffer.as_ref(),
+        }
+    }
+
+    fn file_path(&self, file: CodeWorkspaceFile) -> Option<&PathBuf> {
+        match file {
+            CodeWorkspaceFile::Fnx => self.fnx_path.as_ref(),
+            CodeWorkspaceFile::Json => self.json_path.as_ref(),
+            file => self.project_source(file)?.path.as_ref(),
+        }
+    }
+
+    fn file_loading(&self, file: CodeWorkspaceFile) -> bool {
+        match file {
+            CodeWorkspaceFile::Fnx => self.loading_fnx,
+            CodeWorkspaceFile::Json => self.loading_json,
+            file => self
+                .project_source(file)
+                .is_some_and(|source| source.loading),
+        }
+    }
+
+    /// Every open source buffer: the design pair and the project files.
+    fn source_buffers(&self) -> impl Iterator<Item = &Entity<Buffer>> {
+        [&self.fnx_source_buffer, &self.json_source_buffer]
+            .into_iter()
+            .flatten()
+            .chain(
+                [
+                    &self.variables_source,
+                    &self.manifest_source,
+                    &self.workspace_source,
+                ]
+                .into_iter()
+                .filter_map(|source| source.buffer.as_ref()),
+            )
+    }
+
     pub fn validation_error(&self) -> Option<&str> {
         self.error_message.as_deref()
     }
@@ -344,13 +482,10 @@ impl FantaCodeWorkspace {
     pub(crate) fn source_is_dirty(&self, cx: &App) -> bool {
         self.source_save_in_progress
             || self.source_discard_in_progress
-            || [&self.fnx_source_buffer, &self.json_source_buffer]
-                .into_iter()
-                .flatten()
-                .any(|buffer| {
-                    let buffer = buffer.read(cx);
-                    buffer.is_dirty() || buffer.has_unsaved_edits()
-                })
+            || self.source_buffers().any(|buffer| {
+                let buffer = buffer.read(cx);
+                buffer.is_dirty() || buffer.has_unsaved_edits()
+            })
     }
 
     pub(crate) fn has_source_conflict(&self, cx: &App) -> bool {
@@ -364,21 +499,21 @@ impl FantaCodeWorkspace {
                 "a source operation is already in progress"
             ))));
         }
-        let files = match self.selected_file {
-            CodeWorkspaceFile::Fnx => [CodeWorkspaceFile::Fnx, CodeWorkspaceFile::Json],
-            CodeWorkspaceFile::Json => [CodeWorkspaceFile::Json, CodeWorkspaceFile::Fnx],
-        };
-        let (file, buffer, source_path) = files.into_iter().find_map(|file| {
-            let (buffer, path) = match file {
-                CodeWorkspaceFile::Fnx => (&self.fnx_source_buffer, &self.fnx_path),
-                CodeWorkspaceFile::Json => (&self.json_source_buffer, &self.json_path),
-            };
-            buffer
-                .as_ref()
-                .filter(|buffer| buffer.read(cx).is_dirty())
-                .zip(path.as_ref())
-                .map(|(buffer, path)| (file, buffer.clone(), path.clone()))
-        })?;
+        let files = [
+            self.selected_file,
+            CodeWorkspaceFile::Fnx,
+            CodeWorkspaceFile::Json,
+            CodeWorkspaceFile::Variables,
+        ];
+        let (file, buffer, source_path) = files
+            .into_iter()
+            .filter(|file| !file.managed())
+            .find_map(|file| {
+                self.file_buffer(file)
+                    .filter(|buffer| buffer.read(cx).is_dirty())
+                    .zip(self.file_path(file))
+                    .map(|(buffer, path)| (file, buffer.clone(), path.clone()))
+            })?;
         let label = file.label();
         if buffer.read(cx).has_conflict() {
             return Some(Task::ready(Err(anyhow!(
@@ -446,12 +581,9 @@ impl FantaCodeWorkspace {
                 reload_canvas.await?;
                 let diagnostics = source_write.finish_adoption();
                 let all_sources_saved = this.update(cx, |this, cx| {
-                    [&this.fnx_source_buffer, &this.json_source_buffer]
-                        .into_iter()
-                        .flatten()
-                        .all(|buffer| {
-                            !buffer.read(cx).is_dirty() && !buffer.read(cx).has_unsaved_edits()
-                        })
+                    this.source_buffers().all(|buffer| {
+                        !buffer.read(cx).is_dirty() && !buffer.read(cx).has_unsaved_edits()
+                    })
                 })?;
                 if all_sources_saved
                     && item.read_with(cx, |item, _| item.has_unpersisted_source_layout())
@@ -463,9 +595,7 @@ impl FantaCodeWorkspace {
                         return Err(error);
                     }
                     let saved_buffers = this.update(cx, |this, cx| {
-                        [&this.fnx_source_buffer, &this.json_source_buffer]
-                            .into_iter()
-                            .flatten()
+                        this.source_buffers()
                             .filter(|current| !current.read(cx).has_unsaved_edits())
                             .cloned()
                             .collect()
@@ -521,9 +651,8 @@ impl FantaCodeWorkspace {
                 "wait for the source operation to finish before discarding changes"
             )));
         }
-        let buffers = [&self.fnx_source_buffer, &self.json_source_buffer]
-            .into_iter()
-            .flatten()
+        let buffers = self
+            .source_buffers()
             .filter(|buffer| buffer.read(cx).is_dirty())
             .cloned()
             .collect::<Vec<_>>();
@@ -537,13 +666,10 @@ impl FantaCodeWorkspace {
         cx.spawn(async move |this, cx| {
             reload.await?;
             let still_dirty = this.update(cx, |this, cx| {
-                [&this.fnx_source_buffer, &this.json_source_buffer]
-                    .into_iter()
-                    .flatten()
-                    .any(|buffer| {
-                        let buffer = buffer.read(cx);
-                        buffer.is_dirty() || buffer.has_unsaved_edits()
-                    })
+                this.source_buffers().any(|buffer| {
+                    let buffer = buffer.read(cx);
+                    buffer.is_dirty() || buffer.has_unsaved_edits()
+                })
             })?;
             item.update(cx, |item, cx| {
                 item.set_source_edit_locked(still_dirty, cx);
@@ -569,11 +695,8 @@ impl FantaCodeWorkspace {
                 "wait for the source operation to finish before discarding changes"
             )));
         }
-        let source = match self.selected_file {
-            CodeWorkspaceFile::Fnx => self.fnx_source_buffer.as_ref(),
-            CodeWorkspaceFile::Json => self.json_source_buffer.as_ref(),
-        };
-        let Some(buffer) = source
+        let Some(buffer) = self
+            .file_buffer(self.selected_file)
             .filter(|buffer| {
                 let buffer = buffer.read(cx);
                 buffer.is_dirty() || buffer.has_unsaved_edits()
@@ -673,7 +796,7 @@ impl FantaCodeWorkspace {
             || self.loading_fnx
             || self.loading_json
             || self.source_is_dirty(cx)
-            || (self.fnx_source_buffer.is_none() && self.json_source_buffer.is_none())
+            || self.source_buffers().next().is_none()
         {
             return;
         }
@@ -684,15 +807,11 @@ impl FantaCodeWorkspace {
     }
 
     fn reload_saved_sources(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let buffers: HashSet<_> = [
-            self.fnx_source_buffer.as_ref(),
-            self.json_source_buffer.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|buffer| !buffer.read(cx).has_unsaved_edits())
-        .cloned()
-        .collect();
+        let buffers: HashSet<_> = self
+            .source_buffers()
+            .filter(|buffer| !buffer.read(cx).has_unsaved_edits())
+            .cloned()
+            .collect();
         if buffers.is_empty() {
             return;
         }
@@ -744,11 +863,13 @@ impl FantaCodeWorkspace {
         }
         let Some(project_root) = project_root else {
             self.clear_editors();
+            self.clear_project_sources();
             self.error_message =
                 Some("Save the document once to materialize its FNX and JSON source files.".into());
             cx.notify();
             return;
         };
+        self.refresh_project_sources(&project_root, window, cx);
 
         // Design directories are named by human-readable slugs (layout v3)
         // with identity in the JSON headers, so source paths are resolved by
@@ -807,6 +928,128 @@ impl FantaCodeWorkspace {
         self.fnx_load_task = None;
         self.json_load_task = None;
         self.last_synced_selection = None;
+    }
+
+    fn clear_project_sources(&mut self) {
+        for file in CodeWorkspaceFile::PROJECT_FILES {
+            if let Some(source) = self.project_source_mut(file) {
+                *source = ProjectSource::default();
+            }
+        }
+        self.workspace_fnx_present = false;
+    }
+
+    /// Re-point the project files at `project_root` (a Save As moves it) and
+    /// reopen the selected one. Clean buffers that stay put keep their editor.
+    fn refresh_project_sources(
+        &mut self,
+        project_root: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for file in CodeWorkspaceFile::PROJECT_FILES {
+            let moved = self
+                .project_source(file)
+                .and_then(|source| source.path.as_deref())
+                .zip(file.project_path())
+                .is_some_and(|(path, relative)| path != project_root.join(relative));
+            if moved && let Some(source) = self.project_source_mut(file) {
+                *source = ProjectSource::default();
+            }
+        }
+        self.workspace_fnx_present = project_root.join("workspace.fnx").is_file();
+        if self.selected_file == CodeWorkspaceFile::Workspace && !self.workspace_fnx_present {
+            self.selected_file = CodeWorkspaceFile::Manifest;
+        }
+        if self.selected_file.project_path().is_some() {
+            self.open_project_source(self.selected_file, window, cx);
+        }
+    }
+
+    /// Open a project-wide source into its pane. Opening never formats or
+    /// writes the file.
+    fn open_project_source(
+        &mut self,
+        file: CodeWorkspaceFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self
+            .item
+            .read(cx)
+            .project_root()
+            .zip(file.project_path())
+            .map(|(root, relative)| root.join(relative))
+        else {
+            return;
+        };
+        if self.project_source(file).is_some_and(|source| {
+            source.path.as_ref() == Some(&path) && (source.editor.is_some() || source.loading)
+        }) {
+            self.update_fnx_editability(cx);
+            return;
+        }
+        let open_task = self
+            .project
+            .update(cx, |project, cx| project.open_local_buffer(&path, cx));
+        let load_task = cx.spawn_in(window, {
+            let path = path.clone();
+            async move |this, cx| {
+                let result = open_task.await;
+                if let Err(error) = this.update_in(cx, |this, window, cx| {
+                    if this
+                        .project_source(file)
+                        .is_none_or(|source| source.path.as_ref() != Some(&path))
+                    {
+                        return;
+                    }
+                    match result {
+                        Ok(buffer) => {
+                            let observation =
+                                cx.observe_in(&buffer, window, |this, buffer, window, cx| {
+                                    this.source_buffer_changed(buffer, window, cx);
+                                });
+                            let project = this.project.clone();
+                            let editor = cx.new(|cx| {
+                                Editor::for_buffer(buffer.clone(), Some(project), window, cx)
+                            });
+                            if let Some(source) = this.project_source_mut(file) {
+                                source.loading = false;
+                                source.observation = Some(observation);
+                                source.buffer = Some(buffer.clone());
+                                source.editor = Some(editor);
+                            }
+                            this.source_buffer_changed(buffer, window, cx);
+                            if this.visible && this.selected_file == file {
+                                this.sync_search_editor(window, cx);
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(source) = this.project_source_mut(file) {
+                                source.loading = false;
+                            }
+                            this.error_message = Some(
+                                format!("Could not open {}: {error:#}", path.display()).into(),
+                            );
+                        }
+                    }
+                    this.refresh_pending_saved_sources(window, cx);
+                    cx.notify();
+                }) {
+                    log::debug!("dropping project source load for closed workspace: {error:#}");
+                }
+            }
+        });
+        if let Some(source) = self.project_source_mut(file) {
+            *source = ProjectSource {
+                path: Some(path),
+                loading: true,
+                _load_task: Some(load_task),
+                ..ProjectSource::default()
+            };
+        }
+        self.error_message = None;
+        cx.notify();
     }
 
     /// Opening the editor must not format or write the source. Saving validates
@@ -936,13 +1179,22 @@ impl FantaCodeWorkspace {
         } else if self.json_source_buffer.as_ref() == Some(&buffer) {
             self.json_source_version.replace(version.clone())
         } else {
-            None
+            CodeWorkspaceFile::PROJECT_FILES
+                .into_iter()
+                .find(|file| self.file_buffer(*file) == Some(&buffer))
+                .and_then(|file| self.project_source_mut(file))
+                .and_then(|source| source.version.replace(version.clone()))
         };
         let text_changed = previous_version.is_some_and(|previous| previous != version);
         let dirty = self.source_is_dirty(cx);
         // A clean JSON buffer can arrive before an already-dirty shared FNX
         // buffer. Only release the shared lock after both loads have settled.
-        if dirty || (!self.loading_fnx && !self.loading_json) {
+        let loading = self.loading_fnx
+            || self.loading_json
+            || CodeWorkspaceFile::PROJECT_FILES
+                .into_iter()
+                .any(|file| self.file_loading(file));
+        if dirty || !loading {
             self.item
                 .update(cx, |item, cx| item.set_source_edit_locked(dirty, cx));
         }
@@ -959,7 +1211,18 @@ impl FantaCodeWorkspace {
             || self.item.read(cx).is_dirty()
             || self.source_save_in_progress
             || self.source_discard_in_progress;
-        for editor in [&self.fnx_editor, &self.json_editor].into_iter().flatten() {
+        let project_editors = CodeWorkspaceFile::PROJECT_FILES
+            .into_iter()
+            .filter_map(|file| {
+                let editor = self.project_source(file)?.editor.as_ref()?;
+                Some((editor, read_only || file.managed()))
+            });
+        for (editor, read_only) in [&self.fnx_editor, &self.json_editor]
+            .into_iter()
+            .flatten()
+            .map(|editor| (editor, read_only))
+            .chain(project_editors)
+        {
             if editor.read(cx).read_only(cx) != read_only {
                 editor.update(cx, |editor, _| editor.set_read_only(read_only));
             }
@@ -989,10 +1252,28 @@ impl FantaCodeWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let file = if self.json_path.as_deref() == Some(path)
+        let project_file = self.item.read(cx).project_root().and_then(|root| {
+            let relative = path
+                .strip_prefix(root)
+                .map(Path::to_path_buf)
+                .ok()
+                // Agents may report a canonical path (macOS `/private/var/…`).
+                .or_else(|| {
+                    let path = path.canonicalize().ok()?;
+                    let root = root.canonicalize().ok()?;
+                    path.strip_prefix(root).map(Path::to_path_buf).ok()
+                })?;
+            CodeWorkspaceFile::PROJECT_FILES
+                .into_iter()
+                .find(|file| file.project_path().as_deref() == Some(relative.as_path()))
+        });
+        let file = if let Some(file) = project_file {
+            file
+        } else if self.json_path.as_deref() == Some(path)
             || path.file_name().is_some_and(|name| {
                 name == OsStr::new("page.json") || name == OsStr::new("def.json")
-            }) {
+            })
+        {
             CodeWorkspaceFile::Json
         } else {
             CodeWorkspaceFile::Fnx
@@ -1007,6 +1288,9 @@ impl FantaCodeWorkspace {
         cx: &mut Context<Self>,
     ) {
         self.selected_file = file;
+        if file.project_path().is_some() {
+            self.open_project_source(file, window, cx);
+        }
         if let Some(editor) = self.active_editor() {
             editor.focus_handle(cx).focus(window, cx);
         }
@@ -1018,14 +1302,12 @@ impl FantaCodeWorkspace {
         match self.selected_file {
             CodeWorkspaceFile::Fnx => self.fnx_editor.as_ref(),
             CodeWorkspaceFile::Json => self.json_editor.as_ref(),
+            file => self.project_source(file)?.editor.as_ref(),
         }
     }
 
     fn active_path(&self) -> Option<&PathBuf> {
-        match self.selected_file {
-            CodeWorkspaceFile::Fnx => self.fnx_path.as_ref(),
-            CodeWorkspaceFile::Json => self.json_path.as_ref(),
-        }
+        self.file_path(self.selected_file)
     }
 
     /// The path as the project sees it — `pages/<slug>/page.fnx` — which is
@@ -1129,18 +1411,39 @@ impl FantaCodeWorkspace {
             .map(|tag| tag.offset)
     }
 
+    /// The design pair (named after its files, `page.fnx` or `master.fnx`),
+    /// then the project-wide files.
     fn render_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut selector = h_flex().gap_1();
-        for (index, file) in [CodeWorkspaceFile::Fnx, CodeWorkspaceFile::Json]
+        let has_project = self.item.read(cx).project_root().is_some();
+        let design_files = [CodeWorkspaceFile::Fnx, CodeWorkspaceFile::Json]
             .into_iter()
-            .enumerate()
-        {
+            .map(|file| {
+                let label: SharedString = self
+                    .file_path(file)
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned().into())
+                    .unwrap_or_else(|| file.label().into());
+                (file, label)
+            });
+        let project_files = [CodeWorkspaceFile::Variables, CodeWorkspaceFile::Manifest]
+            .into_iter()
+            .chain(
+                self.workspace_fnx_present
+                    .then_some(CodeWorkspaceFile::Workspace),
+            )
+            .map(|file| (file, SharedString::from(file.label())));
+        let mut selector = h_flex().flex_none().gap_1();
+        for (index, (file, label)) in design_files.chain(project_files).enumerate() {
+            if index == 2 {
+                selector = selector.child(div().h_4().mx_0p5().child(Divider::vertical()));
+            }
             selector = selector.child(
-                Button::new(("fanta-code-file", index), file.label())
+                Button::new(("fanta-code-file", index), label)
                     .size(ButtonSize::Compact)
                     .style(ButtonStyle::Subtle)
                     .start_icon(Icon::new(file.icon()).size(IconSize::XSmall))
                     .toggle_state(file == self.selected_file)
+                    .disabled(file.project_path().is_some() && !has_project)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.select_file(file, window, cx);
                     })),
@@ -1159,7 +1462,7 @@ impl FantaCodeWorkspace {
         let reveal = path;
         Some(
             h_flex()
-                .flex_none()
+                .flex_shrink_1()
                 .gap_0p5()
                 .min_w_0()
                 .child(
@@ -1173,7 +1476,12 @@ impl FantaCodeWorkspace {
                             cx.write_to_clipboard(ClipboardItem::new_string(copied.to_string()));
                             crate::view::show_canvas_notice("Copied path".to_string(), window, cx);
                         }))
-                        .child(Label::new(label).size(LabelSize::Small).single_line()),
+                        .child(
+                            Label::new(label)
+                                .size(LabelSize::Small)
+                                .single_line()
+                                .truncate(),
+                        ),
                 )
                 .child(
                     IconButton::new("fanta-code-reveal", IconName::FolderOpen)
@@ -1214,10 +1522,7 @@ impl FantaCodeWorkspace {
                 })
                 .into_any_element();
         }
-        let loading = match self.selected_file {
-            CodeWorkspaceFile::Fnx => self.loading_fnx,
-            CodeWorkspaceFile::Json => self.loading_json,
-        };
+        let loading = self.file_loading(self.selected_file);
         v_flex()
             .size_full()
             .items_center()
@@ -1416,6 +1721,12 @@ impl Render for FantaCodeWorkspace {
                     },
                 )
                 .into()
+            } else if self.selected_file.managed() {
+                format!(
+                    "{} is managed by Fanta · read-only",
+                    self.selected_file.label()
+                )
+                .into()
             } else if self.item.read(cx).is_dirty() {
                 "Save canvas changes before editing source".into()
             } else if self.source_is_dirty(cx) {
@@ -1424,11 +1735,9 @@ impl Render for FantaCodeWorkspace {
                 EDITABLE_STATUS.into()
             }
         });
-        let selected_dirty = match self.selected_file {
-            CodeWorkspaceFile::Fnx => self.fnx_source_buffer.as_ref(),
-            CodeWorkspaceFile::Json => self.json_source_buffer.as_ref(),
-        }
-        .is_some_and(|buffer| buffer.read(cx).is_dirty() || buffer.read(cx).has_unsaved_edits());
+        let selected_dirty = self.file_buffer(self.selected_file).is_some_and(|buffer| {
+            buffer.read(cx).is_dirty() || buffer.read(cx).has_unsaved_edits()
+        });
         let mut context = gpui::KeyContext::new_with_defaults();
         self.search_bar
             .read(cx)
@@ -1671,7 +1980,11 @@ mod tests {
     fn run_until_sources_open(workspace: &Entity<FantaCodeWorkspace>, cx: &mut TestAppContext) {
         run_until_loaded(cx, |cx| {
             workspace.read_with(cx, |workspace, _| {
-                workspace.loading_fnx || workspace.loading_json
+                workspace.loading_fnx
+                    || workspace.loading_json
+                    || CodeWorkspaceFile::PROJECT_FILES
+                        .into_iter()
+                        .any(|file| workspace.file_loading(file))
             })
         });
     }
@@ -2484,6 +2797,189 @@ mod tests {
                 );
             })
             .expect("read code workspace");
+    }
+
+    /// A project whose variables live in a collection named `collection`.
+    fn write_project_with_variables(root: &Path, collection: &str) -> NodeId {
+        let mut document = Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = "Original".to_owned();
+        let page_id = page.id;
+        document.scene.insert(page).expect("insert page");
+        document.add_page(page_id);
+        let mode = fanta_doc::ModeId::new();
+        document
+            .apply(fanta_doc::Operation::CreateVariableCollection {
+                collection: Box::new(fanta_doc::VariableCollection {
+                    id: fanta_doc::VariableCollectionId::new(),
+                    name: collection.to_owned(),
+                    modes: vec![fanta_doc::Mode {
+                        id: mode,
+                        name: "Mode 1".into(),
+                    }],
+                    default_mode: mode,
+                    variable_order: Vec::new(),
+                }),
+            })
+            .expect("create collection");
+        fanta_format::write_project_tree(root, &document, &BTreeMap::new())
+            .expect("write project tree");
+        page_id
+    }
+
+    fn active_text(workspace: &FantaCodeWorkspace, cx: &App) -> String {
+        workspace
+            .active_editor()
+            .expect("active source editor")
+            .read(cx)
+            .text(cx)
+    }
+
+    #[gpui::test]
+    async fn project_sources_open_beside_the_design_pair(cx: &mut TestAppContext) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        write_project_with_variables(temporary.path(), "Brand");
+        let (_project, item, window) = open_code_workspace(temporary.path(), cx).await;
+        let workspace = window.entity(cx).expect("code workspace");
+
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.workspace_fnx_present);
+            assert_eq!(workspace.selected_file, CodeWorkspaceFile::Fnx);
+        });
+        window
+            .update(cx, |workspace, window, cx| {
+                workspace.select_file(CodeWorkspaceFile::Manifest, window, cx)
+            })
+            .expect("select fanta.json");
+        run_until_sources_open(&workspace, cx);
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(active_text(workspace, cx).contains("fanta-project"));
+            assert!(
+                workspace
+                    .active_editor()
+                    .expect("manifest editor")
+                    .read(cx)
+                    .read_only(cx),
+                "the manifest is managed by Fanta"
+            );
+        });
+
+        window
+            .update(cx, |workspace, window, cx| {
+                workspace.select_file(CodeWorkspaceFile::Variables, window, cx)
+            })
+            .expect("select variables.json");
+        run_until_sources_open(&workspace, cx);
+        let edited = workspace.read_with(cx, |workspace, cx| {
+            let text = active_text(workspace, cx);
+            assert!(
+                text.contains("\"Brand\""),
+                "variables.json lists the collection"
+            );
+            assert!(
+                !workspace
+                    .active_editor()
+                    .expect("variables editor")
+                    .read(cx)
+                    .read_only(cx),
+                "variables.json is editable"
+            );
+            text.replace("\"Brand\"", "\"Marketing\"")
+        });
+        window
+            .update(cx, |workspace, window, cx| {
+                workspace
+                    .active_editor()
+                    .expect("variables editor")
+                    .update(cx, |editor, cx| editor.set_text(edited, window, cx));
+            })
+            .expect("edit variables.json");
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| assert!(item.source_edit_locked()));
+        let save = window
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .save_source_edit(cx)
+                    .expect("dirty variables.json")
+            })
+            .expect("start variables save");
+        save.await.expect("save validated variables.json");
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let collections = item
+                .doc()
+                .map(|doc| {
+                    doc.variables
+                        .collections
+                        .values()
+                        .map(|collection| collection.name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            assert_eq!(collections, ["Marketing"]);
+            assert!(!item.source_edit_locked());
+        });
+
+        std::fs::write(
+            temporary.path().join("workspace.fnx"),
+            "export default function Workspace() { return <Workspace />; }\n",
+        )
+        .expect("write workspace.fnx");
+        window
+            .update(cx, |workspace, window, cx| {
+                workspace.set_visible(false, window, cx);
+                workspace.set_visible(true, window, cx);
+            })
+            .expect("reopen the code workspace");
+        run_until_sources_open(&workspace, cx);
+        window
+            .update(cx, |workspace, window, cx| {
+                assert!(workspace.workspace_fnx_present);
+                workspace.select_file(CodeWorkspaceFile::Workspace, window, cx)
+            })
+            .expect("select workspace.fnx");
+        run_until_sources_open(&workspace, cx);
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(active_text(workspace, cx).contains("function Workspace"));
+            assert!(
+                workspace
+                    .active_editor()
+                    .expect("workspace editor")
+                    .read(cx)
+                    .read_only(cx)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn revealing_project_files_selects_their_source(cx: &mut TestAppContext) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let page = write_project(temporary.path());
+        let (_project, _item, window) = open_code_workspace(temporary.path(), cx).await;
+        let workspace = window.entity(cx).expect("code workspace");
+        let root = temporary.path().canonicalize().expect("canonical root");
+        for (path, file) in [
+            (
+                root.join("doc").join("variables.json"),
+                CodeWorkspaceFile::Variables,
+            ),
+            (root.join("fanta.json"), CodeWorkspaceFile::Manifest),
+            (page_json_path(&root, page), CodeWorkspaceFile::Json),
+            (page_source_path(&root, page), CodeWorkspaceFile::Fnx),
+        ] {
+            window
+                .update(cx, |workspace, window, cx| {
+                    workspace.reveal_source_path(&path, window, cx)
+                })
+                .expect("reveal source");
+            run_until_sources_open(&workspace, cx);
+            workspace.read_with(cx, |workspace, _| {
+                assert_eq!(workspace.selected_file, file, "{}", path.display());
+                assert!(workspace.active_editor().is_some());
+            });
+        }
     }
 
     #[gpui::test]
@@ -3979,6 +4475,45 @@ mod tests {
         }
         cx.run_until_parked();
         (view, code, item, cx)
+    }
+
+    #[gpui::test]
+    async fn code_tab_shows_the_source_of_the_workspace_it_was_opened_from(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::editor_session::EditorWorkspace;
+
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("project");
+        let page = write_project_with_variables(temporary.path(), "Brand");
+        let (view, code, _item, cx) =
+            mounted_source_recovery_fixture(temporary.path(), false, cx).await;
+        let set_workspace = |workspace, cx: &mut gpui::VisualTestContext| {
+            view.update(cx, |view, cx| view.set_editor_workspace(workspace, cx));
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            run_until_sources_open(&code, cx);
+        };
+
+        set_workspace(EditorWorkspace::Variables, cx);
+        set_workspace(EditorWorkspace::Code, cx);
+        code.read_with(cx, |code, cx| {
+            assert_eq!(code.selected_file(), CodeWorkspaceFile::Variables);
+            assert!(active_text(code, cx).contains("\"Brand\""));
+        });
+
+        set_workspace(EditorWorkspace::Canvas, cx);
+        set_workspace(EditorWorkspace::Code, cx);
+        code.read_with(cx, |code, cx| {
+            assert_eq!(code.selected_file(), CodeWorkspaceFile::Fnx);
+            assert_eq!(
+                code.active_path(),
+                Some(&page_source_path(temporary.path(), page))
+            );
+            assert!(active_text(code, cx).contains("Original"));
+        });
     }
 
     #[gpui::test]

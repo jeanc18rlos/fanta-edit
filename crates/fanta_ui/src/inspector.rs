@@ -54,7 +54,6 @@ impl RenderOnce for InspectorSection {
             .justify_between()
             .child(
                 Label::new(self.title)
-                    .size(LabelSize::Small)
                     .weight(FontWeight::SEMIBOLD)
                     .line_height_style(LineHeightStyle::UiLabel),
             )
@@ -95,9 +94,9 @@ impl RenderOnce for InspectorFieldRow {
             .gap_2()
             .items_center()
             .child(
-                div().w(px(72.)).flex_none().child(
+                div().w(px(80.)).flex_none().child(
                     Label::new(self.label)
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Small)
                         .color(Color::Muted)
                         .single_line(),
                 ),
@@ -127,10 +126,10 @@ impl RenderOnce for InspectorEmptyState {
             .px_4()
             .py_3()
             .gap_1()
-            .child(Label::new(self.title).size(LabelSize::Small))
+            .child(Label::new(self.title))
             .child(
                 Label::new(self.message)
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Small)
                     .color(Color::Muted)
                     .line_clamp(3),
             )

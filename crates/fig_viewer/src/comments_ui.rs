@@ -12,17 +12,18 @@ use editor::Editor;
 use fanta_doc::{DocId, NodeId};
 use glam::DVec2;
 use gpui::{
-    AnyElement, App, Bounds, Entity, Focusable as _, ObjectFit, Pixels, Point, SharedString, Size,
-    Stateful, canvas, deferred, img, point,
+    AnyElement, App, Bounds, Entity, Focusable as _, Hsla, ObjectFit, Pixels, Point, ScrollHandle,
+    SharedString, Size, Stateful, canvas, deferred, img, point,
 };
 use ui::prelude::*;
-use ui::{IconButton, IconButtonShape, Tooltip};
+use ui::{Callout, IconButton, ListItem, ListItemSpacing, Severity, Tooltip, rems_from_px};
 use workspace::MultiWorkspace;
 
 use crate::canvas::{bounds_size, screen_position_in_bounds};
 use crate::comments::{self, Attachment, Comment, CommentSkill, Mention, MotionCommentAnchor};
+use crate::editor_session::EditorMode;
 use crate::tools::ToolKind;
-use crate::view::FigView;
+use crate::view::{FigView, SubmitComment};
 
 /// Screen-fixed pin size; must match `canvas::COMMENT_PIN_SIZE`.
 pub(crate) const PIN_SIZE: f64 = 30.0;
@@ -191,6 +192,10 @@ pub(crate) struct CommentState {
     pending_motion_anchor: Option<PendingMotionComment>,
     pub(crate) open_thread: Option<String>,
     open_thread_origin: Option<CommentOrigin>,
+    /// The open thread was opened from the Comments panel, which then shows
+    /// it as a page instead of a popover on the canvas.
+    thread_in_panel: bool,
+    thread_scroll: ScrollHandle,
     pub(crate) hovered_pin: Option<String>,
     pub(crate) reply_editor: Option<Entity<Editor>>,
     reply_composer_id: Option<String>,
@@ -232,6 +237,7 @@ impl CommentState {
     pub(crate) fn close_thread(&mut self) {
         self.open_thread = None;
         self.open_thread_origin = None;
+        self.thread_in_panel = false;
         self.reply_editor = None;
         self.reply_composer_id = None;
         self.reply_attachments.clear();
@@ -297,6 +303,14 @@ impl FigView {
         };
         self.comment_state.arm_motion_anchor(origin, anchor);
         true
+    }
+
+    /// The open thread's page and id, which the Comments panel highlights.
+    pub(crate) fn open_comment_thread(&self) -> Option<(NodeId, String)> {
+        Some((
+            self.comment_state.open_thread_origin?.page,
+            self.comment_state.open_thread.clone()?,
+        ))
     }
 
     pub(crate) fn has_unsent_comment_reply(&self, cx: &App) -> bool {
@@ -464,6 +478,10 @@ impl FigView {
             editor
         });
         editor.read(cx).focus_handle(cx).focus(window, cx);
+        // The press keeps bubbling to FigView's tracked-focus element, which
+        // would take focus back to the canvas: typing would then run canvas
+        // shortcuts, and Backspace would delete the selected layers.
+        window.prevent_default();
         self.comment_state.draft = Some(CommentDraft {
             world,
             editor,
@@ -638,6 +656,46 @@ impl FigView {
         self.show_comment_thread(id, window, cx);
     }
 
+    /// Open a thread from a Comments panel row as the panel's thread page.
+    pub(crate) fn show_comment_thread_in_panel(
+        &mut self,
+        page: NodeId,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_comment_thread_on_page(page, id.clone(), window, cx);
+        if self.open_comment_thread() == Some((page, id)) {
+            self.comment_state.thread_in_panel = true;
+            cx.notify();
+        }
+    }
+
+    /// Back from the panel's thread page to the list of threads.
+    fn close_comment_thread_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_unsent_comment_reply(cx) {
+            crate::view::show_canvas_notice(
+                "Send or clear the current reply before going back to all threads.".to_string(),
+                window,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        self.comment_state.close_thread();
+        self.invalidate_canvas_cache();
+        cx.notify();
+    }
+
+    /// Whether the open thread shows as a page in the Comments panel. It
+    /// falls back to the canvas popover whenever that page is not on screen.
+    pub(crate) fn comment_thread_in_panel(&self, cx: &App) -> bool {
+        self.comment_state.thread_in_panel
+            && self.editor_mode(cx) == EditorMode::Comments
+            && self.inspector_sidebar_expanded(cx)
+            && !self.annotation_panel_active(cx)
+    }
+
     fn open_comment_thread_for_origin(
         &mut self,
         id: String,
@@ -661,6 +719,8 @@ impl FigView {
         }
         self.comment_state.open_thread = Some(id);
         self.comment_state.open_thread_origin = Some(origin);
+        self.comment_state.thread_in_panel = false;
+        self.comment_state.thread_scroll = ScrollHandle::new();
         self.comment_state.reply_editor = (!self.is_dev_mode(cx)).then(|| {
             cx.new(|cx| {
                 let mut editor = Editor::auto_height(1, 4, window, cx);
@@ -770,6 +830,8 @@ impl FigView {
                 .read_until
                 .insert(id.clone(), comments::now_secs());
             self.open_comment_thread_for_origin(id, origin, window, cx);
+            // The draft editor is gone: hand the keyboard back to the canvas.
+            self.focus_handle(cx).focus(window, cx);
             if skill.is_some() {
                 self.route_comment_skill_prompt(skill_prompt, window, cx);
             }
@@ -884,6 +946,7 @@ impl FigView {
                     })
             });
             editor.update(cx, |editor, cx| editor.clear(window, cx));
+            self.comment_state.thread_scroll.scroll_to_bottom();
             self.comment_state.reply_attachments.clear();
             self.comment_state.reply_composer_id = Some(NodeId::new().to_string());
             self.comment_state.reply_error = None;
@@ -1288,16 +1351,21 @@ impl FigView {
 
     /// The floating comment UI: the draft composer, or the open thread
     /// popover, or the hover preview card. `None` when nothing is showing.
-    pub(crate) fn render_comment_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn render_comment_overlay(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if let Some(draft) = &self.comment_state.draft
             && self.origin_is_active(draft.origin, cx)
         {
-            return self.render_comment_composer(draft, cx);
+            return self.render_comment_composer(draft, window, cx);
         }
         if let (Some(open), Some(origin)) = (
             self.comment_state.open_thread.clone(),
             self.comment_state.open_thread_origin,
         ) && self.origin_is_active(origin, cx)
+            && !self.comment_thread_in_panel(cx)
         {
             let comment = self
                 .comments_for_origin(origin, cx)
@@ -1314,7 +1382,7 @@ impl FigView {
             {
                 return None;
             }
-            return self.render_comment_thread(&comment, cx);
+            return self.render_comment_thread(&comment, window, cx);
         }
         if let Some(hovered) = self.comment_state.hovered_pin.clone() {
             let comment = self
@@ -1329,11 +1397,16 @@ impl FigView {
     fn render_comment_composer(
         &self,
         draft: &CommentDraft,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let viewport = self.viewport?;
-        let editor = draft.editor.clone();
+        let motion_label = draft
+            .motion_anchor
+            .map(|anchor| self.motion_comment_label(anchor, cx));
+        let input = comment_input(&draft.editor, window, cx);
         let context = self.render_comment_composer_context(CommentComposerTarget::Draft, cx);
+        let toolbar = self.render_comment_composer_toolbar(CommentComposerTarget::Draft, cx);
         Some(comment_overlay(
             draft.world,
             viewport,
@@ -1341,39 +1414,24 @@ impl FigView {
             v_flex()
                 .id("fanta-comment-composer")
                 .debug_selector(|| "fanta-comment-composer".to_owned())
-                .w(px(300.))
-                .p_2p5()
+                .key_context(COMMENT_COMPOSER_CONTEXT)
+                .on_action(cx.listener(|this, _: &SubmitComment, window, cx| {
+                    this.post_comment_draft(window, cx);
+                }))
+                .on_action(
+                    cx.listener(|this, _: &editor::actions::Cancel, window, cx| {
+                        this.cancel_comment_draft(cx);
+                        this.focus_handle(cx).focus(window, cx);
+                    }),
+                )
+                .w(rems(20.))
+                .p_2()
                 .gap_2()
-                .rounded_xl()
-                .bg(cx.theme().colors().elevated_surface_background)
-                .border_1()
-                .border_color(cx.theme().colors().border)
-                .shadow_lg()
-                .when_some(draft.motion_anchor, |this, anchor| {
-                    this.child(
-                        Label::new(self.motion_comment_label(anchor, cx))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Accent),
-                    )
-                })
-                .child(div().min_w_0().w_full().child(editor))
+                .elevation_2(cx)
+                .children(motion_label.map(comment_motion_label))
+                .child(input)
                 .children(context)
-                .child(
-                    h_flex()
-                        .justify_between()
-                        .flex_wrap()
-                        .gap_1()
-                        .child(self.render_comment_composer_tools(CommentComposerTarget::Draft, cx))
-                        .child(
-                            IconButton::new("fanta-comment-send", IconName::ArrowUp)
-                                .shape(IconButtonShape::Square)
-                                .icon_size(IconSize::Small)
-                                .tooltip(Tooltip::text("Post comment"))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.post_comment_draft(window, cx);
-                                })),
-                        ),
-                ),
+                .child(toolbar),
         ))
     }
 
@@ -1384,9 +1442,18 @@ impl FigView {
     ) -> Option<AnyElement> {
         let world = self.comment_world(comment, cx);
         let viewport = self.viewport?;
-        let author: SharedString = display_author(comment).into();
-        let when: SharedString = relative_time(comment.created).into();
-        let body: SharedString = comment.text.clone().into();
+        let mut summary = Vec::new();
+        if comment.resolved {
+            summary.push("Resolved".to_string());
+        }
+        match comment.replies.len() {
+            0 => {}
+            1 => summary.push("1 reply".to_string()),
+            replies => summary.push(format!("{replies} replies")),
+        }
+        if let Some(anchor) = comment.motion_anchor {
+            summary.push(self.motion_comment_label(anchor, cx));
+        }
         Some(comment_overlay(
             world,
             viewport,
@@ -1394,105 +1461,114 @@ impl FigView {
             v_flex()
                 .id("fanta-comment-preview")
                 .debug_selector(|| "fanta-comment-preview".to_owned())
-                .w(px(300.))
-                .p_3()
-                .gap_1()
-                .rounded_xl()
-                .bg(gpui::opaque_grey(0.12, 1.0))
-                .border_1()
-                .border_color(gpui::opaque_grey(0.3, 1.0))
-                .shadow_lg()
-                .child(
-                    h_flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .child(
-                            Label::new(author)
-                                .size(LabelSize::Small)
-                                .weight(gpui::FontWeight::BOLD),
-                        )
-                        .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted)),
-                )
-                .when_some(comment.motion_anchor, |this, anchor| {
-                    this.child(
-                        Label::new(self.motion_comment_label(anchor, cx))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Accent),
-                    )
-                })
-                .child(Label::new(body).size(LabelSize::Small))
-                .children(Self::render_message_context(
-                    &comment.mentions,
-                    &comment.attachments,
-                    comment.skill,
+                .w(rems(18.))
+                .p_2()
+                .gap_1p5()
+                .elevation_2(cx)
+                .child(comment_message(
+                    CommentMessageView::of_comment(comment),
+                    true,
                     cx,
                 ))
-                .child(
-                    Label::new(format!(
-                        "{}{}",
-                        if comment.resolved { "Resolved" } else { "Open" },
-                        if comment.replies.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" · {} replies", comment.replies.len())
-                        }
-                    ))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-                ),
+                .when(!summary.is_empty(), |card| {
+                    card.child(
+                        Label::new(summary.join(" · "))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                }),
         ))
+    }
+
+    fn comment_location(&self, comment: &Comment, cx: &App) -> Option<SharedString> {
+        let doc = &self.item.read(cx).document()?.doc;
+        let page_name = self
+            .comment_state
+            .open_thread_origin
+            .and_then(|origin| doc.scene.get(origin.page))
+            .map(|page| page.name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "Canvas".to_string());
+        Some(comment.location_label(doc, &page_name).into())
     }
 
     fn render_comment_thread(
         &self,
         comment: &Comment,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let world = self.comment_world(comment, cx);
         let viewport = self.viewport?;
-        let resolve_id = comment.id.clone();
-        let delete_id = comment.id.clone();
-        let reply_id = comment.id.clone();
+        let location = self.comment_location(comment, cx)?;
+        let motion_label = comment
+            .motion_anchor
+            .map(|anchor| self.motion_comment_label(anchor, cx));
+        let read_only = self.is_dev_mode(cx);
+        let border_variant = cx.theme().colors().border_variant;
         let close_id = comment.id.clone();
 
-        let mut messages = v_flex()
+        let messages = v_flex()
             .id("fanta-comment-messages")
-            .px_3p5()
-            .py_3()
+            .p_2()
             .gap_3()
-            .max_h(px(400.))
-            .overflow_y_scroll();
-        messages = messages.child(Self::comment_message_row(
-            display_author(comment),
-            relative_time(comment.created),
-            comment.text.clone(),
-            &comment.mentions,
-            &comment.attachments,
-            comment.skill,
-            cx,
-        ));
-        for reply in &comment.replies {
-            messages = messages.child(Self::comment_message_row(
-                reply.author.clone(),
-                relative_time(reply.created),
-                reply.body.clone(),
-                &reply.mentions,
-                &reply.attachments,
-                reply.skill,
-                cx,
-            ));
-        }
+            .max_h(rems(24.))
+            .overflow_y_scroll()
+            .children(comment_thread_messages(comment, cx));
 
-        let read_only = self.is_dev_mode(cx);
-        let copy_text = std::iter::once(comment.text.clone())
-            .chain(comment.replies.iter().map(|reply| reply.body.clone()))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let reply_editor = (!read_only)
-            .then(|| self.comment_state.reply_editor.clone())
-            .flatten();
-        let reply_context = self.render_comment_composer_context(CommentComposerTarget::Reply, cx);
-        let reply_tools = self.render_comment_composer_tools(CommentComposerTarget::Reply, cx);
+        let header = v_flex()
+            .pl_2()
+            .pr_1()
+            .py_1()
+            .gap_0p5()
+            .border_b_1()
+            .border_color(border_variant)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1p5()
+                            .child(
+                                Icon::new(if comment.resolved {
+                                    IconName::Check
+                                } else {
+                                    IconName::Chat
+                                })
+                                .size(IconSize::Small)
+                                .color(if comment.resolved {
+                                    Color::Success
+                                } else {
+                                    Color::Muted
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .child(Label::new(location).single_line().truncate()),
+                            )
+                            .when(comment.resolved, |title| {
+                                title.child(comment_resolved_label())
+                            }),
+                    )
+                    .child(
+                        self.render_comment_thread_actions(comment, read_only, cx)
+                            .child(
+                                IconButton::new("fanta-comment-close-thread", IconName::Close)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Close"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.toggle_comment_thread(close_id.clone(), window, cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .children(motion_label.map(comment_motion_label));
+
         Some(comment_overlay(
             world,
             viewport,
@@ -1500,240 +1576,378 @@ impl FigView {
             v_flex()
                 .id("fanta-comment-thread")
                 .debug_selector(|| "fanta-comment-thread".to_owned())
-                .w(px(300.))
-                .rounded_xl()
-                .bg(cx.theme().colors().elevated_surface_background)
-                .border_1()
-                .border_color(cx.theme().colors().border)
-                .shadow_lg()
-                .child(
-                    h_flex()
-                        .px_3p5()
-                        .py_2()
-                        .justify_between()
-                        .items_center()
-                        .flex_wrap()
-                        .gap_1()
-                        .border_b_1()
-                        .border_color(cx.theme().colors().border)
-                        .child(
-                            h_flex()
-                                .min_w_0()
-                                .flex_wrap()
-                                .gap_2()
-                                .child(
-                                    Label::new("Comment")
-                                        .size(LabelSize::Small)
-                                        .weight(gpui::FontWeight::BOLD),
-                                )
-                                .child(
-                                    Label::new(if comment.resolved { "Resolved" } else { "Open" })
-                                        .size(LabelSize::XSmall)
-                                        .color(if comment.resolved {
-                                            Color::Muted
-                                        } else {
-                                            Color::Accent
-                                        }),
-                                )
-                                .when_some(comment.motion_anchor, |this, anchor| {
-                                    this.child(
-                                        Label::new(self.motion_comment_label(anchor, cx))
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Accent),
-                                    )
-                                }),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .child(
-                                    IconButton::new(
-                                        "fanta-comment-resolve-thread",
-                                        if comment.resolved {
-                                            IconName::Undo
-                                        } else {
-                                            IconName::Check
-                                        },
-                                    )
-                                    .icon_size(IconSize::XSmall)
-                                    .disabled(read_only)
-                                    .tooltip(Tooltip::text(if comment.resolved {
-                                        "Reopen"
-                                    } else {
-                                        "Resolve"
-                                    }))
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.resolve_comment_thread(resolve_id.clone(), cx);
-                                        },
-                                    )),
-                                )
-                                .child(
-                                    IconButton::new("fanta-comment-delete-thread", IconName::Trash)
-                                        .disabled(read_only)
-                                        .icon_size(IconSize::XSmall)
-                                        .tooltip(Tooltip::text("Delete Thread"))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.delete_comment_thread(delete_id.clone(), cx);
-                                        })),
-                                )
-                                .child(
-                                    IconButton::new("fanta-comment-close-thread", IconName::Close)
-                                        .icon_size(IconSize::XSmall)
-                                        .tooltip(Tooltip::text("Close"))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.toggle_comment_thread(
-                                                close_id.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                        })),
-                                ),
-                        ),
+                .on_action(
+                    cx.listener(|this, _: &editor::actions::Cancel, window, cx| {
+                        if !this.has_unsent_comment_reply(cx)
+                            && let Some(id) = this.comment_state.open_thread.clone()
+                        {
+                            this.toggle_comment_thread(id, window, cx);
+                            this.focus_handle(cx).focus(window, cx);
+                        }
+                    }),
                 )
-                .child(
-                    Label::new(
-                        comment.location_label(&self.item.read(cx).document()?.doc, "Canvas"),
-                    )
-                    .size(LabelSize::XSmall),
-                )
+                .w(rems(20.))
+                .elevation_2(cx)
+                .child(header)
                 .child(messages)
-                .when_some(comment.suggested_fix.as_ref(), |thread, fix| {
-                    thread.child(
-                        v_flex()
-                            .px_3p5()
-                            .py_2()
-                            .gap_1()
-                            .child(Label::new(fix.summary.clone()).size(LabelSize::Small))
-                            .child(
-                                Button::new("apply-comment-suggested-fix", "Apply suggested fix")
-                                    .disabled(read_only)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.apply_open_comment_suggested_fix(cx)
-                                    })),
-                            ),
-                    )
-                })
+                .children(self.render_comment_suggested_fix(comment, read_only, cx))
                 .when(read_only, |thread| {
-                    thread.child(
-                        h_flex()
-                            .debug_selector(|| "dev-comment-read-only".to_owned())
-                            .px_3p5()
-                            .py_2()
-                            .justify_between()
-                            .child(
-                                Label::new("Read-only in Dev")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                div()
-                                    .debug_selector(|| "dev-comment-copy".to_owned())
-                                    .child(
-                                        IconButton::new(
-                                            "fanta-comment-copy-thread",
-                                            IconName::Copy,
-                                        )
-                                        .tooltip(Tooltip::text("Copy thread text"))
-                                        .on_click(
-                                            move |_, _, cx| {
-                                                cx.write_to_clipboard(
-                                                    gpui::ClipboardItem::new_string(
-                                                        copy_text.clone(),
-                                                    ),
-                                                )
-                                            },
-                                        ),
-                                    ),
-                            ),
-                    )
+                    thread.child(comment_read_only_footer(comment, border_variant))
                 })
-                .when_some(reply_editor, |this, editor| {
-                    this.child(
-                        v_flex()
-                            .px_3p5()
-                            .py_2p5()
-                            .gap_1p5()
-                            .border_t_1()
-                            .border_color(cx.theme().colors().border)
-                            .child(div().min_w_0().w_full().child(editor))
-                            .children(reply_context)
-                            .child(
-                                h_flex()
-                                    .justify_between()
-                                    .flex_wrap()
-                                    .gap_1()
-                                    .child(reply_tools)
-                                    .child(
-                                        IconButton::new(
-                                            "fanta-comment-reply-send",
-                                            IconName::ArrowUp,
-                                        )
-                                        .shape(IconButtonShape::Square)
-                                        .icon_size(IconSize::Small)
-                                        .tooltip(Tooltip::text("Reply"))
-                                        .on_click(
-                                            cx.listener(move |this, _, window, cx| {
-                                                this.post_comment_reply(
-                                                    reply_id.clone(),
-                                                    window,
-                                                    cx,
-                                                );
-                                            }),
-                                        ),
-                                    ),
-                            ),
-                    )
-                }),
+                .children(self.render_comment_reply_composer(read_only, window, cx)),
         ))
     }
 
-    fn render_comment_composer_tools(
+    /// The open thread as a page of the Comments panel: every message, then
+    /// the reply composer, under a header whose back button returns to the
+    /// list of threads.
+    pub(crate) fn render_comment_thread_page(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.comment_thread_in_panel(cx) {
+            return None;
+        }
+        let id = self.comment_state.open_thread.clone()?;
+        let origin = self.comment_state.open_thread_origin?;
+        let comment = self
+            .comments_for_origin(origin, cx)
+            .into_iter()
+            .find(|comment| comment.id == id)?;
+        let location = self.comment_location(&comment, cx)?;
+        let motion_label = comment
+            .motion_anchor
+            .map(|anchor| self.motion_comment_label(anchor, cx));
+        let read_only = self.is_dev_mode(cx);
+        let border_variant = cx.theme().colors().border_variant;
+
+        let header = v_flex()
+            .w_full()
+            .flex_none()
+            .border_b_1()
+            .border_color(border_variant)
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .h_8()
+                    .pl_1()
+                    .pr_1()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_none()
+                            .debug_selector(|| "fanta-comment-thread-back".to_owned())
+                            .child(
+                                IconButton::new("fanta-comment-thread-back", IconName::ArrowLeft)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("All Threads"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_comment_thread_page(window, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .child(Label::new(location).single_line().truncate()),
+                            )
+                            .when(comment.resolved, |title| {
+                                title.child(comment_resolved_label())
+                            }),
+                    )
+                    .child(self.render_comment_thread_actions(&comment, read_only, cx)),
+            )
+            .children(motion_label.map(|label| {
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .px_2p5()
+                    .pb_1p5()
+                    .child(comment_motion_label(label))
+            }));
+
+        let mut messages = v_flex()
+            .id("fanta-comment-thread-page-messages")
+            .track_scroll(&self.comment_state.thread_scroll)
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .min_w_0()
+            .overflow_y_scroll()
+            .px_2p5()
+            .py_3()
+            .gap_3();
+        for (index, message) in comment_thread_messages(&comment, cx).enumerate() {
+            if index == 1 {
+                messages = messages.child(comment_replies_divider(comment.replies.len(), cx));
+            }
+            messages = messages.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .debug_selector(move || format!("fanta-comment-thread-page-message-{index}"))
+                    .child(message),
+            );
+        }
+
+        Some(
+            v_flex()
+                .id("fanta-comment-thread-page")
+                .debug_selector(|| "fanta-comment-thread-page".to_owned())
+                .on_action(
+                    cx.listener(|this, _: &editor::actions::Cancel, window, cx| {
+                        if !this.has_unsent_comment_reply(cx) {
+                            this.close_comment_thread_page(window, cx);
+                            this.focus_handle(cx).focus(window, cx);
+                        }
+                    }),
+                )
+                .size_full()
+                .min_w_0()
+                .child(header)
+                .child(messages)
+                .children(
+                    self.render_comment_suggested_fix(&comment, read_only, cx)
+                        .map(|fix| div().flex_none().p_2().child(fix)),
+                )
+                .when(read_only, |page| {
+                    page.child(comment_read_only_footer(&comment, border_variant))
+                })
+                .children(
+                    self.render_comment_reply_composer(read_only, window, cx)
+                        .map(|composer| composer.flex_none()),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Resolve and Delete for the open thread.
+    fn render_comment_thread_actions(
+        &self,
+        comment: &Comment,
+        read_only: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let resolve_id = comment.id.clone();
+        let delete_id = comment.id.clone();
+        h_flex()
+            .flex_none()
+            .child(
+                IconButton::new(
+                    "fanta-comment-resolve-thread",
+                    if comment.resolved {
+                        IconName::Undo
+                    } else {
+                        IconName::Check
+                    },
+                )
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .disabled(read_only)
+                .tooltip(Tooltip::text(if comment.resolved {
+                    "Reopen Thread"
+                } else {
+                    "Resolve Thread"
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.resolve_comment_thread(resolve_id.clone(), cx);
+                })),
+            )
+            .child(
+                IconButton::new("fanta-comment-delete-thread", IconName::Trash)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .disabled(read_only)
+                    .tooltip(Tooltip::text("Delete Thread"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.delete_comment_thread(delete_id.clone(), cx);
+                    })),
+            )
+    }
+
+    fn render_comment_suggested_fix(
+        &self,
+        comment: &Comment,
+        read_only: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Callout> {
+        let fix = comment.suggested_fix.as_ref()?;
+        Some(
+            Callout::new()
+                .severity(Severity::Info)
+                .icon(IconName::Info)
+                .title(fix.summary.clone())
+                .actions_slot(
+                    Button::new("apply-comment-suggested-fix", "Apply Fix")
+                        .label_size(LabelSize::Small)
+                        .disabled(read_only)
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.apply_open_comment_suggested_fix(cx)),
+                        ),
+                ),
+        )
+    }
+
+    /// The open thread's reply editor with its context and toolbar; `None`
+    /// in Dev, where comments are read-only.
+    fn render_comment_reply_composer(
+        &self,
+        read_only: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        let editor = self
+            .comment_state
+            .reply_editor
+            .clone()
+            .filter(|_| !read_only)?;
+        Some(
+            v_flex()
+                .key_context(COMMENT_COMPOSER_CONTEXT)
+                .on_action(cx.listener(|this, _: &SubmitComment, window, cx| {
+                    if let Some(id) = this.comment_state.open_thread.clone() {
+                        this.post_comment_reply(id, window, cx);
+                    }
+                }))
+                .w_full()
+                .min_w_0()
+                .p_2()
+                .gap_2()
+                .border_t_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(comment_input(&editor, window, cx))
+                .children(self.render_comment_composer_context(CommentComposerTarget::Reply, cx))
+                .child(self.render_comment_composer_toolbar(CommentComposerTarget::Reply, cx)),
+        )
+    }
+
+    /// Whether Send would post anything: text, an attachment or a skill.
+    fn comment_composer_has_payload(&self, target: CommentComposerTarget, cx: &App) -> bool {
+        let (editor, attachments) = match target {
+            CommentComposerTarget::Draft => (
+                self.comment_state.draft.as_ref().map(|draft| &draft.editor),
+                &self.comment_state.draft_attachments,
+            ),
+            CommentComposerTarget::Reply => (
+                self.comment_state.reply_editor.as_ref(),
+                &self.comment_state.reply_attachments,
+            ),
+        };
+        editor.is_some_and(|editor| !editor.read(cx).text(cx).trim().is_empty())
+            || !attachments.is_empty()
+            || self.selected_comment_skill(target).is_some()
+    }
+
+    fn render_comment_composer_toolbar(
         &self,
         target: CommentComposerTarget,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (mention_id, attachment_id, skill_id) = match target {
+        let (mention_id, attachment_id, skill_id, send_id, send_label) = match target {
             CommentComposerTarget::Draft => (
                 "fanta-comment-draft-mention",
                 "fanta-comment-draft-attach",
                 "fanta-comment-draft-skill",
+                "fanta-comment-send",
+                "Post Comment",
             ),
             CommentComposerTarget::Reply => (
                 "fanta-comment-reply-mention",
                 "fanta-comment-reply-attach",
                 "fanta-comment-reply-skill",
+                "fanta-comment-reply-send",
+                "Reply",
             ),
         };
         let selected_skill = self.selected_comment_skill(target);
+        let can_send = self.comment_composer_has_payload(target, cx);
+        let editor_focus = match target {
+            CommentComposerTarget::Draft => self
+                .comment_state
+                .draft
+                .as_ref()
+                .map(|draft| draft.editor.focus_handle(cx)),
+            CommentComposerTarget::Reply => self
+                .comment_state
+                .reply_editor
+                .as_ref()
+                .map(|editor| editor.focus_handle(cx)),
+        };
         h_flex()
+            .justify_between()
             .gap_1()
             .child(
-                IconButton::new(mention_id, IconName::AtSign)
-                    .icon_size(IconSize::XSmall)
-                    .tooltip(Tooltip::text("Mention a layer or agent"))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.insert_comment_mention(target, window, cx);
-                    })),
+                h_flex()
+                    .gap_0p5()
+                    .child(
+                        IconButton::new(mention_id, IconName::AtSign)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .toggle_state(self.comment_state.mention_picker == Some(target))
+                            .tooltip(Tooltip::text("Mention a Layer or Agent"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.insert_comment_mention(target, window, cx);
+                            })),
+                    )
+                    .child(
+                        IconButton::new(attachment_id, IconName::Paperclip)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Attach Images or Files"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.choose_comment_attachments(target, cx);
+                            })),
+                    )
+                    .child(
+                        IconButton::new(skill_id, IconName::Sparkle)
+                            .icon_size(IconSize::Small)
+                            .icon_color(if selected_skill.is_some() {
+                                Color::Accent
+                            } else {
+                                Color::Muted
+                            })
+                            .toggle_state(self.comment_state.skill_picker == Some(target))
+                            .tooltip(Tooltip::text(match selected_skill {
+                                Some(skill) => format!("AI Skill: {}", skill.label()),
+                                None => "Add an AI Skill".to_string(),
+                            }))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_comment_skill_picker(target, cx);
+                            })),
+                    ),
             )
             .child(
-                IconButton::new(attachment_id, IconName::Paperclip)
-                    .icon_size(IconSize::XSmall)
-                    .tooltip(Tooltip::text("Attach images or files"))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.choose_comment_attachments(target, cx);
-                    })),
-            )
-            .child(
-                IconButton::new(skill_id, IconName::Sparkle)
-                    .icon_size(IconSize::XSmall)
-                    .toggle_state(selected_skill.is_some())
-                    .tooltip(Tooltip::text(match selected_skill {
-                        Some(skill) => format!("AI skill: {}", skill.label()),
-                        None => "Add an AI skill".to_string(),
-                    }))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_comment_skill_picker(target, cx);
+                IconButton::new(send_id, IconName::Send)
+                    .style(ButtonStyle::Filled)
+                    .icon_size(IconSize::Small)
+                    .map(|button| {
+                        if can_send {
+                            button.icon_color(Color::Accent)
+                        } else {
+                            button.icon_color(Color::Muted).disabled(true)
+                        }
+                    })
+                    .tooltip(move |_, cx| match &editor_focus {
+                        Some(focus) => {
+                            Tooltip::for_action_in(send_label, &SubmitComment, focus, cx)
+                        }
+                        None => Tooltip::simple(send_label, cx),
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| match target {
+                        CommentComposerTarget::Draft => this.post_comment_draft(window, cx),
+                        CommentComposerTarget::Reply => {
+                            if let Some(id) = this.comment_state.open_thread.clone() {
+                                this.post_comment_reply(id, window, cx);
+                            }
+                        }
                     })),
             )
             .into_any_element()
@@ -1779,140 +1993,139 @@ impl FigView {
             return None;
         }
 
-        let colors = cx.theme().colors().clone();
-        let mut context = v_flex().gap_1();
+        let colors = cx.theme().colors();
+        let (border_variant, editor_background, surface) = (
+            colors.border_variant,
+            colors.editor_background,
+            colors.elevated_surface_background,
+        );
+        let mut context = v_flex().gap_1p5();
         if mention_picker_open {
-            let mut candidates = h_flex().gap_1().flex_wrap();
+            let mut menu = comment_menu("Mention", border_variant, editor_background);
             for (index, label) in self.comment_mention_candidates(cx).into_iter().enumerate() {
+                let icon = if COMMENT_AGENT_MENTIONS.contains(&label.as_str()) {
+                    IconName::Sparkle
+                } else {
+                    IconName::ToolFrame
+                };
                 let selected_label = label.clone();
-                candidates = candidates.child(
-                    Button::new((mention_id, index), format!("@{label}"))
-                        .size(ButtonSize::Compact)
-                        .label_size(LabelSize::XSmall)
+                menu = menu.child(
+                    ListItem::new((mention_id, index))
+                        .inset(true)
+                        .spacing(ListItemSpacing::Dense)
+                        .start_slot(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                        .child(
+                            Label::new(format!("@{label}"))
+                                .size(LabelSize::Small)
+                                .single_line()
+                                .truncate(),
+                        )
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.choose_comment_mention(target, selected_label.clone(), window, cx);
                         })),
                 );
             }
-            context = context
-                .child(
-                    Label::new("Mention an agent or layer")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(candidates);
+            context = context.child(menu);
         }
         if skill_picker_open {
-            let mut skills = h_flex().gap_1().flex_wrap();
-            for (index, skill) in CommentSkill::ALL.into_iter().enumerate() {
-                skills = skills.child(
-                    Button::new((skill_id, index), skill.label())
-                        .size(ButtonSize::Compact)
-                        .label_size(LabelSize::XSmall)
-                        .toggle_state(selected_skill == Some(skill))
+            let mut menu = comment_menu(
+                "Run in the Agent Panel after posting",
+                border_variant,
+                editor_background,
+            );
+            for (index, skill) in CommentSkill::ALL
+                .into_iter()
+                .map(Some)
+                .chain([None])
+                .enumerate()
+            {
+                let selected = selected_skill == skill;
+                menu = menu.child(
+                    ListItem::new((skill_id, index))
+                        .inset(true)
+                        .spacing(ListItemSpacing::Dense)
+                        .toggle_state(selected)
+                        .start_slot(
+                            Icon::new(if skill.is_some() {
+                                IconName::Sparkle
+                            } else {
+                                IconName::Close
+                            })
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(skill.map_or("No Skill", CommentSkill::label))
+                                .size(LabelSize::Small),
+                        )
+                        .end_slot::<Icon>(selected.then(|| {
+                            Icon::new(IconName::Check)
+                                .size(IconSize::Small)
+                                .color(Color::Accent)
+                        }))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.choose_comment_skill(target, Some(skill), cx);
+                            this.choose_comment_skill(target, skill, cx);
                         })),
                 );
             }
-            skills = skills.child(
-                Button::new((skill_id, CommentSkill::ALL.len()), "No skill")
-                    .size(ButtonSize::Compact)
-                    .label_size(LabelSize::XSmall)
-                    .toggle_state(selected_skill.is_none())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.choose_comment_skill(target, None, cx);
-                    })),
-            );
-            context = context
-                .child(
-                    Label::new("Run in Agent Panel after posting")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(skills);
+            context = context.child(menu);
         } else if let Some(skill) = selected_skill {
             context = context.child(
                 h_flex()
-                    .px_2()
-                    .py_0p5()
-                    .gap_1()
-                    .rounded_md()
-                    .bg(colors.element_active)
+                    .gap_1p5()
+                    .child(comment_tag(skill.label(), Some(IconName::Sparkle), cx))
                     .child(
-                        Icon::new(IconName::Sparkle)
-                            .size(IconSize::XSmall)
-                            .color(Color::Accent),
-                    )
-                    .child(
-                        Label::new(format!("{} · opens a reviewed Agent draft", skill.label()))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Accent),
+                        Label::new("Opens an Agent Panel draft after posting")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .single_line()
+                            .truncate(),
                     ),
             );
         }
         if let Some(notice) = route_notice {
-            let (icon, color, message) = match notice {
-                SkillRouteNotice::ReadyForReview => (
+            context = context.child(match notice {
+                SkillRouteNotice::ReadyForReview => comment_status_line(
                     IconName::Check,
                     Color::Success,
-                    "Agent draft opened — review and send it in the Agent Panel.".to_string(),
+                    "Agent draft ready to review in the Agent Panel".into(),
+                    Color::Muted,
                 ),
-                SkillRouteNotice::Failed(error) => (IconName::CircleHelp, Color::Error, error),
-            };
-            context = context.child(
-                h_flex()
-                    .px_2()
-                    .py_0p5()
-                    .gap_1()
-                    .rounded_md()
-                    .bg(colors.element_active)
-                    .child(Icon::new(icon).size(IconSize::XSmall).color(color))
-                    .child(Label::new(message).size(LabelSize::XSmall).color(color)),
-            );
+                SkillRouteNotice::Failed(error) => {
+                    comment_status_line(IconName::XCircle, Color::Error, error.into(), Color::Error)
+                }
+            });
         }
         if let Some(error) = error {
-            context = context.child(
-                h_flex()
-                    .px_2()
-                    .py_0p5()
-                    .gap_1()
-                    .rounded_md()
-                    .bg(cx.theme().status().error.opacity(0.12))
-                    .child(
-                        Icon::new(IconName::CircleHelp)
-                            .size(IconSize::XSmall)
-                            .color(Color::Error),
-                    )
-                    .child(
-                        Label::new(error)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Error),
-                    ),
-            );
+            context = context.child(comment_status_line(
+                IconName::XCircle,
+                Color::Error,
+                error.into(),
+                Color::Error,
+            ));
         }
         if !attachments.is_empty() {
             let mut strip = h_flex().id(strip_id).gap_1p5().overflow_x_scroll();
             for (index, attachment) in attachments.into_iter().enumerate() {
-                let remove_target = target;
-                let mut tile = div()
+                let tile = div()
                     .relative()
                     .flex_none()
-                    .w(px(88.))
-                    .h(px(66.))
+                    .w(rems(5.5))
+                    .h(rems(4.))
                     .rounded_md()
                     .overflow_hidden()
                     .border_1()
-                    .border_color(colors.border_variant)
-                    .bg(colors.editor_background);
-                if let Some(path) = attachment
+                    .border_color(border_variant)
+                    .bg(editor_background);
+                let tile = match attachment
                     .path
                     .as_ref()
                     .filter(|path| is_previewable_image(path))
                 {
-                    tile = tile.child(img(path.clone()).size_full().object_fit(ObjectFit::Cover));
-                } else {
-                    tile = tile.child(
+                    Some(path) => {
+                        tile.child(img(path.clone()).size_full().object_fit(ObjectFit::Cover))
+                    }
+                    None => tile.child(
                         v_flex()
                             .size_full()
                             .items_center()
@@ -1920,28 +2133,36 @@ impl FigView {
                             .px_1()
                             .gap_1()
                             .child(
-                                Icon::new(IconName::File)
+                                Icon::new(IconName::FileGeneric)
                                     .size(IconSize::Small)
                                     .color(Color::Muted),
                             )
                             .child(
                                 Label::new(attachment.name.clone())
                                     .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
                                     .single_line()
                                     .truncate(),
                             ),
-                    );
-                }
+                    ),
+                };
                 strip = strip.child(
                     tile.child(
-                        div().absolute().top_0().right_0().child(
-                            IconButton::new((remove_id, index), IconName::Close)
-                                .icon_size(IconSize::XSmall)
-                                .tooltip(Tooltip::text("Remove attachment"))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.remove_comment_attachment(remove_target, index, cx);
-                                })),
-                        ),
+                        div()
+                            .absolute()
+                            .top_0p5()
+                            .right_0p5()
+                            .rounded_sm()
+                            .bg(surface)
+                            .child(
+                                IconButton::new((remove_id, index), IconName::Close)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Remove Attachment"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.remove_comment_attachment(target, index, cx);
+                                    })),
+                            ),
                     ),
                 );
             }
@@ -1949,139 +2170,415 @@ impl FigView {
         }
         Some(context.into_any_element())
     }
+}
 
-    fn render_message_context(
-        mentions: &[Mention],
-        attachments: &[Attachment],
-        skill: Option<CommentSkill>,
-        cx: &App,
-    ) -> Option<AnyElement> {
-        if mentions.is_empty() && attachments.is_empty() && skill.is_none() {
-            return None;
+/// The key context of the draft and reply composers; the keymaps bind Enter
+/// to [`SubmitComment`] inside it.
+const COMMENT_COMPOSER_CONTEXT: &str = "FantaCommentComposer";
+
+/// Mention candidates that address an agent rather than a layer.
+const COMMENT_AGENT_MENTIONS: [&str; 3] = ["Claude", "Codex", "Fanta"];
+
+/// One message of a thread, borrowed for rendering.
+struct CommentMessageView<'a> {
+    author: &'a str,
+    from_agent: bool,
+    created: u64,
+    body: &'a str,
+    mentions: &'a [Mention],
+    attachments: &'a [Attachment],
+    skill: Option<CommentSkill>,
+}
+
+impl<'a> CommentMessageView<'a> {
+    fn of_comment(comment: &'a Comment) -> Self {
+        Self {
+            author: &comment.author,
+            from_agent: comment.from_agent,
+            created: comment.created,
+            body: &comment.text,
+            mentions: &comment.mentions,
+            attachments: &comment.attachments,
+            skill: comment.skill,
         }
-        let colors = cx.theme().colors().clone();
-        let mut context = v_flex().gap_1p5();
-        if !mentions.is_empty() || skill.is_some() {
-            let mut chips = h_flex().gap_1().flex_wrap();
-            for mention in mentions {
-                chips = chips.child(
-                    div()
-                        .px_1p5()
-                        .py_0p5()
-                        .rounded_sm()
-                        .bg(colors.element_active)
-                        .child(
-                            Label::new(format!("@{}", mention.label))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Accent),
-                        ),
-                );
-            }
-            if let Some(skill) = skill {
-                chips = chips.child(
-                    h_flex()
-                        .px_1p5()
-                        .py_0p5()
-                        .gap_1()
-                        .rounded_sm()
-                        .bg(colors.element_active)
-                        .child(
-                            Icon::new(IconName::Sparkle)
-                                .size(IconSize::XSmall)
-                                .color(Color::Accent),
-                        )
-                        .child(
-                            Label::new(skill.label())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Accent),
-                        ),
-                );
-            }
-            context = context.child(chips);
-        }
-        for attachment in attachments {
-            let attachment_element = match attachment
-                .path
-                .as_ref()
-                .filter(|path| is_previewable_image(path))
-            {
-                Some(path) => div()
-                    .w_full()
-                    .h(px(132.))
-                    .rounded_lg()
-                    .overflow_hidden()
-                    .border_1()
-                    .border_color(colors.border_variant)
-                    .child(img(path.clone()).size_full().object_fit(ObjectFit::Cover))
-                    .into_any_element(),
-                None => h_flex()
-                    .px_2()
-                    .py_1p5()
-                    .gap_1p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(colors.border_variant)
-                    .child(
-                        Icon::new(IconName::File)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        Label::new(attachment.name.clone())
-                            .size(LabelSize::XSmall)
-                            .single_line()
-                            .truncate(),
-                    )
-                    .into_any_element(),
-            };
-            context = context.child(attachment_element);
-        }
-        Some(context.into_any_element())
     }
 
-    fn comment_message_row(
-        author: String,
-        when: String,
-        body: String,
-        mentions: &[Mention],
-        attachments: &[Attachment],
-        skill: Option<CommentSkill>,
-        cx: &App,
-    ) -> gpui::Div {
-        v_flex()
-            .gap_1()
-            .child(
-                h_flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(
-                        Label::new(SharedString::from(author))
-                            .size(LabelSize::Small)
-                            .weight(gpui::FontWeight::BOLD),
-                    )
-                    .child(
-                        Label::new(SharedString::from(when))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            )
-            .when(!body.trim().is_empty(), |this| {
-                this.child(Label::new(SharedString::from(body)).size(LabelSize::Small))
-            })
-            .children(Self::render_message_context(
-                mentions,
-                attachments,
-                skill,
-                cx,
-            ))
+    fn of_reply(reply: &'a comments::CommentReply) -> Self {
+        Self {
+            author: &reply.author,
+            from_agent: reply.from_agent,
+            created: reply.created,
+            body: &reply.body,
+            mentions: &reply.mentions,
+            attachments: &reply.attachments,
+            skill: reply.skill,
+        }
     }
 }
 
-fn display_author(comment: &Comment) -> String {
-    if comment.author.trim().is_empty() {
-        "you".to_string()
+/// The thread's opening message followed by its replies.
+fn comment_thread_messages<'a>(
+    comment: &'a Comment,
+    cx: &'a App,
+) -> impl Iterator<Item = gpui::Div> + 'a {
+    std::iter::once(comment_message(
+        CommentMessageView::of_comment(comment),
+        false,
+        cx,
+    ))
+    .chain(
+        comment
+            .replies
+            .iter()
+            .map(|reply| comment_message(CommentMessageView::of_reply(reply), false, cx)),
+    )
+}
+
+/// Separates a thread's opening message from its replies.
+fn comment_replies_divider(replies: usize, cx: &App) -> impl IntoElement {
+    h_flex()
+        .w_full()
+        .gap_2()
+        .child(
+            Label::new(if replies == 1 {
+                "1 reply".to_string()
+            } else {
+                format!("{replies} replies")
+            })
+            .size(LabelSize::Small)
+            .color(Color::Muted)
+            .single_line(),
+        )
+        .child(div().flex_1().h_px().bg(cx.theme().colors().border_variant))
+}
+
+fn comment_resolved_label() -> impl IntoElement {
+    Label::new("Resolved")
+        .size(LabelSize::Small)
+        .color(Color::Muted)
+        .single_line()
+}
+
+/// Dev shows threads read-only, with a way to copy their text.
+fn comment_read_only_footer(comment: &Comment, border: Hsla) -> impl IntoElement {
+    let copy_text = std::iter::once(comment.text.clone())
+        .chain(comment.replies.iter().map(|reply| reply.body.clone()))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    h_flex()
+        .debug_selector(|| "dev-comment-read-only".to_owned())
+        .flex_none()
+        .pl_2()
+        .pr_1()
+        .py_1()
+        .gap_2()
+        .justify_between()
+        .border_t_1()
+        .border_color(border)
+        .child(
+            Label::new("Read-only in Dev")
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
+        .child(
+            div()
+                .debug_selector(|| "dev-comment-copy".to_owned())
+                .child(
+                    IconButton::new("fanta-comment-copy-thread", IconName::Copy)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Copy Thread Text"))
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                copy_text.clone(),
+                            ))
+                        }),
+                ),
+        )
+}
+
+/// A message row: avatar, author and time, then the body and its context.
+/// `compact` (the hover preview) clamps the body and lists attachments by
+/// count instead of previewing them.
+fn comment_message(message: CommentMessageView, compact: bool, cx: &App) -> gpui::Div {
+    let author = comment_author_label(message.author);
+    h_flex()
+        .items_start()
+        .gap_2()
+        .child(CommentAvatar::new(author.clone(), message.from_agent))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .child(Label::new(author).single_line().truncate()),
+                        )
+                        .child(
+                            Label::new(relative_time(message.created))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .single_line(),
+                        ),
+                )
+                .when(!message.body.trim().is_empty(), |content| {
+                    let body = Label::new(message.body.to_string());
+                    content.child(if compact { body.line_clamp(4) } else { body })
+                })
+                .children(comment_message_context(&message, compact, cx)),
+        )
+}
+
+fn comment_message_context(
+    message: &CommentMessageView,
+    compact: bool,
+    cx: &App,
+) -> Option<AnyElement> {
+    if message.mentions.is_empty() && message.attachments.is_empty() && message.skill.is_none() {
+        return None;
+    }
+    let mut tags = h_flex().pt_0p5().gap_1().flex_wrap();
+    for mention in message.mentions {
+        tags = tags.child(comment_tag(format!("@{}", mention.label), None, cx));
+    }
+    if let Some(skill) = message.skill {
+        tags = tags.child(comment_tag(skill.label(), Some(IconName::Sparkle), cx));
+    }
+    let mut context = v_flex().gap_1p5();
+    if compact {
+        if !message.attachments.is_empty() {
+            let count = message.attachments.len();
+            tags = tags.child(comment_tag(
+                if count == 1 {
+                    "1 attachment".to_string()
+                } else {
+                    format!("{count} attachments")
+                },
+                Some(IconName::Paperclip),
+                cx,
+            ));
+        }
+        return Some(context.child(tags).into_any_element());
+    }
+    let mut previews = Vec::new();
+    for attachment in message.attachments {
+        match attachment
+            .path
+            .as_ref()
+            .filter(|path| is_previewable_image(path))
+        {
+            Some(path) => previews.push(
+                div()
+                    .w_full()
+                    .h(rems(8.))
+                    .rounded_md()
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(img(path.clone()).size_full().object_fit(ObjectFit::Cover))
+                    .into_any_element(),
+            ),
+            None => {
+                tags = tags.child(comment_tag(
+                    attachment.name.clone(),
+                    Some(IconName::FileGeneric),
+                    cx,
+                ))
+            }
+        }
+    }
+    if !message.mentions.is_empty()
+        || message.skill.is_some()
+        || previews.len() < message.attachments.len()
+    {
+        context = context.child(tags);
+    }
+    Some(context.children(previews).into_any_element())
+}
+
+/// A compact, muted tag for mentions, skills and file attachments.
+fn comment_tag(
+    label: impl Into<SharedString>,
+    icon: Option<IconName>,
+    cx: &App,
+) -> impl IntoElement {
+    let colors = cx.theme().colors();
+    h_flex()
+        .flex_none()
+        .max_w_full()
+        .min_w_0()
+        .h(rems_from_px(20.))
+        .px_1p5()
+        .gap_1()
+        .rounded_sm()
+        .bg(colors.element_background)
+        .border_1()
+        .border_color(colors.border_variant)
+        .when_some(icon, |tag, icon| {
+            tag.child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+        })
+        .child(
+            Label::new(label)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .single_line()
+                .truncate(),
+        )
+}
+
+/// The bordered field around a composer's editor.
+fn comment_input(editor: &Entity<Editor>, window: &Window, cx: &App) -> gpui::Div {
+    let colors = cx.theme().colors();
+    div()
+        .w_full()
+        .min_w_0()
+        .px_2()
+        .py_1p5()
+        .rounded_md()
+        .border_1()
+        .border_color(if editor.focus_handle(cx).is_focused(window) {
+            colors.border_focused
+        } else {
+            colors.border_variant
+        })
+        .bg(colors.editor_background)
+        .child(editor.clone())
+}
+
+/// An inline menu inside a composer card (mention and skill pickers).
+fn comment_menu(title: &'static str, border: Hsla, background: Hsla) -> gpui::Div {
+    v_flex()
+        .w_full()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(border)
+        .bg(background)
+        .child(
+            div().px_2().pb_0p5().child(
+                Label::new(title)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .single_line(),
+            ),
+        )
+}
+
+fn comment_status_line(
+    icon: IconName,
+    icon_color: Color,
+    message: SharedString,
+    color: Color,
+) -> AnyElement {
+    h_flex()
+        .items_start()
+        .gap_1p5()
+        .child(Icon::new(icon).size(IconSize::Small).color(icon_color))
+        .child(Label::new(message).size(LabelSize::Small).color(color))
+        .into_any_element()
+}
+
+/// The animation and timecode a time comment is anchored to.
+fn comment_motion_label(label: String) -> impl IntoElement {
+    h_flex()
+        .min_w_0()
+        .gap_1()
+        .child(
+            Icon::new(IconName::Clock)
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+        )
+        .child(
+            Label::new(label)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .single_line()
+                .truncate(),
+        )
+}
+
+/// The name shown for a comment's author.
+pub(crate) fn comment_author_label(author: &str) -> SharedString {
+    let author = author.trim();
+    if author.is_empty() {
+        "Unknown".into()
     } else {
-        comment.author.clone()
+        author.to_string().into()
+    }
+}
+
+/// Deterministic per-author color shared by the canvas pins and the thread
+/// avatars: FNV-1a over the normalized name, hashed onto the hue wheel at the
+/// original fanta's fixed saturation and value.
+pub(crate) fn comment_author_color(author: &str) -> Hsla {
+    let normalized = author.trim().to_lowercase();
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in normalized.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    let hue = (hash % 360) as f32 / 360.0;
+    // HSV(h, 0.52, 0.72) converted to HSL.
+    let value = 0.72;
+    let saturation_v = 0.52;
+    let lightness = value * (1.0 - saturation_v / 2.0);
+    let saturation = if lightness <= 0.0 || lightness >= 1.0 {
+        0.0
+    } else {
+        (value - lightness) / f32::min(lightness, 1.0 - lightness)
+    };
+    gpui::hsla(hue, saturation, lightness, 1.0)
+}
+
+/// The author's monogram on their pin color, or a sparkle on the accent for
+/// agent messages, matching the canvas pins.
+#[derive(IntoElement)]
+pub(crate) struct CommentAvatar {
+    author: SharedString,
+    from_agent: bool,
+}
+
+impl CommentAvatar {
+    pub(crate) fn new(author: impl Into<SharedString>, from_agent: bool) -> Self {
+        Self {
+            author: author.into(),
+            from_agent,
+        }
+    }
+}
+
+impl RenderOnce for CommentAvatar {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let avatar = h_flex()
+            .flex_none()
+            .size(rems_from_px(20.))
+            .justify_center()
+            .rounded_full();
+        if self.from_agent {
+            return avatar.bg(cx.theme().players().local().cursor).child(
+                Icon::new(IconName::Sparkle)
+                    .size(IconSize::XSmall)
+                    .color(Color::Custom(gpui::white())),
+            );
+        }
+        let monogram = self
+            .author
+            .trim()
+            .chars()
+            .next()
+            .map(|character| character.to_uppercase().collect::<String>())
+            .unwrap_or_else(|| "?".to_string());
+        avatar.bg(comment_author_color(&self.author)).child(
+            Label::new(monogram)
+                .size(LabelSize::XSmall)
+                .color(Color::Custom(gpui::white())),
+        )
     }
 }
 
@@ -2324,7 +2821,7 @@ mod tests {
             });
             if selector != "fanta-comment-preview" {
                 let send = visual
-                    .debug_bounds("ICON-ArrowUp")
+                    .debug_bounds("ICON-Send")
                     .expect("send button after scrolling");
                 assert!(
                     send.left() >= card.left() && send.right() <= card.right(),
@@ -2376,6 +2873,151 @@ mod tests {
             );
             assert_eq!(document.doc.history.undo_depth(), before.1);
             assert_eq!(item.is_dirty(), before.2);
+        });
+    }
+
+    #[gpui::test]
+    async fn comment_composer_typing_and_backspace_stay_in_the_editor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::{FigView, comments};
+        use crate::tools::ToolKind;
+        use fanta_doc::{Color as DocumentColor, VectorNode};
+        use gpui::{Focusable as _, MouseButton, size};
+        use project::{FakeFs, Project};
+        use settings::SettingsStore;
+
+        cx.update(|cx| {
+            zlog::init_test();
+            assets::Assets.load_test_fonts(cx);
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut document = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        document.apply(Operation::create_node(page)).expect("page");
+        document.add_page(page_id);
+        document.set_active_page(Some(page_id));
+        let mut rectangle = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            20.0,
+            30.0,
+            DocumentColor::BLACK,
+        )));
+        rectangle.parent = Some(page_id);
+        let rectangle_id = rectangle.id;
+        document
+            .apply(Operation::create_node(rectangle))
+            .expect("rectangle");
+        document.selection.select_only(rectangle_id);
+        document.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/Comment-typing.fig".into(),
+            document,
+            cx,
+        );
+        let (view, cx) =
+            cx.add_window_view(|window, cx| FigView::new(item.clone(), project, window, cx));
+        cx.update(|window, cx| {
+            window.activate_window();
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                cx,
+            )
+            .expect("canvas bindings");
+            cx.bind_keys(bindings);
+        });
+        cx.simulate_resize(size(px(1400.), px(1000.)));
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            view.select_page(0, cx);
+            view.activate_tool(ToolKind::Comment, cx);
+            view.focus_handle(cx).focus(window, cx);
+        });
+        cx.run_until_parked();
+        let canvas = view.read_with(cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        let target = canvas.center() + gpui::point(px(150.), px(120.));
+        cx.simulate_mouse_down(target, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(target, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let draft = view.comment_state.draft.as_ref().expect("comment draft");
+            assert!(
+                draft.editor.focus_handle(cx).is_focused(window),
+                "the composer owns focus after placing the pin"
+            );
+        });
+        cx.simulate_input("Hello");
+        cx.simulate_keystrokes("space");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                !view.space_pan_for_test(),
+                "a space typed into the composer must not arm canvas panning"
+            );
+        });
+        cx.simulate_input("world");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("backspace backspace backspace");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            let draft = view.comment_state.draft.as_ref().expect("comment draft");
+            assert_eq!(draft.editor.read(cx).text(cx), "Hello wo");
+        });
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            assert!(document.doc.scene.get(rectangle_id).is_some());
+            assert_eq!(document.doc.selection.as_slice(), &[rectangle_id]);
+        });
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let posted = item.read_with(cx, |item, _| {
+            let comments =
+                comments::read_comments(&item.document().expect("document").doc, page_id);
+            assert_eq!(comments.len(), 1, "Enter posts the composer");
+            assert_eq!(comments[0].text, "Hello wo");
+            comments[0].id.clone()
+        });
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.comment_state.draft.is_none());
+            assert_eq!(
+                view.comment_state.open_thread.as_deref(),
+                Some(posted.as_str())
+            );
+            assert!(view.focus_handle(cx).is_focused(window));
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.toggle_comment_thread(posted, window, cx);
+            view.activate_tool(ToolKind::Comment, cx);
+        });
+        cx.run_until_parked();
+        let target = target + gpui::point(px(-120.), px(-80.));
+        cx.simulate_mouse_down(target, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(target, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_input("Discard me");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(
+                view.comment_state.draft.is_none(),
+                "Escape cancels the draft"
+            );
+            assert!(view.focus_handle(cx).is_focused(window));
+        });
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(comments::read_comments(&document.doc, page_id).len(), 1);
+            assert!(document.doc.scene.get(rectangle_id).is_some());
         });
     }
 

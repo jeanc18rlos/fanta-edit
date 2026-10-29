@@ -120,25 +120,6 @@ pub fn open_external_prompt_for_review(
     window: &mut Window,
     cx: &mut App,
 ) -> anyhow::Result<()> {
-    open_external_prompt(workspace, prompt, false, window, cx)
-}
-
-pub fn open_design_review_prompt(
-    workspace: Entity<Workspace>,
-    prompt: &str,
-    window: &mut Window,
-    cx: &mut App,
-) -> anyhow::Result<()> {
-    open_external_prompt(workspace, prompt, true, window, cx)
-}
-
-fn open_external_prompt(
-    workspace: Entity<Workspace>,
-    prompt: &str,
-    review_profile: bool,
-    window: &mut Window,
-    cx: &mut App,
-) -> anyhow::Result<()> {
     let prompt = ExternalSourcePrompt::new(prompt)
         .ok_or_else(|| anyhow::anyhow!("the generated agent prompt was empty"))?;
     if workspace.read(cx).root_paths(cx).is_empty() {
@@ -155,11 +136,7 @@ fn open_external_prompt(
         workspace.reveal_panel::<AgentPanel>(window, cx);
     });
     panel.update(cx, |panel, cx| {
-        if review_profile {
-            panel.new_design_review_thread(prompt, window, cx);
-        } else {
-            panel.new_agent_thread_with_external_source_prompt(Some(prompt), window, cx);
-        }
+        panel.new_agent_thread_with_external_source_prompt(Some(prompt), window, cx);
     });
     workspace.update(cx, |workspace, cx| {
         workspace.focus_panel::<AgentPanel>(window, cx);
@@ -203,6 +180,7 @@ pub fn open_agent_add_context_menu(
 pub fn attach_canvas_selection_for_review(
     workspace: Entity<Workspace>,
     name: String,
+    nodes: Vec<String>,
     content: String,
     window: &mut Window,
     cx: &mut App,
@@ -219,7 +197,7 @@ pub fn attach_canvas_selection_for_review(
         .read(cx)
         .panel::<AgentPanel>(cx)
         .ok_or_else(|| anyhow::anyhow!("the Agent Panel is not available in this workspace"))?;
-    let mention = MentionUri::CanvasSelection { name };
+    let mention = MentionUri::CanvasSelection { name, nodes };
     let block = acp::ContentBlock::Resource(acp::EmbeddedResource::new(
         acp::EmbeddedResourceResource::TextResourceContents(acp::TextResourceContents::new(
             content,
@@ -237,6 +215,35 @@ pub fn attach_canvas_selection_for_review(
         workspace.focus_panel::<AgentPanel>(window, cx);
     });
     Ok(())
+}
+
+/// Selects and reveals a canvas-selection mention's layers on the open
+/// design; a toast says why when it cannot.
+pub(crate) fn reveal_canvas_selection(
+    nodes: &[String],
+    workspace: &mut Workspace,
+    cx: &mut Context<Workspace>,
+) {
+    let result = (|| {
+        anyhow::ensure!(
+            !nodes.is_empty(),
+            "this selection was attached before mentions linked to their layers"
+        );
+        let surface = design_surface::active(cx)
+            .ok_or_else(|| anyhow::anyhow!("open the design these layers belong to"))?;
+        surface.reveal_nodes(nodes, cx)
+    })();
+    if let Err(error) = result {
+        struct RevealCanvasSelectionToast;
+        workspace.show_toast(
+            workspace::Toast::new(
+                workspace::notifications::NotificationId::unique::<RevealCanvasSelectionToast>(),
+                format!("Could not show the layers: {error:#}"),
+            )
+            .autohide(),
+            cx,
+        );
+    }
 }
 
 pub(crate) fn resolve_agent_image(

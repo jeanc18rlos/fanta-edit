@@ -121,6 +121,11 @@ impl RenderOnce for CollapsibleIconTab {
             ),
             Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint()),
             move |tab, delta| {
+                if selected && delta >= 1. {
+                    // Settled: size to the label, which the measured width can
+                    // undershoot by a few pixels and clip.
+                    return tab;
+                }
                 let width = if selected {
                     collapsed_width + (expanded_width - collapsed_width) * delta
                 } else {
@@ -194,6 +199,7 @@ mod tab_tests {
 pub struct CollapsibleIconTabBar {
     id: &'static str,
     tabs: Vec<AnyElement>,
+    embedded: bool,
 }
 
 impl CollapsibleIconTabBar {
@@ -201,7 +207,15 @@ impl CollapsibleIconTabBar {
         Self {
             id,
             tabs: Vec::new(),
+            embedded: false,
         }
+    }
+
+    /// Drops the floating pill's border, background and shadow, for a bar
+    /// that sits in a panel's own bordered row.
+    pub fn embedded(mut self) -> Self {
+        self.embedded = true;
+        self
     }
 
     pub fn tab(mut self, tab: CollapsibleIconTab) -> Self {
@@ -219,11 +233,13 @@ impl RenderOnce for CollapsibleIconTabBar {
             .h(rems(2.125))
             .p_0p5()
             .gap_0p5()
-            .rounded_lg()
-            .border_1()
-            .border_color(cx.theme().colors().border)
-            .bg(cx.theme().colors().panel_background)
-            .shadow_sm()
+            .when(!self.embedded, |bar| {
+                bar.rounded_lg()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .bg(cx.theme().colors().panel_background)
+                    .shadow_sm()
+            })
             .children(self.tabs)
     }
 }

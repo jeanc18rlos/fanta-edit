@@ -127,8 +127,9 @@ pub fn app_menus() -> Vec<Menu> {
             name: "Design".into(),
             disabled: false,
             items: vec![
-                MenuItem::action("AI Review…", fig_viewer::RunAiReview),
-                MenuItem::action("Ultrareview…", fig_viewer::RunUltraReview),
+                MenuItem::action("Plan & Build…", fanta_actions::agent::PlanAndBuildDesign),
+                MenuItem::action("AI Review…", fanta_actions::agent::ReviewDesign),
+                MenuItem::action("Ultrareview…", fanta_actions::agent::UltrareviewDesign),
                 MenuItem::separator(),
                 MenuItem::action("Export Motion JSON…", fig_viewer::ExportMotionJson),
                 MenuItem::action(
