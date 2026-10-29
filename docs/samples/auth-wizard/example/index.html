@@ -1,0 +1,108 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Auth wizard · Fanta runtime sample</title>
+<style>
+  body { margin: 0; font: 13px system-ui; background: #0b0b0b; color: #eee; }
+  main { display: grid; grid-template-columns: 390px 1fr; gap: 16px; padding: 16px; align-items: start; }
+  canvas { display: block; width: 390px; height: 700px; background: #000; border-radius: 18px; touch-action: none; }
+  button { font: 14px system-ui; padding: 8px 14px; border-radius: 8px; border: 0; background: #F97316; color: #fff; cursor: pointer; }
+  pre { white-space: pre-wrap; font: 11px ui-monospace, monospace; background: #161616; padding: 10px; border-radius: 8px; margin: 0; }
+  table { border-collapse: collapse; font: 12px ui-monospace, monospace; }
+  td, th { border-bottom: 1px solid #333; padding: 4px 8px; text-align: right; } td:first-child, th:first-child { text-align: left; }
+  .hint { color: #9ca3af; }
+</style>
+<main>
+  <canvas id="stage" aria-label="Auth wizard prototype"></canvas>
+  <div style="display:grid;gap:10px">
+    <div><button id="play">Play walkthrough</button> <span id="status">loading…</span></div>
+    <div class="hint">Use it yourself: hover and press the buttons (variants tween), click the field, then type. Keys: A / X type an email, 1 2 3 4 type the code, 0 a wrong one, Backspace clears, Enter submits, Esc goes back or closes the toast, R resends. Click the prototype once so it has keyboard focus, or just type: keys are forwarded.</div>
+    <div id="table"></div>
+    <pre id="log"></pre>
+  </div>
+</main>
+<script type="module">
+  // A built fanta-runtime package (Fanta-JS packages/runtime) copied or linked to ./runtime; see README.md.
+  import {createRuntime} from "./runtime/src/index.js";
+  const status = document.querySelector("#status"), log = document.querySelector("#log"), table = document.querySelector("#table");
+  const lines = []; const say = line => { lines.push(line); log.textContent = lines.join("\n"); };
+  const layout = await (await fetch("./layout.json")).json();
+  const t0 = performance.now();
+  const runtime = await createRuntime();
+  const bytes = new Uint8Array(await (await fetch("./program.fanta")).arrayBuffer());
+  const program = await runtime.loadBundle(bytes);
+  const canvas = document.querySelector("#stage");
+  const player = await runtime.createPlayer({program, canvas, clock: "manual"});
+  status.textContent = `ready in ${Math.round(performance.now() - t0)} ms · bundle ${(bytes.length / 1024).toFixed(0)} KiB · ${player.inspect().nodes.length} nodes on screen`;
+  player.on("navigate", event => say(`navigate → stage ${layout.stages.indexOf(event.state?.currentFrame) + 1}`));
+  // A reaction's clip plays after its actions: on a submit that navigates, the shake clip targets
+  // the stage just left, and the runtime reports that as a diagnostic rather than failing.
+  player.on("error", event => say(event?.kind === "diagnostic" ? `note: ${event.diagnostic?.code} (clip skipped after navigation)` : `ERROR ${JSON.stringify(event)}`));
+
+  let phaseName = "idle", last = performance.now(), syncMode = false;
+  const samples = {};
+  const setPhase = name => { phaseName = name; };
+  function frame(now) {
+    if (!syncMode) {
+      const dt = Math.max(0, Math.min(now - last, 50)); last = now;
+      const started = performance.now();
+      try { player.advanceBy(dt); } catch (error) { say(`advanceBy failed: ${error.message}`); return; }
+      const work = performance.now() - started;
+      const metrics = player.getState().metrics ?? {};
+      (samples[phaseName] ??= []).push({at: now, work, draw: (metrics.frameMicros ?? 0) / 1000});
+    } else { last = now; }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const point = key => layout.targets[key];
+  const send = (type, key) => player.sendPointer({type, x: point(key).x, y: point(key).y});
+  const hover = key => send("move", key), down = key => send("down", key), up = key => send("up", key);
+  const click = key => { hover(key); send("click", key); };
+  const stageNow = () => layout.stages.indexOf(player.getState().currentFrame) + 1;
+  const variable = key => { const v = player.inspect().variables?.variables?.[layout.variables[key]]; const value = v ? Object.values(v.values_by_mode)[0]?.value : undefined;
+    return value && typeof value === "object" ? "#" + [value.r, value.g, value.b].map(c => c.toString(16).padStart(2, "0")).join("").toUpperCase() : value; };
+  const overlays = () => player.getState().overlayFrames.length;
+  const percentile = (values, fraction) => { const sorted = [...values].sort((a, b) => a - b); return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)] ?? 0; };
+  const report = () => {
+    const rows = Object.entries(samples).filter(([, list]) => list.length > 1).map(([name, list]) => {
+      const work = list.map(s => s.work), draw = list.map(s => s.draw), span = list[list.length - 1].at - list[0].at;
+      return {phase: name, frames: list.length, fps: +(1000 * (list.length - 1) / span).toFixed(0), p95Work: percentile(work, .95), maxWork: Math.max(...work), p95Draw: percentile(draw, .95)};
+    });
+    table.innerHTML = "<table><tr><th>phase</th><th>frames</th><th>fps</th><th>p95 work ms</th><th>max ms</th><th>p95 draw ms</th></tr>" +
+      rows.map(r => `<tr><td>${r.phase}</td><td>${r.frames}</td><td>${r.fps}</td><td>${r.p95Work.toFixed(2)}</td><td>${r.maxWork.toFixed(2)}</td><td>${r.p95Draw.toFixed(2)}</td></tr>`).join("") + "</table>";
+    window.wizardReport = {rows, lines: [...lines]};
+  };
+  const variants = () => [...new Set(player.inspect().nodes.filter(n => n.name.startsWith("State=")).map(n => n.name.slice(6)))].join(",");
+  const keys = async (...list) => { for (const k of list) { player.sendKey(k); await wait(140); } };
+  window.runScenario = async () => {
+    for (const key of Object.keys(samples)) delete samples[key];
+    lines.length = 0; log.textContent = "";
+    setPhase("idle"); await wait(600);
+    hover("0:Primary"); setPhase("hover: variant tween"); await wait(500); say(`hovering Continue → variants on screen: ${variants()}`);
+    down("0:Primary"); await wait(260); say(`pressing → ${variants()}`); up("0:Primary"); await wait(260); say(`released → ${variants()}`);
+    hover("0:ChipB"); await wait(400); say(`hovering chip → ${variants()}`); hover("0:Field"); await wait(300);
+    click("0:Field"); setPhase("field focus tween"); await wait(500); say(`field clicked → ${variants()}`);
+    setPhase("keys: X then Enter (shake + error)"); await keys("x"); await wait(300); await keys("Enter"); await wait(900);
+    say(`after X + Enter: stage ${stageNow()}, fieldError=${variable("fieldError")}`);
+    setPhase("keys: A then Enter (smart animate)"); await keys("a"); await wait(300); await keys("Enter"); await wait(900);
+    say(`after A + Enter: stage ${stageNow()}, primary label now "${variable("primaryLabel")}"`);
+    setPhase("keys: 1 2 3 4"); await keys("1", "2", "3", "4"); await wait(400); say(`typed → field "${variable("fieldValue")}"`);
+    setPhase("key R: spring toast"); await keys("r"); await wait(700); say(`toast open: overlays=${overlays()}`); await keys("Escape"); await wait(400); say(`Esc → overlays=${overlays()}`);
+    setPhase("keys: Backspace 0 Enter (wrong code)"); await keys("Backspace", "0"); await wait(200); await keys("Enter"); await wait(800); say(`after 0000 + Enter: stage ${stageNow()}, fieldError=${variable("fieldError")}`);
+    setPhase("keys: Backspace 1 2 3 4 Enter (push)"); await keys("Backspace", "1", "2", "3", "4"); await wait(200); await keys("Enter"); await wait(900); say(`after 1234 + Enter: stage ${stageNow()}`);
+    setPhase("key Esc: back (push right)"); await keys("Escape"); await wait(800); say(`Esc → stage ${stageNow()}`);
+    setPhase("keys: 1 2 3 4 Enter again"); await keys("1", "2", "3", "4", "Enter"); await wait(900); say(`→ stage ${stageNow()}`);
+    hover("2:Primary"); await wait(300);
+    setPhase("keys: N then Enter (check slides in)"); await keys("n"); await wait(300); await keys("Enter"); await wait(1000); say(`after N + Enter: stage ${stageNow()}`);
+    setPhase("ring pulse"); await wait(2000); say(`ring clip running=${player.getState().clip?.running}`);
+    setPhase("key Enter: start over"); await keys("Enter"); await wait(900); say(`→ stage ${stageNow()}, primary label "${variable("primaryLabel")}"`);
+    setPhase("after"); report(); say("walkthrough complete"); status.textContent += " · done";
+  };
+  document.querySelector("#play").onclick = () => window.runScenario();
+  window.addEventListener("keydown", event => {
+    if (document.activeElement === canvas || event.metaKey || event.ctrlKey || event.altKey) return;
+    if (["Enter", "Backspace", "Escape"].includes(event.key) || /^[0-9a-zA-Z]$/.test(event.key)) { event.preventDefault(); player.sendKey(event.key); }
+  });
+  window.wizardReady = true;
+</script>

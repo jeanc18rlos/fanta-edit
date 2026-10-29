@@ -66,7 +66,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: >-
           cargo test --locked --no-fail-fast --lib
-          -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-canvas -p fanta-tools
+          -p fanta-bundle -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-canvas -p fanta-tools
           -p fanta-present -p fanta-text -p design_surface -p fanta-design-ops
           -p fanta-headless -p fanta-api -p fanta-engine
 

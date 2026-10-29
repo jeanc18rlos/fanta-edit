@@ -36,10 +36,10 @@ fn main() -> Result<()> {
     let arguments = Arguments::parse();
     let mut substitutions = BTreeMap::new();
     for substitution in &arguments.substitutions {
-        let Some((family, replacement)) = substitution.split_once('=') else {
+        let Some((family, replacement)) = fanta_site::parse_substitution(substitution) else {
             bail!("--substitute expects FAMILY=REPLACEMENT, got {substitution:?}");
         };
-        substitutions.insert(family.trim().to_owned(), replacement.trim().to_owned());
+        substitutions.insert(family, replacement);
     }
     let assets = RuntimeAssets::read(&arguments.runtime).with_context(|| {
         format!(
@@ -66,13 +66,10 @@ fn main() -> Result<()> {
     }
     for face in &report.fonts {
         let style = if face.italic { " italic" } else { "" };
-        let source = match &face.source {
-            FontSource::File { path } => format!("file {}", path.display()),
-            FontSource::Bundled => "bundled".to_owned(),
-            FontSource::Downloaded => "downloaded".to_owned(),
-            FontSource::Substituted { family } => format!("substituted with {family}"),
-        };
-        println!("  font  {} {}{}: {source}", face.family, face.weight, style);
+        println!(
+            "  font  {} {}{}: {}",
+            face.family, face.weight, style, face.source
+        );
     }
     for face in &report.fonts {
         if let FontSource::Substituted { family } = &face.source {

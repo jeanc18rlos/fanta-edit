@@ -7,6 +7,7 @@ name: Fanta runtime engine
 on:
   pull_request:
     paths:
+      - 'crates/fanta-bundle/**'
       - 'crates/fanta-doc/**'
       - 'crates/fanta-fnx/**'
       - 'crates/fanta-format/**'
@@ -58,9 +59,17 @@ jobs:
 
       - name: Test the Rust design and playback engines
         run: |
-          cargo test --locked --no-fail-fast -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-present -p fanta-render -p fanta-text -p fanta-runtime --lib
+          cargo test --locked --no-fail-fast -p fanta-bundle -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-present -p fanta-render -p fanta-text -p fanta-runtime --lib
           cargo test --locked -p fanta-format --test runtime_project
           cargo check --locked -p fanta-format --no-default-features
+          cargo check --locked -p fanta-bundle
           cargo build --locked -p fanta-runtime --example playback_fixture
           cargo test --locked -p fanta-site
           cargo check --locked -p fanta-site
+
+      - name: Keep the source compiler out of the runtime
+        run: |
+          if cargo tree --locked -p fanta-runtime -e normal --prefix none | grep -E '^fanta-(fnx|format) '; then
+            echo 'fanta-runtime loads bundles only; sources are compiled by fanta-compile' >&2
+            exit 1
+          fi
