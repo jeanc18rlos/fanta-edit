@@ -42,6 +42,7 @@ How Fanta is built and decided:
   review findings, reproduced failures, completed Sol work, and remaining gaps.
 - [`fanta/`](./fanta) — notes on the app itself, including
   [`project-schema.md`](./fanta/project-schema.md) for the editable project tree and
+  [`runtime-bundle.md`](./fanta/runtime-bundle.md) for compiling a project into the bundle the runtime loads,
   [`website-export.md`](./fanta/website-export.md) for publishing a static viewer,
   [`windows-development.md`](./fanta/windows-development.md) for building and testing on Windows, and
   [`code-first-audit.md`](./fanta/code-first-audit.md) for the architecture review, plus

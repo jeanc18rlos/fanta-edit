@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
-description = "Static website export: a read-only page per design page, rendered in the browser by the @fanta/runtime WASM engine."
+description = "Project export for the web: fanta-compile writes the runtime bundle fanta-runtime loads, and fanta-site wraps it in a static website with one read-only page per design page."
 
 [lib]
 path = "src/site.rs"
@@ -13,6 +13,10 @@ path = "src/site.rs"
 [[bin]]
 name = "fanta-site"
 path = "src/main.rs"
+
+[[bin]]
+name = "fanta-compile"
+path = "src/compile_main.rs"
 
 [dependencies]
 anyhow.workspace = true

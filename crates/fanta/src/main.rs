@@ -222,7 +222,6 @@ fn main() {
     // `fanta --mcp-stdio` proxies stdio JSON-RPC to the running app's live MCP
     // socket. It must short-circuit before `ensure_only_instance()` below,
     // which would otherwise refuse to start a second process.
-    #[cfg(not(target_os = "windows"))]
     if args.mcp_stdio {
         process::exit(fanta::mcp_stdio::run());
     }
@@ -1639,7 +1638,6 @@ struct Args {
     /// already be running; this does not start it.
     ///
     /// Register it with:  claude mcp add --scope project --transport stdio fanta -- <path to fanta> --mcp-stdio
-    #[cfg(not(target_os = "windows"))]
     #[arg(long, verbatim_doc_comment)]
     mcp_stdio: bool,
 

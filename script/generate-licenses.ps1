@@ -4,7 +4,9 @@ $PSNativeCommandUseErrorActionPreference = $true
 $CARGO_ABOUT_VERSION="0.8.2"
 $outputFile=$args[0] ? $args[0] : "$(Get-Location)/assets/licenses.md"
 $templateFile="script/licenses/template.md.hbs"
-$metadata = cargo metadata --format-version 1 --locked | ConvertFrom-Json
+# Some crates have features whose names differ only in case (USB and usb), which
+# ConvertFrom-Json rejects unless it builds case-sensitive hashtables.
+$metadata = cargo metadata --format-version 1 --locked | ConvertFrom-Json -AsHashtable
 if ($LASTEXITCODE -ne 0) { throw "Cargo metadata failed" }
 $assetPackage = $metadata.packages | Where-Object { $_.name -eq 'fanta-gpui-zed-ui-assets' } | Select-Object -First 1
 if (-not $assetPackage) { throw "fanta-gpui-zed-ui-assets is missing from Cargo metadata" }
@@ -13,11 +15,11 @@ $assetDirectory = Join-Path (Split-Path $assetPackage.manifest_path) 'assets'
 New-Item -Path "$outputFile" -ItemType File -Value "" -Force
 
 @(
-    "# ###### THEME LICENSES ######\n"
+    "# ###### THEME LICENSES ######`n"
     Get-Content (Join-Path $assetDirectory 'themes/LICENSES')
-    "\n# ###### ICON LICENSES ######\n"
+    "`n# ###### ICON LICENSES ######`n"
     Get-Content (Join-Path $assetDirectory 'icons/LICENSES')
-    "\n# ###### CODE LICENSES ######\n"
+    "`n# ###### CODE LICENSES ######`n"
 ) | Add-Content -Path $outputFile
 
 $needsInstall = $false
@@ -39,9 +41,15 @@ if ($needsInstall) {
 
 Write-Host "Generating cargo licenses"
 
-$failFlag = $env:ALLOW_MISSING_LICENSES ? "--fail" : ""
-$args = @('about', 'generate', $failFlag, '-c', 'script/licenses/fanta-licenses.toml', $templateFile, '-o', $outputFile) | Where-Object { $_ }
-cargo @args
+# As in script/generate-licenses: a crate without an accepted license fails the build unless
+# ALLOW_MISSING_LICENSES is set.
+$failFlag = $env:ALLOW_MISSING_LICENSES ? "" : "--fail"
+# cargo-about's -o replaces the file, which would drop the theme and icon licenses above.
+$codeLicenses = New-TemporaryFile
+$aboutArgs = @('about', 'generate', $failFlag, '-c', 'script/licenses/fanta-licenses.toml', $templateFile, '-o', $codeLicenses.FullName) | Where-Object { $_ }
+cargo @aboutArgs
+Get-Content $codeLicenses.FullName | Add-Content -Path $outputFile
+Remove-Item $codeLicenses.FullName
 
 Write-Host "Applying replacements"
 $replacements = @{

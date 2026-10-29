@@ -1,6 +1,6 @@
 ---
 name: fanta-release
-description: Build, verify and publish a Fanta macOS release - the "Build macOS release" workflow, signing and notarization, version tags, the GitHub prerelease, crash symbols, and every place that pins the download. Use when preparing, building, checking or publishing a Fanta release or DMG.
+description: Build, verify and publish a Fanta release - the "Build macOS release" and "Build Windows release" workflows, signing and notarization, update signatures, version tags, the GitHub prerelease, crash symbols, and every place that pins the download. Use when preparing, building, checking or publishing a Fanta release, DMG or Windows installer.
 ---
 
 # Releasing Fanta for macOS
@@ -35,3 +35,13 @@ Then update every place that pins the release tag, and check that each download 
 - the docs site (`jeanc18rlos/fanta-docs`, `content/docs/getting-started/install.mdx`).
 
 Keep the release's `fanta-symbols-aarch64-<commit>` artifact reachable for crash symbolication (see the `crash-investigation` skill); it expires after 90 days.
+
+## Windows
+
+Workflow "Build Windows release" (`.github/workflows/release-windows.yml`) runs `script/bundle-windows.ps1` on `windows-2025` for `v*` tags, `workflow_dispatch`, and pull requests that change the packaging.
+
+- The installer, `Fanta-x86_64.exe`, is not Authenticode-signed (`FANTA_WINDOWS_SIGN=1` turns signing on once Azure Trusted Signing is set up), so SmartScreen warns on first run.
+- Tag and dispatch builds sign `Fanta-x86_64.exe.sig` for in-app updates. Without the `FANTA_UPDATE_SIGNING_KEY` secret the step only warns, and installed copies will not update to that build.
+- Artifacts: `fanta-windows-x86_64` (installer, `.sig`, `SHA256SUMS-windows-x86_64.txt`) and `fanta-windows-symbols-x86_64-<commit>` (PDBs, kept 90 days).
+- The `smoke-test` job installs, updates in place and uninstalls an installer built from the real update helper and stand-in app binaries, in about 20 minutes. When the bundle script, `fanta.iss` or the helper change, read it first: the full build takes hours.
+- Every platform adds its assets to the tag's one draft through `script/upload-draft-release`, in the concurrency group `draft-release-<tag>`. Don't call `gh release create` for a tag directly: GitHub allows several drafts with the same tag.

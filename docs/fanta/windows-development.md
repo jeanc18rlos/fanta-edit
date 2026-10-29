@@ -1,11 +1,11 @@
 # Developing Fanta on Windows
 
-Fanta ships for macOS, but the repository builds, runs and tests on Windows so
-you can work on it there. The `Windows` workflow
+The repository builds, runs and tests on Windows, and a release ships a Windows
+installer next to the Mac DMG. The `Windows` workflow
 ([`.github/workflows/windows.yml`](../../.github/workflows/windows.yml)) keeps it
-that way: on every pull request that touches code it checks the app and the
-command-line tool and runs the tests of the canvas, the renderer and the design
-engine crates on `windows-2025`.
+that way: on every pull request that touches code it checks the app, the
+command-line tool and the update helper, and runs the tests of the update helper,
+the canvas, the renderer and the design engine crates on `windows-2025`.
 
 ## What is different from a Mac
 
@@ -18,9 +18,10 @@ engine crates on `windows-2025`.
   layers and video fills show the poster frame saved with the project (a video
   placed on Windows has none), and audio previews do not play. Placing video
   and audio on the canvas works on both.
-- **No release packaging.** `script/bundle-mac`, signing, notarization and the
-  in-app updater are macOS-only. `script/bundle-windows.ps1` comes from upstream
-  and has not been validated for Fanta.
+- **The installer is unsigned.** It has no Authenticode signature yet, so
+  SmartScreen warns on first run (*More info*, then *Run anyway*). It installs
+  per user into `%LOCALAPPDATA%\Programs\Fanta` and needs no administrator
+  rights.
 - Tests that need Unix permission bits or symbolic links are `#[cfg(unix)]` and
   are skipped.
 
@@ -79,8 +80,40 @@ reruns each test in its own process to list every test that fails:
 `script/` are Bash; run them from Git Bash, or run the `cargo` commands they wrap
 directly.
 
+## Package a release
+
+`script\bundle-windows.ps1` builds the app, the command-line tool and the update
+helper, and packages them with [Inno Setup 6](https://jrsoftware.org/isinfo.php)
+into `target\Fanta-x86_64.exe`:
+
+```powershell
+winget install -e --id JRSoftware.InnoSetup
+.\script\bundle-windows.ps1
+```
+
+The installer is unsigned unless `FANTA_WINDOWS_SIGN=1`, which signs it with
+Azure Trusted Signing; `crates\fanta\resources\windows\sign.ps1` lists the
+variables that needs.
+
+The *Build Windows release* workflow
+([`release-windows.yml`](../../.github/workflows/release-windows.yml)) runs the
+script for every `v*` tag, on manual dispatch, and on pull requests that change
+the packaging. Tag and manual builds sign `Fanta-x86_64.exe.sig` for in-app
+updates when the `FANTA_UPDATE_SIGNING_KEY` secret is set. Alongside the build, a
+smoke test packages the real update helper with stand-in app binaries, then
+installs, updates in place while the "app" runs, and uninstalls. A tag adds the
+installer, its signature and `SHA256SUMS-windows-x86_64.txt` to the tag's draft
+release once both jobs pass.
+
+An in-app update downloads the new installer into `updates\`, checks its
+signature and runs it with `/verysilent /update=true`, which writes the new
+files into `install\`. When Fanta quits or restarts, `tools\auto_update_helper.exe`
+moves them into place and keeps the old ones in `old\` until the swap succeeds.
+A build without a release-signing key never checks for updates.
+
 ## Agents
 
 Claude Code, Codex and other MCP clients connect to the running app through
 `fanta.exe --mcp-stdio`, exactly as on a Mac; point the client at
-`target\debug\fanta.exe`. See [`agent-quickstart.md`](agent-quickstart.md).
+`target\debug\fanta.exe`, or at `%LOCALAPPDATA%\Programs\Fanta\Fanta.exe` for an
+installed copy. See [`agent-quickstart.md`](agent-quickstart.md).

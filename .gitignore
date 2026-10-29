@@ -30,6 +30,7 @@
 /crates/fanta/resources/flatpak/flatpak-cargo-sources.json
 /crates/project_panel/benches/linux_repo_snapshot.txt
 /dev.fanta.Fanta*.json
+/inno/
 /node_modules/
 /plugins/bin
 /script/node_modules

@@ -1,0 +1,4 @@
+<Frame id="00000000000000000000005056" name="State=Focused" x={2400} y={1560} width={286} height={52} corner_radius={12} background={{"kind":"solid","color":fnxColor("#FFF7ED")}} strokes={[{"paint":{"kind":"solid","color":fnxColor("#F97316")},"width":1.5}]}>
+  <Text id="00000000000000000000005057" name="Value" content="" x={16} y={15} width={254} height={22} align="left" style={{"font_family":"Source Sans 3","size_px":16,"weight":500,"color":fnxColor("#0F172A")}} bindings={[[{"prop":"text_content"},"00000000000000000000005003"]]} />
+  <Text id="00000000000000000000005058" name="Placeholder" content="" x={16} y={15} width={254} height={22} align="left" style={{"font_family":"Source Sans 3","size_px":16,"weight":400,"color":fnxColor("#64748B")}} bindings={[[{"prop":"text_content"},"00000000000000000000005007"],[{"prop":"visible"},"00000000000000000000005004"]]} />
+</Frame>
