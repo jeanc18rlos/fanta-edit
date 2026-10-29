@@ -3,6 +3,18 @@
 Fanta's documentation is plain Markdown in this directory. There is no doc build
 step: read the files here, or on GitHub.
 
+How Fanta is built and decided:
+
+- [`architecture/README.md`](./architecture/README.md) — the system, the
+  repositories, the engine's layers, how changes flow and the known debt;
+  [`architecture/crate-map.md`](./architecture/crate-map.md) is generated
+  from the code.
+- [`decisions/`](./decisions/README.md) — one record per decision, from the
+  Zed fork onward, with the proposals that await a decision.
+- [`process/spec-driven-development.md`](./process/spec-driven-development.md)
+  — when a change needs a spec or a decision record, and who approves it.
+  Specs live in [`/specs`](../specs/README.md).
+
 - [`alpha/PUBLIC_ALPHA.md`](./alpha/PUBLIC_ALPHA.md) — current 1.0.0 installation, requirements, manual updates, limitations and support.
 - [`alpha/DEMO_GUIDE.md`](./alpha/DEMO_GUIDE.md) — three launch demos and the common ten-minute exercise.
 - [`fanta/agent-quickstart.md`](./fanta/agent-quickstart.md) — current local connection, 14-tool interface, scopes and a bounded first task.

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 license = "GPL-3.0-or-later"
+description = "Registers the few languages Fanta's read-only source views need, without language servers or toolchains."
 
 [lints]
 workspace = true

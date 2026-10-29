@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 license = "GPL-3.0-or-later"
+description = "Fanta-specific GPUI components shared by the editor: inspector sections, the animation panel, the timeline and the font picker."
 
 [lints]
 workspace = true
