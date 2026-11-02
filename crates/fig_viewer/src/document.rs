@@ -4098,7 +4098,14 @@ fn add_asset_write_preconditions(
             .join(format!("{id}.{extension}"))
     };
     let mut found = BTreeSet::new();
-    for family in std::fs::read_dir(project_root.join("assets"))? {
+    // Git does not track empty directories, so a cloned project without
+    // images has no `assets/` directory at all.
+    let families = match std::fs::read_dir(project_root.join("assets")) {
+        Ok(families) => Some(families),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    for family in families.into_iter().flatten() {
         let family = family?;
         if !family.file_type()?.is_dir() {
             continue;
@@ -6032,6 +6039,42 @@ mod tests {
                 before_manifest
             );
         }
+    }
+
+    #[test]
+    fn asset_preconditions_accept_a_project_without_an_assets_directory() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let document = Doc::new();
+        fanta_format::write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        match std::fs::remove_dir_all(directory.path().join("assets")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        let id = AssetId::from_u128(7);
+        let image = b"\x89PNG\r\n\x1a\nfirst image".to_vec();
+        let current_assets = BTreeMap::from([(id, image.clone())]);
+        let mut preconditions = BTreeMap::new();
+        add_asset_write_preconditions(
+            directory.path(),
+            &mut preconditions,
+            &BTreeMap::new(),
+            &current_assets,
+        )?;
+        let image_path = PathBuf::from(format!("assets/images/{id}.png"));
+        assert_eq!(preconditions.get(&image_path), Some(&None));
+
+        fanta_format::write_project_tree_cached_with_sources_checked(
+            directory.path(),
+            &document,
+            &current_assets,
+            &mut fanta_format::ProjectWriteCache::default(),
+            &BTreeMap::new(),
+            &preconditions,
+        )?;
+        assert_eq!(std::fs::read(directory.path().join(image_path))?, image);
+        Ok(())
     }
 
     #[test]
