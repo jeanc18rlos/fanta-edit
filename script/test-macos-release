@@ -530,6 +530,26 @@ class MountedContents(unittest.TestCase):
         with self.assertRaisesRegex(verifier.VerificationError, 'Applications symlink'):
             self.check()
 
+    def test_preview_channel_bundle(self):
+        staged = self.root / 'preview-staging/Fanta Preview.app'
+        fixture(staged)
+        info_path = staged / 'Contents/Info.plist'
+        info = plistlib.loads(info_path.read_bytes())
+        info['CFBundleIdentifier'] = 'dev.fanta.Fanta-Preview'
+        info_path.write_bytes(plistlib.dumps(info))
+        mount = self.root / 'preview-mount'
+        mount.mkdir()
+        shutil.copytree(staged, mount / 'Fanta Preview.app', symlinks=True)
+        (mount / 'Applications').symlink_to('/Applications')
+        self.assertGreater(verifier.verify_contents(mount, staged, '1.2.3', channel='preview')['files'], 0)
+        with self.assertRaisesRegex(verifier.VerificationError, 'must be named Fanta.app'):
+            verifier.verify_contents(mount, staged, '1.2.3')
+        info['CFBundleIdentifier'] = 'dev.fanta.Fanta'
+        for app in [staged, mount / 'Fanta Preview.app']:
+            (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
+        with self.assertRaisesRegex(verifier.VerificationError, 'CFBundleIdentifier'):
+            verifier.verify_contents(mount, staged, '1.2.3', channel='preview')
+
     def test_identity_and_version(self):
         for key, value in [('CFBundleIdentifier', 'dev.fanta.Fanta-Dev'),
                            ('CFBundleExecutable', 'other'), ('CFBundleShortVersionString', '0.0.1'),
