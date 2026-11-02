@@ -333,7 +333,7 @@ fi
 
 cargo_bundle_version=$(cargo -q bundle --help 2>&1 | head -n 1 || echo "")
 if [ "$cargo_bundle_version" != "cargo-bundle v0.6.1-zed" ]; then
-    cargo install cargo-bundle --locked --git https://github.com/jeanc18rlos/cargo-bundle.git --rev 2be2669972dff3ddd4daf89a2cb29d2d06cad7c7
+    cargo install cargo-bundle --locked --git https://github.com/zed-industries/cargo-bundle.git --rev 2be2669972dff3ddd4daf89a2cb29d2d06cad7c7
 fi
 
 # Deal with versions of macOS that don't include libstdc++ headers
