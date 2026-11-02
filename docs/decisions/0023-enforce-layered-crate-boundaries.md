@@ -1,6 +1,6 @@
 ---
-status: proposed
-date: 2026-10-27
+status: accepted
+date: 2026-10-29
 decision-makers: Jean Rojas
 tags: [architecture, engine]
 ---

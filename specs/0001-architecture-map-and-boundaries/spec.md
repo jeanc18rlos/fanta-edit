@@ -1,5 +1,5 @@
 ---
-status: draft
+status: implemented
 date: 2026-10-27
 owner: Jean Rojas
 decisions: [0001, 0023]
