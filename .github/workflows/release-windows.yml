@@ -24,8 +24,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: '0'
-  # Tags and manual runs are release builds: their installer gets an update signature.
-  FANTA_SIGN_UPDATE: ${{ github.event_name != 'pull_request' }}
 
 jobs:
   build:
@@ -68,27 +66,6 @@ jobs:
         shell: pwsh
         run: .\script\bundle-windows.ps1 -Architecture x86_64
 
-      # Installed copies update themselves only with installers this key signed
-      # (crates/auto_update/src/verify.rs). The signature ships next to the installer.
-      - name: Sign the installer for in-place updates
-        if: env.FANTA_SIGN_UPDATE == 'true'
-        shell: bash
-        env:
-          FANTA_UPDATE_SIGNING_KEY: ${{ secrets.FANTA_UPDATE_SIGNING_KEY }}
-        run: |
-          if [[ -z "$FANTA_UPDATE_SIGNING_KEY" ]]; then
-            echo "::warning::FANTA_UPDATE_SIGNING_KEY is not set, so this installer has no update signature and installed copies won't update to it in place."
-            exit 0
-          fi
-          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
-          python -m venv "$RUNNER_TEMP/update-signing"
-          "$RUNNER_TEMP/update-signing/Scripts/python" -m pip install --quiet 'cryptography>=42'
-          "$RUNNER_TEMP/update-signing/Scripts/python" script/update_signing.py sign \
-            --asset Fanta-x86_64.exe --version "$version" \
-            --file target/Fanta-x86_64.exe \
-            --public-key-file crates/auto_update/release-signing-key.pub \
-            > target/Fanta-x86_64.exe.sig
-
       - name: Record checksum
         shell: pwsh
         run: |
@@ -102,7 +79,6 @@ jobs:
           name: fanta-windows-x86_64
           path: |
             target/Fanta-x86_64.exe
-            target/Fanta-x86_64.exe.sig
             target/SHA256SUMS-windows-x86_64.txt
           if-no-files-found: error
           compression-level: 0
@@ -119,12 +95,54 @@ jobs:
       - name: Summarize build
         shell: bash
         run: |
-          if [[ -s target/Fanta-x86_64.exe.sig ]]; then
-            update='It has an update signature, so installed copies can update to it in place.'
-          else
-            update='It has no update signature, so installed copies will not update to it in place.'
+          printf '### Fanta for Windows (x86_64)\n\nUnsigned installer: Windows SmartScreen warns on first run. The update signature, if any, comes from the sign-update job.\n\nCommit: `%s`\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  # Installed copies update themselves only with installers this key signed
+  # (crates/auto_update/src/verify.rs). The key lives only in the release environment, which
+  # admits main and release tags, so a branch that edits this workflow still can't reach it.
+  sign-update:
+    name: Sign the installer for in-place updates
+    if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fanta-windows-x86_64
+          path: target
+
+      - name: Sign the installer
+        env:
+          FANTA_UPDATE_SIGNING_KEY: ${{ secrets.FANTA_UPDATE_SIGNING_KEY }}
+        run: |
+          if [[ -z "$FANTA_UPDATE_SIGNING_KEY" ]]; then
+            echo "::warning::FANTA_UPDATE_SIGNING_KEY is not set in the release environment, so this installer has no update signature and installed copies won't update to it in place."
+            exit 0
           fi
-          printf '### Fanta for Windows (x86_64)\n\nUnsigned installer: Windows SmartScreen warns on first run. %s\n\nCommit: `%s`\n' "$update" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
+          python3 -m venv "$RUNNER_TEMP/update-signing"
+          "$RUNNER_TEMP/update-signing/bin/pip" install --quiet --require-hashes --only-binary :all: \
+            -r script/update-signing-requirements.txt
+          "$RUNNER_TEMP/update-signing/bin/python" script/update_signing.py sign \
+            --asset Fanta-x86_64.exe --version "$version" \
+            --file target/Fanta-x86_64.exe \
+            --public-key-file crates/auto_update/release-signing-key.pub \
+            > target/Fanta-x86_64.exe.sig
+          echo 'The installer has an update signature, so installed copies can update to it in place.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the update signature
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fanta-windows-x86_64-update-signature
+          path: target/Fanta-x86_64.exe.sig
+          if-no-files-found: ignore
+          retention-days: 30
 
   # The build proves the installer builds; this proves it installs, updates in place the way
   # the app does and uninstalls. It packages the real update helper with stand-in app
@@ -249,7 +267,7 @@ jobs:
   draft-release:
     name: Add the installer to the draft release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build, smoke-test]
+    needs: [build, sign-update, smoke-test]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -262,9 +280,11 @@ jobs:
         with:
           persist-credentials: false
 
+      # The installer, plus its update signature when sign-update produced one.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: fanta-windows-x86_64
+          pattern: fanta-windows-x86_64*
+          merge-multiple: true
           path: release
 
       - name: Upload to the draft release
