@@ -98,8 +98,10 @@ variables that needs.
 The *Build Windows release* workflow
 ([`release-windows.yml`](../../.github/workflows/release-windows.yml)) runs the
 script for every `v*` tag, on manual dispatch, and on pull requests that change
-the packaging. Tag and manual builds sign `Fanta-x86_64.exe.sig` for in-app
-updates when the `FANTA_UPDATE_SIGNING_KEY` secret is set. Alongside the build, a
+the packaging. Tag builds and manual runs on `main` sign `Fanta-x86_64.exe.sig`
+for in-app updates when the `release` environment holds the
+`FANTA_UPDATE_SIGNING_KEY` secret. A separate job does the signing, so pull
+requests never reach the key. Alongside the build, a
 smoke test packages the real update helper with stand-in app binaries, then
 installs, updates in place while the "app" runs, and uninstalls. A tag adds the
 installer, its signature and `SHA256SUMS-windows-x86_64.txt` to the tag's draft
