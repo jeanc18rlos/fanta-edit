@@ -23,9 +23,16 @@ fanta-api.workspace = true
 fanta-design-ops.workspace = true
 fanta-doc.workspace = true
 fanta-headless.workspace = true
+flate2.workspace = true
+hex.workspace = true
+hmac.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
 tempfile.workspace = true
+tiny_http.workspace = true
+ureq.workspace = true
 
 [dev-dependencies]
 fanta-format.workspace = true

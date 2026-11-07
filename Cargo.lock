@@ -4458,9 +4458,16 @@ dependencies = [
  "fanta-doc",
  "fanta-format",
  "fanta-headless",
+ "flate2",
+ "hex",
+ "hmac",
  "serde",
  "serde_json",
+ "sha2",
+ "tar",
  "tempfile",
+ "tiny_http",
+ "ureq",
 ]
 
 [[package]]

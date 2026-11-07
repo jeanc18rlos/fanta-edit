@@ -21,6 +21,10 @@ enum Command {
     },
     /// Print what `GET /healthz` answers.
     Healthz,
+    /// Answer `GET /healthz` and `POST /v1/run` on `0.0.0.0:$PORT` (8080 by
+    /// default). Needs `ENGINE_HMAC_SECRET`; `FANTA_ENGINE_GITHUB_API`
+    /// overrides `https://api.github.com`.
+    Serve,
 }
 
 fn main() -> Result<()> {
@@ -31,11 +35,31 @@ fn main() -> Result<()> {
             let request: RunRequest = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parsing {}", request.display()))?;
             let work_dir = tempfile::tempdir()?;
+            let project = work_dir.path().join("project");
             match &request.source {
-                Source::Dir { dir } => copy_project(dir, work_dir.path())?,
-                Source::Github { .. } => bail!("reading GitHub sources is not implemented yet"),
+                Source::Dir { dir } => {
+                    std::fs::create_dir(&project)?;
+                    copy_project(dir, &project)?;
+                }
+                Source::Github {
+                    repo,
+                    sha,
+                    path,
+                    token,
+                    overlay,
+                } => {
+                    fanta_engine::validate(&request)?;
+                    let github = fanta_engine::source::Github::new(
+                        std::env::var("FANTA_ENGINE_GITHUB_API")
+                            .unwrap_or_else(|_| "https://api.github.com".into()),
+                    );
+                    github.fetch(repo, sha, path, token, &project)?;
+                    if let Some(overlay) = overlay {
+                        fanta_engine::source::apply_overlay(overlay, &project)?;
+                    }
+                }
             }
-            match fanta_engine::run_in(&request, work_dir.path()) {
+            match fanta_engine::server::run_isolated(&request, &project) {
                 Ok(response) => println!("{}", serde_json::to_string_pretty(&response)?),
                 Err(error) => {
                     println!("{}", serde_json::to_string_pretty(&error)?);
@@ -45,6 +69,25 @@ fn main() -> Result<()> {
         }
         Command::Healthz => {
             println!("{}", serde_json::to_string_pretty(&EngineInfo::current())?);
+        }
+        Command::Serve => {
+            let secret = std::env::var("ENGINE_HMAC_SECRET").unwrap_or_default();
+            if secret.is_empty() {
+                bail!("ENGINE_HMAC_SECRET must be set: every run request is signed with it");
+            }
+            let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
+            let github = std::env::var("FANTA_ENGINE_GITHUB_API")
+                .unwrap_or_else(|_| "https://api.github.com".into());
+            let server = tiny_http::Server::http(format!("0.0.0.0:{port}"))
+                .map_err(|error| anyhow::anyhow!("listening on port {port}: {error}"))?;
+            eprintln!("fanta-engine listening on port {port}");
+            fanta_engine::server::serve(
+                server,
+                fanta_engine::server::Config {
+                    secret: secret.into_bytes(),
+                    github: fanta_engine::source::Github::new(github),
+                },
+            );
         }
     }
     Ok(())
