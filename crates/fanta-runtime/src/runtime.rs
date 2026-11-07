@@ -5,8 +5,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use fanta_bundle::RuntimeProgram;
+use fanta_canvas::{Camera2D, HitPrecision, camera_screen_to_world, camera_world_to_screen};
 use fanta_doc::{
-    AnimationClipId, AssetId, BoundProp, MotionProperty, NodeData, NodeId, ResolvedVarValue,
+    AnimationClipId, AssetId, BoundProp, MotionProperty, NodeData, NodeId, ResolvedVarValue, Scene,
     TextStyle, TextStyleRun, VarValue,
 };
 use fanta_present::{FitMode, PlaybackSession};
@@ -456,6 +457,11 @@ impl Player {
 
     fn command(&mut self, command: &str, arguments: Value) -> Result<Value, RuntimeError> {
         use fanta_present::{KeyEvent, PointerEvent};
+        match command {
+            "hitTest" => return self.hit_test(&arguments),
+            "nodeBounds" => return self.node_bounds(&arguments),
+            _ => {}
+        }
         let mut response = fanta_present::PresentResponse::default();
         let previous_layer = self.session.playback_state().current_layer;
         let previous_generation = self.session.resolution_generation();
@@ -682,6 +688,14 @@ impl Player {
                     .map_err(RuntimeError::from_error)?;
                 response.needs_redraw = true;
             }
+            "setViewport" => {
+                let camera: Camera2D =
+                    serde_json::from_value(arguments).map_err(RuntimeError::from_error)?;
+                response = self
+                    .session
+                    .set_camera(camera)
+                    .map_err(RuntimeError::from_error)?;
+            }
             "state" | "inspect" => {}
             _ => return Err(RuntimeError(format!("Unknown player command {command}"))),
         }
@@ -692,7 +706,7 @@ impl Player {
             .is_some_and(|clip| self.program.text_clips.contains(&clip.clip));
         // Camera moves redraw without changing which text is effective, and a
         // pan gesture would otherwise revalidate every text node per event.
-        let camera = matches!(command, "pan" | "zoom" | "fit");
+        let camera = matches!(command, "pan" | "zoom" | "fit" | "setViewport");
         if self.session.resolution_generation() != previous_generation
             || state.current_layer != previous_layer
             || timer_due
@@ -719,11 +733,128 @@ impl Player {
             json!({"response":response,"state":self.session.playback_state(),"schedule":self.session.schedule(),"paused":self.paused,"openUrl":url,"events":self.session.take_playback_events(),"occurrences": if command == "state" {Some(self.session.occurrences())} else {None}, "inspection":inspection,"viewport":self.session.viewport(),"camera":self.session.camera(),"fitMode":self.session.fit_mode()}),
         )
     }
+
+    /// The layer under a screen point. It is looked up in the design document
+    /// rather than the playback layer because hosts name layers by the ids the
+    /// design tools take, and to those an instance is one layer. A viewer that
+    /// runs no reactions draws the document's geometry.
+    fn hit_test(&self, arguments: &Value) -> Result<Value, RuntimeError> {
+        let point: [f64; 2] = argument(arguments, "point")?;
+        if !point.into_iter().all(f64::is_finite) {
+            return Err(RuntimeError("Hit test coordinates must be finite".into()));
+        }
+        let deep = match arguments.get("deep") {
+            None => false,
+            Some(deep) => deep
+                .as_bool()
+                .ok_or_else(|| RuntimeError("deep must be a boolean".into()))?,
+        };
+        let scene = &self.session.document().scene;
+        let world = camera_screen_to_world(
+            DVec2::from_array(point),
+            &self.session.camera(),
+            self.session.screen_size(),
+        );
+        let Some(leaf) = fanta_canvas::hit_test(
+            scene,
+            world,
+            HitPrecision::Path,
+            Some(self.session.current_frame()),
+        ) else {
+            return Ok(Value::Null);
+        };
+        // From the page's top-level layer down to the hit, like a click and the
+        // double-clicks that drill in from it in the editor.
+        let mut path: Vec<NodeId> = std::iter::once(leaf)
+            .chain(scene.ancestors_of(leaf).map(|ancestor| ancestor.id))
+            .filter(|identifier| {
+                scene
+                    .get(*identifier)
+                    .is_some_and(|node| node.parent.is_some())
+            })
+            .collect();
+        path.reverse();
+        let selected = if deep {
+            leaf
+        } else {
+            path.first().copied().unwrap_or(leaf)
+        };
+        Ok(json!({
+            "node": selected,
+            "id": selected.to_string(),
+            "name": scene.get(selected).map(|node| node.name.as_str()),
+            "path": path,
+        }))
+    }
+
+    /// Screen boxes of layers, keyed by their serde ids; null for a layer the
+    /// shown page doesn't have.
+    fn node_bounds(&self, arguments: &Value) -> Result<Value, RuntimeError> {
+        let nodes: Vec<NodeId> = argument(arguments, "nodes")?;
+        let scene = &self.session.document().scene;
+        let page = self.session.current_frame();
+        let camera = self.session.camera();
+        let mut bounds = serde_json::Map::new();
+        for node in nodes {
+            let Value::String(key) =
+                serde_json::to_value(node).map_err(RuntimeError::from_error)?
+            else {
+                return Err(RuntimeError("Node ids serialize as strings".into()));
+            };
+            let screen = fanta_canvas::hit_test::on_active_page(scene, node, page)
+                .then(|| screen_box(scene, node, &camera, self.session.screen_size()))
+                .flatten();
+            bounds.insert(key, screen.unwrap_or(Value::Null));
+        }
+        Ok(Value::Object(bounds))
+    }
+}
+
+/// A layer's own box on screen: `x`/`y` is its top-left corner and `rotation`
+/// (degrees, clockwise) turns the box around it, so a rotated layer's outline
+/// is exact.
+fn screen_box(scene: &Scene, node: NodeId, camera: &Camera2D, screen_size: DVec2) -> Option<Value> {
+    let local = scene.local_bounds(node)?;
+    let transform = scene.world_transform(node)?;
+    let corner = |x: f64, y: f64| {
+        camera_world_to_screen(
+            transform.transform_point(DVec2::new(x, y)),
+            camera,
+            screen_size,
+        )
+    };
+    // A mirrored layer's corners run the other way round on screen, so its box
+    // starts from the bottom-left corner to stay a rotated rectangle.
+    let (origin, across, down) = if transform.0.matrix2.determinant() < 0.0 {
+        (
+            corner(local.min_x, local.max_y),
+            corner(local.max_x, local.max_y),
+            corner(local.min_x, local.min_y),
+        )
+    } else {
+        (
+            corner(local.min_x, local.min_y),
+            corner(local.max_x, local.min_y),
+            corner(local.min_x, local.max_y),
+        )
+    };
+    let width = across - origin;
+    Some(json!({
+        "x": origin.x,
+        "y": origin.y,
+        "width": width.length(),
+        "height": (down - origin).length(),
+        "rotation": width.y.atan2(width.x).to_degrees(),
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fanta_doc::{
+        CanvasNode, Color, ComponentDef, ComponentId, Doc, DocId, Fill, GroupNode, IndexKey,
+        InstanceNode, NodeFlags, Transform2D, VectorNode,
+    };
     use fanta_format::runtime::SourceBundle;
 
     fn fit_bundle() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -848,6 +979,427 @@ mod tests {
         );
         assert_eq!(cover["fitMode"], "cover");
         assert!(runtime.player_mut(player)?.renderer.is_none());
+        Ok(())
+    }
+
+    fn layer(
+        document: &mut Doc,
+        identity: u128,
+        parent: Option<NodeId>,
+        name: &str,
+        transform: Transform2D,
+        data: NodeData,
+    ) -> Result<NodeId, Box<dyn std::error::Error>> {
+        let mut node = CanvasNode::new(data);
+        node.id = NodeId::from_u128(identity);
+        node.parent = parent;
+        node.index = IndexKey::from_raw(identity as f64);
+        node.name = name.into();
+        node.transform = transform;
+        let identifier = node.id;
+        document.scene.insert(node)?;
+        Ok(identifier)
+    }
+
+    fn frame(width: f64, height: f64) -> NodeData {
+        NodeData::Group(GroupNode {
+            clip_size: Some([width, height]),
+            background: Some(Fill::solid(Color::WHITE)),
+            ..GroupNode::default()
+        })
+    }
+
+    fn rectangle(width: f64, height: f64) -> NodeData {
+        NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            width,
+            height,
+            Color::BLACK,
+        ))
+    }
+
+    fn translated(x: f64, y: f64) -> Transform2D {
+        Transform2D::translation(x, y)
+    }
+
+    /// Page 1 holds the card below; page 2 holds a frame at the same place,
+    /// painted above it, which a hit on page 1 must never reach.
+    ///
+    /// Card (0, 0, 200, 200)
+    ///   Inner (20, 20, 100, 100) > Dot (30, 30, 20, 20)
+    ///   Chip, an instance (20, 140, 80, 40)
+    ///   Shown (130, 20, 60, 60) under Hidden, at the same place
+    ///   Under (130, 100, 60, 30) under Locked, at the same place
+    ///   Turned, 40 × 20 turned 90° at (190, 140): covers (170, 140, 20, 40)
+    ///   Mirrored, 20 × 10 flipped across x at (120, 190): covers (100, 190, 20, 10)
+    fn viewer_bundle() -> Result<(Vec<u8>, NodeId), Box<dyn std::error::Error>> {
+        let mut document = Doc::new();
+        document.id = DocId::from_u128(40);
+        document.metadata.created_at = 0;
+        document.metadata.modified_at = 0;
+        document.metadata.title = "Viewer geometry".into();
+        let identity = Transform2D::IDENTITY;
+        let page = layer(
+            &mut document,
+            1000,
+            None,
+            "Page",
+            identity,
+            NodeData::Group(GroupNode::default()),
+        )?;
+        document.add_page(page);
+        let card = layer(
+            &mut document,
+            1001,
+            Some(page),
+            "Card",
+            identity,
+            frame(200.0, 200.0),
+        )?;
+        let inner = layer(
+            &mut document,
+            1002,
+            Some(card),
+            "Inner",
+            translated(20.0, 20.0),
+            frame(100.0, 100.0),
+        )?;
+        layer(
+            &mut document,
+            1003,
+            Some(inner),
+            "Dot",
+            translated(10.0, 10.0),
+            rectangle(20.0, 20.0),
+        )?;
+        let master = layer(
+            &mut document,
+            1020,
+            None,
+            "Chip master",
+            identity,
+            frame(80.0, 40.0),
+        )?;
+        layer(
+            &mut document,
+            1021,
+            Some(master),
+            "Chip fill",
+            identity,
+            rectangle(80.0, 40.0),
+        )?;
+        let component = ComponentId::from_u128(6000);
+        document
+            .components
+            .defs
+            .insert(component, ComponentDef::new(component, master, "Chip"));
+        layer(
+            &mut document,
+            1004,
+            Some(card),
+            "Chip",
+            translated(20.0, 140.0),
+            NodeData::Instance(InstanceNode {
+                component,
+                overrides: Vec::new(),
+                prop_values: BTreeMap::new(),
+                derived: Vec::new(),
+                local_size: [80.0, 40.0],
+            }),
+        )?;
+        layer(
+            &mut document,
+            1005,
+            Some(card),
+            "Shown",
+            translated(130.0, 20.0),
+            rectangle(60.0, 60.0),
+        )?;
+        let hidden = layer(
+            &mut document,
+            1006,
+            Some(card),
+            "Hidden",
+            translated(130.0, 20.0),
+            rectangle(60.0, 60.0),
+        )?;
+        layer(
+            &mut document,
+            1007,
+            Some(card),
+            "Under",
+            translated(130.0, 100.0),
+            rectangle(60.0, 30.0),
+        )?;
+        let locked = layer(
+            &mut document,
+            1008,
+            Some(card),
+            "Locked",
+            translated(130.0, 100.0),
+            rectangle(60.0, 30.0),
+        )?;
+        for (node, flag) in [(hidden, NodeFlags::HIDDEN), (locked, NodeFlags::LOCKED)] {
+            document.scene.get_mut(node).ok_or("fixture layer")?.flags |= flag;
+        }
+        layer(
+            &mut document,
+            1009,
+            Some(card),
+            "Turned",
+            Transform2D(glam::DAffine2::from_angle_translation(
+                std::f64::consts::FRAC_PI_2,
+                DVec2::new(190.0, 140.0),
+            )),
+            rectangle(40.0, 20.0),
+        )?;
+        layer(
+            &mut document,
+            1010,
+            Some(card),
+            "Mirrored",
+            Transform2D(glam::DAffine2::from_scale_angle_translation(
+                DVec2::new(-1.0, 1.0),
+                0.0,
+                DVec2::new(120.0, 190.0),
+            )),
+            rectangle(20.0, 10.0),
+        )?;
+        let other_page = layer(
+            &mut document,
+            1100,
+            None,
+            "Other page",
+            identity,
+            NodeData::Group(GroupNode::default()),
+        )?;
+        document.add_page(other_page);
+        layer(
+            &mut document,
+            1101,
+            Some(other_page),
+            "Elsewhere",
+            identity,
+            frame(200.0, 200.0),
+        )?;
+
+        let directory = tempfile::tempdir()?;
+        fanta_format::write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        let mut source = SourceBundle::default();
+        let mut pending = vec![directory.path().to_path_buf()];
+        while let Some(folder) = pending.pop() {
+            for entry in std::fs::read_dir(folder)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let relative = path.strip_prefix(directory.path())?;
+                    source.files.insert(
+                        relative.to_string_lossy().replace('\\', "/"),
+                        std::fs::read(&path)?,
+                    );
+                }
+            }
+        }
+        Ok((source.compile()?.to_bundle()?, page))
+    }
+
+    /// Where a world point of the document lands on the player's screen.
+    fn on_screen(state: &Value, world: [f64; 2]) -> [f64; 2] {
+        let camera: Camera2D = serde_json::from_value(state["camera"].clone()).unwrap_or_default();
+        let screen_size = DVec2::new(400.0, 400.0);
+        camera_world_to_screen(DVec2::from_array(world), &camera, screen_size).to_array()
+    }
+
+    fn key(identity: u128) -> Value {
+        json!(NodeId::from_u128(identity))
+    }
+
+    #[test]
+    fn hits_name_the_drawn_layer_on_the_shown_page_in_both_id_forms()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (bundle, page) = viewer_bundle()?;
+        let mut runtime = Runtime::default();
+        let program = runtime.load_bundle(&bundle)?;
+        let player = runtime.create_player(program, 400.0, 400.0, Some(page))?;
+        let state = runtime.command(player, "state", json!({}))?;
+
+        let mut hit = |world: [f64; 2], deep: bool| {
+            runtime.command(
+                player,
+                "hitTest",
+                json!({"point": on_screen(&state, world), "deep": deep}),
+            )
+        };
+        let dot = hit([40.0, 40.0], true)?;
+        assert_eq!(dot["node"], key(1003));
+        assert_eq!(dot["id"], NodeId::from_u128(1003).to_string());
+        assert!(dot["id"].as_str().is_some_and(|id| id.starts_with("n_")));
+        assert!(
+            dot["node"]
+                .as_str()
+                .is_some_and(|node| !node.starts_with("n_"))
+        );
+        assert_eq!(dot["name"], "Dot");
+        assert_eq!(dot["path"], json!([key(1001), key(1002), key(1003)]));
+        // A plain click selects the page's top-level layer, as in the editor.
+        let card = hit([40.0, 40.0], false)?;
+        assert_eq!(card["node"], key(1001));
+        assert_eq!(card["path"], dot["path"]);
+
+        for (world, expected, path) in [
+            // A frame's own body.
+            ([25.0, 25.0], 1002, vec![1001, 1002]),
+            // An instance is one layer, as it is to the design tools.
+            ([60.0, 160.0], 1004, vec![1001, 1004]),
+            // Hidden and locked layers let the click through to what they cover.
+            ([160.0, 50.0], 1005, vec![1001, 1005]),
+            ([160.0, 115.0], 1007, vec![1001, 1007]),
+            ([180.0, 160.0], 1009, vec![1001, 1009]),
+            ([110.0, 195.0], 1010, vec![1001, 1010]),
+            // Page 2's frame sits at the same place, painted above.
+            ([5.0, 5.0], 1001, vec![1001]),
+        ] {
+            let found = hit(world, true)?;
+            assert_eq!(found["node"], key(expected), "at {world:?}");
+            assert_eq!(
+                found["path"],
+                json!(path.into_iter().map(key).collect::<Vec<_>>()),
+                "at {world:?}"
+            );
+        }
+        assert_eq!(hit([-50.0, -50.0], true)?, Value::Null);
+        assert_eq!(hit([40.0, 40.0], false)?["node"], key(1001));
+
+        for invalid in [
+            json!({}),
+            json!({"point": [1.0]}),
+            json!({"point": [0.0, 0.0], "deep": "yes"}),
+        ] {
+            assert!(runtime.command(player, "hitTest", invalid).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn node_bounds_outline_rotated_and_mirrored_layers_and_follow_the_camera()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (bundle, page) = viewer_bundle()?;
+        let mut runtime = Runtime::default();
+        let program = runtime.load_bundle(&bundle)?;
+        let player = runtime.create_player(program, 400.0, 400.0, Some(page))?;
+        let fitted = runtime.command(player, "state", json!({}))?;
+        let scale = fitted["camera"]["scale"][0]
+            .as_f64()
+            .ok_or("camera scale")?;
+
+        let nodes = [1003, 1009, 1010, 1101, 4242].map(key);
+        let bounds = runtime.command(player, "nodeBounds", json!({"nodes": nodes}))?;
+        let close = |found: &Value, expected: [f64; 5]| {
+            let found = ["x", "y", "width", "height", "rotation"]
+                .map(|field| found[field].as_f64().unwrap_or(f64::NAN));
+            found
+                .iter()
+                .zip(expected)
+                .all(|(found, expected)| (found - expected).abs() < 1e-9)
+        };
+        let [dot_x, dot_y] = on_screen(&fitted, [30.0, 30.0]);
+        assert!(
+            close(
+                &bounds[nodes[0].as_str().unwrap_or_default()],
+                [dot_x, dot_y, 20.0 * scale, 20.0 * scale, 0.0]
+            ),
+            "{bounds}"
+        );
+        let [turned_x, turned_y] = on_screen(&fitted, [190.0, 140.0]);
+        assert!(
+            close(
+                &bounds[nodes[1].as_str().unwrap_or_default()],
+                [turned_x, turned_y, 40.0 * scale, 20.0 * scale, 90.0]
+            ),
+            "{bounds}"
+        );
+        let [mirrored_x, mirrored_y] = on_screen(&fitted, [120.0, 200.0]);
+        assert!(
+            close(
+                &bounds[nodes[2].as_str().unwrap_or_default()],
+                [mirrored_x, mirrored_y, 20.0 * scale, 10.0 * scale, 180.0]
+            ),
+            "{bounds}"
+        );
+        // On another page, or not in the design at all.
+        assert_eq!(bounds[nodes[3].as_str().unwrap_or_default()], Value::Null);
+        assert_eq!(bounds[nodes[4].as_str().unwrap_or_default()], Value::Null);
+        // Hosts name layers to the runtime by their serde ids only.
+        let display = NodeId::from_u128(1003).to_string();
+        assert!(
+            runtime
+                .command(player, "nodeBounds", json!({"nodes": [display]}))
+                .is_err()
+        );
+
+        runtime.command(
+            player,
+            "zoom",
+            json!({"point": [200.0, 200.0], "factor": 2.0}),
+        )?;
+        let zoomed = runtime.command(player, "state", json!({}))?;
+        let bounds = runtime.command(player, "nodeBounds", json!({"nodes": [key(1003)]}))?;
+        let [dot_x, dot_y] = on_screen(&zoomed, [30.0, 30.0]);
+        assert!(
+            close(
+                &bounds[nodes[0].as_str().unwrap_or_default()],
+                [dot_x, dot_y, 40.0 * scale, 40.0 * scale, 0.0]
+            ),
+            "{bounds}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn set_viewport_restores_a_saved_camera_and_refuses_invalid_ones()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (bundle, page) = viewer_bundle()?;
+        let mut runtime = Runtime::default();
+        let program = runtime.load_bundle(&bundle)?;
+        let player = runtime.create_player(program, 400.0, 400.0, Some(page))?;
+        runtime.command(
+            player,
+            "zoom",
+            json!({"point": [120.0, 80.0], "factor": 3.0}),
+        )?;
+        runtime.command(player, "pan", json!({"delta": [-40.0, 25.0]}))?;
+        let saved = runtime.command(player, "state", json!({}))?["camera"].clone();
+
+        // A reload creates a new player, fitted again; the host puts the camera back.
+        let reloaded = runtime.create_player(program, 400.0, 400.0, Some(page))?;
+        assert_ne!(
+            runtime.command(reloaded, "state", json!({}))?["camera"],
+            saved
+        );
+        let restored = runtime.command(reloaded, "setViewport", saved.clone())?;
+        assert_eq!(restored["camera"], saved);
+        assert_eq!(restored["response"]["needsRedraw"], true);
+        let point = on_screen(&restored, [40.0, 40.0]);
+        assert_eq!(
+            runtime.command(reloaded, "hitTest", json!({"point": point, "deep": true}))?["node"],
+            key(1003)
+        );
+
+        for invalid in [
+            json!({}),
+            json!({"center": [0.0, 0.0], "zoom": 2.0}),
+            json!({"center": [0.0, 0.0], "scale": [0.0, 1.0]}),
+            json!({"center": [0.0, 0.0], "scale": [-1.0, 1.0]}),
+            json!({"center": [0.0], "scale": [1.0, 1.0]}),
+        ] {
+            assert!(runtime.command(reloaded, "setViewport", invalid).is_err());
+            assert_eq!(
+                runtime.command(reloaded, "state", json!({}))?["camera"],
+                saved
+            );
+        }
         Ok(())
     }
 }
