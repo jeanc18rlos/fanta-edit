@@ -27,6 +27,10 @@ pub const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_CLOCK_SKEW_SECONDS: u64 = 300;
 /// Runs one instance takes at once; more answer `429 busy`.
 pub const MAX_CONCURRENT_RUNS: usize = 2;
+/// Requests one instance handles at once, `/healthz` included. Beyond this
+/// the accept loop answers `429` itself, before reading a body or starting a
+/// thread, so open connections can't pile up threads and buffers.
+pub const MAX_OPEN_REQUESTS: usize = 8;
 
 pub struct Config {
     /// `ENGINE_HMAC_SECRET`, shared with the v2 API.
@@ -38,16 +42,31 @@ pub struct Config {
 pub fn serve(server: tiny_http::Server, config: Config) {
     let config = Arc::new(config);
     let in_flight = Arc::new(AtomicUsize::new(0));
+    let open = Arc::new(AtomicUsize::new(0));
     for request in server.incoming_requests() {
+        let started = Instant::now();
+        let slot = match Slot::take(&open, MAX_OPEN_REQUESTS, "requests") {
+            Ok(slot) => slot,
+            Err(error) => {
+                respond(request, started, Err(error));
+                continue;
+            }
+        };
         let config = config.clone();
         let in_flight = in_flight.clone();
-        std::thread::spawn(move || handle(request, &config, &in_flight));
+        std::thread::spawn(move || {
+            let _slot = slot;
+            handle(request, &config, &in_flight, started);
+        });
     }
 }
 
-fn handle(mut request: tiny_http::Request, config: &Config, in_flight: &AtomicUsize) {
-    let started = Instant::now();
-    let route = format!("{} {}", request.method(), request.url());
+fn handle(
+    mut request: tiny_http::Request,
+    config: &Config,
+    in_flight: &Arc<AtomicUsize>,
+    started: Instant,
+) {
     let answer = match (request.method(), request.url()) {
         (tiny_http::Method::Get, "/healthz") => serde_json::to_vec(&EngineInfo::current())
             .map(|body| (200, body))
@@ -60,6 +79,15 @@ fn handle(mut request: tiny_http::Request, config: &Config, in_flight: &AtomicUs
             }),
         _ => Err(EngineError::new(ErrorCode::NotFound, "no such route")),
     };
+    respond(request, started, answer);
+}
+
+fn respond(
+    request: tiny_http::Request,
+    started: Instant,
+    answer: Result<(u16, Vec<u8>), EngineError>,
+) {
+    let route = format!("{} {}", request.method(), request.url());
     let (status, body) = answer.unwrap_or_else(|error| {
         (
             error.error.code.status(),
@@ -83,9 +111,37 @@ fn handle(mut request: tiny_http::Request, config: &Config, in_flight: &AtomicUs
 fn run(
     request: &mut tiny_http::Request,
     config: &Config,
-    in_flight: &AtomicUsize,
+    in_flight: &Arc<AtomicUsize>,
     started: Instant,
 ) -> Result<RunResponse, EngineError> {
+    let unauthorized = || {
+        EngineError::new(
+            ErrorCode::Unauthorized,
+            "missing, malformed, stale or wrong X-Fanta-Internal",
+        )
+    };
+    let too_large = || {
+        EngineError::new(
+            ErrorCode::PayloadTooLarge,
+            format!("the request body is over {MAX_BODY_BYTES} bytes"),
+        )
+    };
+    // Everything that needs no body is checked first, so a request that can't
+    // be ours costs no read and no buffer.
+    let now = unix_now();
+    let signature = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("X-Fanta-Internal"))
+        .and_then(|header| parse_signature(header.value.as_str()))
+        .filter(|(timestamp, _)| now.abs_diff(*timestamp) <= MAX_CLOCK_SKEW_SECONDS)
+        .ok_or_else(unauthorized)?;
+    if request
+        .body_length()
+        .is_some_and(|length| length as u64 > MAX_BODY_BYTES)
+    {
+        return Err(too_large());
+    }
     let mut body = Vec::new();
     request
         .as_reader()
@@ -93,22 +149,10 @@ fn run(
         .read_to_end(&mut body)
         .map_err(|error| EngineError::new(ErrorCode::BadRequest, error.to_string()))?;
     if body.len() as u64 > MAX_BODY_BYTES {
-        return Err(EngineError::new(
-            ErrorCode::PayloadTooLarge,
-            format!("the request body is over {MAX_BODY_BYTES} bytes"),
-        ));
+        return Err(too_large());
     }
-    let signature = request
-        .headers()
-        .iter()
-        .find(|header| header.field.equiv("X-Fanta-Internal"))
-        .map(|header| header.value.as_str())
-        .unwrap_or_default();
-    if !verify_signature(&config.secret, signature, &body, unix_now()) {
-        return Err(EngineError::new(
-            ErrorCode::Unauthorized,
-            "missing, malformed, stale or wrong X-Fanta-Internal",
-        ));
+    if !signature_matches(&config.secret, &signature, &body) {
+        return Err(unauthorized());
     }
     let mut run_request: RunRequest = serde_json::from_slice(&body)
         .map_err(|error| EngineError::new(ErrorCode::BadRequest, error.to_string()))?;
@@ -126,7 +170,7 @@ fn run(
             "dir sources are for `fanta-engine run` only",
         ));
     };
-    let _slot = RunSlot::take(in_flight)?;
+    let _slot = Slot::take(in_flight, MAX_CONCURRENT_RUNS, "runs")?;
     let work = tempfile::tempdir()
         .map_err(|error| EngineError::new(ErrorCode::Internal, error.to_string()))?;
     let project = work.path().join("project");
@@ -163,23 +207,23 @@ pub fn run_isolated(request: &RunRequest, project: &Path) -> Result<RunResponse,
     )
 }
 
-/// Holds one of the instance's run slots until dropped.
-struct RunSlot<'a>(&'a AtomicUsize);
+/// Holds one of `limit` places in a counter until dropped.
+struct Slot(Arc<AtomicUsize>);
 
-impl<'a> RunSlot<'a> {
-    fn take(in_flight: &'a AtomicUsize) -> Result<Self, EngineError> {
-        if in_flight.fetch_add(1, Ordering::SeqCst) >= MAX_CONCURRENT_RUNS {
-            in_flight.fetch_sub(1, Ordering::SeqCst);
+impl Slot {
+    fn take(counter: &Arc<AtomicUsize>, limit: usize, what: &str) -> Result<Self, EngineError> {
+        if counter.fetch_add(1, Ordering::SeqCst) >= limit {
+            counter.fetch_sub(1, Ordering::SeqCst);
             return Err(EngineError::new(
                 ErrorCode::Busy,
-                format!("the instance is already running {MAX_CONCURRENT_RUNS} requests"),
+                format!("the instance is already handling {limit} {what}"),
             ));
         }
-        Ok(Self(in_flight))
+        Ok(Self(counter.clone()))
     }
 }
 
-impl Drop for RunSlot<'_> {
+impl Drop for Slot {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
@@ -189,25 +233,30 @@ impl Drop for RunSlot<'_> {
 /// `HMAC-SHA256(secret, "{t}.{hex sha256(body)}")`, in constant time. The
 /// v2 API signs with `fanta_gpu_common.auth.sign`.
 pub fn verify_signature(secret: &[u8], header: &str, body: &[u8], now: u64) -> bool {
+    parse_signature(header)
+        .filter(|(timestamp, _)| now.abs_diff(*timestamp) <= MAX_CLOCK_SKEW_SECONDS)
+        .is_some_and(|signature| signature_matches(secret, &signature, body))
+}
+
+/// The header's timestamp and signature bytes, when it is well formed.
+fn parse_signature(header: &str) -> Option<(u64, Vec<u8>)> {
     let (mut timestamp, mut signature) = (None, None);
     for part in header.split(',') {
         match part.split_once('=') {
             Some(("t", value)) => timestamp = value.parse::<u64>().ok(),
             Some(("v1", value)) => signature = hex::decode(value).ok(),
-            _ => return false,
+            _ => return None,
         }
     }
-    let (Some(timestamp), Some(signature)) = (timestamp, signature) else {
-        return false;
-    };
-    if now.abs_diff(timestamp) > MAX_CLOCK_SKEW_SECONDS {
-        return false;
-    }
+    timestamp.zip(signature)
+}
+
+fn signature_matches(secret: &[u8], (timestamp, signature): &(u64, Vec<u8>), body: &[u8]) -> bool {
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret) else {
         return false;
     };
     mac.update(format!("{timestamp}.{}", hex::encode(Sha256::digest(body))).as_bytes());
-    mac.verify_slice(&signature).is_ok()
+    mac.verify_slice(signature).is_ok()
 }
 
 fn unix_now() -> u64 {
@@ -371,18 +420,35 @@ mod tests {
         .expect("request");
         let (status, response) = post(&address, &local, Some(sign(&local, unix_now())));
         assert_eq!((status, &response["error"]["code"]), (400, &json!("bad_request")));
+
+        // An unsigned request is refused before its body is read: this one
+        // promises a megabyte and never sends it.
+        use std::io::{Read as _, Write as _};
+        let host = address.trim_start_matches("http://");
+        let mut stream = std::net::TcpStream::connect(host).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        write!(
+            stream,
+            "POST /v1/run HTTP/1.1\r\nHost: {host}\r\nContent-Length: 1000000\r\n\r\n"
+        )
+        .expect("headers");
+        let mut answer = [0u8; 12];
+        stream.read_exact(&mut answer).expect("an answer before the body");
+        assert_eq!(&answer, b"HTTP/1.1 401");
     }
 
     #[test]
-    fn runs_beyond_the_instance_limit_are_busy() {
-        let in_flight = AtomicUsize::new(0);
-        let first = RunSlot::take(&in_flight).expect("first slot");
-        let _second = RunSlot::take(&in_flight).expect("second slot");
+    fn requests_beyond_a_limit_are_busy() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let first = Slot::take(&counter, 2, "runs").expect("first slot");
+        let _second = Slot::take(&counter, 2, "runs").expect("second slot");
         assert_eq!(
-            RunSlot::take(&in_flight).err().map(|error| error.error.code),
+            Slot::take(&counter, 2, "runs").err().map(|error| error.error.code),
             Some(ErrorCode::Busy)
         );
         drop(first);
-        RunSlot::take(&in_flight).expect("a freed slot");
+        Slot::take(&counter, 2, "runs").expect("a freed slot");
     }
 }
