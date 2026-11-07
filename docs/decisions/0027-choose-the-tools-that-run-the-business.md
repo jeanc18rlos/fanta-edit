@@ -33,7 +33,7 @@ the owner of one kind of data.
 | --- | --- | --- | --- |
 | Team chat and alerts | Slack | 90 days of visible history, 10 apps | A second person joins, or 10 apps are not enough |
 | Community, help forum, announcements | Discord, the existing server | Free | — |
-| Bugs, support tickets, roadmap | Linear | 250 issues, 2 teams, unlimited members; API, webhooks, MCP and triage included; Slack and email intake need Business | Open issues pass 200, or a third team is needed |
+| Bugs, support tickets, roadmap | Linear, one workspace shared with the AI-native engineering program (its FAN team plus a Support team) | 250 issues across both teams, 2 teams, unlimited members; API, webhooks, MCP and triage included; Slack and email intake need Business | Open issues pass 200, or a third team is needed |
 | CRM | Attio (kept) | 3 seats, 50,000 records, API on every plan | A fourth seat |
 | Product analytics | PostHog EU (kept) | 1M events and 5,000 recordings a month | 80% of an allowance |
 | Errors and crashes | Sentry | 1 user, 5,000 errors a month | A second engineer, or errors dropped at the cap |
@@ -78,9 +78,9 @@ These rules hold for every tool:
    cost money before there is revenue. HubSpot's free CRM came closest, and
    Attio is already integrated.
 6. **PostHog for errors as well.** One vendor fewer and a larger free
-   allowance (100,000 exceptions a month). The app's crash path uploads
-   native minidumps, which Sentry symbolicates; spec 0005's Q3 keeps this
-   choice open until we confirm whether PostHog accepts them.
+   allowance (100,000 exceptions a month), but the app's crash path uploads
+   native minidumps, which Sentry symbolicates. Spec 0005's Q3 took Sentry
+   as the default on 2026-11-07.
 
 ## Consequences
 
@@ -94,9 +94,9 @@ These rules hold for every tool:
   first month with revenue. Linear's Slack and email intake need its
   Business plan, so intake goes through the backend and the Linear API. Each
   new processor has to appear in the privacy policy before data reaches it.
-- Follow-up: the phases of spec 0005, and the design decision on how the
-  backend delivers events to these tools, which spec 0005's design will
-  propose.
+- Follow-up: the phases of spec 0005, and
+  [ADR 0028](0028-deliver-business-events-through-the-backend-outbox.md) on
+  how the backend delivers events to these tools.
 
 ## Confirmation
 

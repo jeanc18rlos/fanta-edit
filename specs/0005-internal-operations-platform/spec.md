@@ -2,7 +2,7 @@
 status: draft
 date: 2026-11-04
 owner: Jean Rojas
-decisions: [0027]
+decisions: [0027, 0028]
 repositories: [fanta-backend, fanta-admin, fanta-edit, fantaisa-landing, fanta-dashboard, fanta-handbook]
 ---
 
@@ -109,9 +109,9 @@ records the choice of tools and their free-plan limits.
 | Identity and sign-in | Clerk | Sign-up |
 | People, companies, deals, notes | Attio | The backend (facts); the founder (notes, owners, deals) |
 | Product behaviour, funnels, replays | PostHog EU | Landing, dashboard, editor (opt-in), backend |
-| Errors and crashes | Sentry (Q3) | Backend, web apps, editor (opt-in) |
+| Errors and crashes | Sentry | Backend, web apps, editor (opt-in) |
 | Uptime, heartbeats, status page | Better Stack | Probes, the backend's scheduled jobs |
-| Bugs, support tickets, roadmap | Linear | Every intake channel, the founder |
+| Bugs, support tickets, roadmap | Linear: one workspace, the FAN team for engineering and a Support team for customers | Every intake channel, the founder |
 | Internal conversation and alerts | Slack | People, the backend, vendor apps |
 | Community, help forum, announcements | Discord | Users, release automation |
 | Transactional and support email | Resend; ImprovMX forwarding | The backend; the founder |
@@ -134,8 +134,8 @@ Engineering specs and decision records stay in the product repositories.
   it. It is recorded in the same transaction as the change and delivered
   with retries, so a Slack outage delays alerts but never fails a signup or a
   purchase.
-- **R3.** Each morning at a set time (Q1) the founder must get a digest of
-  the last 24 hours and the month to date: signups, activations, purchases
+- **R3.** Each morning at 08:00 Madrid time (Q1) the founder must get a
+  digest of the last 24 hours and the month to date: signups, activations, purchases
   and refunds, credits spent, AI cost against revenue, cloud spend against
   budget, new error groups, open tickets by age, uptime, and any tool near a
   free-plan limit. Its figures must match the founder console for the same
@@ -171,9 +171,9 @@ Engineering specs and decision records stay in the product repositories.
 - **R10.** A person must be one PostHog person across the landing site, the
   dashboard, the backend and the editor, keyed by the backend user id and not
   by email address. Anonymous landing visits join that person at sign-up.
-- **R11.** PostHog must hold the funnel from landing visit to download, first
-  launch, sign-in, first project, first agent turn, first export and first
-  purchase, and weekly retention. The handbook keeps the definitions needed
+- **R11.** PostHog must hold the funnel from landing visit to download,
+  sign-in, first project, first agent turn, first export and first purchase,
+  and weekly retention. The handbook keeps the definitions needed
   to rebuild these dashboards.
 
 ### CRM
@@ -201,7 +201,8 @@ Engineering specs and decision records stay in the product repositories.
   from a personal address.
 - **R18.** Pull requests must link to their Linear issue and close it on
   merge.
-- **R19.** Open issues must stay under the Linear free plan's cap, and the
+- **R19.** Open issues must stay under the Linear free plan's cap, which the
+  Support team shares with the engineering program's FAN team, and the
   digest must report the count.
 
 ### Community
@@ -326,12 +327,12 @@ account is deleted.
    checklist, starting with the privacy page: the Slack workspace and
    channels, Linear connected to GitHub, the Attio key on v2, Better Stack
    probes, Sentry projects, the vendors' Slack apps, and the handbook
-   repository with the operations map. Covers R4, R6, R18, R21 and R22, and
-   starts R27.
+   repository with the operations map and the credentials register. Covers
+   R4, R6, R18, R21, R22 and R26, and starts R27.
 1. **Alerts, the digest and the CRM** (fanta-backend): the alert catalog
-   through the outbox, the budget feed, credential expiry, the morning digest
-   with its free-plan warnings, and the Attio gaps. Covers R1–R3, R5, R12,
-   R13, R26 and R27.
+   through the outbox, the budget feed, the morning digest with its
+   free-plan warnings, and the Attio gaps. Covers R1–R3, R5, R12, R13 and
+   R27.
 2. **Support and tickets** (fanta-backend, fanta-edit, fanta-dashboard):
    intake from each channel into Linear, acknowledgements and replies, Attio
    links, sending as support@ and Discord release posts. Covers R14–R17, R19
@@ -345,36 +346,32 @@ account is deleted.
 
 ## Open questions
 
-- **Q1.** What time and time zone should the digest arrive? Recommended:
-  08:00 your time, every day.
-- **Q2.** A public status page now, or at the first paying customer?
-  Recommended: probes now, the public page at the first paying customer.
-- **Q3.** Sentry or PostHog for errors and crashes? Recommended: Sentry. Its
-  free Developer plan (one user, 5,000 errors a month) covers us, and the
-  app's inherited crash uploader already posts native minidumps to a
-  configurable endpoint, which Sentry symbolicates. PostHog would save a
-  vendor and allows 100,000 exceptions a month free, but we would have to
-  confirm it accepts native crash dumps.
-- **Q4.** Ask for metrics and crash-report consent at first launch, or only
-  in settings? Recommended: one prompt at first launch, off unless accepted,
-  changeable later in settings.
-- **Q5.** Which two Linear teams (the free plan's limit)? Recommended:
-  Product (bugs and roadmap) and Support (customer tickets).
-- **Q6.** Where do you answer support email? Recommended: in Gmail, sending
-  as support@fantaisa.net through Resend's SMTP with a sending-only key. That
-  keeps the free ImprovMX forwarding for incoming mail.
-- **Q7.** Should v1 get alerts too? It serves the stable app until the v2
-  cutover. Recommended: only payment-webhook failures and a probe on v1;
-  everything else on v2.
-- **Q8.** Discord roles tied to Fanta accounts, such as a role for paying
-  users? Recommended: later. It needs a bot and account linking, and nobody
-  pays yet.
-- **Q9.** Once phase 2 lands, may an agent run a daily operations routine:
-  triage new Linear issues, draft support replies for your approval, and
-  write a weekly metrics note in the handbook? Recommended: yes, drafts only.
-- **Q10.** What should the handbook repository be called, and who owns it?
-  Recommended: private `fanta-handbook`, created in `fantaisa-ai` if spec
-  0003's move has happened by then, otherwise under `jeanc18rlos`.
+On 2026-11-07 the founder said "go forth" and declined to answer one by one,
+so each recommendation below is the default. Change any of them in review.
+
+- **Q1.** The digest arrives at 08:00 Madrid time, every day.
+- **Q2.** Probes start now; the public status page opens at the first paying
+  customer.
+- **Q3.** Sentry tracks errors and crashes. The app's inherited uploader
+  already posts native minidumps, which Sentry symbolicates.
+- **Q4.** The editor asks once, at first launch, whether to share analytics
+  and crash reports. Both stay off unless accepted and can be changed later
+  in settings.
+- **Q5.** One Linear workspace, shared with the AI-native engineering
+  program, which recreates it: its FAN team holds engineering work and
+  roadmap, and a Support team holds customer tickets. A ticket that turns out
+  to be a bug moves to FAN at triage.
+- **Q6.** Support email is answered in Gmail, sending as support@fantaisa.net
+  through Resend's SMTP with a sending-only key. ImprovMX keeps forwarding
+  incoming mail.
+- **Q7.** v1 gets payment-webhook failure alerts and a probe; everything else
+  runs on v2.
+- **Q8.** Discord roles tied to Fanta accounts wait until people pay.
+- **Q9.** After phase 2, an agent runs a daily routine: it triages new Linear
+  issues, drafts support replies for the founder's approval and writes a
+  weekly metrics note in the handbook. It drafts only, never sends or posts.
+- **Q10.** The handbook is a private `fanta-handbook` repository under
+  `jeanc18rlos`, moving with the others if spec 0003's move happens.
 
 ## Changes after acceptance
 

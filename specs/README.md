@@ -42,5 +42,5 @@ has no open tasks. `script/architecture index --check` enforces both in CI.
 | [0002](0002-fanta-engine-repository/spec.md) | The fanta-engine repository | draft | 2026-10-27 | 0023, 0024, 0025, 0026 |
 | [0003](0003-github-organization/spec.md) | One GitHub organization | draft | 2026-10-27 | 0025 |
 | [0004](0004-pen-drawing-that-closes-snaps-and-previews/spec.md) | Pen drawing that closes, snaps and previews | draft | 2026-10-29 | — |
-| [0005](0005-internal-operations-platform/spec.md) | Internal operations platform | draft | 2026-11-04 | 0027 |
+| [0005](0005-internal-operations-platform/spec.md) | Internal operations platform | draft | 2026-11-04 | 0027, 0028 |
 <!-- specs:end -->
