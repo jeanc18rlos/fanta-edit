@@ -6301,6 +6301,7 @@ impl FigView {
     /// project already existed.
     fn save_document(
         &mut self,
+        overwrite_conflict: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<std::path::PathBuf>>> {
         if let Some(error) = self.pending_bound_text_error(cx) {
@@ -6322,8 +6323,13 @@ impl FigView {
         }
         // Persist committed state, not a transient preview mid-session.
         self.finish_document_edits(cx);
-        self.item
-            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+        self.item.update(cx, |item, cx| {
+            if overwrite_conflict {
+                item.save_overwriting_conflict(cx)
+            } else {
+                item.save(SaveKind::Explicit, cx)
+            }
+        })
     }
 
     pub fn toggle_layers_sidebar(
@@ -10048,7 +10054,9 @@ impl Item for FigView {
             {
                 return source_save;
             }
-            let task = view.save_document(cx);
+            // The pane asks Overwrite / Discard before saving an item in
+            // conflict, so a non-autosave call here carries that answer.
+            let task = view.save_document(!options.autosave, cx);
             let project = view.project.clone();
             cx.spawn(async move |_, cx| {
                 let Some(root) = task.await? else {
@@ -13864,7 +13872,7 @@ mod tests {
             fault.restore()?;
             first
                 .view
-                .update(cx, |view, cx| view.save_document(cx))
+                .update(cx, |view, cx| view.save_document(false, cx))
                 .await?;
             cx.run_until_parked();
             assert_save_failure_notice(&first, false, cx);
@@ -14240,7 +14248,7 @@ mod tests {
             add_rect(&item, cx);
             settle_autosave_and_resync(cx);
             let error = view
-                .update(cx, |view, cx| view.save_document(cx))
+                .update(cx, |view, cx| view.save_document(false, cx))
                 .await
                 .expect_err("explicit retry still reaches the read-only directory");
             assert!(error.chain().any(|error| {
@@ -14256,7 +14264,7 @@ mod tests {
             assert_eq!(autosave_project_files(&root)?, files);
             assert!(view.read_with(cx, |view, _| view.reported_save_failure.is_some()));
             fault.restore()?;
-            view.update(cx, |view, cx| view.save_document(cx)).await?;
+            view.update(cx, |view, cx| view.save_document(false, cx)).await?;
             cx.run_until_parked();
             assert_eq!(
                 item.read_with(cx, |item, _| item.save_attempts_for_test()),
@@ -15240,7 +15248,7 @@ mod tests {
         });
         assert_ne!(moved, baseline, "the mounted drag must commit geometry");
         assert_camera(&visual);
-        view.update(&mut visual, |view, cx| view.save_document(cx))
+        view.update(&mut visual, |view, cx| view.save_document(false, cx))
             .await
             .expect("save committed drag");
         visual.run_until_parked();
@@ -15258,7 +15266,7 @@ mod tests {
                 );
             });
             assert_camera(&visual);
-            view.update(&mut visual, |view, cx| view.save_document(cx))
+            view.update(&mut visual, |view, cx| view.save_document(false, cx))
                 .await
                 .expect("save history result");
             visual.run_until_parked();

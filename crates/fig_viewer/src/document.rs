@@ -3153,20 +3153,31 @@ impl FigItem {
         kind: SaveKind,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<PathBuf>>> {
-        self.save_inner(kind, false, cx)
+        self.save_inner(kind, false, false, cx)
+    }
+
+    /// The save behind the pane's "Overwrite" answer: when external edits
+    /// conflict with the canvas, the canvas replaces the whole project on
+    /// disk. Without a conflict it is a plain explicit save.
+    pub(crate) fn save_overwriting_conflict(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<PathBuf>>> {
+        self.save_inner(SaveKind::Explicit, false, true, cx)
     }
 
     pub(crate) fn save_computed_source_layout(
         &mut self,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<PathBuf>>> {
-        self.save_inner(SaveKind::Explicit, true, cx)
+        self.save_inner(SaveKind::Explicit, true, false, cx)
     }
 
     fn save_inner(
         &mut self,
         kind: SaveKind,
         computed_source_layout: bool,
+        overwrite_conflict: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<PathBuf>>> {
         if self.project_writes.changing_destination() {
@@ -3288,6 +3299,25 @@ impl FigItem {
                         &mut changed_artifacts,
                         pending_layout_nodes.iter().copied(),
                     );
+                }
+                // The session's file hashes and the baselines predate the
+                // conflicting external edit, so every write checked against
+                // them fails as "changed on disk" and the conflict never
+                // clears. Overwrite starts from the disk as it is now and
+                // rewrites every artifact, so external edits to sources the
+                // canvas didn't touch can't survive behind a canvas that
+                // doesn't show them.
+                if overwrite_conflict && this.conflict && !materializing {
+                    changed_artifacts = changed_artifact_ids(&doc, None, None);
+                    this.workspace_session = None;
+                    return Ok(Some((
+                        target,
+                        materializing,
+                        this.write_cache.take().unwrap_or_default(),
+                        None,
+                        None,
+                        None,
+                    )));
                 }
                 Ok::<_, anyhow::Error>(Some((
                     target,
@@ -8731,6 +8761,52 @@ mod tests {
         let page = reopened.scene.get(page).expect("page");
         assert_eq!(page.name, "External 3");
         assert_eq!(page.opacity, 0.5.into());
+    }
+
+    #[gpui::test]
+    async fn overwrite_resolves_a_conflict_with_an_external_edit(cx: &mut TestAppContext) {
+        let (directory, item, mut external, page) = reload_queue_fixture(cx).await;
+        let original_name = external.scene.get(page).expect("page").name.clone();
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetOpacity {
+                    id: page,
+                    old: 1.0.into(),
+                    new: 0.5.into(),
+                },
+                cx,
+            )
+        })
+        .expect("unsaved canvas edit");
+        let agent_page = external.scene.get_mut(page).expect("page");
+        agent_page.opacity = 0.25.into();
+        agent_page.name = "Renamed by an agent".into();
+        write_project(directory.path(), &external, &BTreeMap::new()).expect("external edit");
+        item.update(cx, |item, cx| item.schedule_merge(cx));
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 2);
+        cx.run_until_parked();
+        assert!(item.read_with(cx, |item, _| item.has_conflict()));
+
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect_err("a plain save must not overwrite the conflicting edit");
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 2);
+        cx.run_until_parked();
+        assert!(item.read_with(cx, |item, _| item.has_conflict()));
+
+        item.update(cx, |item, cx| item.save_overwriting_conflict(cx))
+            .await
+            .expect("Overwrite writes the canvas");
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert!(!item.has_conflict());
+            assert!(!item.is_dirty());
+        });
+        let (reopened, _) =
+            fanta_format::read_project_tree(directory.path()).expect("reopen overwrite");
+        let page = reopened.scene.get(page).expect("page");
+        assert_eq!(page.opacity, 0.5.into());
+        assert_eq!(page.name, original_name);
     }
 
     #[test]

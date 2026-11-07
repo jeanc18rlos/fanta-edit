@@ -123,7 +123,23 @@ fn team_identifier(codesign_output: &str) -> Option<&str> {
         })
 }
 
-async fn team_of(app: &Path) -> Result<Option<String>> {
+/// The signing identifier (the bundle id) in `codesign --display` output. It is spliced into a
+/// code requirement, so only reverse-DNS characters are accepted.
+fn signing_identifier(codesign_output: &str) -> Option<&str> {
+    codesign_output
+        .lines()
+        .find_map(|line| line.strip_prefix("Identifier="))
+        .map(str::trim)
+        .filter(|identifier| {
+            !identifier.is_empty()
+                && identifier
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        })
+}
+
+/// The running app's signing identifier and Apple Team ID, when a team signed it.
+async fn signer_of(app: &Path) -> Result<Option<(String, String)>> {
     let output = new_command("codesign")
         .args(["--display", "--verbose=2"])
         .arg(app)
@@ -132,16 +148,25 @@ async fn team_of(app: &Path) -> Result<Option<String>> {
         .context("running codesign")?;
     // codesign writes the details to stderr.
     let details = String::from_utf8_lossy(&output.stderr);
-    Ok(team_identifier(&details).map(str::to_owned))
+    Ok(signing_identifier(&details)
+        .zip(team_identifier(&details))
+        .map(|(identifier, team)| (identifier.to_owned(), team.to_owned())))
 }
 
-/// The new app must be validly signed, by an Apple-issued certificate, for the running app's team.
+fn update_requirement(identifier: &str, team: &str) -> String {
+    format!(
+        r#"=identifier "{identifier}" and anchor apple generic and certificate leaf[subject.OU] = "{team}""#
+    )
+}
+
+/// The new app must be validly signed, by an Apple-issued certificate, for the running app's team
+/// and with the running app's bundle id. Every channel's installer has the same name and is signed
+/// the same way, so the id is what stops Fanta Preview installing the stable app over itself.
 pub(crate) async fn check_macos_code_signature(new_app: &Path, running_app: &Path) -> Result<()> {
-    let team = team_of(running_app).await?.context(
+    let (identifier, team) = signer_of(running_app).await?.context(
         "this copy of Fanta isn't signed by an Apple developer team, so it can't verify updates",
     )?;
-    let requirement =
-        format!(r#"=anchor apple generic and certificate leaf[subject.OU] = "{team}""#);
+    let requirement = update_requirement(&identifier, &team);
     let output = new_command("codesign")
         .args(["--verify", "--deep", "--strict", "-R"])
         .arg(&requirement)
@@ -151,7 +176,7 @@ pub(crate) async fn check_macos_code_signature(new_app: &Path, running_app: &Pat
         .context("running codesign")?;
     ensure!(
         output.status.success(),
-        "the update isn't signed by Fanta's Apple team: {}",
+        "the update isn't this Fanta app ({identifier}) signed by Fanta's Apple team: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(())
@@ -304,5 +329,22 @@ mod tests {
         );
         assert_eq!(team_identifier("TeamIdentifier=abc\"; true"), None);
         assert_eq!(team_identifier("Identifier=x"), None);
+    }
+
+    #[test]
+    fn updates_must_keep_the_running_apps_bundle_id() {
+        let preview = "Executable=/Applications/Fanta Preview.app/Contents/MacOS/fanta\n\
+                       Identifier=dev.fanta.Fanta-Preview\nTeamIdentifier=ABCDE12345";
+        assert_eq!(signing_identifier(preview), Some("dev.fanta.Fanta-Preview"));
+        assert_eq!(
+            update_requirement("dev.fanta.Fanta-Preview", "ABCDE12345"),
+            r#"=identifier "dev.fanta.Fanta-Preview" and anchor apple generic and certificate leaf[subject.OU] = "ABCDE12345""#
+        );
+        assert_eq!(signing_identifier("TeamIdentifier=ABCDE12345"), None);
+        assert_eq!(signing_identifier("Identifier="), None);
+        assert_eq!(
+            signing_identifier(r#"Identifier=dev.fanta.Fanta" or anchor apple"#),
+            None
+        );
     }
 }

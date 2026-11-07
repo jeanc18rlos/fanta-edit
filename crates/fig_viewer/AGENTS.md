@@ -34,6 +34,7 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 - Derive macOS video duration from native playback preparation. Raw MP4 track duration can include samples an edit list excludes. (#4)
 - A project folder that can be empty, such as `assets/`, may be missing: git does not track empty folders, so a cloned project without images has none. Treat `NotFound` from listing it as empty. A bare `read_dir(...)?` failed every save, autosave included, with "No such file or directory". (#173)
 - Ingest and roll back images through `document::AssetStores`, never the same-named `fanta_headless::assets::AssetStores` it wraps. Only the wrapper keeps the asset panel's GPUI thumbnail cache in step, so the headless store alone leaves new images without thumbnails and removed ones with stale ones. (#160)
+- A conflicting merge keeps the `WorkspaceSession`, `merge_base` and asset baseline from before the external edit, so every checked save against them fails as "changed on disk" and the conflict never clears. The pane's Overwrite answer goes through `save_overwriting_conflict`, which opens a fresh session and rewrites every artifact; other explicit saves (agent tools, the code workspace) keep refusing.
 
 ## Templates
 
