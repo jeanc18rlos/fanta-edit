@@ -477,18 +477,19 @@ impl DesignSurface for FigDesignSurface {
                 return Ok(json!({ "reported": false }));
             };
             let source = project_source_path(root, Path::new(&path))?;
-            let source_page = document.pages.iter().enumerate().find_map(|(index, page)| {
-                let page_root = page.root?;
-                let page_source = document
-                    .doc
-                    .components
-                    .defs
-                    .values()
-                    .find(|definition| definition.root == page_root)
-                    .and_then(|definition| fanta_format::locate_master_source(root, definition.id))
-                    .or_else(|| fanta_format::locate_page_source(root, page_root))?;
-                (page_source.canonicalize().ok().as_ref() == Some(&source)).then_some(index)
-            });
+            // Read the design from the source's own header. Locating every
+            // page's source instead scans `components/` once per page, on the
+            // UI thread, for every streamed edit chunk.
+            let source_page =
+                fanta_format::page_scope_of_source(&source).and_then(|(_, design)| {
+                    let page_root = match design {
+                        fanta_format::ScopedDesign::Page(page) => page,
+                        fanta_format::ScopedDesign::Component(component) => {
+                            document.doc.components.defs.get(&component)?.root
+                        }
+                    };
+                    document.page_index_for_root(Some(page_root))
+                });
             activity.source_path = Some(source.display().to_string());
             activity.workspace.get_or_insert_with(|| {
                 match source.file_name().and_then(|name| name.to_str()) {

@@ -88,8 +88,7 @@ impl PreparedImage {
             bytes.len()
         );
         let id = fanta_format::asset_id_for_bytes(&bytes);
-        let decoded = image::load_from_memory(&bytes).context("decoding image bytes")?;
-        let rgba = decoded.to_rgba8();
+        let rgba = crate::render::decode_rgba(&bytes).context("decoding image bytes")?;
         let (width, height) = rgba.dimensions();
         anyhow::ensure!(width > 0 && height > 0, "the image has no pixels");
         let format = image::guess_format(&bytes).ok();
@@ -387,5 +386,31 @@ mod tests {
             decode_image_source(&wrapped).expect("wrapped base64 decodes"),
             png(1, 1)
         );
+    }
+
+    /// A 54-byte BMP header claiming `width` x `height` 24-bit pixels, with no
+    /// pixel data: BMP headers carry no checksum.
+    fn bmp_header(width: i32, height: i32) -> Vec<u8> {
+        let mut bytes = b"BM".to_vec();
+        bytes.extend(54u32.to_le_bytes());
+        bytes.extend(0u32.to_le_bytes());
+        bytes.extend(54u32.to_le_bytes());
+        bytes.extend(40u32.to_le_bytes());
+        bytes.extend(width.to_le_bytes());
+        bytes.extend(height.to_le_bytes());
+        bytes.extend(1u16.to_le_bytes());
+        bytes.extend(24u16.to_le_bytes());
+        bytes.extend([0; 24]);
+        bytes
+    }
+
+    #[test]
+    fn images_over_the_pixel_limit_are_refused_from_their_header() {
+        let error = PreparedImage::new(bmp_header(10_000, 10_000))
+            .err()
+            .expect("a 100-megapixel image is refused");
+        assert!(format!("{error:#}").contains("the limit is"), "{error:#}");
+        let image = PreparedImage::new(png(3, 2)).expect("a small image decodes");
+        assert_eq!(image.size, [3, 2]);
     }
 }

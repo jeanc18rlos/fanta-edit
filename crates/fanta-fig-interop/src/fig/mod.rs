@@ -56,6 +56,11 @@ const ZIP_IMAGES_PREFIX: &str = "images/";
 /// Zstandard frame magic — the data chunk's compression in current exports.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
+/// The most a decompressed chunk, or everything read from the zip beyond the
+/// archive's own size, may grow to. A small crafted file can otherwise
+/// inflate to many gigabytes (a "zip bomb"); real files stay far below.
+const MAX_EXPANSION_BYTES: u64 = 2 << 30;
+
 /// Embedded bitmap bytes keyed by their lowercase-hex SHA-1 hash — the same
 /// hash an IMAGE `Paint.image.hash` references and the key under which the
 /// `.fig` ZIP stores the file at `images/<hash>`.
@@ -176,6 +181,9 @@ fn extract_zip_entries(bytes: &[u8]) -> FigResult<(Vec<u8>, ImageMap)> {
 
     let mut canvas: Option<Vec<u8>> = None;
     let mut images: ImageMap = ImageMap::new();
+    // Entries stored without compression take as much as the archive itself.
+    // Sizes the entries declare are not trusted: zip64 sizes are read unchecked.
+    let mut budget = (bytes.len() as u64).saturating_add(MAX_EXPANSION_BYTES);
 
     for i in 0..archive.len() {
         let mut entry = archive
@@ -183,21 +191,22 @@ fn extract_zip_entries(bytes: &[u8]) -> FigResult<(Vec<u8>, ImageMap)> {
             .map_err(|e| FigError::BadHeader(format!("reading .fig zip entry {i}: {e}")))?;
         let name = entry.name().to_owned();
         if name == ZIP_CANVAS_ENTRY {
-            let mut out = Vec::with_capacity(entry.size() as usize);
-            entry
-                .read_to_end(&mut out)
-                .map_err(|e| FigError::Inflate(format!("reading {ZIP_CANVAS_ENTRY}: {e}")))?;
+            let out = read_at_most(&mut entry, budget)
+                .map_err(|e| FigError::Inflate(format!("reading {ZIP_CANVAS_ENTRY}: {e}")))?
+                .ok_or_else(|| too_large(ZIP_CANVAS_ENTRY))?;
+            budget -= out.len() as u64;
             canvas = Some(out);
         } else if let Some(hash) = name.strip_prefix(ZIP_IMAGES_PREFIX) {
             // Skip the directory entry itself (`images/`, empty hash).
             if hash.is_empty() {
                 continue;
             }
-            let mut out = Vec::with_capacity(entry.size() as usize);
-            match entry.read_to_end(&mut out) {
-                Ok(_) => {
+            match read_at_most(&mut entry, budget) {
+                Ok(Some(out)) => {
+                    budget -= out.len() as u64;
                     images.insert(hash.to_owned(), out);
                 }
+                Ok(None) => return Err(too_large(&name)),
                 Err(e) => {
                     tracing::warn!(
                         target: "fanta-fig-interop",
@@ -351,16 +360,26 @@ fn write_chunk(out: &mut Vec<u8>, payload: &[u8]) -> FigResult<()> {
 /// Zstandard (`28 B5 2F FD`) for current data chunks, raw DEFLATE otherwise
 /// (the schema chunk, and data chunks in older exports).
 fn decompress_chunk(payload: &[u8]) -> FigResult<Vec<u8>> {
-    if payload.len() >= 4 && payload[0..4] == ZSTD_MAGIC {
-        zstd::stream::decode_all(payload).map_err(|e| FigError::Inflate(format!("zstd: {e}")))
+    let out = if payload.len() >= 4 && payload[0..4] == ZSTD_MAGIC {
+        zstd::stream::read::Decoder::new(payload)
+            .and_then(|decoder| read_at_most(decoder, MAX_EXPANSION_BYTES))
+            .map_err(|e| FigError::Inflate(format!("zstd: {e}")))?
     } else {
-        let mut decoder = DeflateDecoder::new(payload);
-        let mut out = Vec::new();
-        decoder
-            .read_to_end(&mut out)
-            .map_err(|e| FigError::Inflate(e.to_string()))?;
-        Ok(out)
-    }
+        read_at_most(DeflateDecoder::new(payload), MAX_EXPANSION_BYTES)
+            .map_err(|e| FigError::Inflate(e.to_string()))?
+    };
+    out.ok_or_else(|| too_large("a chunk"))
+}
+
+/// Read everything, or `None` once more than `limit` bytes arrive.
+fn read_at_most(reader: impl Read, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let mut out = Vec::new();
+    reader.take(limit.saturating_add(1)).read_to_end(&mut out)?;
+    Ok((out.len() as u64 <= limit).then_some(out))
+}
+
+fn too_large(what: &str) -> FigError {
+    FigError::Inflate(format!("{what} expands past the size limit"))
 }
 
 /// Raw-DEFLATE a byte slice (default compression). Used by [`write_fig`], the

@@ -9,6 +9,7 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 - Written bytes are a pure function of the document (the byte-determinism contract). Never depend on `HashMap` or `serde_json::Map` iteration order: stage `source-order` runs this crate with `serde_json/preserve_order` enabled, and feature unification can enable it in any build.
 - Persisted ids are bare ULIDs; file and directory names use the prefixed `Display` form. Convert with `json_key`/`id_from_key`, never `to_string()`/`FromStr` (see the root rules). (#85, #102, #110, #128)
 - Never derive a design's directory from its id: page and component directories are name slugs. Use `locate_page_source`, `locate_master_source` and `page_scope_of_source`.
+- Classify project paths by file name, never by folder name: a slug can be any word, so a variant named "Nodes" lives in `nodes/`, the per-node folder's name. Misclassified files made a journal that every later open refused. (#176)
 - Save ownership is the nearest ancestor-or-self registered component root, otherwise the page. When projecting one artifact from the shared scene, exclude descendant component roots owned by another artifact: geometric containment is not ownership. (#86)
 - Never reformat `.fnx` or managed project JSON with another formatter. The engine printer is the canonical form, and a second formatter makes every open and save rewrite the file.
 
@@ -19,6 +20,7 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 - `merge_docs` is an undo barrier and drops history on purpose: undo across a merge would revert the other side's edits. Do not carry history through a merge.
 - Geometry signatures stored in project data use the source format's numeric normalization and stable object ordering. Otherwise a save, or a change in serde feature unification, invalidates preserved imported artwork. (#41)
 - Move owned JSON fragments as `Value::Object`/`Value::Array`. `json!` serializes its arguments by reference and copies large geometry. (#126)
+- Validate a transaction plan before moving it into `.fanta-transaction`. Recovery replays the journal on every open and refuses one it cannot validate, so an invalid plan in place makes the project unopenable. (#176)
 
 ## Runtime bundles
 

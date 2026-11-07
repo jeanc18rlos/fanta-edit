@@ -169,9 +169,12 @@ impl KiwiValue {
     /// non-numeric values. Figma stores most geometry as `float`, but ids and
     /// counts arrive as `uint`/`int`, so a forgiving numeric read is convenient
     /// at the mapping layer.
+    ///
+    /// NaN and infinite floats read as missing: JSON stores them as `null`, so
+    /// one reaching the document makes the saved project fail to load.
     pub fn as_f64(&self) -> Option<f64> {
         match *self {
-            KiwiValue::Float(v) => Some(v as f64),
+            KiwiValue::Float(v) => v.is_finite().then_some(v as f64),
             KiwiValue::Int(v) => Some(v as f64),
             KiwiValue::Uint(v) => Some(v as f64),
             KiwiValue::Int64(v) => Some(v as f64),
@@ -231,11 +234,17 @@ impl KiwiValue {
     /// each primitive in isolation.
     pub fn decode(schema: &Schema, root_type: KiwiType, bytes: &[u8]) -> FigResult<KiwiValue> {
         let mut r = ByteReader::new(bytes);
-        Self::decode_type(schema, root_type, &mut r)
+        Self::decode_type(schema, root_type, &mut r, 0)
     }
 
-    /// Decode a value of `ty` from the reader at its current position.
-    fn decode_type(schema: &Schema, ty: KiwiType, r: &mut ByteReader) -> FigResult<KiwiValue> {
+    /// Decode a value of `ty` from the reader at its current position, inside
+    /// `depth` enclosing objects.
+    fn decode_type(
+        schema: &Schema,
+        ty: KiwiType,
+        r: &mut ByteReader,
+        depth: usize,
+    ) -> FigResult<KiwiValue> {
         Ok(match ty.0 {
             TYPE_BOOL => KiwiValue::Bool(r.read_bool()?),
             TYPE_BYTE => KiwiValue::Byte(r.read_byte()?),
@@ -264,9 +273,13 @@ impl KiwiValue {
                         }
                     }
                     DefKind::Struct => {
+                        let depth = nested(depth)?;
                         let mut fields = KiwiFields::with_capacity(def.fields.len());
                         for f in &def.fields {
-                            fields.push_unsorted(f.name.clone(), Self::decode_field(schema, f, r)?);
+                            fields.push_unsorted(
+                                f.name.clone(),
+                                Self::decode_field(schema, f, r, depth)?,
+                            );
                         }
                         fields.seal();
                         KiwiValue::Object {
@@ -275,6 +288,7 @@ impl KiwiValue {
                         }
                     }
                     DefKind::Message => {
+                        let depth = nested(depth)?;
                         let mut fields = KiwiFields::default();
                         loop {
                             let id = r.read_var_uint()?;
@@ -285,15 +299,12 @@ impl KiwiValue {
                                 Some(f) => {
                                     fields.push_unsorted(
                                         f.name.clone(),
-                                        Self::decode_field(schema, f, r)?,
+                                        Self::decode_field(schema, f, r, depth)?,
                                     );
                                 }
-                                // Unknown id but known message type: skip by
-                                // type. We cannot recover the type of an id the
-                                // schema does not list, so this is still an
-                                // error — but it only fires for genuinely
-                                // malformed data, not for forward-compat skips
-                                // (those are handled inside `skip_type`).
+                                // The schema does not list this id, so its type
+                                // and length are unknown and it cannot be
+                                // skipped: the data is malformed.
                                 None => {
                                     return Err(FigError::Schema(format!(
                                         "unknown field id {id} in message '{}'",
@@ -315,19 +326,30 @@ impl KiwiValue {
     }
 
     /// Decode a field value, applying the array length prefix when needed.
-    fn decode_field(schema: &Schema, field: &Field, r: &mut ByteReader) -> FigResult<KiwiValue> {
+    fn decode_field(
+        schema: &Schema,
+        field: &Field,
+        r: &mut ByteReader,
+        depth: usize,
+    ) -> FigResult<KiwiValue> {
         if field.is_array {
-            let len = r.read_var_uint()?;
+            let len = r.read_var_uint()? as usize;
             if field.ty == KiwiType::BYTE {
-                return Ok(KiwiValue::Bytes(r.read_bytes(len as usize)?.to_vec()));
+                return Ok(KiwiValue::Bytes(r.read_bytes(len)?.to_vec()));
             }
-            let mut items = Vec::with_capacity(len as usize);
+            // Every element but an empty struct takes at least one byte, so a
+            // longer count is corrupt; checking first keeps the allocation
+            // bounded by the input.
+            if len > r.remaining() {
+                return Err(FigError::Truncated);
+            }
+            let mut items = Vec::with_capacity(len);
             for _ in 0..len {
-                items.push(Self::decode_type(schema, field.ty, r)?);
+                items.push(Self::decode_type(schema, field.ty, r, depth)?);
             }
             Ok(KiwiValue::array(items))
         } else {
-            Self::decode_type(schema, field.ty, r)
+            Self::decode_type(schema, field.ty, r, depth)
         }
     }
 
@@ -484,6 +506,22 @@ impl KiwiValue {
     }
 }
 
+/// How deep decoded objects may nest. The schema comes from the file, and a
+/// type that contains itself would otherwise recurse until the stack
+/// overflows; imports run on 512 KiB worker-thread stacks. Real files nest at
+/// most about 15 levels.
+const MAX_DEPTH: usize = 64;
+
+/// The depth inside one more object, or an error past [`MAX_DEPTH`].
+fn nested(depth: usize) -> FigResult<usize> {
+    if depth >= MAX_DEPTH {
+        return Err(FigError::Schema(format!(
+            "values nest deeper than {MAX_DEPTH} levels"
+        )));
+    }
+    Ok(depth + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,11 +659,17 @@ mod tests {
     }
 
     #[test]
-    fn unknown_message_field_is_skipped_when_present_in_schema() {
-        // Simulate a "newer writer": a Node message that includes a field id
-        // the *reader's* schema does not list. We do this by encoding with a
-        // schema that has an extra field, then decoding with one that does not,
-        // proving forward-compat skipping works end to end.
+    fn non_finite_floats_read_as_missing_numbers() {
+        assert_eq!(KiwiValue::Float(1.5).as_f64(), Some(1.5));
+        assert_eq!(KiwiValue::Float(f32::NAN).as_f64(), None);
+        assert_eq!(KiwiValue::Float(f32::INFINITY).as_f64(), None);
+        assert_eq!(KiwiValue::Float(f32::NEG_INFINITY).as_f64(), None);
+    }
+
+    #[test]
+    fn a_message_field_id_missing_from_the_schema_is_rejected() {
+        // A newer writer's message carries a field id the reader's schema does
+        // not list; its type and length are unknown, so decoding must fail.
         let writer_schema = Schema::new(vec![Def::new(
             "M",
             DefKind::Message,
@@ -649,21 +693,83 @@ mod tests {
         );
         let bytes = v.encode(&writer_schema).unwrap();
 
-        // The reader's schema lacks `extra` (id 2). Decoding currently errors
-        // on an unrecognized id because we cannot know its type from the reader
-        // schema alone — but the writer's schema CAN skip it. Verify skipping
-        // via the writer schema's skip path: decode with the writer schema,
-        // then confirm the reader schema can still skip the whole message.
-        let mut r = ByteReader::new(&bytes);
-        writer_schema
-            .skip_type(&mut r, KiwiType::user(0))
-            .expect("writer schema skips its own message cleanly");
-        assert!(r.is_at_end());
-
-        // Sanity: the reader schema decodes the known field and rejects the
-        // unknown id (documented limitation — generic decode is strict; the
-        // skip API is the forward-compat tool).
+        assert!(KiwiValue::decode(&writer_schema, KiwiType::user(0), &bytes).is_ok());
         assert!(KiwiValue::decode(&reader_schema, KiwiType::user(0), &bytes).is_err());
+    }
+
+    /// `message M { M m = 1; }`: each `01` opens one more nested M, and each
+    /// `00` closes one.
+    fn self_nesting_message() -> Schema {
+        Schema::new(vec![Def::new(
+            "M",
+            DefKind::Message,
+            vec![Field::new("m", KiwiType::user(0), 1)],
+        )])
+    }
+
+    fn nested_messages(count: usize) -> Vec<u8> {
+        let mut bytes = vec![1; count - 1];
+        bytes.extend(std::iter::repeat_n(0, count));
+        bytes
+    }
+
+    #[test]
+    fn the_deepest_allowed_value_decodes_and_drops_on_a_worker_thread_stack() {
+        let decoded = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                KiwiValue::decode(
+                    &self_nesting_message(),
+                    KiwiType::user(0),
+                    &nested_messages(MAX_DEPTH),
+                )
+                .is_ok()
+            })
+            .expect("spawn")
+            .join()
+            .expect("no stack overflow");
+        assert!(decoded);
+    }
+
+    #[test]
+    fn values_nested_past_the_limit_are_refused() {
+        let schema = self_nesting_message();
+        let error = KiwiValue::decode(&schema, KiwiType::user(0), &nested_messages(MAX_DEPTH + 1))
+            .expect_err("too deep");
+        assert!(matches!(error, FigError::Schema(_)), "{error}");
+
+        // A struct that contains itself recurses without reading a byte.
+        let schema = Schema::new(vec![
+            Def::new(
+                "Root",
+                DefKind::Message,
+                vec![Field::new("s", KiwiType::user(1), 1)],
+            ),
+            Def::new(
+                "S",
+                DefKind::Struct,
+                vec![Field::new("s", KiwiType::user(1), 0)],
+            ),
+        ]);
+        assert!(KiwiValue::decode(&schema, KiwiType::user(0), &[1]).is_err());
+    }
+
+    #[test]
+    fn an_array_longer_than_the_remaining_bytes_is_refused_before_allocating() {
+        let mut array = Field::new("a", KiwiType::user(1), 1);
+        array.is_array = true;
+        let schema = Schema::new(vec![
+            Def::new("Root", DefKind::Message, vec![array]),
+            Def::new("Empty", DefKind::Struct, Vec::new()),
+        ]);
+        // Field 1, then a count of u32::MAX empty structs.
+        let error = KiwiValue::decode(
+            &schema,
+            KiwiType::user(0),
+            &[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F],
+        )
+        .expect_err("count exceeds the data");
+        assert!(matches!(error, FigError::Truncated), "{error}");
     }
 
     #[test]

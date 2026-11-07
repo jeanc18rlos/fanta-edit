@@ -69,13 +69,13 @@ pub(crate) fn read_auto_layout(change: &KiwiValue) -> Option<AutoLayout> {
     };
 
     // Figma's "Auto" gap between wrapped rows/columns is encoded as a NaN
-    // `stackCounterSpacing` (the finite filter above already rejected it);
-    // it means "distribute the lines across the counter extent", not a gap
-    // of zero, so it maps to the explicit auto flag.
-    let counter_auto_spacing = change
-        .get("stackCounterSpacing")
-        .and_then(KiwiValue::as_f64)
-        .is_some_and(f64::is_nan);
+    // `stackCounterSpacing` (`as_f64` drops it as non-finite); it means
+    // "distribute the lines across the counter extent", not a gap of zero, so
+    // it maps to the explicit auto flag.
+    let counter_auto_spacing = matches!(
+        change.get("stackCounterSpacing"),
+        Some(KiwiValue::Float(spacing)) if spacing.is_nan()
+    );
 
     Some(AutoLayout {
         mode,

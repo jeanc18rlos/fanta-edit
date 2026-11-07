@@ -176,6 +176,65 @@ fn a_component_set_is_one_folder_holding_its_variants() {
     assert!(read.components.def(f.avatar).is_some());
 }
 
+#[test]
+fn a_variant_named_nodes_saves_reopens_and_saves_again() {
+    // A variant folder is named after the variant, so "Nodes" lands in
+    // `components/button/nodes/`, the name of a design's per-node folder.
+    let dir = tempdir().unwrap();
+    let mut f = fixture();
+    let (variant, root) = f.variants[1];
+    let membership = f.doc.components.defs.get_mut(&variant).unwrap();
+    membership.variant_of.as_mut().unwrap().axis_values =
+        BTreeMap::from([("Variant".to_owned(), "Nodes".to_owned())]);
+    write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+    assert!(
+        dir.path()
+            .join("components/button/nodes/def.json")
+            .is_file()
+    );
+
+    let (mut read, assets) = read_project_tree(dir.path()).unwrap();
+    assert!(read.components.def(variant).is_some());
+    read.scene.get_mut(root).unwrap().opacity = fanta_doc::UnitInterval::new(0.5);
+    write_project_tree(dir.path(), &read, &assets).unwrap();
+    assert!(!dir.path().join(".fanta-transaction").exists());
+    let (reopened, _) = read_project_tree(dir.path()).unwrap();
+    assert_eq!(
+        reopened.scene.get(root).unwrap().opacity,
+        fanta_doc::UnitInterval::new(0.5)
+    );
+}
+
+#[test]
+fn a_case_only_rename_of_a_variant_folder_never_deletes_the_variant() {
+    let dir = tempdir().unwrap();
+    let f = fixture();
+    write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+    // Two steps, so the rename also applies on a case-insensitive disk.
+    let components = dir.path().join("components/button");
+    std::fs::rename(
+        components.join("primary-hover"),
+        components.join("case-tmp"),
+    )
+    .unwrap();
+    std::fs::rename(
+        components.join("case-tmp"),
+        components.join("Primary-Hover"),
+    )
+    .unwrap();
+
+    write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+
+    for file in ["def.json", "master.fnx", "master.ids.json"] {
+        assert!(
+            components.join("primary-hover").join(file).is_file(),
+            "{file}"
+        );
+    }
+    let (read, _) = read_project_tree(dir.path()).unwrap();
+    assert!(read.components.def(f.variants[1].0).is_some());
+}
+
 /// Rewrite a freshly written v5 tree the way v4 laid it out: every variant
 /// flat in `components/` (2 folders deep, importing `../../fnx`), every set
 /// in `components/sets.json`, manifest version 4.
@@ -302,6 +361,22 @@ fn a_variants_source_path_resolves_to_its_component() {
         design,
         fanta_format::ScopedDesign::Component(f.variants[1].0)
     );
+}
+
+#[test]
+fn a_variants_source_validates_and_saves_as_a_source_edit() {
+    let dir = tempdir().unwrap();
+    let f = fixture();
+    write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+    let path = dir
+        .path()
+        .join("components/button/primary-hover/master.fnx");
+    let source = std::fs::read_to_string(&path).unwrap();
+    fanta_format::validate_project_source_edit(dir.path(), &path, &source)
+        .expect("a variant's master.fnx is a project source");
+    let edit = fanta_format::apply_project_source_edit(dir.path(), &path, &source)
+        .expect("and saves as one");
+    assert!(edit.document.components.def(f.variants[1].0).is_some());
 }
 
 #[test]

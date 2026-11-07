@@ -477,7 +477,7 @@ fn write_project_tree_cached_impl(
     }
 
     // Do not traverse a planted symlink or case-aliased design directory.
-    heal_directory_case(dir, &files)?;
+    heal_path_case(dir, files.keys().chain(asset_files.keys()));
     remove_symlinks_on_projected_paths(dir, files.keys().chain(asset_files.keys()))?;
 
     let keep: BTreeSet<&Path> = files
@@ -537,87 +537,90 @@ fn write_project_tree_cached_impl(
     })
 }
 
-/// Rename design directories whose on-disk name differs from a projected
-/// design dir only by ASCII case. On a case-insensitive filesystem (APFS,
-/// NTFS) such a directory ALIASES the projected path: the byte-diff succeeds
-/// through the alias while the exact-case prune deletes the live files — a
-/// case-only folder rename would silently destroy the design. Healing is a
-/// two-step rename (via a temp name, since a direct case-only rename is a
-/// no-op-or-error on some filesystems); on a case-sensitive filesystem where
-/// the projected name is genuinely occupied the rename fails harmlessly and
-/// the differently-cased dir is pruned as the stale dir it really is.
-fn heal_directory_case(dir: &Path, files: &ProjectedFiles) -> Result<()> {
-    let mut expected: BTreeSet<(&str, &str)> = BTreeSet::new();
-    for relative in files.keys() {
-        let mut components = relative.components();
-        let (Some(managed), Some(design), Some(_file)) =
-            (components.next(), components.next(), components.next())
-        else {
-            continue;
-        };
-        if let (Some(managed), Some(design)) =
-            (managed.as_os_str().to_str(), design.as_os_str().to_str())
-            && (managed == PAGES_DIR || managed == COMPONENTS_DIR)
-        {
-            expected.insert((managed, design));
-        }
-    }
-    // List each managed parent once and index it by lowercase name: listing
-    // it again for every design made this quadratic (2.5 s per save on a
-    // project with ~2,400 components).
-    let mut listings: BTreeMap<&str, BTreeMap<String, Vec<String>>> = BTreeMap::new();
-    for (managed, design) in expected {
-        let listing = listings.entry(managed).or_insert_with(|| {
-            let mut by_lowercase: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            if let Ok(entries) = fs::read_dir(dir.join(managed)) {
-                for entry in entries.flatten() {
-                    if let Ok(name) = entry.file_name().into_string() {
-                        by_lowercase
-                            .entry(name.to_ascii_lowercase())
-                            .or_default()
-                            .push(name);
-                    }
+/// Rename every folder or file on a projected path whose on-disk name differs
+/// from the projected one only by ASCII case. On a case-insensitive filesystem
+/// (APFS, NTFS) such an entry ALIASES the projected path: the byte-diff
+/// succeeds through the alias while the exact-case prune deletes the live
+/// files, so a case-only rename of a design, variant or asset folder would
+/// silently destroy it. Healing is a two-step rename (via a temp name, since a
+/// direct case-only rename is a no-op-or-error on some filesystems). On a
+/// case-sensitive filesystem an entry with the exact name is a different file,
+/// so the differently-cased one is left for the prune as the stale entry it
+/// really is.
+fn heal_path_case<'a>(dir: &Path, projected: impl IntoIterator<Item = &'a PathBuf>) {
+    // List each parent once and index it by lowercase name: listing it again
+    // for every design made this quadratic (2.5 s per save on a project with
+    // ~2,400 components).
+    let mut listings: BTreeMap<PathBuf, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+    let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
+    for relative in projected {
+        let mut parent = PathBuf::new();
+        for component in relative.components() {
+            let Some(name) = component.as_os_str().to_str() else {
+                break;
+            };
+            let path = parent.join(name);
+            if visited.insert(path.clone()) {
+                let listing = listings
+                    .entry(parent.clone())
+                    .or_insert_with(|| names_by_lowercase(&dir.join(&parent)));
+                if let Some(names) = listing.get(&name.to_ascii_lowercase())
+                    && !names.iter().any(|existing| existing == name)
+                    && let Some(existing) = names.first()
+                {
+                    rename_case(&dir.join(&parent), existing, name);
                 }
             }
-            by_lowercase
-        });
-        let Some(names) = listing.get(&design.to_ascii_lowercase()) else {
-            continue;
-        };
-        let parent = dir.join(managed);
-        for name in names {
-            let name = name.as_str();
-            if name != design {
-                let from = parent.join(name);
-                let via = parent.join(format!("{design}.case-heal"));
-                let to = parent.join(design);
-                match fs::rename(&from, &via) {
-                    Ok(()) => {
-                        if let Err(error) = fs::rename(&via, &to) {
-                            tracing::warn!(
-                                target: "fanta::format",
-                                "healing dir case for {} failed ({error}); restoring",
-                                from.display()
-                            );
-                            if let Err(error) = fs::rename(&via, &from) {
-                                tracing::warn!(
-                                    target: "fanta::format",
-                                    "restoring {} after failed case heal failed: {error}",
-                                    from.display()
-                                );
-                            }
-                        }
-                    }
-                    Err(error) => tracing::warn!(
+            parent = path;
+        }
+    }
+}
+
+fn names_by_lowercase(dir: &Path) -> BTreeMap<String, Vec<String>> {
+    let mut by_lowercase: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(name) = entry.file_name().into_string() {
+                by_lowercase
+                    .entry(name.to_ascii_lowercase())
+                    .or_default()
+                    .push(name);
+            }
+        }
+    }
+    for names in by_lowercase.values_mut() {
+        names.sort();
+    }
+    by_lowercase
+}
+
+fn rename_case(parent: &Path, existing: &str, projected: &str) {
+    let from = parent.join(existing);
+    let via = parent.join(format!("{projected}.case-heal"));
+    let to = parent.join(projected);
+    match fs::rename(&from, &via) {
+        Ok(()) => {
+            if let Err(error) = fs::rename(&via, &to) {
+                tracing::warn!(
+                    target: "fanta::format",
+                    "healing case for {} failed ({error}); restoring",
+                    from.display()
+                );
+                if let Err(error) = fs::rename(&via, &from) {
+                    tracing::warn!(
                         target: "fanta::format",
-                        "case heal of {} skipped: {error}",
+                        "restoring {} after failed case heal failed: {error}",
                         from.display()
-                    ),
+                    );
                 }
             }
         }
+        Err(error) => tracing::warn!(
+            target: "fanta::format",
+            "case heal of {} skipped: {error}",
+            from.display()
+        ),
     }
-    Ok(())
 }
 
 /// Unlink any symlink sitting on (or on an ancestor of) a projected path, so
@@ -1473,9 +1476,8 @@ fn is_generated_artifact(relative: &Path) -> bool {
         [COMPONENTS_DIR, SETS_JSON] | [ASSETS_DIR, ASSET_INDEX_FILE] => true,
         [PAGES_DIR, _, name] => [PAGE_JSON, PAGE_FNX, PAGE_IDS].contains(name),
         [COMPONENTS_DIR, _, name] => [DEF_JSON, MASTER_FNX, MASTER_IDS, SET_JSON].contains(name),
-        [COMPONENTS_DIR, _, variant, name] if *variant != NODES_DIR => {
-            [DEF_JSON, MASTER_FNX, MASTER_IDS].contains(name)
-        }
+        // A variant folder is named after the variant, so it can be `nodes`.
+        [COMPONENTS_DIR, _, _, name] if [DEF_JSON, MASTER_FNX, MASTER_IDS].contains(name) => true,
         [PAGES_DIR | COMPONENTS_DIR, _, NODES_DIR, name] => {
             Path::new(name)
                 .extension()
@@ -1813,6 +1815,9 @@ fn apply_project_transaction(
             new_sha256: hash_hex(&write.new_hash),
         });
     }
+    // Recovery replays the journal on every open and refuses one it cannot
+    // validate, so an invalid plan must fail here, before it is in place.
+    validate_transaction(&transaction)?;
     write_with_parents(
         &staging.path().join("plan.json"),
         &serde_json::to_vec(&transaction)?,
