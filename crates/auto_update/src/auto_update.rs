@@ -384,10 +384,12 @@ pub fn view_release_notes(_: &ViewReleaseNotes, cx: &mut App) -> Option<()> {
     None
 }
 
-#[cfg(not(target_os = "windows"))]
+// Tests download in parallel, so each gets its own folder; the fixed
+// `updates` folder belongs to the Windows update helper.
+#[cfg(any(not(target_os = "windows"), test))]
 struct InstallerDir(tempfile::TempDir);
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(any(not(target_os = "windows"), test))]
 impl InstallerDir {
     async fn new() -> Result<Self> {
         Ok(Self(
@@ -402,10 +404,10 @@ impl InstallerDir {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(test)))]
 struct InstallerDir(PathBuf);
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(test)))]
 impl InstallerDir {
     async fn new() -> Result<Self> {
         let installer_dir = std::env::current_exe()?
@@ -1652,8 +1654,11 @@ mod tests {
         cx.run_until_parked();
         release_available.store(true, atomic::Ordering::SeqCst);
         auto_updater.update(cx, |updater, cx| updater.poll(UpdateCheckType::Manual, cx));
+        // The download and its check run partly on real threads, so wait on
+        // the clock rather than a count of scheduler turns.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut status = AutoUpdateStatus::Idle;
-        for _ in 0..10_000 {
+        while std::time::Instant::now() < deadline {
             cx.background_executor.timer(Duration::from_millis(0)).await;
             cx.run_until_parked();
             status = auto_updater.read_with(cx, |updater, _| updater.status());
