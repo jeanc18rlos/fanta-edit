@@ -1,20 +1,31 @@
 //! `fanta-engine serve`: the HTTP API of `docs/cloud-engine-contracts.md`.
-//! Every run gets its own temp folder and runs on its own thread, and a panic
-//! fails only that request.
+//!
+//! Each connection carries one request and is then closed, so an unread body
+//! goes with the socket instead of being drained. Headers and bodies have read
+//! deadlines, the signature header is checked before any body is read, and
+//! connections beyond the limit are closed as they arrive. Runs go to blocking
+//! threads, each with its own temp folder, and a panic fails only its request.
 
 use std::{
-    io::Read as _,
+    convert::Infallible,
+    net::TcpListener,
     panic::AssertUnwindSafe,
     path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use bytes::Bytes;
 use hmac::{Hmac, Mac as _};
+use http_body_util::{BodyExt as _, Full, LengthLimitError, Limited};
+use hyper::{
+    Method, Request, Response, StatusCode, body::Incoming, header, server::conn::http1,
+    service::service_fn,
+};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+use tokio::sync::Semaphore;
 
 use crate::{
     EngineError, EngineInfo, ErrorCode, RunRequest, RunResponse, Source,
@@ -22,15 +33,21 @@ use crate::{
 };
 
 /// The largest request body the engine reads.
-pub const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// How far a signature's timestamp may be from the engine's clock.
 pub const MAX_CLOCK_SKEW_SECONDS: u64 = 300;
 /// Runs one instance takes at once; more answer `429 busy`.
 pub const MAX_CONCURRENT_RUNS: usize = 2;
-/// Requests one instance handles at once, `/healthz` included. Beyond this
-/// the accept loop answers `429` itself, before reading a body or starting a
-/// thread, so open connections can't pile up threads and buffers.
-pub const MAX_OPEN_REQUESTS: usize = 8;
+/// Connections one instance holds at once, `/healthz` included. Beyond this a
+/// new connection is closed unanswered, since answering means reading it.
+pub const MAX_OPEN_CONNECTIONS: usize = 8;
+/// How long a client may take to send its request headers.
+pub const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a client may take to send its request body.
+pub const BODY_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest one connection lives: the longest run plus its download.
+/// Cloud Run ends requests at 300 s anyway.
+pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(320);
 
 pub struct Config {
     /// `ENGINE_HMAC_SECRET`, shared with the v2 API.
@@ -38,80 +55,102 @@ pub struct Config {
     pub github: Github,
 }
 
-/// Answers requests until the server stops.
-pub fn serve(server: tiny_http::Server, config: Config) {
-    let config = Arc::new(config);
-    let in_flight = Arc::new(AtomicUsize::new(0));
-    let open = Arc::new(AtomicUsize::new(0));
-    for request in server.incoming_requests() {
-        let started = Instant::now();
-        let slot = match Slot::take(&open, MAX_OPEN_REQUESTS, "requests") {
-            Ok(slot) => slot,
+struct State {
+    config: Config,
+    runs: Arc<Semaphore>,
+}
+
+/// Answers requests on `listener` until the process ends.
+pub fn serve(listener: TcpListener, config: Config) -> std::io::Result<()> {
+    listener.set_nonblocking(true)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let listener = {
+        let _context = runtime.enter();
+        tokio::net::TcpListener::from_std(listener)?
+    };
+    let state = Arc::new(State {
+        config,
+        runs: Arc::new(Semaphore::new(MAX_CONCURRENT_RUNS)),
+    });
+    runtime.block_on(accept(listener, state));
+    Ok(())
+}
+
+async fn accept(listener: tokio::net::TcpListener, state: Arc<State>) {
+    let connections = Arc::new(Semaphore::new(MAX_OPEN_CONNECTIONS));
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
             Err(error) => {
-                respond(request, started, Err(error));
+                eprintln!("accepting a connection failed: {error}");
                 continue;
             }
         };
-        let config = config.clone();
-        let in_flight = in_flight.clone();
-        std::thread::spawn(move || {
-            let _slot = slot;
-            handle(request, &config, &in_flight, started);
+        let Ok(permit) = connections.clone().try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
+        let state = state.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let service = service_fn(move |request| {
+                let state = state.clone();
+                async move { Ok::<_, Infallible>(handle(request, state).await) }
+            });
+            let connection = http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HEADER_TIMEOUT)
+                .keep_alive(false)
+                .serve_connection(TokioIo::new(stream), service);
+            match tokio::time::timeout(CONNECTION_TIMEOUT, connection).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("a connection failed: {error}"),
+                Err(_) => eprintln!("closed a connection after {CONNECTION_TIMEOUT:?}"),
+            }
         });
     }
 }
 
-fn handle(
-    mut request: tiny_http::Request,
-    config: &Config,
-    in_flight: &Arc<AtomicUsize>,
-    started: Instant,
-) {
-    let answer = match (request.method(), request.url()) {
-        (tiny_http::Method::Get, "/healthz") => serde_json::to_vec(&EngineInfo::current())
-            .map(|body| (200, body))
-            .map_err(|error| EngineError::new(ErrorCode::Internal, error.to_string())),
-        (tiny_http::Method::Post, "/v1/run") => run(&mut request, config, in_flight, started)
-            .and_then(|response| {
-                serde_json::to_vec(&response)
-                    .map(|body| (200, body))
-                    .map_err(|error| EngineError::new(ErrorCode::Internal, error.to_string()))
-            }),
+async fn handle(request: Request<Incoming>, state: Arc<State>) -> Response<Full<Bytes>> {
+    let started = Instant::now();
+    // Requests carry a token, so log only the route.
+    let route = format!("{} {}", request.method(), request.uri().path());
+    let answer = match (request.method(), request.uri().path()) {
+        (&Method::GET, "/healthz") => json(&EngineInfo::current()),
+        (&Method::POST, "/v1/run") => match run(request, state, started).await {
+            Ok(response) => json(&response),
+            Err(error) => Err(error),
+        },
         _ => Err(EngineError::new(ErrorCode::NotFound, "no such route")),
     };
-    respond(request, started, answer);
-}
-
-fn respond(
-    request: tiny_http::Request,
-    started: Instant,
-    answer: Result<(u16, Vec<u8>), EngineError>,
-) {
-    let route = format!("{} {}", request.method(), request.url());
     let (status, body) = answer.unwrap_or_else(|error| {
         (
             error.error.code.status(),
             serde_json::to_vec(&error).unwrap_or_default(),
         )
     });
-    // Cloud Run collects stderr. Requests carry a token, so log only the route.
-    eprintln!(
-        "{route} {status} {} ms",
-        started.elapsed().as_millis()
+    eprintln!("{route} {status} {} ms", started.elapsed().as_millis());
+    let mut response = Response::new(Full::new(Bytes::from(body)));
+    *response.status_mut() =
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
     );
-    let mut response = tiny_http::Response::from_data(body).with_status_code(status);
-    if let Ok(content_type) = tiny_http::Header::from_bytes("Content-Type", "application/json") {
-        response.add_header(content_type);
-    }
-    if let Err(error) = request.respond(response) {
-        eprintln!("{route}: answering failed: {error}");
-    }
+    response
 }
 
-fn run(
-    request: &mut tiny_http::Request,
-    config: &Config,
-    in_flight: &Arc<AtomicUsize>,
+fn json(value: &impl Serialize) -> Result<(u16, Vec<u8>), EngineError> {
+    serde_json::to_vec(value)
+        .map(|body| (200, body))
+        .map_err(|error| EngineError::new(ErrorCode::Internal, error.to_string()))
+}
+
+async fn run(
+    request: Request<Incoming>,
+    state: Arc<State>,
     started: Instant,
 ) -> Result<RunResponse, EngineError> {
     let unauthorized = || {
@@ -131,32 +170,72 @@ fn run(
     let now = unix_now();
     let signature = request
         .headers()
-        .iter()
-        .find(|header| header.field.equiv("X-Fanta-Internal"))
-        .and_then(|header| parse_signature(header.value.as_str()))
+        .get("x-fanta-internal")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_signature)
         .filter(|(timestamp, _)| now.abs_diff(*timestamp) <= MAX_CLOCK_SKEW_SECONDS)
         .ok_or_else(unauthorized)?;
     if request
-        .body_length()
-        .is_some_and(|length| length as u64 > MAX_BODY_BYTES)
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > MAX_BODY_BYTES as u64)
     {
         return Err(too_large());
     }
-    let mut body = Vec::new();
-    request
-        .as_reader()
-        .take(MAX_BODY_BYTES + 1)
-        .read_to_end(&mut body)
-        .map_err(|error| EngineError::new(ErrorCode::BadRequest, error.to_string()))?;
-    if body.len() as u64 > MAX_BODY_BYTES {
-        return Err(too_large());
-    }
-    if !signature_matches(&config.secret, &signature, &body) {
+    let body = Limited::new(request.into_body(), MAX_BODY_BYTES).collect();
+    let body = match tokio::time::timeout(BODY_TIMEOUT, body).await {
+        Err(_) => {
+            return Err(EngineError::new(
+                ErrorCode::BadRequest,
+                format!("the request body took over {BODY_TIMEOUT:?}"),
+            ));
+        }
+        Ok(Err(error)) if error.downcast_ref::<LengthLimitError>().is_some() => {
+            return Err(too_large());
+        }
+        Ok(Err(error)) => {
+            return Err(EngineError::new(ErrorCode::BadRequest, error.to_string()));
+        }
+        Ok(Ok(collected)) => collected.to_bytes(),
+    };
+    if !signature_matches(&state.config.secret, &signature, &body) {
         return Err(unauthorized());
     }
-    let mut run_request: RunRequest = serde_json::from_slice(&body)
+    let run_request: RunRequest = serde_json::from_slice(&body)
         .map_err(|error| EngineError::new(ErrorCode::BadRequest, error.to_string()))?;
     crate::validate(&run_request)?;
+    if !matches!(run_request.source, Source::Github { .. }) {
+        return Err(EngineError::new(
+            ErrorCode::BadRequest,
+            "dir sources are for `fanta-engine run` only",
+        ));
+    }
+    let permit = state.runs.clone().try_acquire_owned().map_err(|_| {
+        EngineError::new(
+            ErrorCode::Busy,
+            format!("the instance is already running {MAX_CONCURRENT_RUNS} requests"),
+        )
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        fetch_and_run(&state.config, run_request, started)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(EngineError::new(
+            ErrorCode::Internal,
+            format!("the run's thread failed: {error}"),
+        ))
+    })
+}
+
+fn fetch_and_run(
+    config: &Config,
+    mut run_request: RunRequest,
+    started: Instant,
+) -> Result<RunResponse, EngineError> {
     let Source::Github {
         repo,
         sha,
@@ -170,7 +249,6 @@ fn run(
             "dir sources are for `fanta-engine run` only",
         ));
     };
-    let _slot = Slot::take(in_flight, MAX_CONCURRENT_RUNS, "runs")?;
     let work = tempfile::tempdir()
         .map_err(|error| EngineError::new(ErrorCode::Internal, error.to_string()))?;
     let project = work.path().join("project");
@@ -182,7 +260,9 @@ fn run(
     }
     let sha = sha.clone();
     let deadline = Duration::from_millis(run_request.deadline_ms);
-    let Some(remaining) = deadline.checked_sub(started.elapsed()).filter(|left| !left.is_zero())
+    let Some(remaining) = deadline
+        .checked_sub(started.elapsed())
+        .filter(|left| !left.is_zero())
     else {
         return Err(EngineError::new(
             ErrorCode::DeadlineExceeded,
@@ -205,28 +285,6 @@ pub fn run_isolated(request: &RunRequest, project: &Path) -> Result<RunResponse,
             ))
         },
     )
-}
-
-/// Holds one of `limit` places in a counter until dropped.
-struct Slot(Arc<AtomicUsize>);
-
-impl Slot {
-    fn take(counter: &Arc<AtomicUsize>, limit: usize, what: &str) -> Result<Self, EngineError> {
-        if counter.fetch_add(1, Ordering::SeqCst) >= limit {
-            counter.fetch_sub(1, Ordering::SeqCst);
-            return Err(EngineError::new(
-                ErrorCode::Busy,
-                format!("the instance is already handling {limit} {what}"),
-            ));
-        }
-        Ok(Self(counter.clone()))
-    }
-}
-
-impl Drop for Slot {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
 }
 
 /// Checks `t=<unix seconds>,v1=<hex>`, where `v1` is
@@ -271,6 +329,7 @@ mod tests {
     use super::*;
     use crate::source::tests::{Entry, tarball};
     use serde_json::json;
+    use std::io::{Read as _, Write as _};
 
     const SECRET: &[u8] = b"engine-test-secret";
 
@@ -348,12 +407,28 @@ mod tests {
         files
     }
 
-    fn post(address: &str, body: &[u8], signature: Option<String>) -> (u16, serde_json::Value) {
+    /// Starts an engine on a free port and returns `host:port`.
+    fn engine(github: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("engine port");
+        let host = listener.local_addr().expect("address").to_string();
+        std::thread::spawn(move || {
+            serve(
+                listener,
+                Config {
+                    secret: SECRET.to_vec(),
+                    github: Github::new(github),
+                },
+            )
+        });
+        host
+    }
+
+    fn post(host: &str, body: &[u8], signature: Option<String>) -> (u16, serde_json::Value) {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .build()
             .into();
-        let mut request = agent.post(format!("{address}/v1/run"));
+        let mut request = agent.post(format!("http://{host}/v1/run"));
         if let Some(signature) = signature {
             request = request.header("X-Fanta-Internal", signature);
         }
@@ -363,24 +438,24 @@ mod tests {
         (status, serde_json::from_str(&text).expect("json body"))
     }
 
+    /// Sends raw request headers and returns the first bytes of the answer,
+    /// or what reading them failed with.
+    fn raw(host: &str, headers: &str) -> Result<String, std::io::Error> {
+        let mut stream = std::net::TcpStream::connect(host)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.write_all(headers.as_bytes())?;
+        let mut answer = [0u8; 12];
+        let read = stream.read(&mut answer)?;
+        Ok(String::from_utf8_lossy(&answer[..read]).into_owned())
+    }
+
     #[test]
     fn a_signed_github_run_reads_the_commit_and_answers_its_steps() {
         let sha = "0123456789abcdef0123456789abcdef01234567";
         let project = tempfile::tempdir().expect("project");
         fanta_format::write_project_tree(project.path(), &fanta_doc::Doc::new(), &Default::default())
             .expect("write project");
-        let github = fake_github(project.path(), sha);
-        let server = tiny_http::Server::http("127.0.0.1:0").expect("engine");
-        let address = format!("http://{}", server.server_addr());
-        std::thread::spawn(move || {
-            serve(
-                server,
-                Config {
-                    secret: SECRET.to_vec(),
-                    github: Github::new(github),
-                },
-            )
-        });
+        let host = engine(fake_github(project.path(), sha));
         let request = |token: &str, path: &str| {
             serde_json::to_vec(&json!({
                 "request_id": "r1",
@@ -394,22 +469,22 @@ mod tests {
         };
 
         let body = request("ghs_test", "design");
-        let (status, response) = post(&address, &body, Some(sign(&body, unix_now())));
+        let (status, response) = post(&host, &body, Some(sign(&body, unix_now())));
         assert_eq!(status, 200, "{response}");
         assert_eq!(response["source"]["sha"], sha);
         assert_eq!(response["results"][0]["ok"], true, "{response}");
 
-        let (status, response) = post(&address, &body, None);
+        let (status, response) = post(&host, &body, None);
         assert_eq!((status, &response["error"]["code"]), (401, &json!("unauthorized")));
-        let (status, _) = post(&address, &body, Some(sign(&body, unix_now() - 600)));
+        let (status, _) = post(&host, &body, Some(sign(&body, unix_now() - 600)));
         assert_eq!(status, 401);
 
         let denied = request("ghs_other", "design");
-        let (status, response) = post(&address, &denied, Some(sign(&denied, unix_now())));
+        let (status, response) = post(&host, &denied, Some(sign(&denied, unix_now())));
         assert_eq!((status, &response["error"]["code"]), (403, &json!("forbidden")));
 
         let missing = request("ghs_test", "elsewhere");
-        let (status, response) = post(&address, &missing, Some(sign(&missing, unix_now())));
+        let (status, response) = post(&host, &missing, Some(sign(&missing, unix_now())));
         assert_eq!((status, &response["error"]["code"]), (404, &json!("not_found")));
 
         let local = serde_json::to_vec(&json!({
@@ -418,37 +493,47 @@ mod tests {
             "steps": [{"step": "inspect"}]
         }))
         .expect("request");
-        let (status, response) = post(&address, &local, Some(sign(&local, unix_now())));
+        let (status, response) = post(&host, &local, Some(sign(&local, unix_now())));
         assert_eq!((status, &response["error"]["code"]), (400, &json!("bad_request")));
-
-        // An unsigned request is refused before its body is read: this one
-        // promises a megabyte and never sends it.
-        use std::io::{Read as _, Write as _};
-        let host = address.trim_start_matches("http://");
-        let mut stream = std::net::TcpStream::connect(host).expect("connect");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("timeout");
-        write!(
-            stream,
-            "POST /v1/run HTTP/1.1\r\nHost: {host}\r\nContent-Length: 1000000\r\n\r\n"
-        )
-        .expect("headers");
-        let mut answer = [0u8; 12];
-        stream.read_exact(&mut answer).expect("an answer before the body");
-        assert_eq!(&answer, b"HTTP/1.1 401");
     }
 
     #[test]
-    fn requests_beyond_a_limit_are_busy() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let first = Slot::take(&counter, 2, "runs").expect("first slot");
-        let _second = Slot::take(&counter, 2, "runs").expect("second slot");
-        assert_eq!(
-            Slot::take(&counter, 2, "runs").err().map(|error| error.error.code),
-            Some(ErrorCode::Busy)
+    fn requests_that_cant_be_ours_cost_no_body() {
+        let host = engine("http://127.0.0.1:9".into());
+        // Unsigned, promising a megabyte that never comes: refused at once.
+        let unsigned = format!("POST /v1/run HTTP/1.1\r\nHost: {host}\r\nContent-Length: 1000000\r\n\r\n");
+        assert_eq!(raw(&host, &unsigned).expect("an answer"), "HTTP/1.1 401");
+        // A well-formed, fresh header with a terabyte declared: refused before
+        // anything is read or reserved.
+        let huge = format!(
+            "POST /v1/run HTTP/1.1\r\nHost: {host}\r\nX-Fanta-Internal: t={},v1=00\r\nContent-Length: 1000000000000\r\n\r\n",
+            unix_now()
         );
-        drop(first);
-        Slot::take(&counter, 2, "runs").expect("a freed slot");
+        assert_eq!(raw(&host, &huge).expect("an answer"), "HTTP/1.1 413");
+        let healthz = format!("GET /healthz HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        assert_eq!(raw(&host, &healthz).expect("still alive"), "HTTP/1.1 200");
+    }
+
+    #[test]
+    fn connections_beyond_the_limit_are_closed_unanswered() {
+        let host = engine("http://127.0.0.1:9".into());
+        // Idle connections that never send headers hold every slot until the
+        // header timeout.
+        let idle: Vec<_> = (0..MAX_OPEN_CONNECTIONS)
+            .map(|_| std::net::TcpStream::connect(&host).expect("idle connection"))
+            .collect();
+        std::thread::sleep(Duration::from_millis(200));
+        let healthz = format!("GET /healthz HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        match raw(&host, &healthz) {
+            Ok(answer) => assert_eq!(answer, "", "an extra connection must be closed unanswered"),
+            Err(error) => assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                ),
+                "{error}"
+            ),
+        }
+        drop(idle);
     }
 }

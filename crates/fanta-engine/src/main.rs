@@ -78,16 +78,16 @@ fn main() -> Result<()> {
             let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
             let github = std::env::var("FANTA_ENGINE_GITHUB_API")
                 .unwrap_or_else(|_| "https://api.github.com".into());
-            let server = tiny_http::Server::http(format!("0.0.0.0:{port}"))
-                .map_err(|error| anyhow::anyhow!("listening on port {port}: {error}"))?;
+            let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+                .with_context(|| format!("listening on port {port}"))?;
             eprintln!("fanta-engine listening on port {port}");
             fanta_engine::server::serve(
-                server,
+                listener,
                 fanta_engine::server::Config {
                     secret: secret.into_bytes(),
                     github: fanta_engine::source::Github::new(github),
                 },
-            );
+            )?;
         }
     }
     Ok(())

@@ -4452,6 +4452,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bytes 1.11.1",
  "clap",
  "fanta-api",
  "fanta-design-ops",
@@ -4461,12 +4462,16 @@ dependencies = [
  "flate2",
  "hex",
  "hmac",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde",
  "serde_json",
  "sha2",
  "tar",
  "tempfile",
  "tiny_http",
+ "tokio",
  "ureq",
 ]
 
@@ -7017,6 +7022,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "pin-utils",
