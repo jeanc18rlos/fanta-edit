@@ -40,6 +40,14 @@ pub const MAX_CLOCK_SKEW_SECONDS: u64 = 300;
 pub const MAX_CONCURRENT_RUNS: usize = 2;
 /// Connections one instance holds at once, `/healthz` included. Beyond this a
 /// new connection is closed unanswered, since answering means reading it.
+///
+/// A caller with a well-formed, fresh but forged signature header can hold
+/// a connection until the body timeout, because the HMAC covers the body.
+/// That is acceptable only because Cloud Run admits nobody but v2's service
+/// account (`--no-allow-unauthenticated`, `roles/run.invoker`) and routes at
+/// most 2 requests to an instance. Before exposing the engine any other way,
+/// sign the timestamp and `Content-Length` in the header as well, which is a
+/// contract change made together with the backend.
 pub const MAX_OPEN_CONNECTIONS: usize = 8;
 /// How long a client may take to send its request headers.
 pub const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
