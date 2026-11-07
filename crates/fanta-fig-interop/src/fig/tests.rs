@@ -96,6 +96,16 @@ pub(super) fn figma_like_doc() -> FigDocument {
 }
 
 #[test]
+fn capped_reads_refuse_one_byte_past_the_limit() {
+    let bytes = [1u8, 2, 3];
+    assert_eq!(
+        read_at_most(&bytes[..], 3).expect("read"),
+        Some(vec![1, 2, 3])
+    );
+    assert_eq!(read_at_most(&bytes[..], 2).expect("read"), None);
+}
+
+#[test]
 fn write_then_read_round_trips_the_container() {
     let doc = figma_like_doc();
     let bytes = write_fig(&doc).unwrap();

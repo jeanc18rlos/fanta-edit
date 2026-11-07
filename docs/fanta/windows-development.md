@@ -4,8 +4,8 @@ The repository builds, runs and tests on Windows, and a release ships a Windows
 installer next to the Mac DMG. The `Windows` workflow
 ([`.github/workflows/windows.yml`](../../.github/workflows/windows.yml)) keeps it
 that way: on every pull request that touches code it checks the app, the
-command-line tool and the update helper, and runs the tests of the update helper,
-the canvas, the renderer and the design engine crates on `windows-2025`.
+command-line tool and the update helper, and runs the tests of the updater, its
+helper, the canvas, the renderer and the design engine crates on `windows-2025`.
 
 ## What is different from a Mac
 

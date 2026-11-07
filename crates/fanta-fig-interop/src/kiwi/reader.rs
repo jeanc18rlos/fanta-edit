@@ -31,6 +31,12 @@ impl<'a> ByteReader<'a> {
         self.index >= self.data.len()
     }
 
+    /// Bytes left to read. Counts read from the stream are checked against it
+    /// before they size an allocation.
+    pub fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.index)
+    }
+
     pub fn read_byte(&mut self) -> FigResult<u8> {
         let b = *self.data.get(self.index).ok_or(FigError::Truncated)?;
         self.index += 1;

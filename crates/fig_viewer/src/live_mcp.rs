@@ -449,9 +449,10 @@ fn non_destructive_write() -> ToolAnnotations {
 }
 
 /// Import a generated image into the active project's Assets panel and persist
-/// its bytes under assets/images/. Supply exactly one of path (local file,
-/// relative to the project or absolute), url (HTTP/HTTPS), or source (base64 or
-/// a base64 data URI). Returns the asset id and saved path for FNX file edits.
+/// its bytes under assets/images/. Supply exactly one of path (a file inside the
+/// project folder, relative to it or absolute; copy other files in first), url
+/// (HTTPS on a public host, without redirects), or source (base64 or a base64
+/// data URI). Returns the asset id and saved path for FNX file edits.
 /// Use this after image generation, including images made by another MCP
 /// server. Importing an asset does not place a new layer on the canvas.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -468,6 +469,14 @@ struct ImportImageArgs {
 
 #[derive(Clone)]
 struct ImportImageTool;
+
+/// Whether `host`, a domain name, can name a server on the public internet:
+/// it has a dot and is not `localhost`, nor under `.localhost` or `.local`
+/// (mDNS names on the user's own network).
+fn is_public_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host.contains('.') && !host.ends_with(".localhost") && !host.ends_with(".local")
+}
 
 impl McpServerTool for ImportImageTool {
     type Input = ImportImageArgs;
@@ -497,20 +506,23 @@ impl McpServerTool for ImportImageTool {
         let initial_state = with_surface(cx, |surface, cx| surface.state(cx))?;
         let document_id = initial_state.get("document_id").cloned();
         let bytes = if let Some(path) = input.path {
-            let path = PathBuf::from(path);
-            let path = if path.is_absolute() {
-                path
-            } else {
-                let root = initial_state
-                    .get("project_root")
-                    .and_then(serde_json::Value::as_str)
-                    .context(
-                        "relative image paths require a saved project; use an absolute path",
-                    )?;
-                Path::new(root).join(path)
-            };
+            let root = initial_state
+                .get("project_root")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from)
+                .context("importing an image from a path requires a saved project")?;
+            let path = root.join(path);
             cx.background_spawn(async move {
                 use std::io::Read as _;
+                // Only files inside the project, as the built-in import allows
+                // without asking: other files may be private, and the project
+                // is usually pushed to git.
+                let path = path
+                    .canonicalize()
+                    .with_context(|| format!("opening image {}", path.display()))?;
+                if !path.starts_with(root.canonicalize()?) {
+                    bail!("the image must be inside the project folder; copy it there first");
+                }
                 let file = std::fs::File::open(&path)
                     .with_context(|| format!("opening image {}", path.display()))?;
                 if !file.metadata()?.is_file() {
@@ -527,14 +539,19 @@ impl McpServerTool for ImportImageTool {
             .await?
         } else if let Some(url) = input.url {
             let parsed = url::Url::parse(&url).context("the image URL is invalid")?;
-            if !matches!(parsed.scheme(), "http" | "https") {
-                bail!("the image URL must use HTTP or HTTPS");
+            if parsed.scheme() != "https" {
+                bail!("the image URL must use HTTPS");
+            }
+            // The app fetches for the agent, so keep the request off the user's
+            // own machine and network; a redirect could lead back onto it.
+            if !matches!(parsed.host(), Some(url::Host::Domain(host)) if is_public_host(host)) {
+                bail!("the image URL must name a public host, not an IP address or a local name");
             }
             let client = cx.update(|cx| client::Client::global(cx).http_client());
             let executor = cx.background_executor().clone();
             cx.background_spawn(async move {
                 let download = async {
-                    let response = client.get(&url, http_client::AsyncBody::empty(), true).await?;
+                    let response = client.get(&url, http_client::AsyncBody::empty(), false).await?;
                     if !response.status().is_success() { bail!("the image download failed: {}", response.status()); }
                     let mut bytes = Vec::new();
                     response.into_body().take(crate::document::MAX_IMAGE_SOURCE_BYTES as u64 + 1).read_to_end(&mut bytes).await?;
@@ -1333,6 +1350,16 @@ mod tests {
                 description.len() >= 20,
                 "`{name}` needs a doc comment on its input type describing the tool"
             );
+        }
+    }
+
+    #[test]
+    fn image_urls_must_name_a_public_host() {
+        for host in ["images.example.com", "cdn.example.co.uk."] {
+            assert!(is_public_host(host), "{host}");
+        }
+        for host in ["localhost", "app.localhost", "printer.local", "router"] {
+            assert!(!is_public_host(host), "{host}");
         }
     }
 

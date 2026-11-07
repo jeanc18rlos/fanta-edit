@@ -68,6 +68,15 @@ jobs:
         shell: pwsh
         run: .\script\bundle-windows.ps1 -Architecture x86_64
 
+      # The signer installs in its own step, so no package's install code sees
+      # the key, and its packages are pinned, so a new release of one cannot.
+      - name: Install the update signer
+        if: env.FANTA_SIGN_UPDATE == 'true'
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/update-signing"
+          "$RUNNER_TEMP/update-signing/Scripts/python" -m pip install --quiet cryptography==50.0.2 cffi==2.1.1 pycparser==3.12
+
       # Installed copies update themselves only with installers this key signed
       # (crates/auto_update/src/verify.rs). The signature ships next to the installer.
       - name: Sign the installer for in-place updates
@@ -81,8 +90,6 @@ jobs:
             exit 0
           fi
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
-          python -m venv "$RUNNER_TEMP/update-signing"
-          "$RUNNER_TEMP/update-signing/Scripts/python" -m pip install --quiet 'cryptography>=42'
           "$RUNNER_TEMP/update-signing/Scripts/python" script/update_signing.py sign \
             --asset Fanta-x86_64.exe --version "$version" \
             --file target/Fanta-x86_64.exe \

@@ -6,3 +6,4 @@ FNX is the design-as-source text format. The in-memory `FnxElement` tree is alwa
 - Print sugar only when it is strictly lossless: print → parse → print must be a fixpoint, with no float tolerance. A sugared spelling must never reach sidecar fingerprints, reconciliation or the document projection.
 - `width`/`height` sugar folds into `clip_size` for frames and `local_size` for other nodes. It never folds on `Vector` (whose `local_size` is the SVG viewport clip, so folding would crop instead of resize), and page roots stay unsized.
 - Output must not depend on map iteration order: stage `source-order` runs this crate with `serde_json/preserve_order` enabled.
+- The parser (`parse.rs`) and the source scanner (`source.rs`) read the same text. They share `skip_whitespace`, `root_start` and `MAX_DEPTH` from `parse.rs`; a rule only one of them follows lets a page validate and then fail to open.

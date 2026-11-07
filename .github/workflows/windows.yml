@@ -58,9 +58,9 @@ jobs:
       - name: Check the app, command-line tool and update helper
         run: cargo check --locked --keep-going -p fanta -p cli -p auto_update_helper
 
-      - name: Test the update helper
+      - name: Test the updater and its helper
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p auto_update_helper
+        run: cargo test --locked -p auto_update -p auto_update_helper
 
       - name: Test the design engine crates
         if: ${{ !cancelled() }}

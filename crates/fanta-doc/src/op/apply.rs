@@ -293,7 +293,13 @@ impl Operation {
                 old,
                 new,
                 ..
-            } => set_instance_override(ctx.scene, *id, *index, dir.pick(old, new).clone()),
+            } => set_instance_override(
+                ctx.scene,
+                *id,
+                *index,
+                dir.pick(old, new).clone(),
+                dir.pick(new, old).is_some(),
+            ),
             Self::SwapInstance { id, old, new, .. } => {
                 set_instance_component(ctx.scene, *id, *dir.pick(old, new))
             }
@@ -756,20 +762,20 @@ fn with_instance<R>(
     })
 }
 
+/// Write `value` into slot `index`. `occupied` says whether the slot held an
+/// override before this write: writing into an empty slot inserts, because
+/// removing an override shifted the later ones down, and undoing that removal
+/// must shift them back rather than overwrite one.
 fn set_instance_override(
     scene: &mut Scene,
     id: NodeId,
     index: usize,
     value: Option<Override>,
+    occupied: bool,
 ) -> Result<(), SceneError> {
     with_instance(scene, id, |inst| match value {
-        Some(ov) => {
-            if index < inst.overrides.len() {
-                inst.overrides[index] = ov;
-            } else {
-                inst.overrides.push(ov);
-            }
-        }
+        Some(ov) if occupied && index < inst.overrides.len() => inst.overrides[index] = ov,
+        Some(ov) => inst.overrides.insert(index.min(inst.overrides.len()), ov),
         None => {
             if index < inst.overrides.len() {
                 inst.overrides.remove(index);

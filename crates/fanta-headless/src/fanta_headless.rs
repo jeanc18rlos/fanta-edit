@@ -303,7 +303,13 @@ impl HeadlessProject {
             "rules": rules,
             "rules_error": rules_error,
             "motion": motion,
-            "flows": doc.flows,
+            // Every id an agent sends back uses the prefixed form; serde would
+            // write the bare ULID files store.
+            "flows": doc
+                .flows
+                .iter()
+                .map(|flow| json!({ "name": flow.name, "start": flow.start.to_string() }))
+                .collect::<Vec<_>>(),
             "fonts": self.font_families(),
         }))
     }
@@ -331,6 +337,12 @@ impl HeadlessProject {
             }
         }
         families
+    }
+
+    /// The font families the project names that this machine cannot render,
+    /// each with the family renders use instead.
+    pub fn missing_fonts(&self) -> Vec<(String, Option<String>)> {
+        fanta_render::missing_font_families(self.font_families().iter().map(String::as_str))
     }
 
     /// The root node of `page`.
@@ -603,6 +615,21 @@ impl HeadlessProject {
         };
         Some(self.root.join(&metadata.design_dir).join(file_name))
     }
+}
+
+/// Whether [`HeadlessProject::open`] failed because a newer Fanta saved the
+/// project.
+pub fn saved_by_newer_fanta(error: &anyhow::Error) -> bool {
+    use fanta_format::{FormatError, SessionError};
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<SessionError>(),
+            Some(SessionError::Format(FormatError::UnsupportedSchema { .. }))
+        ) || matches!(
+            cause.downcast_ref::<FormatError>(),
+            Some(FormatError::UnsupportedSchema { .. })
+        )
+    })
 }
 
 /// Compare the files under `work_dir` with the hashes they had when the
@@ -1136,7 +1163,26 @@ mod tests {
             }),
             "{changed:?}"
         );
-        let reopened = HeadlessProject::open(project.root()).expect("reopen");
+        let mut reopened = HeadlessProject::open(project.root()).expect("reopen");
+        assert!(reopened.doc().scene.get(image).is_some());
+
+        // An edit that adds no image takes the fast save, which must account
+        // for the image already on disk.
+        let result = reopened
+            .apply(
+                None,
+                "Rotate",
+                &design_ops(json!([
+                    {"op": "rotate", "id": fixture.card.to_string(), "degrees": 45},
+                ])),
+                true,
+            )
+            .expect("apply");
+        assert_eq!(result["applied"], json!(true), "{result}");
+        reopened
+            .save()
+            .expect("a project with an image saves a later edit");
+        let reopened = HeadlessProject::open(project.root()).expect("reopen again");
         assert!(reopened.doc().scene.get(image).is_some());
     }
 

@@ -4,12 +4,13 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context as _, Result};
 use fanta_doc::{AssetId, Doc, NodeId};
 use fanta_format::{ArtifactId, ProjectWriteCache, WorkspaceSession, WriteReport};
+use sha2::{Digest as _, Sha256};
 
 /// Write `doc` over the project at `root`, which `session` indexes and
 /// `baseline` was last read or saved as. An edit confined to known artifacts
@@ -29,16 +30,18 @@ pub fn save_project(
     changed_artifacts: &BTreeSet<ArtifactId>,
     cache: &mut ProjectWriteCache,
 ) -> Result<WriteReport> {
-    if !assets_changed
-        && let Some(report) = session.try_save_document_artifacts(
+    if !assets_changed {
+        let mut asset_preconditions = BTreeMap::new();
+        add_asset_write_preconditions(root, &mut asset_preconditions, raw_assets, raw_assets)?;
+        if let Some(report) = session.try_save_document_artifacts(
             doc,
             baseline,
             changed_artifacts,
-            &BTreeMap::new(),
-        )?
-    {
-        *cache = ProjectWriteCache::default();
-        return Ok(report);
+            &asset_preconditions,
+        )? {
+            *cache = ProjectWriteCache::default();
+            return Ok(report);
+        }
     }
     for id in changed_artifacts {
         let Some(indexed_hash) = session.file_index.get(id).copied() else {
@@ -87,6 +90,76 @@ pub fn save_project(
         session.reconcile_disk_snapshot()?;
     }
     Ok(report)
+}
+
+/// Add the project's asset files to `expected_disk`: each file on disk must
+/// still hold the bytes `previous_assets` saved, and each asset in
+/// `current_assets` may be written. The fast artifact save treats any file it
+/// was not told about as stale and refuses, so every host passes these.
+pub fn add_asset_write_preconditions(
+    project_root: &Path,
+    expected_disk: &mut BTreeMap<PathBuf, Option<[u8; 32]>>,
+    previous_assets: &BTreeMap<AssetId, Vec<u8>>,
+    current_assets: &BTreeMap<AssetId, Vec<u8>>,
+) -> Result<()> {
+    let media = fanta_format::MediaRegistry::default();
+    let asset_path = |id: &AssetId, bytes: &[u8]| {
+        let (family, extension) = media
+            .sniff(bytes)
+            .map(|format| (format.family, format.extension))
+            .unwrap_or(("other", "bin"));
+        PathBuf::from("assets")
+            .join(family)
+            .join(format!("{id}.{extension}"))
+    };
+    let mut found = BTreeSet::new();
+    // Git does not track empty directories, so a cloned project without
+    // images has no `assets/` directory at all.
+    let families = match std::fs::read_dir(project_root.join("assets")) {
+        Ok(families) => Some(families),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    for family in families.into_iter().flatten() {
+        let family = family?;
+        if !family.file_type()?.is_dir() {
+            continue;
+        }
+        for file in std::fs::read_dir(family.path())? {
+            let file = file?;
+            let path = file.path();
+            let Some(id) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<AssetId>().ok())
+            else {
+                continue;
+            };
+            anyhow::ensure!(
+                file.file_type()?.is_file(),
+                "asset {} is not a regular file",
+                path.display()
+            );
+            let expected = previous_assets
+                .get(&id)
+                .with_context(|| format!("asset {id} appeared since the last saved snapshot"))?;
+            anyhow::ensure!(found.insert(id), "asset {id} has duplicate files");
+            expected_disk.insert(
+                PathBuf::from("assets")
+                    .join(family.file_name())
+                    .join(file.file_name()),
+                Some(Sha256::digest(expected).into()),
+            );
+        }
+    }
+    anyhow::ensure!(
+        found.len() == previous_assets.len(),
+        "an asset disappeared since the last saved snapshot"
+    );
+    for (id, bytes) in current_assets {
+        expected_disk.entry(asset_path(id, bytes)).or_insert(None);
+    }
+    Ok(())
 }
 
 pub fn all_artifact_ids(document: &Doc) -> BTreeSet<ArtifactId> {

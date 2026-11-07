@@ -31,7 +31,8 @@ use fanta_headless::pages::{default_page_root, visible_page_roots};
 use fanta_headless::render::{decode_embedded_image, embedded_image_size};
 pub(crate) use fanta_headless::render::{page_bounds, try_page_bounds};
 use fanta_headless::save::{
-    changed_artifact_ids, changed_artifact_ids_from_baseline, extend_artifact_owners,
+    add_asset_write_preconditions, changed_artifact_ids, changed_artifact_ids_from_baseline,
+    extend_artifact_owners,
 };
 
 /// How long to let a burst of external writes (an agent rewriting several
@@ -4079,72 +4080,6 @@ fn write_project_cached_report(
     cache: &mut fanta_format::ProjectWriteCache,
 ) -> Result<fanta_format::WriteReport> {
     write_project_cached_report_with_sources(root, doc, raw_assets, cache, None, None)
-}
-
-fn add_asset_write_preconditions(
-    project_root: &Path,
-    expected_disk: &mut BTreeMap<PathBuf, Option<[u8; 32]>>,
-    previous_assets: &BTreeMap<AssetId, Vec<u8>>,
-    current_assets: &BTreeMap<AssetId, Vec<u8>>,
-) -> Result<()> {
-    let media = fanta_format::MediaRegistry::default();
-    let asset_path = |id: &AssetId, bytes: &[u8]| {
-        let (family, extension) = media
-            .sniff(bytes)
-            .map(|format| (format.family, format.extension))
-            .unwrap_or(("other", "bin"));
-        PathBuf::from("assets")
-            .join(family)
-            .join(format!("{id}.{extension}"))
-    };
-    let mut found = BTreeSet::new();
-    // Git does not track empty directories, so a cloned project without
-    // images has no `assets/` directory at all.
-    let families = match std::fs::read_dir(project_root.join("assets")) {
-        Ok(families) => Some(families),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    for family in families.into_iter().flatten() {
-        let family = family?;
-        if !family.file_type()?.is_dir() {
-            continue;
-        }
-        for file in std::fs::read_dir(family.path())? {
-            let file = file?;
-            let path = file.path();
-            let Some(id) = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .and_then(|stem| stem.parse::<AssetId>().ok())
-            else {
-                continue;
-            };
-            anyhow::ensure!(
-                file.file_type()?.is_file(),
-                "asset {} is not a regular file",
-                path.display()
-            );
-            let expected = previous_assets
-                .get(&id)
-                .with_context(|| format!("asset {id} appeared since the last saved snapshot"))?;
-            anyhow::ensure!(found.insert(id), "asset {id} has duplicate files");
-            expected_disk.insert(
-                PathBuf::from("assets")
-                    .join(family.file_name())
-                    .join(file.file_name()),
-                Some(Sha256::digest(expected).into()),
-            );
-        }
-    }
-    anyhow::ensure!(
-        found.len() == previous_assets.len(),
-        "an asset disappeared since the last saved snapshot"
-    );
-    for (id, bytes) in current_assets {
-        expected_disk.entry(asset_path(id, bytes)).or_insert(None);
-    }
-    Ok(())
 }
 
 fn write_project_cached_report_with_sources(

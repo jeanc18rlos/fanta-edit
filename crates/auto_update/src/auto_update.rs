@@ -303,6 +303,12 @@ fn release_key(cx: &App) -> Option<String> {
     verify::compiled_release_key().map(str::to_owned)
 }
 
+/// Whether this build can update itself: it carries a key to verify updates
+/// with, so it polls for them.
+pub fn can_update(cx: &App) -> bool {
+    release_key(cx).is_some()
+}
+
 pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
     if let Some(message) = option_env!("FANTA_UPDATE_EXPLANATION")
         .map(ToOwned::to_owned)

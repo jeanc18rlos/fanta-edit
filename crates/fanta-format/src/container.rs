@@ -277,7 +277,8 @@ impl FantaFile {
         let mut e = zip
             .by_name(entry_path)
             .map_err(|_| FormatError::AssetNotFound(id))?;
-        let mut buf = Vec::with_capacity(e.size() as usize);
+        // The declared size is not trusted: zip64 sizes are read unchecked.
+        let mut buf = Vec::new();
         e.read_to_end(&mut buf)?;
         validate_hash_named_asset(entry_path, id, &buf)?;
         Ok(buf)
@@ -433,7 +434,7 @@ fn read_optional_binary_entry<R: Read + Seek>(
 ) -> Result<Option<Vec<u8>>> {
     match zip.by_name(name) {
         Ok(mut e) => {
-            let mut bytes = Vec::with_capacity(e.size() as usize);
+            let mut bytes = Vec::new();
             e.read_to_end(&mut bytes)?;
             Ok(Some(bytes))
         }
