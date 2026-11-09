@@ -63,4 +63,5 @@ these rules or when the index below is stale.
 | [0024](0024-move-the-engine-into-its-own-repository.md) | Move the engine into its own repository | proposed | 2026-10-27 |
 | [0025](0025-organize-the-repositories-under-one-github-organization.md) | Organize the repositories under one GitHub organization | proposed | 2026-10-27 |
 | [0026](0026-choose-the-engine-and-sdk-licence.md) | Choose the engine and SDK licence | proposed | 2026-10-27 |
+| [0027](0027-project-designs-onto-plain-web-files.md) | Project designs onto plain web files | proposed | 2026-11-09 |
 <!-- decisions:end -->
