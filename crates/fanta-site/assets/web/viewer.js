@@ -1,11 +1,12 @@
 // Dependency-free viewer for the plain web projection: page navigation and
-// pan/zoom over the per-page SVGs. Generated files: pages.js (the manifest),
-// tokens.css, pages/<slug>.svg.
+// pan/zoom over the per-page SVGs. Each page SVG is fetched and inlined into
+// the document so tokens.css and design.css style it; that is also why the
+// folder must be served rather than opened over file://. Generated files:
+// pages.js (the manifest), tokens.css, design.css, pages/<slug>.svg.
 (function () {
   "use strict";
   var stage = document.getElementById("stage");
   var canvas = document.getElementById("canvas");
-  var image = document.getElementById("page");
   var nav = document.getElementById("pages");
   var zoomLevel = document.getElementById("zoom-level");
   var pages = window.FANTA_PAGES || (typeof FANTA_PAGES !== "undefined" ? FANTA_PAGES : []);
@@ -39,10 +40,19 @@
 
   function show(page) {
     current = page;
-    image.src = "pages/" + page.slug + ".svg";
-    image.alt = page.name;
-    image.width = page.width;
-    image.height = page.height;
+    fetch("pages/" + page.slug + ".svg")
+      .then(function (response) {
+        if (!response.ok) throw new Error(response.status);
+        return response.text();
+      })
+      .then(function (markup) {
+        if (current !== page) return;
+        canvas.innerHTML = markup;
+        fit();
+      })
+      .catch(function () {
+        document.getElementById("notice").hidden = false;
+      });
     var buttons = nav.querySelectorAll("button");
     for (var i = 0; i < buttons.length; i++) {
       if (buttons[i].dataset.slug === page.slug) {

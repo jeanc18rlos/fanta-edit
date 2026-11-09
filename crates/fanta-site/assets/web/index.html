@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{title}}</title>
 <link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="design.css">
 <style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
@@ -35,7 +36,7 @@
   main { flex: 1; position: relative; overflow: hidden; cursor: grab; }
   main.panning { cursor: grabbing; }
   #canvas { position: absolute; transform-origin: 0 0; }
-  #canvas img { display: block; user-select: none; -webkit-user-drag: none; }
+  #canvas svg { display: block; user-select: none; }
   #zoom {
     position: absolute; right: 14px; bottom: 14px; display: flex; gap: 6px;
     background: rgba(28, 28, 28, 0.82); color: #fff; border-radius: 8px;
@@ -59,7 +60,7 @@
   <nav id="pages"></nav>
 </aside>
 <main id="stage">
-  <div id="canvas"><img id="page" alt=""></div>
+  <div id="canvas"></div>
   <div id="zoom">
     <button id="zoom-out" aria-label="Zoom out">−</button>
     <span id="zoom-level">100%</span>
