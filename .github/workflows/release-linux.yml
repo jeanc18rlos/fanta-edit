@@ -230,13 +230,17 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
-    # Shared with the other platforms' release workflows, so only one of them creates the draft.
+    # Each platform's release workflow uses this group, so they add to one draft in turn.
     concurrency:
-      group: draft-release-${{ github.ref }}
+      group: draft-release-${{ github.ref_name }}
       cancel-in-progress: false
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: fanta-linux-x86_64
@@ -247,19 +251,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          prerelease=()
-          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
-            prerelease=(--prerelease)
-          fi
-          if is_draft=$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2> /dev/null); then
-            if [[ "$is_draft" != true ]]; then
-              echo "::error::${GITHUB_REF_NAME} is already published, so its installers stay as they are."
-              exit 1
-            fi
-          else
-            gh release create "$GITHUB_REF_NAME" --draft --verify-tag --generate-notes \
-              --title "Fanta ${GITHUB_REF_NAME}" "${prerelease[@]}"
-          fi
           assets=(release/fanta-linux-x86_64.tar.gz release/SHA256SUMS-linux-x86_64.txt)
           # The .sig is what installed copies check before updating in place.
           if [[ -s release/fanta-linux-x86_64.tar.gz.sig ]]; then
@@ -271,4 +262,4 @@ jobs:
               gh release delete-asset "$GITHUB_REF_NAME" fanta-linux-x86_64.tar.gz.sig --yes
             fi
           fi
-          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          script/upload-draft-release "$GITHUB_REF_NAME" "${assets[@]}"
