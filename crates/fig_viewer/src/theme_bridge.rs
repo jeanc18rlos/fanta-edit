@@ -14,6 +14,11 @@ use theme::theme_settings;
 pub fn init(cx: &mut App) {
     apply(cx);
     cx.observe_global::<SettingsStore>(apply).detach();
+    // A system appearance flip reloads the theme through GlobalTheme without a settings
+    // write (workspace's observe_window_appearance → theme_settings::reload_theme), so
+    // watching SettingsStore alone leaves gpui_component panels in the previous mode. On
+    // Linux the XDG portal answers after startup, which made that flip routine.
+    cx.observe_global::<theme::GlobalTheme>(apply).detach();
 }
 
 fn apply(cx: &mut App) {
@@ -230,5 +235,39 @@ mod tests {
                 assert_success_contrast(&colors, panel_background);
             }
         }
+    }
+
+    #[gpui::test]
+    fn component_theme_follows_a_theme_reload_without_a_settings_write(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            zlog::init_test();
+            assets::Assets.load_test_fonts(cx);
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            gpui_component::init(cx);
+            init(cx);
+        });
+        let seeded_dark = cx.update(|cx| Theme::global(cx).mode.is_dark());
+
+        // A system appearance flip goes through theme_settings::reload_theme, which
+        // writes GlobalTheme directly and never touches SettingsStore.
+        cx.update(|cx| {
+            let mut flipped = (**theme::ActiveTheme::theme(cx)).clone();
+            flipped.appearance = match flipped.appearance {
+                theme::Appearance::Dark => theme::Appearance::Light,
+                theme::Appearance::Light => theme::Appearance::Dark,
+            };
+            theme::GlobalTheme::update_theme(cx, std::sync::Arc::new(flipped));
+        });
+        cx.run_until_parked();
+
+        let reseeded_dark = cx.update(|cx| Theme::global(cx).mode.is_dark());
+        assert_ne!(
+            seeded_dark, reseeded_dark,
+            "gpui_component's theme must reseed when the active theme changes without a settings write"
+        );
     }
 }
