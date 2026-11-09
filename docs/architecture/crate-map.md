@@ -139,7 +139,7 @@ flowchart TD
   crate_fanta_render --> crate_fanta_text
   crate_fanta_runtime --> crate_fanta_bundle
   crate_fanta_runtime --> crate_fanta_present
-  crate_fanta_site --> crate_fanta_format
+  crate_fanta_site --> crate_fanta_headless
   crate_fanta_site --> crate_fanta_runtime
   crate_fanta_text --> crate_fanta_doc
   crate_fanta_tools --> crate_fanta_canvas
@@ -182,10 +182,10 @@ flowchart TD
 | [`fanta-text`](../../crates/fanta-text) | Rendering | Rich text model + Skia paragraph layout + font resolution (bundled faces, metric-compatible substitution, optional Google Fonts fetch). | `fanta-doc` | `fanta-render`, `fanta-runtime`, `fanta-site`, `fig_viewer` |
 | [`fanta-present`](../../crates/fanta-present) | Playback | Prototype-playback runtime: plays imported Figma prototypes (trigger dispatch, actions, transitions) over an immutable Doc via the Skia renderer. | `fanta-canvas`, `fanta-doc`, `fanta-render` | `fanta-runtime`, `fig_viewer` |
 | [`fanta-api`](../../crates/fanta-api) | Application | Fanta's programmatic design API: create or open a design, edit its nodes, follow its changes and export it without the app. | `fanta-canvas`, `fanta-design-ops`, `fanta-doc`, `fanta-format`, `fanta-headless`, `fanta-tools` | `fanta-engine` |
-| [`fanta-headless`](../../crates/fanta-headless) | Application | Fanta's design engine without the app: open, edit, render and save a project directory. | `fanta-canvas`, `fanta-design-ops`, `fanta-doc`, `fanta-format`, `fanta-render` | `fanta-api`, `fanta-engine`, `fig_viewer` |
+| [`fanta-headless`](../../crates/fanta-headless) | Application | Fanta's design engine without the app: open, edit, render and save a project directory. | `fanta-canvas`, `fanta-design-ops`, `fanta-doc`, `fanta-format`, `fanta-render` | `fanta-api`, `fanta-engine`, `fanta-site`, `fig_viewer` |
 | [`fanta-engine`](../../crates/fanta-engine) | Engine hosts | The cloud engine worker: runs design steps (inspect, edit, comment, render, changeset) on a Fanta project without the app. | `fanta-api`, `fanta-design-ops`, `fanta-doc`, `fanta-headless` | — |
 | [`fanta-runtime`](../../crates/fanta-runtime) | Engine hosts | Fanta's portable playback runtime: compiles project sources into runtime programs and plays them natively, over a C JSON bridge or as WebAssembly. | `fanta-bundle`, `fanta-doc`, `fanta-present`, `fanta-render`, `fanta-text` | `fanta-site` |
-| [`fanta-site`](../../crates/fanta-site) | Engine hosts | Project export for the web: fanta-compile writes the runtime bundle fanta-runtime loads, and fanta-site wraps it in a static website with one read-only page per design page. | `fanta-doc`, `fanta-format`, `fanta-runtime`, `fanta-text` | — |
+| [`fanta-site`](../../crates/fanta-site) | Engine hosts | Project export for the web: fanta-compile writes the runtime bundle fanta-runtime loads, and fanta-site wraps it in a static website with one read-only page per design page. | `fanta-doc`, `fanta-format`, `fanta-headless`, `fanta-runtime`, `fanta-text` | — |
 | [`design_surface`](../../crates/design_surface) | Desktop editor | The seam between agents and the design editor: the DesignSurface trait the editor registers as a GPUI global, plus the design-op vocabulary re-exported from fanta-design-ops. | `fanta-design-ops` | `fig_viewer`; inherited shell: `agent`, `agent_servers`, `agent_ui`, `project_panel`, `workspace` |
 | [`fanta_languages`](../../crates/fanta_languages) | Desktop editor | Registers the few languages Fanta's read-only source views need, without language servers or toolchains. | 2 inherited shell crates | `fanta` |
 | [`fanta_ui`](../../crates/fanta_ui) | Desktop editor | Fanta-specific GPUI components shared by the editor: inspector sections, the animation panel, the timeline and the font picker. | 4 inherited shell crates | `fig_viewer` |
