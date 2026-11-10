@@ -954,6 +954,47 @@ fn read_design_nodes(
                 },
             );
         }
+        // Web storage (spec 0007): the design's complete records live in one
+        // `nodes.json` beside its SVG; the SVG and CSS are the readable
+        // projection (their parsed fields win from T3's hand-edit contract
+        // onward).
+        let records_path = design_dir.join(super::web::NODES_JSON);
+        if records_path.is_file() {
+            let Value::Object(records) = read_project_json(&records_path, json_override)? else {
+                return Err(FormatError::InvalidProjectTree(format!(
+                    "{} must be an object keyed by node id",
+                    records_path.display()
+                )));
+            };
+            // The design root is the one record whose parent lies outside the
+            // record set (a page root has no parent; a component master's
+            // parent is its page).
+            let mut roots = Vec::new();
+            for (key, record) in &records {
+                let id = id_from_key::<NodeId>(key).map_err(|error| {
+                    FormatError::InvalidProjectTree(format!(
+                        "{}: key {key:?}: {error}",
+                        records_path.display()
+                    ))
+                })?;
+                pending_layout.remove(&id);
+                let parent_inside = record
+                    .get("parent")
+                    .and_then(Value::as_str)
+                    .is_some_and(|parent| records.contains_key(parent));
+                if !parent_inside {
+                    roots.push(id);
+                }
+            }
+            for (key, record) in records {
+                nodes.insert(key, record);
+            }
+            return Ok(match roots.as_slice() {
+                [root] => Some(*root),
+                _ => None,
+            });
+        }
+
         // No `.fnx`. A `nodes/` dir means either a v1 tree or a v2 design that
         // fell back to per-node JSON (an un-encodable bucket) — read it either
         // way. With neither file present, a `required` design (a page) in a v2
