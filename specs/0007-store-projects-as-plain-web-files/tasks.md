@@ -4,7 +4,8 @@ One task per pull request, in order. Each task says what it changes, which
 requirements it serves and how it is verified. Tick it and link the pull
 request when it merges.
 
-- [ ] **T1.** Writer in `fanta-format`: move spec 0005's emitter out of
+- [x] **T1.** ([#186](https://github.com/jeanc18rlos/fanta-edit/pull/186))
+  Writer in `fanta-format`: move spec 0005's emitter out of
   `fanta-site` and extend it to the full project (components, interaction
   sidecars, `fanta.json` version bump); `fanta-site --plain` becomes a
   caller (R1 file set, R2–R5, R10). Verify: A3's byte round-trip on write,
