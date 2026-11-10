@@ -57,8 +57,9 @@ CI regression suites against the new save path.
 - **`nodes.json` beside each SVG**: the complete serialized node records of
   the design, keyed by the persisted (bare ULID) id form in sorted order.
   This makes the web format lossless from day one — the SVG+CSS pair is the
-  readable projection, and T2's reader lets parsed SVG/CSS fields win over
-  the record. T4 shrinks the sidecar as native SVG/CSS coverage grows; it is
+  readable projection, and T3's hand-edit contract lets parsed SVG/CSS
+  fields win over the record (one tolerant parser, built once; T2 loads
+  from the records). T4 shrinks the sidecar as native SVG/CSS coverage grows; it is
   not a second source of truth for anything the SVG expresses.
 - **Two-phase raster API**: `fanta-format` sits in the persistence layer and
   cannot render. `write_web_project_tree` returns `NeedsRasters(nodes)` for
@@ -73,3 +74,12 @@ CI regression suites against the new save path.
 - **`fanta.json` marks storage** with an optional `"storage": "web"` field
   instead of a version bump: older binaries that drop the field simply fail
   to find `.fnx` sources and refuse, which is the intended behavior.
+
+## T2 decisions (recorded after implementation, PR #187)
+
+- **One reader path**: web storage loads through `read_project_tree`'s
+  existing pipeline — a design dir with no `.fnx` and a `nodes.json` feeds
+  its records straight into the shared scene map; headers, singletons,
+  component scan, assets and winner dedup are unchanged. The SVG+CSS parse
+  belongs to T3: a strict parser for the canonical dialect would be replaced
+  wholesale by T3's tolerant one.
