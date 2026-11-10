@@ -41,8 +41,8 @@ part — the tree and geometry markup — is what SVG does natively, and spec
 - Keeping FNX/FSS as a parallel write format (readers stay for migration).
 - Parsing arbitrary SVG/CSS from other tools; the loader accepts the dialect
   Fanta emits, plus the hand-edit subset (R7).
-- Importing PSD/EPS/PDF (separate work; this spec only fixes what their
-  importers will eventually write).
+- Importing PSD/AI/EPS/InDesign/PDF: separate work, and those importers
+  write their own print-origin profile (R12), not this one.
 - Changing prototype playback; the viewer remains spec 0005's.
 
 ## Requirements
@@ -84,6 +84,12 @@ part — the tree and geometry markup — is what SVG does natively, and spec
   non-raster source representation: gradients, masks, booleans and instances
   as SVG/CSS/JSON, never a baked PNG standing in for the source. (Raster
   fallback remains acceptable in the *viewer*, not in storage.)
+- **R12.** `fanta.json` declares the project's content profile. This spec
+  implements the **design** profile (SVG+CSS+JSON) and the prototype layer
+  over it (HTML+JS+JSON referencing the designs). Print-origin profiles —
+  PDF or SVG + JSON for PSD, AI, EPS, InDesign and text documents — are
+  reserved in the manifest and specced with their importers; nothing in
+  this layout may assume every project has pages of screens.
 
 ## Acceptance criteria
 
@@ -103,10 +109,11 @@ part — the tree and geometry markup — is what SVG does natively, and spec
 
 ## Open questions
 
-- **Q1.** The founder listed "html, svg, pdf and some js and json". This
-  draft reads it as CSS (the stack of the whole direction) and treats PDF as
-  an export target, not a stored source file. Founder to confirm, or PDF
-  per page joins the derived outputs.
+- **Q1.** ~~Is "pdf" in the founder's message CSS or a stored file?~~
+  **Resolved by the founder, 2026-11-10:** PDF is a *source* representation,
+  but only for print-origin content — InDesign files and text documents —
+  never for screen designs. Recorded as R12's profile family; the design
+  profile stores no PDF.
 - **Q2.** Instances in SVG: expanded subtree per use-site annotated with the
   component link (bigger files, every page self-contained) versus SVG
   `<use>` into the component's file (smallest source, cross-file `<use>` is

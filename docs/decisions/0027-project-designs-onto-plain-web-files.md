@@ -19,6 +19,13 @@ or importing a `.fig` must produce **no `.fnx` or `.fss` at all** — only
 HTML, SVG, CSS, JS and JSON. The question with lasting consequences: are the
 web files the design, or a view of it?
 
+A further founder clarification (2026-11-10): Fanta began as a Figma parser,
+but the product is converting existing design files into projects that
+extend the standard formats natural to each kind of content — not one
+format for everything. PDF is a legitimate *source* representation, but
+only for print-origin content (InDesign, text documents), never for screen
+designs.
+
 Two facts make the stronger direction cheaper than it first looks. FNX
 already stores everything non-visual (reactions, bindings, text styles) as
 JSON embedded in its markup, and `.fss` is already a CSS dialect
@@ -30,7 +37,22 @@ path needs a 13.5 MB WebAssembly runtime from a second repository
 
 ## Decision
 
-Make plain web files the authoritative project format, in stages. A project
+Make plain standard files the authoritative project format, as a family
+keyed by what the project holds, each kind stored in the standard that fits
+it:
+
+- **Designs** (screens, UI): SVG + CSS + JSON.
+- **Prototypes**: HTML + JS + JSON referencing the designs' SVG and CSS —
+  the shape the viewer and `doc/flows.json` already have.
+- **Print and vector-art imports** (PSD, AI, EPS, InDesign, text
+  documents): PDF or SVG, plus JSON.
+
+`fanta.json` names the project's profile. This record and
+[spec 0007](../../specs/0007-store-projects-as-plain-web-files/spec.md)
+implement the design and prototype profiles; print profiles are specced
+with their importers.
+
+For the design profile: a project
 is `fanta.json`, one SVG per page and per component variant (structure,
 geometry, ids), `design.css` + `tokens.css` (styling and variables, with
 engine concepts as `--fanta-*` custom properties, the role `.fss` plays
