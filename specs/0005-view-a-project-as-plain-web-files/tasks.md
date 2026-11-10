@@ -1,5 +1,12 @@
 # Tasks: View a project as plain web files
 
+> **2026-11-10:** the founder directed that web files become the project's
+> *source*, not a projection
+> ([spec 0007](../0007-store-projects-as-plain-web-files/spec.md),
+> ADR 0027 revised). T2 (hotspots) stands; T3–T6 fold into spec 0007's
+> tasks if it is accepted — T3's save wiring becomes the format flip, T6's
+> coverage becomes source parity.
+
 One task per pull request, in order. Each task says what it changes, which
 requirements it serves and how it is verified. Tick it and link the pull
 request when it merges.
