@@ -6,7 +6,20 @@ under `web/`.
 
 ## Approach
 
-The projection reuses the engine's existing SVG renderer instead of a new
+> **Amended during T1 (PR #183).** The first implementation used the Skia
+> SVG backend as written below, but its output bakes every style into
+> attributes (`fill="#111C33"` on each element), so nothing referenced
+> `tokens.css` and the founder rejected it ("but I see no CSS"). T1 shipped
+> the hand-written, CSS-first emitter that this document originally deferred
+> to T6: elements carry only `id`/`class`/`data-name` and geometry; all
+> styling lives in `design.css`, one rule per node id, with
+> variable-bound properties emitted as `var(--token, literal)`. Nodes the
+> emitter does not cover yet (gradients, masks, instances, booleans) fall
+> back per node to a Skia-rendered PNG placed in the tree, so pages stay
+> correct while the native subset grows. T6 therefore becomes coverage
+> expansion, not a new emitter.
+
+The original plan: reuse the engine's existing SVG renderer instead of a new
 emitter. `fanta-headless::export` already renders any node or page to SVG
 through the real Skia pipeline (`render_svg`, `export_node` with
 `ExportEncoding::Svg`), so page fidelity is the renderer's fidelity from day
@@ -45,20 +58,23 @@ free).
 - Determinism (R8): stable page order from the manifest, fixed float
   formatting, no timestamps; the directory is replaced atomically like other
   derived outputs.
-- Node-id metadata (R4): the Skia SVG backend does not annotate source ids.
-  v1 ships the id map as `web/pages/<slug>.map.json` (node id → bounds);
-  inline `data-fanta-id` attributes need an id-aware emitter and move to a
-  later task.
-- Text (R9): the Skia SVG backend may outline text runs; v1 records each
-  outlined run in the report instead of guaranteeing selectable text. R9's
-  full form lands with the id-aware emitter.
+- Node-id metadata (R4): *as built*, every emitted element carries
+  `id` (display-form node id), `class` (name slug) and `data-name`;
+  `web/pages/<slug>.map.json` (node id → world bounds) still ships for
+  tools that want bounds without parsing SVG.
+- Text (R9): *as built*, text is emitted as `<text>`/`<tspan>` with font
+  properties in CSS — selectable and restylable — but laid out by the
+  browser, not the engine shaper; every text node is recorded in the
+  report as that approximation until engine-shaped positions land (T6).
 
 ## Alternatives
 
 - A hand-rolled SVG emitter walking the scene: full control over ids and
   `<text>` from day one, but reimplements fills, strokes, gradients, masks
-  and blend modes the renderer already gets right; rejected for v1, revisit
-  for R4/R9.
+  and blend modes the renderer already gets right. **Chosen during T1
+  after all**: the Skia backend's baked attributes defeated R5 (styling in
+  CSS), and the per-node raster fallback keeps the renderer as the safety
+  net instead of reimplementing everything at once.
 - Serving through the wasm runtime (status quo, ADR 0018): perfect fidelity
   and motion, but 13.5 MB of runtime and no plain files; stays the
   full-fidelity path.

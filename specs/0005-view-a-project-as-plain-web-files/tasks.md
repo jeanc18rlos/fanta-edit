@@ -5,12 +5,18 @@ requirements it serves and how it is verified. Tick it and link the pull
 request when it merges.
 
 - [ ] **T1.** `fanta_site::web::export_web` and `fanta-site --plain`: one
-  Skia-rendered SVG per page (via `fanta-headless` export), `tokens.css`
-  from variables and modes, `index.html` + dependency-free `viewer.js`,
-  `pages/<slug>.map.json` id map, `report.json` (R1, R3, R4, R8, R11; R2
-  except the `file://` notice). Verify: fixture export test asserting the
-  file set and no `.wasm`, byte-identical double export, tokens.css mode
+  CSS-first SVG per page from the hand-written emitter (ids/classes on
+  elements, all styling in `design.css`, bound properties as `var()`,
+  per-node Skia PNG fallback for uncovered features), `tokens.css` from
+  variables and modes, `index.html` + dependency-free `viewer.js`,
+  `pages/<slug>.map.json` id map, `report.json` (R1, R3, R4, R5, R8, R11;
+  R2 except the `file://` notice; R9 browser-laid-out). Verify: fixture
+  export test asserting the file set and no `.wasm`, byte-identical double
+  export, `var()` surviving a project round-trip, tokens.css mode
   assertions, `script/architecture verify` for the new dependency.
+  In review: [PR #183](https://github.com/jeanc18rlos/fanta-edit/pull/183)
+  — amended from the Skia-SVG plan to the emitter; see the note atop
+  [design.md](design.md).
 - [ ] **T2.** Prototype hotspots: overlay anchors from `flow_start.json`
   and click triggers, plus the `file://` notice (R2, R6). Verify: anchor
   targets resolve to exported pages in tests; a served click-through smoke
@@ -26,6 +32,7 @@ request when it merges.
   and substitution policy; substitutions and unembeddable runs land in
   `report.json`; support matrix page in `docs/fanta/` (R9 partial, R11, A6,
   A8).
-- [ ] **T6.** Id-aware emitter: inline `data-fanta-id` attributes and
-  text-as-`<text>`, replacing the map file where it can (R4 full, R9 full,
-  A2). Revisits the design's emitter alternative.
+- [ ] **T6.** Emitter coverage: gradients, masks, booleans and expanded
+  instances emitted natively instead of the per-node raster fallback, and
+  engine-shaped text positions so R9 no longer depends on browser layout
+  (R9 full, A2). The emitter itself landed in T1.
