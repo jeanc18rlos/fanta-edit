@@ -1,40 +1,121 @@
-//! The CSS-first SVG emitter: a page becomes readable SVG elements whose
-//! styling lives in CSS rules, with `var(--token)` wherever the design binds a
-//! variable. Node kinds and features outside the supported subset fall back to
-//! a rasterized `<image>` and are named in the report, so pages stay correct
-//! while the subset grows.
+//! The plain-web-files project format (spec 0007, ADR 0027): one CSS-first
+//! SVG per page and per component, all styling in `design.css` (with
+//! `var(--token)` wherever the design binds a variable), variables and modes
+//! in `tokens.css`, a dependency-free HTML+JS viewer, and the shared JSON
+//! sidecars. No `.fnx`, no `.fss`, no WebAssembly, no build step.
+//!
+//! The SVG and CSS are the readable projection of structure and styling;
+//! `nodes.json` beside each SVG carries the complete node records, so the
+//! format is lossless from day one while native SVG/CSS coverage grows
+//! (T4 shrinks the sidecar as coverage lands — see the spec's design notes).
+//!
+//! This module is pure over the document (the persistence layer forbids
+//! Skia): node kinds outside the SVG subset need a pre-rendered PNG from the
+//! caller. [`write_web_project_tree`] reports which nodes need one via
+//! [`WebWriteOutcome::NeedsRasters`]; render them (`fanta-headless`'s
+//! `export_node`) and call again.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result};
-use fanta_doc::variables::VariableRegistry;
+use fanta_doc::value::VarValue;
+use fanta_doc::variables::{Variable, VariableRegistry};
 use fanta_doc::{
-    BlendMode, BlurKind, BoundProp, CanvasNode, Color, Doc, Fill, NodeData, NodeFlags, NodeId,
-    PathData, PathSegment, ShadowKind, Stroke, TextAlign, TextStyle, Transform2D,
+    AssetId, BlendMode, BlurKind, BoundProp, Bounds, CanvasNode, Color, Doc, Fill, ModeId,
+    NodeData, NodeFlags, NodeId, PathData, PathSegment, ShadowKind, Stroke, TextAlign, TextStyle,
+    Transform2D, resolve_export_bindings,
 };
-use fanta_headless::export::{
-    ExportEncoding, ExportSizing, export_node, page_visual_bounds, resolve_export_bindings,
-};
-use fanta_render::AssetResolver;
 use serde::Serialize;
+use serde_json::Value;
 
-/// Raster hrefs carry this placeholder because the page's directory name is
-/// not known inside the emitter; the caller substitutes the slug.
-pub(crate) const RASTER_PLACEHOLDER: &str = "__RASTER_DIR__";
+use crate::error::{FormatError, Result};
 
-/// One page, emitted. The caller writes the files.
-pub(crate) struct EmittedPage {
-    pub svg: String,
-    /// CSS rules for this page's nodes, appended to the shared design.css.
-    pub css: String,
+use super::layout::{
+    ASSETS_DIR, COMPONENTS_DIR, FANTA_JSON, PAGES_DIR, ProjectManifest, STORAGE_WEB, json_bytes,
+    json_key, slugify,
+};
+use super::media::{ASSET_INDEX_FILE, asset_index_bytes, sniff_media};
+use super::write::{
+    ProjectedFiles, WriteReport, design_grouping, project_asset_files,
+    project_design_headers, project_doc_singletons, project_loose_nodes, sync_project_files,
+};
+
+const PAGE_SVG: &str = "page.svg";
+const MASTER_SVG: &str = "master.svg";
+const NODES_JSON: &str = "nodes.json";
+const MAP_JSON: &str = "map.json";
+const INDEX_TEMPLATE: &str = include_str!("../../assets/web/index.html");
+const VIEWER_JS: &str = include_str!("../../assets/web/viewer.js");
+/// Aliases may chain; past this many hops the chain is reported, not followed.
+const MAX_ALIAS_HOPS: usize = 8;
+
+/// A pre-rendered PNG fallback for one node outside the SVG subset.
+#[derive(Debug, Clone)]
+pub struct WebRaster {
+    pub bytes: Vec<u8>,
+    /// The world rectangle the image shows.
+    pub bounds: Bounds,
+}
+
+/// Renderer-derived inputs the pure projection cannot compute itself.
+#[derive(Default)]
+pub struct WebWriteInputs {
+    /// viewBox bounds per design root (pages and component roots), usually
+    /// from `fanta-headless`'s `page_visual_bounds` so effects are included.
+    /// A missing entry falls back to the scene's world bounds.
+    pub bounds: BTreeMap<NodeId, Bounds>,
+    /// Pre-rendered fallbacks, keyed by node.
+    pub rasters: BTreeMap<NodeId, WebRaster>,
+    /// Carried into `report.json` verbatim (for example project-open warnings).
+    pub warnings: Vec<String>,
+}
+
+/// What [`write_web_project_tree`] did.
+pub enum WebWriteOutcome {
+    Written {
+        write: WriteReport,
+        report: WebReport,
+    },
+    /// Nothing was written: these nodes are outside the SVG subset and have
+    /// no raster in the inputs. Render them and call again.
+    NeedsRasters(Vec<NodeId>),
+}
+
+/// What the projection wrote and what it had to approximate.
+#[derive(Debug, Serialize)]
+pub struct WebReport {
+    pub pages: Vec<WebDesignReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<WebDesignReport>,
+    /// Variables that have no CSS form, with the reason.
+    pub skipped_variables: Vec<SkippedVariable>,
+    /// Warnings from opening the project, verbatim.
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WebDesignReport {
+    pub slug: String,
+    pub name: String,
+    /// Design units.
     pub width: u32,
     pub height: u32,
-    /// Rasterized fallback nodes: file name under `pages/<slug>/` and bytes.
-    pub rasters: Vec<(String, Vec<u8>)>,
-    /// Asset ids referenced by `<image href="assets/…">` elements.
-    pub assets: Vec<fanta_doc::AssetId>,
+    /// Where the emitted SVG diverges from the canvas (rasterized nodes,
+    /// browser-laid-out text, dropped features).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub approximations: Vec<Approximation>,
+    /// Set when no SVG could be emitted (`nodes.json` still has the design).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkippedVariable {
+    pub collection: String,
+    pub variable: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,43 +125,380 @@ pub struct Approximation {
     pub what: String,
 }
 
-pub(crate) fn emit_page(
+/// The complete in-memory web projection of `doc`, before any disk I/O.
+pub struct WebProjection {
+    pub files: BTreeMap<PathBuf, Arc<Vec<u8>>>,
+    pub report: WebReport,
+    /// Nodes that need a raster before the projection is complete. When this
+    /// is non-empty the SVG files are placeholders and must not be written.
+    pub missing_rasters: Vec<NodeId>,
+}
+
+/// Write `doc` to `dir` in the web format, through the same transactional
+/// sync as the FNX writer (locking, symlink defense, stale pruning — which
+/// also removes `.fnx`/`.fss` files when converting a project in place).
+pub fn write_web_project_tree(
+    dir: &Path,
+    doc: &Doc,
+    assets: &BTreeMap<AssetId, Vec<u8>>,
+    inputs: &WebWriteInputs,
+) -> Result<WebWriteOutcome> {
+    let asset_hrefs = asset_hrefs(assets);
+    let projection = web_project_files(doc, &asset_hrefs, inputs)?;
+    if !projection.missing_rasters.is_empty() {
+        return Ok(WebWriteOutcome::NeedsRasters(projection.missing_rasters));
+    }
+    let mut files = projection.files;
+    files.insert(
+        PathBuf::from(ASSETS_DIR).join(ASSET_INDEX_FILE),
+        Arc::new(asset_index_bytes(assets)?),
+    );
+    let asset_files = project_asset_files(assets, None)?;
+    let write = sync_project_files(dir, &files, &asset_files, None)?;
+    Ok(WebWriteOutcome::Written {
+        write,
+        report: projection.report,
+    })
+}
+
+/// `assets/<family>/<id>.<ext>` for every asset — the same naming
+/// [`project_asset_files`] uses, as href strings for `<image>` elements.
+fn asset_hrefs(assets: &BTreeMap<AssetId, Vec<u8>>) -> BTreeMap<AssetId, String> {
+    assets
+        .iter()
+        .map(|(id, bytes)| {
+            let (family, ext) = sniff_media(bytes);
+            (*id, format!("{ASSETS_DIR}/{family}/{id}.{ext}"))
+        })
+        .collect()
+}
+
+/// The complete in-memory web projection: every non-asset file the tree
+/// should contain, with the exact bytes, as a pure function of the document
+/// and the inputs (the byte-determinism contract).
+pub fn web_project_files(
+    doc: &Doc,
+    asset_hrefs: &BTreeMap<AssetId, String>,
+    inputs: &WebWriteInputs,
+) -> Result<WebProjection> {
+    let resolved = resolve_export_bindings(doc);
+    let grouping = design_grouping(doc)?;
+    let mut files = ProjectedFiles::new();
+
+    let mut manifest = ProjectManifest::for_doc(doc);
+    manifest.storage = Some(STORAGE_WEB.to_owned());
+    files.insert(
+        PathBuf::from(FANTA_JSON),
+        Arc::new(json_bytes(&serde_json::to_value(manifest)?)?),
+    );
+    project_doc_singletons(&mut files, doc)?;
+    project_design_headers(&mut files, doc, &grouping)?;
+    project_loose_nodes(&mut files, doc, &grouping.loose)?;
+
+    let mut design_css = String::from(
+        "/* Generated by Fanta: per-node styles, selected by node id. Edit values here or in the editor; the writer canonicalizes. */\n",
+    );
+    let mut pages = Vec::new();
+    let mut components = Vec::new();
+    let mut missing_rasters = Vec::new();
+
+    // Pages in document order.
+    for page in &doc.pages {
+        let slug = grouping.page_slugs.get(page).ok_or_else(|| {
+            FormatError::InvalidProjectTree(format!("page {page} has no directory slug"))
+        })?;
+        let design_dir = PathBuf::from(PAGES_DIR).join(slug);
+        let name = doc
+            .scene
+            .get(*page)
+            .map(|node| node.name.as_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Untitled")
+            .to_owned();
+        let nodes = grouping.page_nodes.get(slug).map_or(&[][..], Vec::as_slice);
+        design_nodes_json(&mut files, doc, &design_dir, nodes)?;
+        let report = emit_design(
+            doc,
+            &resolved,
+            *page,
+            &design_dir,
+            PAGE_SVG,
+            slug,
+            &name,
+            asset_hrefs,
+            inputs,
+            &mut files,
+            &mut design_css,
+            &mut missing_rasters,
+        )?;
+        files.insert(
+            design_dir.join(MAP_JSON),
+            Arc::new(json_bytes(&serde_json::to_value(page_map(
+                doc, *page, &name,
+            ))?)?),
+        );
+        pages.push(report);
+    }
+
+    // Component designs, sorted by directory.
+    let root_of_dir: BTreeMap<&String, NodeId> = grouping
+        .component_roots
+        .iter()
+        .map(|(root, cdir)| (cdir, *root))
+        .collect();
+    for (cdir, nodes) in &grouping.comp_nodes {
+        let design_dir = PathBuf::from(COMPONENTS_DIR).join(cdir);
+        design_nodes_json(&mut files, doc, &design_dir, nodes)?;
+        let Some(root) = root_of_dir.get(cdir).copied() else {
+            continue;
+        };
+        let name = doc
+            .scene
+            .get(root)
+            .map(|node| node.name.as_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Component")
+            .to_owned();
+        let report = emit_design(
+            doc,
+            &resolved,
+            root,
+            &design_dir,
+            MASTER_SVG,
+            cdir,
+            &name,
+            asset_hrefs,
+            inputs,
+            &mut files,
+            &mut design_css,
+            &mut missing_rasters,
+        )?;
+        components.push(report);
+    }
+
+    let mut skipped_variables = Vec::new();
+    files.insert(
+        PathBuf::from("tokens.css"),
+        Arc::new(tokens_css(doc, &mut skipped_variables).into_bytes()),
+    );
+    files.insert(PathBuf::from("design.css"), Arc::new(design_css.into_bytes()));
+
+    let title = match doc.metadata.title.trim() {
+        "" => "Fanta project",
+        title => title,
+    };
+    files.insert(
+        PathBuf::from("index.html"),
+        Arc::new(
+            INDEX_TEMPLATE
+                .replace("{{title}}", &html_escape(title))
+                .into_bytes(),
+        ),
+    );
+    files.insert(
+        PathBuf::from("viewer.js"),
+        Arc::new(VIEWER_JS.as_bytes().to_vec()),
+    );
+
+    let manifest: Vec<_> = pages
+        .iter()
+        .filter(|page| page.error.is_none())
+        .map(|page| {
+            serde_json::json!({
+                "slug": page.slug,
+                "name": page.name,
+                "width": page.width,
+                "height": page.height,
+            })
+        })
+        .collect();
+    let mut pages_js = String::from("const FANTA_PAGES = ");
+    pages_js.push_str(&serde_json::to_string_pretty(&manifest)?);
+    pages_js.push_str(";\n");
+    files.insert(PathBuf::from("pages.js"), Arc::new(pages_js.into_bytes()));
+
+    let report = WebReport {
+        pages,
+        components,
+        skipped_variables,
+        warnings: inputs.warnings.clone(),
+    };
+    files.insert(
+        PathBuf::from("report.json"),
+        Arc::new(json_bytes(&serde_json::to_value(&report)?)?),
+    );
+
+    missing_rasters.sort();
+    missing_rasters.dedup();
+    Ok(WebProjection {
+        files,
+        report,
+        missing_rasters,
+    })
+}
+
+/// `nodes.json` beside a design's SVG: the complete record of every node in
+/// the design, keyed by the persisted (serde) id form, in sorted key order.
+/// This is what makes the format lossless while the SVG/CSS subset grows.
+fn design_nodes_json(
+    files: &mut ProjectedFiles,
+    doc: &Doc,
+    design_dir: &Path,
+    nodes: &[NodeId],
+) -> Result<()> {
+    let mut table = serde_json::Map::new();
+    for id in nodes {
+        let node = doc
+            .scene
+            .get(*id)
+            .ok_or_else(|| FormatError::InvalidProjectTree(format!("node {id} vanished")))?;
+        let mut value = serde_json::to_value(node)?;
+        crate::project::read::repair_non_finite_geometry(&mut value);
+        table.insert(json_key(id)?, value);
+    }
+    files.insert(
+        design_dir.join(NODES_JSON),
+        Arc::new(json_bytes(&Value::Object(table))?),
+    );
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct PageMap {
+    /// The page root's id in display form and the world rectangle the SVG
+    /// shows; node bounds below are in the same world coordinates.
+    page: MapNode,
+    nodes: BTreeMap<String, MapNode>,
+}
+
+#[derive(Serialize)]
+struct MapNode {
+    name: String,
+    /// `[min_x, min_y, width, height]` in world units.
+    bounds: [f64; 4],
+}
+
+fn page_map(doc: &Doc, page: NodeId, page_name: &str) -> PageMap {
+    let mut nodes = BTreeMap::new();
+    for id in doc.scene.descendants_of(page) {
+        let Some(node) = doc.scene.get(id) else {
+            continue;
+        };
+        let Some(bounds) = doc.scene.world_bounds(id) else {
+            continue;
+        };
+        // Display form (`n_…`): this file is for outside consumers, which per
+        // ADR 0014 see prefixed ids, like MCP and logs do.
+        nodes.insert(
+            id.to_string(),
+            MapNode {
+                name: node.name.clone(),
+                bounds: [
+                    bounds.min_x,
+                    bounds.min_y,
+                    bounds.max_x - bounds.min_x,
+                    bounds.max_y - bounds.min_y,
+                ],
+            },
+        );
+    }
+    let page_bounds = doc
+        .scene
+        .world_bounds(page)
+        .map(|bounds| {
+            [
+                bounds.min_x,
+                bounds.min_y,
+                bounds.max_x - bounds.min_x,
+                bounds.max_y - bounds.min_y,
+            ]
+        })
+        .unwrap_or([0.0, 0.0, 0.0, 0.0]);
+    PageMap {
+        page: MapNode {
+            name: page_name.to_string(),
+            bounds: page_bounds,
+        },
+        nodes,
+    }
+}
+
+/// Emit one design's SVG into `files` and its CSS into `design_css`.
+#[expect(clippy::too_many_arguments, reason = "internal assembly step")]
+fn emit_design(
     authored: &Doc,
-    resolver: Option<Arc<dyn AssetResolver>>,
-    page: NodeId,
-) -> Result<EmittedPage> {
-    let resolved = resolve_export_bindings(authored);
-    let bounds = page_visual_bounds(&resolved, Some(page))
-        .filter(|bounds| bounds.is_finite() && bounds.width() > 0.0 && bounds.height() > 0.0)
-        .context("the page draws nothing to export")?;
+    resolved: &Doc,
+    root: NodeId,
+    design_dir: &Path,
+    svg_name: &str,
+    slug: &str,
+    name: &str,
+    asset_hrefs: &BTreeMap<AssetId, String>,
+    inputs: &WebWriteInputs,
+    files: &mut ProjectedFiles,
+    design_css: &mut String,
+    missing_rasters: &mut Vec<NodeId>,
+) -> Result<WebDesignReport> {
+    let design_dir_href = design_dir.to_string_lossy().replace('\\', "/");
+    let bounds = inputs
+        .bounds
+        .get(&root)
+        .copied()
+        .or_else(|| resolved.scene.world_bounds(root))
+        .filter(|bounds| {
+            bounds.min_x.is_finite()
+                && bounds.min_y.is_finite()
+                && bounds.max_x > bounds.min_x
+                && bounds.max_y > bounds.min_y
+        });
+    let Some(bounds) = bounds else {
+        return Ok(WebDesignReport {
+            slug: slug.to_owned(),
+            name: name.to_owned(),
+            width: 0,
+            height: 0,
+            approximations: Vec::new(),
+            error: Some("the design draws nothing to emit".to_owned()),
+        });
+    };
     let mut emitter = Emitter {
-        resolved: &resolved,
+        resolved,
         authored,
         registry: &authored.variables,
-        resolver,
+        asset_hrefs,
+        inputs,
+        raster_dir: &design_dir_href,
         css: String::new(),
         rasters: Vec::new(),
-        assets: Vec::new(),
+        missing_rasters: Vec::new(),
         approximations: Vec::new(),
     };
     let mut body = String::new();
-    emitter.emit_node(page, &mut body, 1)?;
-    let width = bounds.width().ceil();
-    let height = bounds.height().ceil();
+    emitter.emit_node(root, &mut body, 1)?;
+    let width = (bounds.max_x - bounds.min_x).ceil();
+    let height = (bounds.max_y - bounds.min_y).ceil();
     let svg = format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" \
          viewBox=\"{} {} {width} {height}\">\n{body}</svg>\n",
         number(bounds.min_x),
         number(bounds.min_y),
     );
-    Ok(EmittedPage {
-        svg,
-        css: emitter.css,
+    if !emitter.css.is_empty() {
+        design_css.push_str(&format!("\n/* {design_dir_href} */\n"));
+        design_css.push_str(&emitter.css);
+    }
+    files.insert(design_dir.join(svg_name), Arc::new(svg.into_bytes()));
+    for (file, bytes) in emitter.rasters {
+        files.insert(design_dir.join(file), Arc::new(bytes));
+    }
+    missing_rasters.extend(emitter.missing_rasters);
+    Ok(WebDesignReport {
+        slug: slug.to_owned(),
+        name: name.to_owned(),
         width: width as u32,
         height: height as u32,
-        rasters: emitter.rasters,
-        assets: emitter.assets,
         approximations: emitter.approximations,
+        error: None,
     })
 }
 
@@ -90,10 +508,13 @@ struct Emitter<'a> {
     /// The authored document: bindings live here.
     authored: &'a Doc,
     registry: &'a VariableRegistry,
-    resolver: Option<Arc<dyn AssetResolver>>,
+    asset_hrefs: &'a BTreeMap<AssetId, String>,
+    inputs: &'a WebWriteInputs,
+    /// Project-relative directory raster hrefs point into.
+    raster_dir: &'a str,
     css: String,
     rasters: Vec<(String, Vec<u8>)>,
-    assets: Vec<fanta_doc::AssetId>,
+    missing_rasters: Vec<NodeId>,
     approximations: Vec<Approximation>,
 }
 
@@ -318,12 +739,17 @@ impl Emitter<'_> {
                 if bitmap.crop.is_some() {
                     return self.raster_fallback(&node, out, depth, "cropped image");
                 }
-                self.assets.push(bitmap.asset);
+                let href = match self.asset_hrefs.get(&bitmap.asset) {
+                    Some(href) => href.clone(),
+                    None => {
+                        self.approximate(&node, "image asset has no file under assets/");
+                        format!("{ASSETS_DIR}/{}", bitmap.asset)
+                    }
+                };
                 self.start_element(&node, out, depth, "image");
                 let _ = write!(
                     out,
-                    " href=\"assets/{}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\"",
-                    bitmap.asset,
+                    " href=\"{href}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\"",
                     number(bitmap.local_size[0]),
                     number(bitmap.local_size[1]),
                 );
@@ -343,7 +769,7 @@ impl Emitter<'_> {
     fn start_element(&mut self, node: &CanvasNode, out: &mut String, depth: usize, tag: &str) {
         indent(out, depth);
         let _ = write!(out, "<{tag} id=\"{}\"", node.id);
-        let class = crate::slug(&node.name);
+        let class = slugify(&node.name, "");
         if !class.is_empty() {
             let _ = write!(out, " class=\"{class}\"");
         }
@@ -479,8 +905,8 @@ impl Emitter<'_> {
         let collection = self.registry.collections.get(&variable.collection)?;
         Some(format!(
             "--{}-{}",
-            crate::slug(&collection.name),
-            crate::slug(&variable.name)
+            slugify(&collection.name, "collection"),
+            slugify(&variable.name, "variable")
         ))
     }
 
@@ -492,14 +918,10 @@ impl Emitter<'_> {
         what: &str,
     ) -> Result<()> {
         self.approximate(node, &format!("rasterized: {what}"));
-        let image = export_node(
-            self.resolved,
-            self.resolver.clone(),
-            node.id,
-            ExportEncoding::Png,
-            ExportSizing::Scale(2.0),
-        )
-        .with_context(|| format!("rasterizing {} ({})", node.id, node.name))?;
+        let Some(raster) = self.inputs.rasters.get(&node.id) else {
+            self.missing_rasters.push(node.id);
+            return Ok(());
+        };
         // The PNG covers the node's visual bounds in world space; place it in
         // the parent's space through the inverse of the parent's world
         // transform.
@@ -511,21 +933,28 @@ impl Emitter<'_> {
             self.approximate(node, "rasterized under a rotated ancestor; placement is approximate");
         }
         let inverse = parent_world.0.inverse();
-        let low = inverse.transform_point2(glam::DVec2::new(image.bounds.min_x, image.bounds.min_y));
-        let high = inverse.transform_point2(glam::DVec2::new(image.bounds.max_x, image.bounds.max_y));
+        let low = inverse.transform_point2(glam::DVec2::new(
+            raster.bounds.min_x,
+            raster.bounds.min_y,
+        ));
+        let high = inverse.transform_point2(glam::DVec2::new(
+            raster.bounds.max_x,
+            raster.bounds.max_y,
+        ));
         let file = format!("{}.png", node.id);
         indent(out, depth);
         let _ = writeln!(
             out,
-            "<image id=\"{}\" data-name=\"{}\" href=\"{RASTER_PLACEHOLDER}/{file}\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/>",
+            "<image id=\"{}\" data-name=\"{}\" href=\"{}/{file}\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/>",
             node.id,
             xml_escape(&node.name),
+            self.raster_dir,
             number(low.x.min(high.x)),
             number(low.y.min(high.y)),
             number((high.x - low.x).abs()),
             number((high.y - low.y).abs()),
         );
-        self.rasters.push((file, image.bytes));
+        self.rasters.push((file, raster.bytes.clone()));
         Ok(())
     }
 
@@ -572,6 +1001,135 @@ impl Declarations {
             None => self.push(property, literal),
         }
     }
+}
+
+/// Variables and modes as CSS custom properties: `:root` carries the active
+/// (or default) mode of every collection, and each mode gets a class scope so
+/// the page can switch by toggling one class.
+fn tokens_css(doc: &Doc, skipped: &mut Vec<SkippedVariable>) -> String {
+    let registry = &doc.variables;
+    let mut by_collection: BTreeMap<_, Vec<&Variable>> = BTreeMap::new();
+    for variable in registry.variables.values() {
+        by_collection
+            .entry(variable.collection)
+            .or_default()
+            .push(variable);
+    }
+
+    let mut css = String::from(
+        "/* Generated by Fanta from doc/variables.json; edit the project, not this file. */\n",
+    );
+    let mut root_block = String::new();
+    for (collection_id, variables) in &by_collection {
+        let Some(collection) = registry.collections.get(collection_id) else {
+            continue;
+        };
+        let collection_slug = slugify(&collection.name, "collection");
+        let active_mode = doc
+            .active_modes
+            .get(collection_id)
+            .copied()
+            .unwrap_or(collection.default_mode);
+        for mode in &collection.modes {
+            let mut block = String::new();
+            for variable in variables {
+                match css_value_in_mode(registry, doc, variable, mode.id) {
+                    Ok(value) => {
+                        let _ = writeln!(
+                            block,
+                            "  --{collection_slug}-{}: {value};",
+                            slugify(&variable.name, "variable")
+                        );
+                    }
+                    Err(reason) => {
+                        // Report a variable once, from its collection's first mode.
+                        if mode.id == collection.modes[0].id {
+                            skipped.push(SkippedVariable {
+                                collection: collection.name.clone(),
+                                variable: variable.name.clone(),
+                                reason,
+                            });
+                        }
+                    }
+                }
+            }
+            if block.is_empty() {
+                continue;
+            }
+            let _ = writeln!(
+                css,
+                ".{collection_slug}--{} {{\n{block}}}",
+                slugify(&mode.name, "mode")
+            );
+            if mode.id == active_mode {
+                root_block.push_str(&block);
+            }
+        }
+    }
+    if !root_block.is_empty() {
+        css.push_str(":root {\n");
+        css.push_str(&root_block);
+        css.push_str("}\n");
+    }
+    css
+}
+
+fn css_value_in_mode(
+    registry: &VariableRegistry,
+    doc: &Doc,
+    variable: &Variable,
+    mode: ModeId,
+) -> std::result::Result<String, String> {
+    let mut current = variable;
+    let mut current_mode = mode;
+    for _ in 0..MAX_ALIAS_HOPS {
+        let Some(value) = current.value_for_mode(current_mode) else {
+            return Err(format!("no value for mode of {}", current.name));
+        };
+        match value {
+            VarValue::Alias { variable: target } => {
+                let Some(target) = registry.variable(*target) else {
+                    return Err(format!("alias from {} to a missing variable", current.name));
+                };
+                // An alias into another collection resolves under that
+                // collection's own active (or default) mode; within the same
+                // collection the mode axis carries over.
+                current_mode = if target.collection == current.collection {
+                    current_mode
+                } else {
+                    doc.active_modes
+                        .get(&target.collection)
+                        .copied()
+                        .or_else(|| {
+                            registry
+                                .collections
+                                .get(&target.collection)
+                                .map(|collection| collection.default_mode)
+                        })
+                        .ok_or_else(|| {
+                            format!("alias into a missing collection from {}", current.name)
+                        })?
+                };
+                current = target;
+            }
+            VarValue::Color { value } => return Ok(css_color(*value)),
+            VarValue::Float { value } => return Ok(format!("{value}")),
+            VarValue::Boolean { value } => return Ok(value.to_string()),
+            VarValue::String { value } | VarValue::Enum { value } => {
+                if value.contains([';', '{', '}']) || value.contains('\n') {
+                    return Err("string holds CSS delimiters".to_string());
+                }
+                return Ok(value.clone());
+            }
+            VarValue::TextStyle { .. } => {
+                return Err("typography tokens have no single CSS value yet".to_string());
+            }
+            VarValue::Image { .. } => {
+                return Err("image tokens have no CSS projection yet".to_string());
+            }
+        }
+    }
+    Err(format!("alias chain from {} is too deep", variable.name))
 }
 
 fn rect_of(path: &PathData) -> Option<(f64, f64, f64, f64)> {
@@ -661,7 +1219,7 @@ fn css_blend_mode(mode: BlendMode) -> Option<&'static str> {
     })
 }
 
-pub(crate) fn css_color(color: Color) -> String {
+fn css_color(color: Color) -> String {
     if color.a == 255 {
         color.to_hex()
     } else {
@@ -677,6 +1235,10 @@ pub(crate) fn css_color(color: Color) -> String {
 
 fn css_font_family(value: &str) -> String {
     format!("\"{}\"", value.replace('"', ""))
+}
+
+fn html_escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 fn xml_escape(text: &str) -> String {

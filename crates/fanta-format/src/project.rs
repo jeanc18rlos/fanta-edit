@@ -52,6 +52,7 @@ mod refs_ctx;
 pub mod session;
 mod snapshot;
 mod source_edit;
+mod web;
 mod write;
 
 pub use fanta_fnx::canonicalize_legacy_source;
@@ -78,6 +79,10 @@ pub use session::{
     read_motion_dual, synthesize_workspace_fnx, write_artifact_files,
 };
 pub use snapshot::{export_fant_snapshot, import_fant_snapshot};
+pub use web::{
+    WebDesignReport, WebProjection, WebRaster, WebReport, WebWriteInputs, WebWriteOutcome,
+    web_project_files, write_web_project_tree,
+};
 pub use source_edit::{
     ProjectSourceEdit, apply_project_json_edit, apply_project_source_edit,
     apply_project_source_edit_with_diagnostics, validate_project_json_edit,

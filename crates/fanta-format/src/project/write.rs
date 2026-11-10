@@ -134,7 +134,7 @@ pub struct WriteReport {
 /// The in-memory projection: every non-asset file the tree should contain,
 /// keyed by project-relative path. Bytes are shared with the
 /// [`ProjectWriteCache`] so a cache hit costs a refcount, not a copy.
-type ProjectedFiles = BTreeMap<PathBuf, Arc<Vec<u8>>>;
+pub(crate) type ProjectedFiles = BTreeMap<PathBuf, Arc<Vec<u8>>>;
 
 /// Memo of the per-design projection across successive writes of the same
 /// document. Owned by whoever saves repeatedly (the editor's autosave);
@@ -448,9 +448,6 @@ fn write_project_tree_cached_impl(
     sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
     expected_disk: Option<&BTreeMap<PathBuf, Option<[u8; 32]>>>,
 ) -> Result<WriteReport> {
-    // The writer is synchronous; a per-thread delta includes shared recovery and
-    // editor-support helpers without counting concurrent saves on other threads.
-    let syncs_before = SUCCESSFUL_PROJECT_SYNCS.get();
     validate_source_override_keys(sources)?;
     if let Some(expected_disk) = expected_disk {
         validate_expected_disk_paths(expected_disk)?;
@@ -461,7 +458,23 @@ fn write_project_tree_cached_impl(
         Arc::new(asset_index_bytes(assets)?),
     );
     let asset_files = project_asset_files(assets, media_registry)?;
+    sync_project_files(dir, &files, &asset_files, expected_disk)
+}
 
+/// Bring the tree at `dir` to exactly `files` + `asset_files`: plan the byte
+/// diff, apply it transactionally under the project lock, prune stale managed
+/// files, and seed editor support. Shared by every on-disk format the writer
+/// projects (FNX and web), so the locking, symlink defense, case healing and
+/// stale pruning never fork.
+pub(crate) fn sync_project_files(
+    dir: &Path,
+    files: &ProjectedFiles,
+    asset_files: &BTreeMap<PathBuf, &[u8]>,
+    expected_disk: Option<&BTreeMap<PathBuf, Option<[u8; 32]>>>,
+) -> Result<WriteReport> {
+    // The writer is synchronous; a per-thread delta includes shared recovery and
+    // editor-support helpers without counting concurrent saves on other threads.
+    let syncs_before = SUCCESSFUL_PROJECT_SYNCS.get();
     fs::create_dir_all(dir)?;
 
     fs::create_dir_all(dir.join(PREVIEWS_DIR))?;
@@ -477,7 +490,7 @@ fn write_project_tree_cached_impl(
     }
 
     // Do not traverse a planted symlink or case-aliased design directory.
-    heal_directory_case(dir, &files)?;
+    heal_directory_case(dir, files)?;
     remove_symlinks_on_projected_paths(dir, files.keys().chain(asset_files.keys()))?;
 
     let keep: BTreeSet<&Path> = files
@@ -487,10 +500,10 @@ fn write_project_tree_cached_impl(
         .collect();
 
     let mut writes = Vec::new();
-    for (relative, bytes) in &files {
+    for (relative, bytes) in files.iter() {
         plan_write(dir, relative, bytes, &mut writes)?;
     }
-    for (relative, bytes) in &asset_files {
+    for (relative, bytes) in asset_files.iter() {
         plan_write(dir, relative, bytes, &mut writes)?;
     }
     let removals = stale_managed_files(dir, &keep)?;
@@ -700,7 +713,7 @@ fn project_files_cached_with_sources(
 /// it, including the `skip_serializing_if` cases, where the whole-document
 /// projection had no key and the writer substituted an empty object — the
 /// bytes must not move when a document gains or loses its first variable.
-fn project_doc_singletons(files: &mut ProjectedFiles, doc: &Doc) -> Result<()> {
+pub(crate) fn project_doc_singletons(files: &mut ProjectedFiles, doc: &Doc) -> Result<()> {
     let doc_dir = PathBuf::from(DOC_DIR);
     if !doc.styles.is_empty() {
         files.insert(
@@ -826,15 +839,25 @@ pub fn projected_design_dirs(
     (pages, components)
 }
 
-/// Page headers, component defs/sets, and one source (or fallback node file)
-/// per design.
-fn project_designs(
-    files: &mut ProjectedFiles,
-    doc: &Doc,
-    refs: &fanta_fnx::RefTable,
-    cache: &mut ProjectWriteCache,
-    sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
-) -> Result<()> {
+/// Everything a writer needs to place nodes in the tree: directory slugs for
+/// pages, components and sets, and every scene node grouped by the design
+/// directory it belongs to, in sorted-key order (the determinism contract).
+/// Shared by the FNX projection and the web projection, so both formats file
+/// every node in the same place.
+pub(crate) struct DesignGrouping {
+    pub(crate) page_slugs: BTreeMap<NodeId, String>,
+    pub(crate) component_slugs: BTreeMap<ComponentId, String>,
+    pub(crate) set_dirs: BTreeMap<ComponentId, PathBuf>,
+    /// Component design root → its directory under `components/`.
+    pub(crate) component_roots: BTreeMap<NodeId, String>,
+    /// Page slug → the page's nodes.
+    pub(crate) page_nodes: BTreeMap<String, Vec<NodeId>>,
+    /// Component directory → the design's nodes.
+    pub(crate) comp_nodes: BTreeMap<String, Vec<NodeId>>,
+    pub(crate) loose: Vec<NodeId>,
+}
+
+pub(crate) fn design_grouping(doc: &Doc) -> Result<DesignGrouping> {
     // v3: design directories are named by a slug of the design's name; the
     // ids move into the JSON headers (`page.json` "id", `def.json`).
     let page_slugs: BTreeMap<NodeId, String> = design_slugs(
@@ -860,71 +883,24 @@ fn project_designs(
             (*cid, under.to_string_lossy().replace('\\', "/"))
         })
         .collect();
-    let slug_of_page = |page: &NodeId| -> Result<&String> {
-        page_slugs.get(page).ok_or_else(|| {
-            FormatError::InvalidProjectTree(format!("page {page} has no directory slug"))
-        })
-    };
-    let slug_of_component = |cid: &ComponentId| -> Result<&String> {
-        component_slugs.get(cid).ok_or_else(|| {
-            FormatError::InvalidProjectTree(format!("component {cid} has no directory slug"))
-        })
-    };
 
     // Design root → directory slug for the two kinds of design roots.
     let mut component_roots: BTreeMap<NodeId, String> = BTreeMap::new();
     for (cid, def) in &doc.components.defs {
-        component_roots.insert(def.root, slug_of_component(cid)?.clone());
+        let slug = component_slugs.get(cid).ok_or_else(|| {
+            FormatError::InvalidProjectTree(format!("component {cid} has no directory slug"))
+        })?;
+        component_roots.insert(def.root, slug.clone());
     }
     let mut page_dirs: BTreeMap<NodeId, String> = BTreeMap::new();
     for page in &doc.pages {
-        page_dirs.insert(*page, slug_of_page(page)?.clone());
-    }
-
-    // pages/<slug>/page.json — id + name + order. The id is the page's
-    // identity of record (the directory name is only a readable projection).
-    // `order` is the position in `doc.pages` today; the fractional-IndexKey
-    // ordering discipline (spec 02 §1, a shared prerequisite of spec 09)
-    // replaces this u32 with an order key string when that migration lands.
-    for (order, page) in doc.pages.iter().enumerate() {
-        let mut header = Map::new();
-        header.insert("id".to_owned(), Value::from(page.to_string()));
-        if let Some(node) = doc.scene.get(*page) {
-            header.insert("name".to_owned(), Value::from(node.name.clone()));
-        }
-        header.insert("order".to_owned(), Value::from(order as u32));
-        files.insert(
-            PathBuf::from(PAGES_DIR)
-                .join(slug_of_page(page)?)
-                .join(PAGE_JSON),
-            Arc::new(json_bytes(&Value::Object(header))?),
-        );
-    }
-
-    // components/…/def.json + components/<set>/set.json — each def and set
-    // exactly as `Doc` serializes it (both carry their id).
-    for (cid, def) in &doc.components.defs {
-        files.insert(
-            PathBuf::from(COMPONENTS_DIR)
-                .join(slug_of_component(cid)?)
-                .join(DEF_JSON),
-            Arc::new(json_bytes(&serde_json::to_value(def)?)?),
-        );
-    }
-    for (set_id, set) in &doc.components.sets {
-        let set_dir = component_dirs.sets.get(set_id).ok_or_else(|| {
-            FormatError::InvalidProjectTree(format!("set {set_id} has no directory"))
+        let slug = page_slugs.get(page).ok_or_else(|| {
+            FormatError::InvalidProjectTree(format!("page {page} has no directory slug"))
         })?;
-        files.insert(
-            set_dir.join(SET_JSON),
-            Arc::new(json_bytes(&serde_json::to_value(set)?)?),
-        );
+        page_dirs.insert(*page, slug.clone());
     }
 
-    // v2: one readable `.fnx` source + an `.ids` sidecar per page / component
-    // (was one JSON file per node). Keys are sorted (determinism contract) then
-    // grouped by their design; `_loose` orphans stay per-node JSON because they
-    // need not form a single-rooted tree.
+    // Keys are sorted (determinism contract) then grouped by their design.
     let mut keyed_nodes: Vec<(String, NodeId)> = Vec::with_capacity(doc.scene.len());
     for id in scene_node_ids(doc)? {
         keyed_nodes.push((json_key(&id)?, id));
@@ -947,16 +923,122 @@ fn project_designs(
             Bucket::Loose => loose.push(id),
         }
     }
+    Ok(DesignGrouping {
+        page_slugs,
+        component_slugs,
+        set_dirs: component_dirs.sets,
+        component_roots,
+        page_nodes,
+        comp_nodes,
+        loose,
+    })
+}
 
+/// `pages/<slug>/page.json`, `components/…/def.json` and
+/// `components/<set>/set.json` — the design headers both formats share.
+pub(crate) fn project_design_headers(
+    files: &mut ProjectedFiles,
+    doc: &Doc,
+    grouping: &DesignGrouping,
+) -> Result<()> {
+    // pages/<slug>/page.json — id + name + order. The id is the page's
+    // identity of record (the directory name is only a readable projection).
+    // `order` is the position in `doc.pages` today; the fractional-IndexKey
+    // ordering discipline (spec 02 §1, a shared prerequisite of spec 09)
+    // replaces this u32 with an order key string when that migration lands.
+    for (order, page) in doc.pages.iter().enumerate() {
+        let mut header = Map::new();
+        header.insert("id".to_owned(), Value::from(page.to_string()));
+        if let Some(node) = doc.scene.get(*page) {
+            header.insert("name".to_owned(), Value::from(node.name.clone()));
+        }
+        header.insert("order".to_owned(), Value::from(order as u32));
+        let slug = grouping.page_slugs.get(page).ok_or_else(|| {
+            FormatError::InvalidProjectTree(format!("page {page} has no directory slug"))
+        })?;
+        files.insert(
+            PathBuf::from(PAGES_DIR).join(slug).join(PAGE_JSON),
+            Arc::new(json_bytes(&Value::Object(header))?),
+        );
+    }
+
+    // components/…/def.json + components/<set>/set.json — each def and set
+    // exactly as `Doc` serializes it (both carry their id).
+    for (cid, def) in &doc.components.defs {
+        let slug = grouping.component_slugs.get(cid).ok_or_else(|| {
+            FormatError::InvalidProjectTree(format!("component {cid} has no directory slug"))
+        })?;
+        files.insert(
+            PathBuf::from(COMPONENTS_DIR).join(slug).join(DEF_JSON),
+            Arc::new(json_bytes(&serde_json::to_value(def)?)?),
+        );
+    }
+    for (set_id, set) in &doc.components.sets {
+        let set_dir = grouping.set_dirs.get(set_id).ok_or_else(|| {
+            FormatError::InvalidProjectTree(format!("set {set_id} has no directory"))
+        })?;
+        files.insert(
+            set_dir.join(SET_JSON),
+            Arc::new(json_bytes(&serde_json::to_value(set)?)?),
+        );
+    }
+    Ok(())
+}
+
+/// `pages/_loose/nodes/<id>.json` for orphans, which need not form a
+/// single-rooted tree.
+pub(crate) fn project_loose_nodes(
+    files: &mut ProjectedFiles,
+    doc: &Doc,
+    loose: &[NodeId],
+) -> Result<()> {
+    for id in loose {
+        let node = doc
+            .scene
+            .get(*id)
+            .ok_or_else(|| FormatError::InvalidProjectTree(format!("node {id} vanished")))?;
+        files.insert(
+            PathBuf::from(PAGES_DIR)
+                .join(LOOSE_DIR)
+                .join(NODES_DIR)
+                .join(format!("{id}.json")),
+            Arc::new(json_bytes(&{
+                let mut value = serde_json::to_value(node)?;
+                crate::project::read::repair_non_finite_geometry(&mut value);
+                value
+            })?),
+        );
+    }
+    Ok(())
+}
+
+/// Page headers, component defs/sets, and one source (or fallback node file)
+/// per design.
+fn project_designs(
+    files: &mut ProjectedFiles,
+    doc: &Doc,
+    refs: &fanta_fnx::RefTable,
+    cache: &mut ProjectWriteCache,
+    sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
+) -> Result<()> {
+    let grouping = design_grouping(doc)?;
+    project_design_headers(files, doc, &grouping)?;
+
+    // v2: one readable `.fnx` source + an `.ids` sidecar per page / component
+    // (was one JSON file per node); `_loose` orphans stay per-node JSON.
     let refs_digest = ref_table_digest(doc);
-    let page_by_slug: BTreeMap<&String, NodeId> =
-        page_slugs.iter().map(|(id, slug)| (slug, *id)).collect();
-    let component_by_slug: BTreeMap<&String, ComponentId> = component_slugs
+    let page_by_slug: BTreeMap<&String, NodeId> = grouping
+        .page_slugs
+        .iter()
+        .map(|(id, slug)| (slug, *id))
+        .collect();
+    let component_by_slug: BTreeMap<&String, ComponentId> = grouping
+        .component_slugs
         .iter()
         .map(|(id, slug)| (slug, *id))
         .collect();
     let mut live_designs: BTreeSet<PathBuf> = BTreeSet::new();
-    for (pdir, group) in &page_nodes {
+    for (pdir, group) in &grouping.page_nodes {
         let name = page_by_slug
             .get(pdir)
             .and_then(|id| doc.scene.get(*id))
@@ -978,7 +1060,7 @@ fn project_designs(
         .map_err(|e| FormatError::InvalidProjectTree(format!("page {pdir}: {e}")))?;
         live_designs.insert(design_dir);
     }
-    for (cdir, group) in &comp_nodes {
+    for (cdir, group) in &grouping.comp_nodes {
         let name = component_by_slug
             .get(cdir)
             .and_then(|id| doc.components.defs.get(id))
@@ -1012,24 +1094,7 @@ fn project_designs(
             unknown.display()
         )));
     }
-    for id in loose {
-        let node = doc
-            .scene
-            .get(id)
-            .ok_or_else(|| FormatError::InvalidProjectTree(format!("node {id} vanished")))?;
-        files.insert(
-            PathBuf::from(PAGES_DIR)
-                .join(LOOSE_DIR)
-                .join(NODES_DIR)
-                .join(format!("{id}.json")),
-            Arc::new(json_bytes(&{
-                let mut value = serde_json::to_value(node)?;
-                crate::project::read::repair_non_finite_geometry(&mut value);
-                value
-            })?),
-        );
-    }
-    Ok(())
+    project_loose_nodes(files, doc, &grouping.loose)
 }
 
 /// Every node id in the scene. The scene exposes no whole-map iterator, so
@@ -1303,7 +1368,7 @@ fn classify(
 
 /// `assets/<family>/<asset-id>.<ext>` — family and extension sniffed from the
 /// bytes (see [`super::media`]); the id in the filename is the truth.
-fn project_asset_files<'a>(
+pub(crate) fn project_asset_files<'a>(
     assets: &'a BTreeMap<AssetId, Vec<u8>>,
     media_registry: Option<&MediaRegistry>,
 ) -> Result<BTreeMap<PathBuf, &'a [u8]>> {
@@ -1457,6 +1522,9 @@ fn is_generated_artifact(relative: &Path) -> bool {
     else {
         return false;
     };
+    if is_web_artifact(&parts) {
+        return true;
+    }
     match parts.as_slice() {
         [DOC_DIR, name] => [
             METADATA_JSON,
@@ -1489,6 +1557,38 @@ fn is_generated_artifact(relative: &Path) -> bool {
             .file_stem()
             .and_then(|stem| stem.to_str())
             .is_some_and(|stem| stem.parse::<AssetId>().is_ok()),
+        _ => false,
+    }
+}
+
+/// The files web storage (spec 0007) writes beyond the shared set. Managed,
+/// so the transactional sync writes them and stale pruning converts a project
+/// between storage formats by deleting the other format's files.
+fn is_web_artifact(parts: &[&str]) -> bool {
+    fn node_raster(name: &str) -> bool {
+        let name = Path::new(name);
+        name.extension().is_some_and(|extension| extension == "png")
+            && name
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.parse::<NodeId>().is_ok())
+    }
+    match parts {
+        [name] => [
+            "index.html",
+            "viewer.js",
+            "tokens.css",
+            "design.css",
+            "pages.js",
+            "report.json",
+        ]
+        .contains(name),
+        [PAGES_DIR, _, name] => {
+            ["page.svg", "nodes.json", "map.json"].contains(name) || node_raster(name)
+        }
+        [COMPONENTS_DIR, _, name] | [COMPONENTS_DIR, _, _, name] => {
+            ["master.svg", "nodes.json"].contains(name) || node_raster(name)
+        }
         _ => false,
     }
 }

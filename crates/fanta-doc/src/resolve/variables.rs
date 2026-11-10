@@ -2,11 +2,13 @@
 //! node ([`resolve_effective_mode`]), and chase a bound variable (with a cycle
 //! guard, across collections) down to a concrete value ([`resolve_bound_value`]).
 
+use crate::doc::Doc;
 use crate::id::{ModeId, NodeId, VariableCollectionId, VariableId};
 use crate::node::{CanvasNode, NodeData};
 use crate::scene::Scene;
 use crate::value::{ResolvedVarValue, VarValue};
 use crate::variables::{VariableCollection, VariableRegistry};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 /// The mode in force for `collection` when resolving a binding on `node_id`.
@@ -121,6 +123,49 @@ fn resolve_var(
         ),
         concrete => concrete.as_resolved(),
     }
+}
+
+/// The document with every bound property's value substituted, so literals
+/// match the modes in force at each node. Returns the document unchanged
+/// (borrowed) when nothing is bound.
+pub fn resolve_export_bindings(document: &Doc) -> Cow<'_, Doc> {
+    let bound_nodes = document
+        .scene
+        .roots()
+        .iter()
+        .flat_map(|root| document.scene.descendants_of(*root))
+        .filter_map(|id| {
+            let node = document.scene.get(id)?;
+            (!node.bindings.is_empty()).then_some((id, node.bindings.clone()))
+        })
+        .collect::<Vec<_>>();
+    if bound_nodes.is_empty() {
+        return Cow::Borrowed(document);
+    }
+
+    let mut resolved = document.clone();
+    for (id, bindings) in bound_nodes {
+        let values = bindings
+            .into_iter()
+            .filter_map(|(property, variable)| {
+                resolve_bound_value(
+                    &document.variables,
+                    &document.scene,
+                    id,
+                    &document.active_modes,
+                    variable,
+                )
+                .map(|value| (property, value))
+            })
+            .collect::<Vec<_>>();
+        let Some(node) = resolved.scene.get_mut(id) else {
+            continue;
+        };
+        for (property, value) in values {
+            property.apply_resolved(node, value);
+        }
+    }
+    Cow::Owned(resolved)
 }
 
 #[cfg(test)]

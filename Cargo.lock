@@ -4496,6 +4496,7 @@ dependencies = [
  "fanta-bundle",
  "fanta-doc",
  "fanta-fnx",
+ "glam 0.32.1",
  "serde",
  "serde_json",
  "serde_path_to_error",
