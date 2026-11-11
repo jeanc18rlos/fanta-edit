@@ -54,4 +54,8 @@ request when it merges.
   the new files. Also fixed en route: the post-save session reconcile treated
   the writer's own singleton output (design.css, set.json, the asset index)
   as a foreign edit and left the session stale; `accept_own_write` now
-  explains disk differences through the write report. PR #192.
+  explains disk differences through the write report. Live testing on a
+  9,034-design import added: single-quoted font families and one style
+  attribute per element (both were malformed XML standalone), and a
+  `data-fanta="page|master"` root marker naming the file's design kind
+  (founder direction 2026-11-11). PR #192.
