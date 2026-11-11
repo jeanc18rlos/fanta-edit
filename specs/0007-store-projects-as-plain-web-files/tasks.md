@@ -47,8 +47,11 @@ request when it merges.
   templates, MCP and built-in tool text, quickstart, README). The
   `read_fnx_source`/`validate_fnx_source` tool *names* stay until a rename
   is worth breaking connected agents. PR #191.
-- [ ] **T7.** Scoped CSS (R3 as amended): per-design stylesheets beside each
+- [x] **T7.** Scoped CSS (R3 as amended): per-design stylesheets beside each
   SVG, root `design.css` as the import aggregator and theme-wide home,
   `xml-stylesheet` references so a standalone SVG renders styled; the loader
   reads rules from the root and the design files; the session index hashes
-  the new files.
+  the new files. Also fixed en route: the post-save session reconcile treated
+  the writer's own singleton output (design.css, set.json, the asset index)
+  as a foreign edit and left the session stale; `accept_own_write` now
+  explains disk differences through the write report. PR #192.
