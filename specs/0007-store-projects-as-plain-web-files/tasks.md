@@ -29,9 +29,16 @@ request when it merges.
   native instances. Canvas golden against the written form moves to T5 with
   the editor flip, which makes the written form the one the canvas opens.
   ([#189](https://github.com/jeanc18rlos/fanta-edit/pull/189))
-- [ ] **T5.** The flip: editor save, headless engine and `.fig` import
+- [x] **T5.** The flip: editor save, headless engine and `.fig` import
   write the web format; legacy FNX/FSS projects convert on save; FNX/FSS
-  writers removed, readers kept (R1, R9, R10). Verify: A1, A2, A5, A7.
+  writers removed, readers kept (R1, R9, R10). Verified: A1/A2 — the
+  staging and materialization paths write only the R1 file set (no
+  `.fnx`/`.fss`); A5 — `a_legacy_project_converts_to_web_on_save_and_`
+  `renders_identically` (byte-equal render before/after conversion, FNX
+  pruned, resave stable); A7 — the 51 editor/workspace CI regressions and
+  the import suite pass against the new save path. The FNX writer remains
+  as `write_legacy_project_tree` for R9 conversion fixtures and the kept
+  readers' tests; see "T5 decisions" in design.md.
 - [ ] **T6.** Docs and schema: project-schema doc rewritten for the web
   layout, support matrix for hand-editing tools, deprecation note for the
   FNX/FSS readers' future.

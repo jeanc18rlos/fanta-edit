@@ -129,3 +129,49 @@ CI regression suites against the new save path.
   with counter-keyed def ids (`{instance}-v<n>-…`) for inner clips, masks
   and gradients. Derived content is invisible to the loader; the instance
   node itself keeps its id, transform and record.
+
+## T5 decisions (recorded after implementation)
+
+- **One writer through a trait seam**: `write_web_project_tree(dir, doc,
+  assets, render: Option<&dyn WebRenderSource>, warnings)` replaces the
+  two-phase `NeedsRenderData` handshake. `ProjectRenderSource` in
+  `fanta-headless` (document + asset resolver over the real renderer) is the
+  one implementation; the editor, `HeadlessProject::save`, cloud workers and
+  `fanta-site` all pass it (R10). `write_project_tree` and
+  `write_project_tree_cached` now *are* the web writer; the cache argument
+  is accepted and ignored (full projection per save until large-project
+  save profiles call for caching).
+- **The FNX writer survives as `write_legacy_project_tree(_checked)`**,
+  unreachable from the product: R9 conversion needs legacy fixtures to
+  convert *from*, and the legacy reader/session/source-edit tests pin the
+  reader half that R9 keeps. Everything else went with it: the incremental
+  artifact save path in both hosts, `ProjectWriteCache` plumbing, the
+  media-registry and with-sources writer variants, and the asset write
+  preconditions (risk recorded below).
+- **Conversion contract in the editor**: a canvas or source-layout save on
+  a legacy project writes web storage and prunes the replaced FNX; the
+  session rebuilds via `reconcile_disk_snapshot`, and the code workspace
+  reopens panes on `page.svg` (source paths changed, so buffer identity and
+  FNX undo history do not survive the one-time conversion — the three tests
+  pinning them were adapted or removed). `apply_source_edit` still writes
+  FNX in place on legacy projects; SVG buffers have no source-save path yet
+  (validation happens at load through T3's overlay).
+- **The session index knows web storage**: per-artifact disk hashes cover
+  `page.svg`/`master.svg`, `nodes.json` and `map.json`, and `design.css`
+  joins the singleton hashes — external edits to web files now register in
+  incremental reload and merge instead of being silently ignored (found by
+  the dirty-canvas merge regression test). Startup watcher echoes of web
+  files are seeded from the index like `def.json`. Incremental splice of a
+  changed web artifact falls back to the full reader, which applies the
+  hand-edit contract.
+- **Shared seams follow the storage**: `locate_page_source`,
+  `locate_master_source` and `page_scope_of_source` resolve the SVG first
+  (agent tabs, scoped opens and session restore work on web projects);
+  `SourceBundle::compile` reads `nodes.json` records so site export works;
+  an empty design emits a zero-size SVG instead of an error so every design
+  stays hand-editable from its root element.
+- **Risk accepted**: the deleted asset write preconditions were the TOCTOU
+  guard for concurrent external *asset* edits during a save; a web save can
+  now overwrite an asset changed on disk mid-save. The watcher still
+  detects it afterwards. Revisit if asset-heavy collaborative flows appear
+  before per-file preconditions return in the web writer.
