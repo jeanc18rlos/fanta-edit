@@ -81,7 +81,7 @@ pub use session::{
 };
 pub use snapshot::{export_fant_snapshot, import_fant_snapshot};
 pub use web::{
-    WebDesignReport, WebProjection, WebRaster, WebReport, WebWriteInputs, WebWriteOutcome,
+    WebDesignReport, WebProjection, WebRaster, WebReport, WebRenderSource,
     web_project_files, write_web_project_tree,
 };
 pub use source_edit::{
@@ -936,49 +936,44 @@ mod tests {
             .defs
             .insert(comp_id, ComponentDef::new(comp_id, comp_root, "Button"));
 
+        // The format layer has no renderer; stand in for fanta-headless's
+        // exporter with fixed bytes and a fixed outline.
+        struct FixtureRender {
+            bounds: BTreeMap<NodeId, Bounds>,
+        }
+        impl WebRenderSource for FixtureRender {
+            fn design_bounds(&self, root: NodeId) -> Option<Bounds> {
+                self.bounds.get(&root).copied()
+            }
+            fn raster(&self, _node: NodeId) -> Option<WebRaster> {
+                Some(WebRaster {
+                    bytes: b"\x89PNG\r\n\x1a\nfixture-raster".to_vec(),
+                    bounds: Bounds {
+                        min_x: 0.0,
+                        min_y: 0.0,
+                        max_x: 10.0,
+                        max_y: 10.0,
+                    },
+                })
+            }
+            fn outline(&self, _node: NodeId) -> Option<fanta_doc::PathData> {
+                Some(fanta_doc::PathData::rect(0.0, 0.0, 5.0, 5.0))
+            }
+        }
         let design_bounds = Bounds {
             min_x: 0.0,
             min_y: 0.0,
             max_x: 240.0,
             max_y: 40.0,
         };
-        let mut inputs = WebWriteInputs::default();
-        inputs.bounds.insert(page, design_bounds);
-        inputs.bounds.insert(comp_root, design_bounds);
-        let write = |dir: &Path, doc: &Doc, inputs: &mut WebWriteInputs| {
-            loop {
-                match write_web_project_tree(dir, doc, &assets, inputs).expect("write") {
-                    WebWriteOutcome::Written { .. } => return,
-                    WebWriteOutcome::NeedsRenderData { rasters, outlines } => {
-                        for node in rasters {
-                            let stale = inputs.rasters.insert(
-                                node,
-                                WebRaster {
-                                    bytes: b"\x89PNG\r\n\x1a\nfixture-raster".to_vec(),
-                                    bounds: Bounds {
-                                        min_x: 0.0,
-                                        min_y: 0.0,
-                                        max_x: 10.0,
-                                        max_y: 10.0,
-                                    },
-                                },
-                            );
-                            assert!(stale.is_none(), "the writer re-requested {node}");
-                        }
-                        // The format layer has no renderer; stand in for
-                        // fanta-headless's `boolean_outline` with a fixed path.
-                        for node in outlines {
-                            let stale = inputs
-                                .outlines
-                                .insert(node, fanta_doc::PathData::rect(0.0, 0.0, 5.0, 5.0));
-                            assert!(stale.is_none(), "the writer re-requested {node}");
-                        }
-                    }
-                }
-            }
+        let render = FixtureRender {
+            bounds: BTreeMap::from([(page, design_bounds), (comp_root, design_bounds)]),
+        };
+        let write = |dir: &Path, doc: &Doc| {
+            write_web_project_tree(dir, doc, &assets, Some(&render), &[]).expect("write");
         };
         let dir = tempdir().unwrap();
-        write(dir.path(), &doc, &mut inputs);
+        write(dir.path(), &doc);
         assert!(
             !tree_snapshot(dir.path())
                 .keys()
@@ -992,7 +987,7 @@ mod tests {
         assert_eq!(loaded.pages(), doc.pages(), "page order survives");
 
         let second = tempdir().unwrap();
-        write(second.path(), &loaded, &mut inputs);
+        write(second.path(), &loaded);
         assert_eq!(
             tree_snapshot(second.path()),
             tree_snapshot(dir.path()),
@@ -1110,17 +1105,8 @@ mod tests {
         );
 
         let dir = tempdir().unwrap();
-        let bounds = fanta_doc::Bounds {
-            min_x: 0.0,
-            min_y: 0.0,
-            max_x: 320.0,
-            max_y: 160.0,
-        };
-        let mut inputs = WebWriteInputs::default();
-        inputs.bounds.insert(page, bounds);
         let assets = BTreeMap::new();
-        let written = write_web_project_tree(dir.path(), &doc, &assets, &inputs).unwrap();
-        assert!(matches!(written, WebWriteOutcome::Written { .. }));
+        write_web_project_tree(dir.path(), &doc, &assets, None, &[]).unwrap();
 
         // A pristine projection loads with nothing to report.
         let (_, _, warnings) = read_project_tree_with_warnings(dir.path()).unwrap();
@@ -1195,8 +1181,7 @@ mod tests {
         );
 
         // The next save canonicalizes and keeps every edit (A4).
-        let rewritten = write_web_project_tree(dir.path(), &loaded, &assets, &inputs).unwrap();
-        assert!(matches!(rewritten, WebWriteOutcome::Written { .. }));
+        write_web_project_tree(dir.path(), &loaded, &assets, None, &[]).unwrap();
         let css = fs::read_to_string(&css_path).unwrap();
         assert!(css.contains("fill: #FF0000;"), "{css}");
         // The canonical fallback literal is the token's resolved value.
@@ -1215,8 +1200,8 @@ mod tests {
     #[test]
     fn web_t4_features_emit_natively_without_rasters() {
         use fanta_doc::{
-            BlendMode, BooleanBakedGeometry, BooleanNode, Bounds, Color, Fill, Gradient,
-            GradientStop, InstanceNode, PathData, Transform2D, VectorNode,
+            BlendMode, BooleanBakedGeometry, BooleanNode, Color, Fill, Gradient, GradientStop,
+            InstanceNode, PathData, Transform2D, VectorNode,
         };
 
         let mut doc = Doc::new();
@@ -1347,21 +1332,20 @@ mod tests {
             .defs
             .insert(comp_id, ComponentDef::new(comp_id, comp_root, "Chip"));
 
-        let bounds = Bounds {
-            min_x: 0.0,
-            min_y: 0.0,
-            max_x: 220.0,
-            max_y: 80.0,
-        };
-        let mut inputs = WebWriteInputs::default();
-        inputs.bounds.insert(page, bounds);
-        inputs.bounds.insert(comp_root, bounds);
         let assets = BTreeMap::new();
         let dir = tempdir().unwrap();
-        let outcome = write_web_project_tree(dir.path(), &doc, &assets, &inputs).unwrap();
+        // No render source at all: these features must not need one (R11).
+        let (_, report) = write_web_project_tree(dir.path(), &doc, &assets, None, &[]).unwrap();
+        let not_drawn: Vec<_> = report
+            .pages
+            .iter()
+            .chain(report.components.iter())
+            .flat_map(|design| design.approximations.iter())
+            .filter(|approximation| approximation.what.starts_with("not drawn"))
+            .collect();
         assert!(
-            matches!(outcome, WebWriteOutcome::Written { .. }),
-            "R11: none of these features may ask for renderer help"
+            not_drawn.is_empty(),
+            "R11: none of these features may need renderer help: {not_drawn:?}"
         );
 
         let svg = fs::read_to_string(dir.path().join("pages/home/page.svg")).unwrap();
@@ -1400,8 +1384,7 @@ mod tests {
         assert_eq!(warnings, Vec::<String>::new(), "a pristine projection loads clean");
         assert_eq!(persisted(&loaded), persisted(&doc));
         let second = tempdir().unwrap();
-        let rewritten = write_web_project_tree(second.path(), &loaded, &assets, &inputs).unwrap();
-        assert!(matches!(rewritten, WebWriteOutcome::Written { .. }));
+        write_web_project_tree(second.path(), &loaded, &assets, None, &[]).unwrap();
         assert_eq!(
             tree_snapshot(second.path()),
             tree_snapshot(dir.path()),
@@ -1449,12 +1432,7 @@ mod tests {
             "the FNX writer must have written sources"
         );
 
-        let inputs = WebWriteInputs::default();
-        let outcome = write_web_project_tree(dir.path(), &f.doc, &assets, &inputs).unwrap();
-        assert!(
-            matches!(outcome, WebWriteOutcome::Written { .. }),
-            "an all-group fixture needs no rasters"
-        );
+        write_web_project_tree(dir.path(), &f.doc, &assets, None, &[]).unwrap();
         let tree = tree_snapshot(dir.path());
         assert!(
             !tree

@@ -78,7 +78,7 @@ pub use project::{
     ReviewConflict, ReviewResolution, SaveBlocked, SaveResult, ScopedDesign, ScopedDoc,
     SessionError, SessionEvent, SourceDiagnostic, SourceProposalOutcome, SourceRebuildReason,
     SourceSeverity, SourceSync, WebDesignReport, WebProjection, WebRaster, WebReport,
-    WebWriteInputs, WebWriteOutcome, WorkspaceDirty, WorkspaceDiskSnapshot, WorkspaceIr,
+    WebRenderSource, WorkspaceDirty, WorkspaceDiskSnapshot, WorkspaceIr,
     WorkspaceSession, WorkspaceSharedState, WriteReport, apply_project_json_edit,
     apply_project_source_edit, apply_project_source_edit_with_diagnostics, artifact_op_impact,
     canonicalize_legacy_source, component_id_of_dir, ensure_project_editor_support,

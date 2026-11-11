@@ -17,10 +17,12 @@
 //!
 //! This module is pure over the document (the persistence layer forbids
 //! Skia): node kinds outside the SVG subset need a pre-rendered PNG, and an
-//! unbaked boolean needs its flattened outline, from the caller.
-//! [`write_web_project_tree`] reports both via
-//! [`WebWriteOutcome::NeedsRenderData`]; render them (`fanta-headless`'s
-//! `export_node` / `boolean_outline`) and call again.
+//! unbaked boolean needs its flattened outline, from the caller's
+//! [`WebRenderSource`] (`fanta-headless` implements it over its exporter).
+//! With no render source, those nodes keep their full record in `nodes.json`
+//! but draw nothing in the SVG, and the report says so per node — the write
+//! still succeeds, so renderer-less library callers (tests, migration
+//! tooling) stay usable.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -68,35 +70,22 @@ pub struct WebRaster {
     pub bounds: Bounds,
 }
 
-/// Renderer-derived inputs the pure projection cannot compute itself.
-#[derive(Default)]
-pub struct WebWriteInputs {
-    /// viewBox bounds per design root (pages and component roots), usually
-    /// from `fanta-headless`'s `page_visual_bounds` so effects are included.
-    /// A missing entry falls back to the scene's world bounds.
-    pub bounds: BTreeMap<NodeId, Bounds>,
-    /// Pre-rendered fallbacks, keyed by node.
-    pub rasters: BTreeMap<NodeId, WebRaster>,
-    /// Flattened outlines for booleans without baked geometry, keyed by node
-    /// (`fanta-headless`'s `boolean_outline`).
-    pub outlines: BTreeMap<NodeId, PathData>,
-    /// Carried into `report.json` verbatim (for example project-open warnings).
-    pub warnings: Vec<String>,
-}
-
-/// What [`write_web_project_tree`] did.
-pub enum WebWriteOutcome {
-    Written {
-        write: WriteReport,
-        report: WebReport,
-    },
-    /// Nothing was written: these nodes need renderer help. Render the
-    /// `rasters` (PNG) and `outlines` (flattened boolean paths) and call
-    /// again with them in the inputs.
-    NeedsRenderData {
-        rasters: Vec<NodeId>,
-        outlines: Vec<NodeId>,
-    },
+/// Renderer-derived data the pure projection cannot compute itself. The
+/// writer queries it on demand during a save; `fanta-headless` provides the
+/// shared implementation over its exporter, so the editor, the engine and
+/// `fanta-site` project identically (R10). Implementations must be
+/// deterministic over an unchanged document — the written bytes are a pure
+/// function of the document (R5), and a save of an unchanged project must
+/// not rewrite files.
+pub trait WebRenderSource {
+    /// viewBox bounds for a design root (page or component root), effects
+    /// included. `None` falls back to the scene's world bounds.
+    fn design_bounds(&self, root: NodeId) -> Option<Bounds>;
+    /// A PNG covering `node`'s visual bounds in world space, for node kinds
+    /// beyond the SVG subset.
+    fn raster(&self, node: NodeId) -> Option<WebRaster>;
+    /// The flattened outline of a boolean with no baked geometry.
+    fn outline(&self, node: NodeId) -> Option<PathData>;
 }
 
 /// What the projection wrote and what it had to approximate.
@@ -145,31 +134,22 @@ pub struct Approximation {
 pub struct WebProjection {
     pub files: BTreeMap<PathBuf, Arc<Vec<u8>>>,
     pub report: WebReport,
-    /// Nodes that need a raster before the projection is complete. When this
-    /// or `missing_outlines` is non-empty the SVG files are placeholders and
-    /// must not be written.
-    pub missing_rasters: Vec<NodeId>,
-    /// Booleans that need their flattened outline from the renderer.
-    pub missing_outlines: Vec<NodeId>,
 }
 
 /// Write `doc` to `dir` in the web format, through the same transactional
-/// sync as the FNX writer (locking, symlink defense, stale pruning — which
-/// also removes `.fnx`/`.fss` files when converting a project in place).
+/// sync as the legacy FNX writer (locking, symlink defense, stale pruning —
+/// which also removes `.fnx`/`.fss` files when converting a project in
+/// place). `render` supplies what the pure projection cannot compute; with
+/// `None`, nodes that need it draw nothing and the report says so.
 pub fn write_web_project_tree(
     dir: &Path,
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
-    inputs: &WebWriteInputs,
-) -> Result<WebWriteOutcome> {
+    render: Option<&dyn WebRenderSource>,
+    warnings: &[String],
+) -> Result<(WriteReport, WebReport)> {
     let asset_hrefs = asset_hrefs(assets);
-    let projection = web_project_files(doc, &asset_hrefs, inputs)?;
-    if !projection.missing_rasters.is_empty() || !projection.missing_outlines.is_empty() {
-        return Ok(WebWriteOutcome::NeedsRenderData {
-            rasters: projection.missing_rasters,
-            outlines: projection.missing_outlines,
-        });
-    }
+    let projection = web_project_files(doc, &asset_hrefs, render, warnings)?;
     let mut files = projection.files;
     files.insert(
         PathBuf::from(ASSETS_DIR).join(ASSET_INDEX_FILE),
@@ -177,10 +157,7 @@ pub fn write_web_project_tree(
     );
     let asset_files = project_asset_files(assets, None)?;
     let write = sync_project_files(dir, &files, &asset_files, None)?;
-    Ok(WebWriteOutcome::Written {
-        write,
-        report: projection.report,
-    })
+    Ok((write, projection.report))
 }
 
 /// `assets/<family>/<id>.<ext>` for every asset — the same naming
@@ -201,7 +178,8 @@ fn asset_hrefs(assets: &BTreeMap<AssetId, Vec<u8>>) -> BTreeMap<AssetId, String>
 pub fn web_project_files(
     doc: &Doc,
     asset_hrefs: &BTreeMap<AssetId, String>,
-    inputs: &WebWriteInputs,
+    render: Option<&dyn WebRenderSource>,
+    warnings: &[String],
 ) -> Result<WebProjection> {
     let resolved = resolve_export_bindings(doc);
     let grouping = design_grouping(doc)?;
@@ -222,8 +200,6 @@ pub fn web_project_files(
     );
     let mut pages = Vec::new();
     let mut components = Vec::new();
-    let mut missing_rasters = Vec::new();
-    let mut missing_outlines = Vec::new();
 
     // Pages in document order.
     for page in &doc.pages {
@@ -249,11 +225,9 @@ pub fn web_project_files(
             slug,
             &name,
             asset_hrefs,
-            inputs,
+            render,
             &mut files,
             &mut design_css,
-            &mut missing_rasters,
-            &mut missing_outlines,
         )?;
         files.insert(
             design_dir.join(MAP_JSON),
@@ -292,11 +266,9 @@ pub fn web_project_files(
             cdir,
             &name,
             asset_hrefs,
-            inputs,
+            render,
             &mut files,
             &mut design_css,
-            &mut missing_rasters,
-            &mut missing_outlines,
         )?;
         components.push(report);
     }
@@ -346,23 +318,14 @@ pub fn web_project_files(
         pages,
         components,
         skipped_variables,
-        warnings: inputs.warnings.clone(),
+        warnings: warnings.to_vec(),
     };
     files.insert(
         PathBuf::from("report.json"),
         Arc::new(json_bytes(&serde_json::to_value(&report)?)?),
     );
 
-    missing_rasters.sort();
-    missing_rasters.dedup();
-    missing_outlines.sort();
-    missing_outlines.dedup();
-    Ok(WebProjection {
-        files,
-        report,
-        missing_rasters,
-        missing_outlines,
-    })
+    Ok(WebProjection { files, report })
 }
 
 /// `nodes.json` beside a design's SVG: the complete record of every node in
@@ -462,17 +425,13 @@ fn emit_design(
     slug: &str,
     name: &str,
     asset_hrefs: &BTreeMap<AssetId, String>,
-    inputs: &WebWriteInputs,
+    render: Option<&dyn WebRenderSource>,
     files: &mut ProjectedFiles,
     design_css: &mut String,
-    missing_rasters: &mut Vec<NodeId>,
-    missing_outlines: &mut Vec<NodeId>,
 ) -> Result<WebDesignReport> {
     let design_dir_href = design_dir.to_string_lossy().replace('\\', "/");
-    let bounds = inputs
-        .bounds
-        .get(&root)
-        .copied()
+    let bounds = render
+        .and_then(|render| render.design_bounds(root))
         .or_else(|| resolved.scene.world_bounds(root))
         .filter(|bounds| {
             bounds.min_x.is_finite()
@@ -495,13 +454,11 @@ fn emit_design(
         authored,
         registry: &authored.variables,
         asset_hrefs,
-        inputs,
+        render,
         raster_dir: &design_dir_href,
         css: String::new(),
         defs: String::new(),
         rasters: Vec::new(),
-        missing_rasters: Vec::new(),
-        missing_outlines: Vec::new(),
         approximations: Vec::new(),
         virtual_defs: 0,
     };
@@ -528,8 +485,6 @@ fn emit_design(
     for (file, bytes) in emitter.rasters {
         files.insert(design_dir.join(file), Arc::new(bytes));
     }
-    missing_rasters.extend(emitter.missing_rasters);
-    missing_outlines.extend(emitter.missing_outlines);
     Ok(WebDesignReport {
         slug: slug.to_owned(),
         name: name.to_owned(),
@@ -547,15 +502,13 @@ struct Emitter<'a> {
     authored: &'a Doc,
     registry: &'a VariableRegistry,
     asset_hrefs: &'a BTreeMap<AssetId, String>,
-    inputs: &'a WebWriteInputs,
+    render: Option<&'a dyn WebRenderSource>,
     /// Project-relative directory raster hrefs point into.
     raster_dir: &'a str,
     css: String,
     /// `<defs>` content: gradient paint servers and instance clip paths.
     defs: String,
     rasters: Vec<(String, Vec<u8>)>,
-    missing_rasters: Vec<NodeId>,
-    missing_outlines: Vec<NodeId>,
     approximations: Vec<Approximation>,
     /// Counter for def ids inside derived (instance) content, which emits no
     /// node ids because expansion ids are not stable across saves.
@@ -657,9 +610,12 @@ impl Emitter<'_> {
                     .baked
                     .as_ref()
                     .map(|baked| baked.vector.path.clone())
-                    .or_else(|| self.inputs.outlines.get(&id).cloned());
+                    .or_else(|| self.render.and_then(|render| render.outline(id)));
                 let Some(outline) = outline else {
-                    self.missing_outlines.push(id);
+                    self.approximate(
+                        &node,
+                        "not drawn: flattening this boolean needs a renderer",
+                    );
                     return Ok(());
                 };
                 let vector = VectorNode {
@@ -1464,11 +1420,11 @@ impl Emitter<'_> {
         depth: usize,
         what: &str,
     ) -> Result<()> {
-        self.approximate(node, &format!("rasterized: {what}"));
-        let Some(raster) = self.inputs.rasters.get(&node.id) else {
-            self.missing_rasters.push(node.id);
+        let Some(raster) = self.render.and_then(|render| render.raster(node.id)) else {
+            self.approximate(node, &format!("not drawn: {what}, and no renderer is available"));
             return Ok(());
         };
+        self.approximate(node, &format!("rasterized: {what}"));
         // The PNG covers the node's visual bounds in world space; place it in
         // the parent's space through the inverse of the parent's world
         // transform.
@@ -1501,7 +1457,7 @@ impl Emitter<'_> {
             number((high.x - low.x).abs()),
             number((high.y - low.y).abs()),
         );
-        self.rasters.push((file, raster.bytes.clone()));
+        self.rasters.push((file, raster.bytes));
         Ok(())
     }
 
