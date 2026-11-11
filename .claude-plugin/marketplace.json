@@ -1,0 +1,11 @@
+{
+  "name": "fanta",
+  "owner": { "name": "Fanta" },
+  "plugins": [
+    {
+      "name": "fanta-canvas",
+      "source": "./examples/claude-plugin",
+      "description": "Fanta's live design tools in Claude Code: inspect and edit the running app's open document, screenshot the canvas, and review every change as a git diff."
+    }
+  ]
+}

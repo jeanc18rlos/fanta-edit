@@ -14,6 +14,9 @@ attach-or-launch wrapper in this directory.
 
 ## Claude Code
 
+Prefer the installable plugin in [`../claude-plugin`](../claude-plugin); the
+command below is the manual equivalent.
+
 ```sh
 claude mcp add --scope project --transport stdio fanta \
   --env FANTA_BIN=/path/to/fanta \
