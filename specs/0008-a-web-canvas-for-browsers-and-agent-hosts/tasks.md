@@ -4,7 +4,7 @@ One task per pull request, in order. Each task says what it changes, which
 requirements it serves and how it is verified. Tick it and link the pull
 request when it merges.
 
-- [ ] **T1.** Engine to WebAssembly: move `fanta-format`'s filesystem code
+- [x] **T1.** ([#194](https://github.com/jeanc18rlos/fanta-edit/pull/194)) Engine to WebAssembly: move `fanta-format`'s filesystem code
   behind a default-on cargo feature, add the browser `getrandom` cfg, and
   build a wasm package over `fanta-doc` + `fanta-design-ops` + the
   read/emit core with a bytes-in/bytes-out API: load sources, apply a
