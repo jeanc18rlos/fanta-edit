@@ -56,7 +56,7 @@ pub(crate) fn apply_web_overlay(
     let mut relayout = Vec::new();
     for raw in ids {
         let (display, slot) = split_slot(raw);
-        if matches!(slot, Slot::Clip) {
+        if matches!(slot, Slot::Clip | Slot::Skip) {
             continue;
         }
         let Ok(id) = display.parse::<NodeId>() else {
@@ -126,14 +126,21 @@ pub(crate) fn apply_web_overlay(
 }
 
 /// What an element id addresses: the node itself, one of a frame's background
-/// rects, or its clip path (projection-only).
+/// rects, a stacked-fill clone element, or a projection-only def (clip path,
+/// mask, gradient).
 enum Slot {
     Node,
     Background(usize),
+    Fill(usize),
     Clip,
+    /// Mask and gradient defs: regenerated on save, never node edits.
+    Skip,
 }
 
 fn split_slot(raw: &str) -> (&str, Slot) {
+    if raw.ends_with("-mask") || raw.ends_with("-grad") {
+        return (raw, Slot::Skip);
+    }
     if let Some(display) = raw.strip_suffix("-clip") {
         return (display, Slot::Clip);
     }
@@ -144,6 +151,12 @@ fn split_slot(raw: &str) -> (&str, Slot) {
         let (display, index) = raw.split_at(position);
         if let Ok(index) = index["-bg".len()..].parse::<usize>() {
             return (display, Slot::Background(index));
+        }
+    }
+    if let Some(position) = raw.rfind("-f") {
+        let (display, index) = raw.split_at(position);
+        if let Ok(index) = index["-f".len()..].parse::<usize>() {
+            return (display, Slot::Fill(index));
         }
     }
     (raw, Slot::Node)
@@ -453,6 +466,11 @@ impl Edit<'_> {
     }
 
     fn apply_svg(&mut self, slot: &Slot, element: &SvgElement) {
+        if matches!(slot, Slot::Fill(_)) {
+            // Clone elements mirror the base element's geometry; geometry
+            // edits come from the base, only the paint belongs to the clone.
+            return;
+        }
         if let Slot::Background(index) = slot {
             // The background rect mirrors the frame's size; its paint comes
             // from CSS. Resizing bg0 resizes the frame.
@@ -551,6 +569,12 @@ impl Edit<'_> {
     }
 
     fn apply_declaration(&mut self, slot: &Slot, property: &str, value: &str) {
+        // On a stacked-fill clone only the paint is authoritative; the other
+        // declarations (rx, opacity) mirror the base element as plain
+        // literals, and applying them would unbind the base's variables.
+        if matches!(slot, Slot::Fill(_)) && property != "fill" {
+            return;
+        }
         match property {
             "fill" => self.apply_fill(slot, value),
             "stroke" => self.apply_stroke_paint(value),
@@ -713,6 +737,11 @@ impl Edit<'_> {
     }
 
     fn apply_fill(&mut self, slot: &Slot, value: &str) {
+        if value.trim_start().starts_with("url(") {
+            // A canonical gradient paint: its def lives in the SVG; editing
+            // gradients by hand goes through nodes.json.
+            return;
+        }
         let Some(paint) = parse_paint(value) else {
             return self.keep(&format!(
                 "fill {value:?} is outside the emitted dialect; the save regenerates it"
@@ -721,6 +750,9 @@ impl Edit<'_> {
         let binding_prop = match (&slot, &self.node.data) {
             (Slot::Node, NodeData::Text(_)) => BoundProp::TextStyle,
             (Slot::Background(index), _) => BoundProp::FillColor {
+                index: u16::try_from(*index).unwrap_or(u16::MAX),
+            },
+            (Slot::Fill(index), _) => BoundProp::FillColor {
                 index: u16::try_from(*index).unwrap_or(u16::MAX),
             },
             _ => BoundProp::FillColor { index: 0 },
@@ -733,6 +765,10 @@ impl Edit<'_> {
                 {
                     vector.fills.clear();
                     self.changed = true;
+                } else if matches!(slot, Slot::Fill(_)) {
+                    self.keep(
+                        "removing a stacked fill is not applied from CSS; edit nodes.json or the editor",
+                    );
                 }
                 return;
             }
@@ -771,6 +807,44 @@ impl Edit<'_> {
                         None
                     }
                 },
+                (Slot::Fill(index), NodeData::Vector(vector)) => {
+                    match vector.fills.get_mut(*index) {
+                        Some(Fill::Solid { color, .. }) => Some(color),
+                        Some(_) => {
+                            note = Some(
+                                "a fill edit on a non-solid paint is not applied; the save regenerates it",
+                            );
+                            None
+                        }
+                        None => {
+                            note = Some(
+                                "the fill index does not exist; the declaration is regenerated on save",
+                            );
+                            None
+                        }
+                    }
+                }
+                (Slot::Node | Slot::Fill(_), NodeData::Boolean(boolean)) => {
+                    let index = match slot {
+                        Slot::Fill(index) => *index,
+                        _ => 0,
+                    };
+                    match boolean.fills.get_mut(index) {
+                        Some(Fill::Solid { color, .. }) => Some(color),
+                        Some(_) => {
+                            note = Some(
+                                "a fill edit on a non-solid paint is not applied; the save regenerates it",
+                            );
+                            None
+                        }
+                        None => {
+                            note = Some(
+                                "the fill index does not exist; the declaration is regenerated on save",
+                            );
+                            None
+                        }
+                    }
+                }
                 (Slot::Node, NodeData::Text(text)) => Some(&mut text.style.color),
                 (Slot::Background(index), NodeData::Group(group)) => {
                     let fill = group
@@ -810,6 +884,11 @@ impl Edit<'_> {
     }
 
     fn apply_stroke_paint(&mut self, value: &str) {
+        if value.trim_start().starts_with("url(") {
+            // A canonical gradient paint: its def lives in the SVG; editing
+            // gradients by hand goes through nodes.json.
+            return;
+        }
         let Some(paint) = parse_paint(value) else {
             return self.keep(&format!(
                 "stroke {value:?} is outside the emitted dialect; the save regenerates it"

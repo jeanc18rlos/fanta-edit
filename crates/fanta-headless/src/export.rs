@@ -108,6 +108,12 @@ pub fn detach_export_root<'a>(
 }
 
 /// What a page or node draws, in world units.
+/// The flattened outline of a boolean node, as document path data — what the
+/// web projection stores instead of a raster stand-in (spec 0007 R11).
+pub fn boolean_outline(document: &Doc, node: NodeId) -> Option<fanta_doc::PathData> {
+    fanta_render::raster::boolean_outline(&document.scene, node)
+}
+
 pub fn page_visual_bounds(document: &Doc, root: Option<NodeId>) -> Option<Bounds> {
     match root {
         Some(root) => visual_world_bounds(&document.scene, root, 0.0),

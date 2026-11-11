@@ -9,11 +9,18 @@
 //! format is lossless from day one while native SVG/CSS coverage grows
 //! (T4 shrinks the sidecar as coverage lands — see the spec's design notes).
 //!
+//! Native coverage (R11): solid and gradient paints (linear and axis-aligned
+//! radial), stacked fills as `-f<n>` clone elements, masks as SVG `<mask>`,
+//! booleans as their flattened outline, and instances as inline-styled
+//! derived content without element ids (expansion ids are not stable across
+//! saves, so derived content never enters `design.css` or the loader).
+//!
 //! This module is pure over the document (the persistence layer forbids
-//! Skia): node kinds outside the SVG subset need a pre-rendered PNG from the
-//! caller. [`write_web_project_tree`] reports which nodes need one via
-//! [`WebWriteOutcome::NeedsRasters`]; render them (`fanta-headless`'s
-//! `export_node`) and call again.
+//! Skia): node kinds outside the SVG subset need a pre-rendered PNG, and an
+//! unbaked boolean needs its flattened outline, from the caller.
+//! [`write_web_project_tree`] reports both via
+//! [`WebWriteOutcome::NeedsRenderData`]; render them (`fanta-headless`'s
+//! `export_node` / `boolean_outline`) and call again.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -23,9 +30,10 @@ use std::sync::Arc;
 use fanta_doc::value::VarValue;
 use fanta_doc::variables::{Variable, VariableRegistry};
 use fanta_doc::{
-    AssetId, BlendMode, BlurKind, BoundProp, Bounds, CanvasNode, Color, Doc, Fill, ModeId,
-    NodeData, NodeFlags, NodeId, PathData, PathSegment, ShadowKind, Stroke, TextAlign, TextStyle,
-    Transform2D, resolve_export_bindings,
+    AssetId, BlendMode, BlurKind, BoundProp, Bounds, CanvasNode, Color, Doc, Fill, Gradient,
+    GradientStop, InstanceNode, ModeId, NodeData, NodeFlags, NodeId, PathData, PathSegment,
+    ShadowKind, Stroke, TextAlign, TextStyle, Transform2D, VectorNode, expand_instance,
+    resolve_export_bindings,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -69,6 +77,9 @@ pub struct WebWriteInputs {
     pub bounds: BTreeMap<NodeId, Bounds>,
     /// Pre-rendered fallbacks, keyed by node.
     pub rasters: BTreeMap<NodeId, WebRaster>,
+    /// Flattened outlines for booleans without baked geometry, keyed by node
+    /// (`fanta-headless`'s `boolean_outline`).
+    pub outlines: BTreeMap<NodeId, PathData>,
     /// Carried into `report.json` verbatim (for example project-open warnings).
     pub warnings: Vec<String>,
 }
@@ -79,9 +90,13 @@ pub enum WebWriteOutcome {
         write: WriteReport,
         report: WebReport,
     },
-    /// Nothing was written: these nodes are outside the SVG subset and have
-    /// no raster in the inputs. Render them and call again.
-    NeedsRasters(Vec<NodeId>),
+    /// Nothing was written: these nodes need renderer help. Render the
+    /// `rasters` (PNG) and `outlines` (flattened boolean paths) and call
+    /// again with them in the inputs.
+    NeedsRenderData {
+        rasters: Vec<NodeId>,
+        outlines: Vec<NodeId>,
+    },
 }
 
 /// What the projection wrote and what it had to approximate.
@@ -131,8 +146,11 @@ pub struct WebProjection {
     pub files: BTreeMap<PathBuf, Arc<Vec<u8>>>,
     pub report: WebReport,
     /// Nodes that need a raster before the projection is complete. When this
-    /// is non-empty the SVG files are placeholders and must not be written.
+    /// or `missing_outlines` is non-empty the SVG files are placeholders and
+    /// must not be written.
     pub missing_rasters: Vec<NodeId>,
+    /// Booleans that need their flattened outline from the renderer.
+    pub missing_outlines: Vec<NodeId>,
 }
 
 /// Write `doc` to `dir` in the web format, through the same transactional
@@ -146,8 +164,11 @@ pub fn write_web_project_tree(
 ) -> Result<WebWriteOutcome> {
     let asset_hrefs = asset_hrefs(assets);
     let projection = web_project_files(doc, &asset_hrefs, inputs)?;
-    if !projection.missing_rasters.is_empty() {
-        return Ok(WebWriteOutcome::NeedsRasters(projection.missing_rasters));
+    if !projection.missing_rasters.is_empty() || !projection.missing_outlines.is_empty() {
+        return Ok(WebWriteOutcome::NeedsRenderData {
+            rasters: projection.missing_rasters,
+            outlines: projection.missing_outlines,
+        });
     }
     let mut files = projection.files;
     files.insert(
@@ -202,6 +223,7 @@ pub fn web_project_files(
     let mut pages = Vec::new();
     let mut components = Vec::new();
     let mut missing_rasters = Vec::new();
+    let mut missing_outlines = Vec::new();
 
     // Pages in document order.
     for page in &doc.pages {
@@ -231,6 +253,7 @@ pub fn web_project_files(
             &mut files,
             &mut design_css,
             &mut missing_rasters,
+            &mut missing_outlines,
         )?;
         files.insert(
             design_dir.join(MAP_JSON),
@@ -273,6 +296,7 @@ pub fn web_project_files(
             &mut files,
             &mut design_css,
             &mut missing_rasters,
+            &mut missing_outlines,
         )?;
         components.push(report);
     }
@@ -331,10 +355,13 @@ pub fn web_project_files(
 
     missing_rasters.sort();
     missing_rasters.dedup();
+    missing_outlines.sort();
+    missing_outlines.dedup();
     Ok(WebProjection {
         files,
         report,
         missing_rasters,
+        missing_outlines,
     })
 }
 
@@ -439,6 +466,7 @@ fn emit_design(
     files: &mut ProjectedFiles,
     design_css: &mut String,
     missing_rasters: &mut Vec<NodeId>,
+    missing_outlines: &mut Vec<NodeId>,
 ) -> Result<WebDesignReport> {
     let design_dir_href = design_dir.to_string_lossy().replace('\\', "/");
     let bounds = inputs
@@ -470,17 +498,25 @@ fn emit_design(
         inputs,
         raster_dir: &design_dir_href,
         css: String::new(),
+        defs: String::new(),
         rasters: Vec::new(),
         missing_rasters: Vec::new(),
+        missing_outlines: Vec::new(),
         approximations: Vec::new(),
+        virtual_defs: 0,
     };
     let mut body = String::new();
     emitter.emit_node(root, &mut body, 1)?;
     let width = (bounds.max_x - bounds.min_x).ceil();
     let height = (bounds.max_y - bounds.min_y).ceil();
+    let defs = if emitter.defs.is_empty() {
+        String::new()
+    } else {
+        format!("  <defs>\n{}  </defs>\n", emitter.defs)
+    };
     let svg = format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" \
-         viewBox=\"{} {} {width} {height}\">\n{body}</svg>\n",
+         viewBox=\"{} {} {width} {height}\">\n{defs}{body}</svg>\n",
         number(bounds.min_x),
         number(bounds.min_y),
     );
@@ -493,6 +529,7 @@ fn emit_design(
         files.insert(design_dir.join(file), Arc::new(bytes));
     }
     missing_rasters.extend(emitter.missing_rasters);
+    missing_outlines.extend(emitter.missing_outlines);
     Ok(WebDesignReport {
         slug: slug.to_owned(),
         name: name.to_owned(),
@@ -514,9 +551,15 @@ struct Emitter<'a> {
     /// Project-relative directory raster hrefs point into.
     raster_dir: &'a str,
     css: String,
+    /// `<defs>` content: gradient paint servers and instance clip paths.
+    defs: String,
     rasters: Vec<(String, Vec<u8>)>,
     missing_rasters: Vec<NodeId>,
+    missing_outlines: Vec<NodeId>,
     approximations: Vec<Approximation>,
+    /// Counter for def ids inside derived (instance) content, which emits no
+    /// node ids because expansion ids are not stable across saves.
+    virtual_defs: usize,
 }
 
 impl Emitter<'_> {
@@ -526,17 +569,6 @@ impl Emitter<'_> {
         };
         if node.flags.contains(NodeFlags::HIDDEN) {
             return Ok(());
-        }
-        // Siblings after a mask node are clipped by it; the subset cannot
-        // express that yet, so a parent holding a mask rasterizes whole.
-        let has_mask_child = self
-            .resolved
-            .scene
-            .children_of(Some(id))
-            .iter()
-            .any(|child| self.resolved.scene.get(*child).is_some_and(|c| c.is_mask));
-        if has_mask_child {
-            return self.raster_fallback(&node, out, depth, "a mask clips this subtree");
         }
 
         match &node.data {
@@ -576,7 +608,13 @@ impl Emitter<'_> {
                             number(height),
                         );
                         let mut rule = Declarations::default();
-                        self.fill_declaration(&node, fill, index, &mut rule);
+                        match self.paint_value(&node, fill, index, &element_id) {
+                            Some(paint) => rule.push("fill", paint),
+                            None => self.approximate(
+                                &node,
+                                "a background paint beyond the SVG subset is dropped",
+                            ),
+                        }
                         if let Some(radius) = radius {
                             rule.push_bound(
                                 self,
@@ -604,67 +642,58 @@ impl Emitter<'_> {
                         );
                     }
                 }
-                for child in self.resolved.scene.children_of(Some(id)).to_vec() {
-                    self.emit_node(child, out, depth + 1)?;
-                }
+                self.emit_children(id, out, depth)?;
                 indent(out, depth);
                 out.push_str("</g>\n");
             }
             NodeData::Vector(vector) => {
                 let vector = vector.clone();
-                let single_solid = vector.fills.len() <= 1
-                    && vector
-                        .fills
-                        .first()
-                        .is_none_or(|fill| matches!(fill, Fill::Solid { .. }));
-                if !single_solid {
-                    return self.raster_fallback(&node, out, depth, "gradient or stacked fills");
+                self.emit_vector(&node, &vector, out, depth)?;
+            }
+            NodeData::Boolean(boolean) => {
+                // The flattened outline is the visual projection (R11); the
+                // operands stay in nodes.json, where the editor reads them.
+                let outline = boolean
+                    .baked
+                    .as_ref()
+                    .map(|baked| baked.vector.path.clone())
+                    .or_else(|| self.inputs.outlines.get(&id).cloned());
+                let Some(outline) = outline else {
+                    self.missing_outlines.push(id);
+                    return Ok(());
+                };
+                let vector = VectorNode {
+                    path: outline,
+                    fills: boolean.fills.clone(),
+                    strokes: boolean.strokes.clone(),
+                    ..VectorNode::default()
+                };
+                self.emit_vector(&node, &vector, out, depth)?;
+            }
+            NodeData::Instance(instance) => {
+                let instance = instance.clone();
+                self.start_element(&node, out, depth, "g");
+                out.push_str(">\n");
+                // Like the canvas, the expansion clips to the instance size.
+                let [width, height] = instance.local_size;
+                if width > 0.0 && height > 0.0 {
+                    indent(out, depth + 1);
+                    let _ = writeln!(
+                        out,
+                        "<clipPath id=\"{id}-clip\"><rect width=\"{}\" height=\"{}\"/></clipPath>",
+                        number(width),
+                        number(height),
+                    );
+                    indent(out, depth + 1);
+                    let _ = writeln!(out, "<g clip-path=\"url(#{id}-clip)\">");
+                    self.emit_expansion(&node, &instance, out, depth + 2)?;
+                    indent(out, depth + 1);
+                    out.push_str("</g>\n");
+                } else {
+                    self.emit_expansion(&node, &instance, out, depth + 1)?;
                 }
-                let mut rule = Declarations::default();
-                match vector.fills.first() {
-                    Some(fill) => self.fill_declaration(&node, fill, 0, &mut rule),
-                    None => rule.push("fill", "none".to_string()),
-                }
-                self.stroke_declarations(&node, &vector.strokes, &mut rule);
-                match vector.path.is_rect().then(|| rect_of(&vector.path)).flatten() {
-                    Some((x, y, width, height)) => {
-                        let radius = vector
-                            .corner_radii
-                            .map(|radii| radii[0])
-                            .or(vector.corner_radius);
-                        if vector
-                            .corner_radii
-                            .is_some_and(|radii| radii.windows(2).any(|pair| pair[0] != pair[1]))
-                        {
-                            self.approximate(&node, "mixed corner radii use the first corner");
-                        }
-                        if let Some(radius) = radius {
-                            rule.push_bound(
-                                self,
-                                &node,
-                                BoundProp::CornerRadius,
-                                "rx",
-                                number(radius),
-                            );
-                        }
-                        self.start_element(&node, out, depth, "rect");
-                        let _ = write!(
-                            out,
-                            " x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"",
-                            number(x),
-                            number(y),
-                            number(width),
-                            number(height)
-                        );
-                        out.push_str("/>\n");
-                    }
-                    None => {
-                        self.start_element(&node, out, depth, "path");
-                        let _ = write!(out, " d=\"{}\"", vector.path.to_svg_d());
-                        out.push_str("/>\n");
-                    }
-                }
-                self.rule(&id.to_string(), rule);
+                indent(out, depth);
+                out.push_str("</g>\n");
             }
             NodeData::Text(text) => {
                 let text = text.clone();
@@ -775,24 +804,33 @@ impl Emitter<'_> {
             let _ = write!(out, " class=\"{class}\"");
         }
         let _ = write!(out, " data-name=\"{}\"", xml_escape(&node.name));
-        if let Some(transform) = transform_attribute(&node.transform) {
-            let _ = write!(out, " transform=\"{transform}\"");
-        }
-        if let Some(parent) = node.parent {
-            let parent_clips = self
-                .resolved
-                .scene
-                .get(parent)
-                .is_some_and(|parent_node| match &parent_node.data {
-                    NodeData::Group(group) => group.clip_size.is_some(),
-                    _ => false,
-                });
-            if parent_clips {
-                let _ = write!(out, " clip-path=\"url(#{parent}-clip)\"");
-            }
-        }
+        out.push_str(&self.shared_attrs(node));
 
         let mut rule = Declarations::default();
+        self.node_level_declarations(node, &mut rule);
+        // R8: auto-layout intent lives in CSS; the solved child geometry in
+        // the SVG is derived from it and regenerated when the intent changes.
+        if let NodeData::Group(group) = &node.data
+            && let Some(layout) = &group.auto_layout
+        {
+            if let Some(mode) = serde_json::to_value(layout.mode)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+            {
+                rule.push("--fanta-layout", mode);
+            }
+            rule.push("--fanta-gap", number(layout.spacing));
+            if layout.padding != [0.0; 4] {
+                rule.push("--fanta-padding", layout.padding.map(number).join(" "));
+            }
+        }
+        self.rule(&node.id.to_string(), rule);
+    }
+
+    /// Opacity, blend mode and filter effects for one node — the node-level
+    /// CSS shared by real elements (`design.css` rules) and derived instance
+    /// content (inline styles; its ids never bind, so literals come out).
+    fn node_level_declarations(&mut self, node: &CanvasNode, rule: &mut Declarations) {
         let opacity = f64::from(node.opacity.get());
         if opacity < 1.0 {
             rule.push_bound(self, node, BoundProp::Opacity, "opacity", number(opacity));
@@ -830,32 +868,446 @@ impl Emitter<'_> {
         if !filters.is_empty() {
             rule.push("filter", filters.join(" "));
         }
-        // R8: auto-layout intent lives in CSS; the solved child geometry in
-        // the SVG is derived from it and regenerated when the intent changes.
-        if let NodeData::Group(group) = &node.data
-            && let Some(layout) = &group.auto_layout
-        {
-            if let Some(mode) = serde_json::to_value(layout.mode)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_owned))
-            {
-                rule.push("--fanta-layout", mode);
-            }
-            rule.push("--fanta-gap", number(layout.spacing));
-            if layout.padding != [0.0; 4] {
-                rule.push("--fanta-padding", layout.padding.map(number).join(" "));
-            }
-        }
-        self.rule(&node.id.to_string(), rule);
     }
 
-    fn fill_declaration(
+    /// Emit a group's children, folding mask nodes into SVG `<mask>`: a mask
+    /// node clips its following siblings, so they nest in a
+    /// `<g mask="url(#…)">` wrapper (one per mask; later masks nest deeper).
+    fn emit_children(&mut self, id: NodeId, out: &mut String, depth: usize) -> Result<()> {
+        let mut open_masks = 0usize;
+        for child in self.resolved.scene.children_of(Some(id)).to_vec() {
+            let child_depth = depth + 1 + open_masks;
+            let is_mask = self.resolved.scene.get(child).is_some_and(|child_node| {
+                child_node.is_mask && !child_node.flags.contains(NodeFlags::HIDDEN)
+            });
+            if is_mask {
+                indent(out, child_depth);
+                let _ = writeln!(out, "<mask id=\"{child}-mask\" style=\"mask-type:alpha\">");
+                self.emit_node(child, out, child_depth + 1)?;
+                indent(out, child_depth);
+                out.push_str("</mask>\n");
+                indent(out, child_depth);
+                let _ = writeln!(out, "<g mask=\"url(#{child}-mask)\">");
+                open_masks += 1;
+            } else {
+                self.emit_node(child, out, child_depth)?;
+            }
+        }
+        for closing in (0..open_masks).rev() {
+            indent(out, depth + 1 + closing);
+            out.push_str("</g>\n");
+        }
+        Ok(())
+    }
+
+    /// Emit a vector-shaped node: the base element carries the geometry, the
+    /// first fill and the strokes; additional fills stack as `-f<n>` clones of
+    /// the same geometry. A paint outside the subset rasterizes the node.
+    fn emit_vector(
+        &mut self,
+        node: &CanvasNode,
+        vector: &VectorNode,
+        out: &mut String,
+        depth: usize,
+    ) -> Result<()> {
+        let paintable = vector.fills.iter().all(paint_expressible)
+            && vector
+                .strokes
+                .first()
+                .is_none_or(|stroke| paint_expressible(&stroke.paint));
+        if !paintable {
+            return self.raster_fallback(node, out, depth, "paints beyond the SVG subset");
+        }
+        let id = node.id;
+        let radius = vector
+            .corner_radii
+            .map(|radii| radii[0])
+            .or(vector.corner_radius);
+        if vector
+            .corner_radii
+            .is_some_and(|radii| radii.windows(2).any(|pair| pair[0] != pair[1]))
+        {
+            self.approximate(node, "mixed corner radii use the first corner");
+        }
+        let (tag, geometry) = match vector.path.is_rect().then(|| rect_of(&vector.path)).flatten()
+        {
+            Some((x, y, width, height)) => (
+                "rect",
+                format!(
+                    " x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"",
+                    number(x),
+                    number(y),
+                    number(width),
+                    number(height)
+                ),
+            ),
+            None => ("path", format!(" d=\"{}\"", vector.path.to_svg_d())),
+        };
+
+        let base_id = id.to_string();
+        let mut rule = Declarations::default();
+        match vector.fills.first() {
+            Some(fill) => match self.paint_value(node, fill, 0, &base_id) {
+                Some(paint) => rule.push("fill", paint),
+                None => rule.push("fill", "none".to_string()),
+            },
+            None => rule.push("fill", "none".to_string()),
+        }
+        self.stroke_declarations(node, &vector.strokes, &base_id, &mut rule);
+        if tag == "rect"
+            && let Some(radius) = radius
+        {
+            rule.push_bound(self, node, BoundProp::CornerRadius, "rx", number(radius));
+        }
+        self.start_element(node, out, depth, tag);
+        out.push_str(&geometry);
+        out.push_str("/>\n");
+        self.rule(&base_id, rule);
+
+        for (index, fill) in vector.fills.iter().enumerate().skip(1) {
+            let element_id = format!("{id}-f{index}");
+            let mut rule = Declarations::default();
+            match self.paint_value(node, fill, index, &element_id) {
+                Some(paint) => rule.push("fill", paint),
+                None => rule.push("fill", "none".to_string()),
+            }
+            if tag == "rect"
+                && let Some(radius) = radius
+            {
+                rule.push("rx", number(radius));
+            }
+            indent(out, depth);
+            let _ = writeln!(
+                out,
+                "<{tag} id=\"{element_id}\"{}{geometry}/>",
+                self.shared_attrs(node),
+            );
+            self.rule(&element_id, rule);
+        }
+        Ok(())
+    }
+
+    /// Expand an instance and emit its derived content: same drawing
+    /// vocabulary, but no element ids (expansion mints fresh ids every call)
+    /// and inline styles instead of `design.css` rules, so the output stays
+    /// byte-deterministic and invisible to the loader.
+    fn emit_expansion(
+        &mut self,
+        node: &CanvasNode,
+        instance: &InstanceNode,
+        out: &mut String,
+        depth: usize,
+    ) -> Result<()> {
+        let expanded = expand_instance(&self.resolved.scene, &self.resolved.components, instance);
+        if expanded.is_empty() {
+            self.approximate(node, "the instance's component has no content");
+            return Ok(());
+        }
+        let nodes: Vec<CanvasNode> = expanded.into_iter().map(|entry| entry.node).collect();
+        let ids: std::collections::BTreeSet<NodeId> =
+            nodes.iter().map(|virtual_node| virtual_node.id).collect();
+        let mut children: BTreeMap<NodeId, Vec<usize>> = BTreeMap::new();
+        let mut roots = Vec::new();
+        for (position, virtual_node) in nodes.iter().enumerate() {
+            match virtual_node.parent {
+                Some(parent) if ids.contains(&parent) => {
+                    children.entry(parent).or_default().push(position);
+                }
+                _ => roots.push(position),
+            }
+        }
+        let instance_display = node.id.to_string();
+        for root in roots {
+            self.emit_virtual(&nodes, root, &children, &instance_display, out, depth)?;
+        }
+        Ok(())
+    }
+
+    fn emit_virtual(
+        &mut self,
+        nodes: &[CanvasNode],
+        position: usize,
+        children: &BTreeMap<NodeId, Vec<usize>>,
+        instance: &str,
+        out: &mut String,
+        depth: usize,
+    ) -> Result<()> {
+        let node = &nodes[position];
+        if node.flags.contains(NodeFlags::HIDDEN) {
+            return Ok(());
+        }
+        let mut level = Declarations::default();
+        self.node_level_declarations(node, &mut level);
+        let transform = transform_attribute(&node.transform)
+            .map(|transform| format!(" transform=\"{transform}\""))
+            .unwrap_or_default();
+        let style = match level.0.is_empty() {
+            true => String::new(),
+            false => format!(" style=\"{}\"", level.inline()),
+        };
+        match &node.data {
+            NodeData::Group(group) => {
+                let clip = group.clip_size.map(|[width, height]| {
+                    self.virtual_defs += 1;
+                    let clip_id = format!("{instance}-v{}-clip", self.virtual_defs);
+                    let _ = writeln!(
+                        self.defs,
+                        "    <clipPath id=\"{clip_id}\"><rect width=\"{}\" height=\"{}\"/></clipPath>",
+                        number(width),
+                        number(height),
+                    );
+                    format!(" clip-path=\"url(#{clip_id})\"")
+                });
+                indent(out, depth);
+                let _ = writeln!(
+                    out,
+                    "<g data-virtual=\"true\"{transform}{}{style}>",
+                    clip.unwrap_or_default(),
+                );
+                if let Some([width, height]) = group.clip_size.or(group.local_size) {
+                    for fill in group.background.iter().chain(group.background_fills.iter()) {
+                        let Some(paint) = self.virtual_paint(fill, instance) else {
+                            self.approximate(
+                                node,
+                                "a paint beyond the SVG subset inside an instance is dropped",
+                            );
+                            continue;
+                        };
+                        let radius = group
+                            .corner_radii
+                            .map(|radii| radii[0])
+                            .or(group.corner_radius)
+                            .map(|radius| format!(" rx=\"{}\"", number(radius)))
+                            .unwrap_or_default();
+                        indent(out, depth + 1);
+                        let _ = writeln!(
+                            out,
+                            "<rect width=\"{}\" height=\"{}\"{radius} style=\"fill: {paint}\"/>",
+                            number(width),
+                            number(height),
+                        );
+                    }
+                }
+                let mut open_masks = 0usize;
+                for child in children.get(&node.id).map_or(&[][..], Vec::as_slice) {
+                    let child_depth = depth + 1 + open_masks;
+                    let child_node = &nodes[*child];
+                    if child_node.is_mask && !child_node.flags.contains(NodeFlags::HIDDEN) {
+                        self.virtual_defs += 1;
+                        let mask_id = format!("{instance}-v{}-mask", self.virtual_defs);
+                        indent(out, child_depth);
+                        let _ =
+                            writeln!(out, "<mask id=\"{mask_id}\" style=\"mask-type:alpha\">");
+                        self.emit_virtual(nodes, *child, children, instance, out, child_depth + 1)?;
+                        indent(out, child_depth);
+                        out.push_str("</mask>\n");
+                        indent(out, child_depth);
+                        let _ = writeln!(out, "<g mask=\"url(#{mask_id})\">");
+                        open_masks += 1;
+                    } else {
+                        self.emit_virtual(nodes, *child, children, instance, out, child_depth)?;
+                    }
+                }
+                for closing in (0..open_masks).rev() {
+                    indent(out, depth + 1 + closing);
+                    out.push_str("</g>\n");
+                }
+                indent(out, depth);
+                out.push_str("</g>\n");
+            }
+            NodeData::Vector(vector) => {
+                self.emit_virtual_vector(node, vector, instance, &transform, &style, out, depth);
+            }
+            NodeData::Boolean(boolean) => match &boolean.baked {
+                Some(baked) => {
+                    let vector = VectorNode {
+                        path: baked.vector.path.clone(),
+                        fills: boolean.fills.clone(),
+                        strokes: boolean.strokes.clone(),
+                        ..VectorNode::default()
+                    };
+                    self.emit_virtual_vector(
+                        node, &vector, instance, &transform, &style, out, depth,
+                    );
+                }
+                None => {
+                    self.approximate(node, "an unbaked boolean inside an instance is dropped")
+                }
+            },
+            NodeData::Instance(nested) => {
+                indent(out, depth);
+                let _ = writeln!(out, "<g data-virtual=\"true\"{transform}{style}>");
+                let nested = nested.clone();
+                self.emit_expansion(node, &nested, out, depth + 1)?;
+                indent(out, depth);
+                out.push_str("</g>\n");
+            }
+            NodeData::Text(text) => {
+                let text_style = &text.style;
+                let mut declarations = level;
+                declarations.push("font-family", css_font_family(&text_style.font_family));
+                declarations.push("font-size", format!("{}px", number(text_style.size_px)));
+                if text_style.weight != 400 {
+                    declarations.push("font-weight", text_style.weight.to_string());
+                }
+                declarations.push("fill", css_color(text_style.color));
+                let (anchor, x) = match text.align {
+                    TextAlign::Left => (None, 0.0),
+                    TextAlign::Center => (Some("middle"), text.local_size[0] / 2.0),
+                    TextAlign::Right => (Some("end"), text.local_size[0]),
+                    _ => (None, 0.0),
+                };
+                if let Some(anchor) = anchor {
+                    declarations.push("text-anchor", anchor.to_string());
+                }
+                indent(out, depth);
+                let _ = writeln!(
+                    out,
+                    "<text data-virtual=\"true\"{transform} y=\"{}\" style=\"{}\">",
+                    number(text_style.size_px),
+                    declarations.inline(),
+                );
+                let line_height = text_style.size_px * line_height_factor(text_style);
+                for (index, line) in text.content.split('\n').enumerate() {
+                    indent(out, depth + 1);
+                    let _ = writeln!(
+                        out,
+                        "<tspan x=\"{}\"{}>{}</tspan>",
+                        number(x),
+                        if index == 0 {
+                            String::new()
+                        } else {
+                            format!(" dy=\"{}\"", number(line_height))
+                        },
+                        xml_escape(line),
+                    );
+                }
+                indent(out, depth);
+                out.push_str("</text>\n");
+            }
+            NodeData::Bitmap(bitmap) => {
+                if bitmap.crop.is_some() {
+                    self.approximate(node, "a cropped image inside an instance is dropped");
+                    return Ok(());
+                }
+                let href = match self.asset_hrefs.get(&bitmap.asset) {
+                    Some(href) => href.clone(),
+                    None => {
+                        self.approximate(node, "image asset has no file under assets/");
+                        format!("{ASSETS_DIR}/{}", bitmap.asset)
+                    }
+                };
+                indent(out, depth);
+                let _ = writeln!(
+                    out,
+                    "<image data-virtual=\"true\"{transform}{style} href=\"{href}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\"/>",
+                    number(bitmap.local_size[0]),
+                    number(bitmap.local_size[1]),
+                );
+            }
+            _ => self.approximate(
+                node,
+                "content beyond the SVG subset inside an instance is dropped",
+            ),
+        }
+        Ok(())
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "internal assembly step")]
+    fn emit_virtual_vector(
+        &mut self,
+        node: &CanvasNode,
+        vector: &VectorNode,
+        instance: &str,
+        transform: &str,
+        style: &str,
+        out: &mut String,
+        depth: usize,
+    ) {
+        let radius = vector
+            .corner_radii
+            .map(|radii| radii[0])
+            .or(vector.corner_radius);
+        let (tag, geometry) = match vector.path.is_rect().then(|| rect_of(&vector.path)).flatten()
+        {
+            Some((x, y, width, height)) => (
+                "rect",
+                format!(
+                    " x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"{}",
+                    number(x),
+                    number(y),
+                    number(width),
+                    number(height),
+                    radius
+                        .map(|radius| format!(" rx=\"{}\"", number(radius)))
+                        .unwrap_or_default(),
+                ),
+            ),
+            None => ("path", format!(" d=\"{}\"", vector.path.to_svg_d())),
+        };
+        let mut paints = Vec::new();
+        for fill in &vector.fills {
+            match self.virtual_paint(fill, instance) {
+                Some(paint) => paints.push(paint),
+                None => self.approximate(
+                    node,
+                    "a paint beyond the SVG subset inside an instance is dropped",
+                ),
+            }
+        }
+        if paints.is_empty() {
+            paints.push("none".to_string());
+        }
+        let stroke = vector.strokes.first().and_then(|stroke| {
+            let paint = self.virtual_paint(&stroke.paint, instance)?;
+            Some(format!(
+                "; stroke: {paint}; stroke-width: {}",
+                number(stroke.width)
+            ))
+        });
+        for (index, paint) in paints.iter().enumerate() {
+            let stroke_part = if index == 0 {
+                stroke.as_deref().unwrap_or_default()
+            } else {
+                ""
+            };
+            indent(out, depth);
+            let _ = writeln!(
+                out,
+                "<{tag} data-virtual=\"true\"{}{geometry} style=\"fill: {paint}{stroke_part}\"/>",
+                if index == 0 {
+                    format!("{transform}{style}")
+                } else {
+                    transform.to_string()
+                },
+            );
+        }
+    }
+
+    /// The CSS paint for derived content: literals only (bindings resolve
+    /// before expansion), gradients through counter-keyed defs.
+    fn virtual_paint(&mut self, fill: &Fill, instance: &str) -> Option<String> {
+        match fill {
+            Fill::Solid { color, .. } => Some(css_color(*color)),
+            Fill::Gradient { gradient, .. } => {
+                self.virtual_defs += 1;
+                let def_id = format!("{instance}-v{}-grad", self.virtual_defs);
+                self.gradient_def(&def_id, gradient)
+            }
+            _ => None,
+        }
+    }
+
+    /// The CSS paint for one fill of a real element: a literal or `var()` for
+    /// solids, a `url(#…)` def reference for expressible gradients, `None`
+    /// beyond the subset.
+    fn paint_value(
         &mut self,
         node: &CanvasNode,
         fill: &Fill,
         index: usize,
-        rule: &mut Declarations,
-    ) {
+        element_id: &str,
+    ) -> Option<String> {
         match fill {
             Fill::Solid { color, blend } => {
                 if !blend.is_normal() {
@@ -863,19 +1315,85 @@ impl Emitter<'_> {
                 }
                 let literal = css_color(*color);
                 let index = u16::try_from(index).unwrap_or(u16::MAX);
-                match self.bound_variable(node, BoundProp::FillColor { index }) {
-                    Some(token) => rule.push("fill", format!("var({token}, {literal})")),
-                    None => rule.push("fill", literal),
-                }
+                Some(
+                    match self.bound_variable(node, BoundProp::FillColor { index }) {
+                        Some(token) => format!("var({token}, {literal})"),
+                        None => literal,
+                    },
+                )
             }
-            _ => self.approximate(node, "non-solid background fills are dropped"),
+            Fill::Gradient { gradient, .. } => self.gradient_def(&format!("{element_id}-grad"), gradient),
+            _ => None,
         }
+    }
+
+    /// Emit a gradient def and return its `url(#…)` paint. Coordinates are
+    /// node-local 0–1, which is SVG's default `objectBoundingBox` space.
+    /// Linear and axis-aligned radial map to SVG; angular, diamond and
+    /// handle-rotated radial do not and return `None`.
+    fn gradient_def(&mut self, def_id: &str, gradient: &Gradient) -> Option<String> {
+        match gradient {
+            Gradient::Linear { start, end, stops } => {
+                let _ = writeln!(
+                    self.defs,
+                    "    <linearGradient id=\"{def_id}\" x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\">",
+                    number(f64::from(start[0])),
+                    number(f64::from(start[1])),
+                    number(f64::from(end[0])),
+                    number(f64::from(end[1])),
+                );
+                write_stops(&mut self.defs, stops);
+                self.defs.push_str("    </linearGradient>\n");
+            }
+            Gradient::Radial {
+                center,
+                radius,
+                handles: None,
+                stops,
+            } => {
+                let _ = writeln!(
+                    self.defs,
+                    "    <radialGradient id=\"{def_id}\" cx=\"{}\" cy=\"{}\" r=\"{}\">",
+                    number(f64::from(center[0])),
+                    number(f64::from(center[1])),
+                    number(f64::from(*radius)),
+                );
+                write_stops(&mut self.defs, stops);
+                self.defs.push_str("    </radialGradient>\n");
+            }
+            _ => return None,
+        }
+        Some(format!("url(#{def_id})"))
+    }
+
+    /// ` transform=".." clip-path=".."` — shared by a node's base element and
+    /// its stacked-fill clones.
+    fn shared_attrs(&self, node: &CanvasNode) -> String {
+        let mut attrs = String::new();
+        if let Some(transform) = transform_attribute(&node.transform) {
+            let _ = write!(attrs, " transform=\"{transform}\"");
+        }
+        if let Some(parent) = node.parent {
+            let parent_clips = self
+                .resolved
+                .scene
+                .get(parent)
+                .is_some_and(|parent_node| match &parent_node.data {
+                    NodeData::Group(group) => group.clip_size.is_some(),
+                    _ => false,
+                });
+            if parent_clips {
+                let _ = write!(attrs, " clip-path=\"url(#{parent}-clip)\"");
+            }
+        }
+        attrs
     }
 
     fn stroke_declarations(
         &mut self,
         node: &CanvasNode,
         strokes: &[Stroke],
+        element_id: &str,
         rule: &mut Declarations,
     ) {
         let Some(stroke) = strokes.first() else {
@@ -891,26 +1409,38 @@ impl Emitter<'_> {
                     Some(token) => rule.push("stroke", format!("var({token}, {literal})")),
                     None => rule.push("stroke", literal),
                 }
-                rule.push_bound(
-                    self,
-                    node,
-                    BoundProp::StrokeWidth { index: 0 },
-                    "stroke-width",
-                    number(stroke.width),
-                );
-                if !stroke.dash.is_empty() {
-                    rule.push(
-                        "stroke-dasharray",
-                        stroke
-                            .dash
-                            .iter()
-                            .map(|dash| number(*dash))
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    );
+            }
+            Fill::Gradient { gradient, .. } => {
+                match self.gradient_def(&format!("{element_id}-stroke-grad"), gradient) {
+                    Some(paint) => rule.push("stroke", paint),
+                    None => {
+                        self.approximate(node, "a stroke gradient beyond the SVG subset is dropped");
+                        return;
+                    }
                 }
             }
-            _ => self.approximate(node, "non-solid strokes are dropped"),
+            _ => {
+                self.approximate(node, "non-solid strokes are dropped");
+                return;
+            }
+        }
+        rule.push_bound(
+            self,
+            node,
+            BoundProp::StrokeWidth { index: 0 },
+            "stroke-width",
+            number(stroke.width),
+        );
+        if !stroke.dash.is_empty() {
+            rule.push(
+                "stroke-dasharray",
+                stroke
+                    .dash
+                    .iter()
+                    .map(|dash| number(*dash))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
         }
     }
 
@@ -1017,6 +1547,49 @@ impl Declarations {
             Some(token) => self.push(property, format!("var({token}, {literal})")),
             None => self.push(property, literal),
         }
+    }
+
+    /// `p1: v1; p2: v2` — the inline-style form for derived content.
+    fn inline(&self) -> String {
+        self.0
+            .iter()
+            .map(|(property, value)| format!("{property}: {value}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+/// Whether a paint stays vector in the projection: solid, or a gradient SVG
+/// can express.
+fn paint_expressible(fill: &Fill) -> bool {
+    match fill {
+        Fill::Solid { .. } => true,
+        Fill::Gradient { gradient, .. } => matches!(
+            gradient,
+            Gradient::Linear { .. } | Gradient::Radial { handles: None, .. }
+        ),
+        _ => false,
+    }
+}
+
+fn write_stops(defs: &mut String, stops: &[GradientStop]) {
+    for stop in stops {
+        let _ = write!(
+            defs,
+            "      <stop offset=\"{}\" stop-color=\"#{:02X}{:02X}{:02X}\"",
+            number(f64::from(stop.position)),
+            stop.color.r,
+            stop.color.g,
+            stop.color.b,
+        );
+        if stop.color.a != 255 {
+            let _ = write!(
+                defs,
+                " stop-opacity=\"{}\"",
+                number(f64::from(stop.color.a) / 255.0)
+            );
+        }
+        defs.push_str("/>\n");
     }
 }
 
@@ -1207,8 +1780,6 @@ fn line_height_factor(style: &TextStyle) -> f64 {
 
 fn unsupported_kind(data: &NodeData) -> &'static str {
     match data {
-        NodeData::Instance(_) => "component instances are rasterized for now",
-        NodeData::Boolean(_) => "boolean shapes are rasterized for now",
         NodeData::TextPath(_) => "text on a path is rasterized for now",
         NodeData::Video(_) | NodeData::Audio(_) => "media nodes export their poster",
         _ => "this node kind is rasterized for now",
