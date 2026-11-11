@@ -1388,6 +1388,12 @@ mod tests {
             svg.contains("font-family: 'Source Serif Pro'"),
             "a spaced family in an inline style must stay XML-safe (single quotes): {svg}"
         );
+        assert!(
+            svg.contains("<svg xmlns=\"http://www.w3.org/2000/svg\" data-fanta=\"page\""),
+            "the root element identifies the file as Fanta source and its kind: {svg}"
+        );
+        let master = fs::read_to_string(dir.path().join("components/chip/master.svg")).unwrap();
+        assert!(master.contains("data-fanta=\"master\""), "{master}");
         let css = fs::read_to_string(dir.path().join("pages/home/page.css")).unwrap();
         assert!(
             css.contains(&format!("fill: url(#{gradient_id}-grad);")),

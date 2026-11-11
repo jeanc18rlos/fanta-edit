@@ -47,8 +47,10 @@ without an SVG/CSS spelling are never lost. The root `design.css` imports
 every design stylesheet and is where project-wide rules live; where a root
 rule and a design's rule set the same property for a node, the design's
 declaration wins. Each SVG references `tokens.css` and its own stylesheet
-with `<?xml-stylesheet?>`, so opening it standalone renders styled. On load
-the records are read first, then parsed SVG and CSS fields win over them. The
+with `<?xml-stylesheet?>`, so opening it standalone renders styled, and its
+root element carries `data-fanta="page"` or `data-fanta="master"` so a tool
+handed the bare file knows it is Fanta source and which kind. On load the
+records are read first, then parsed SVG and CSS fields win over them. The
 writer is canonical and deterministic: load-then-save normalizes hand-edited
 formatting like a formatter — values survive, whitespace does not.
 

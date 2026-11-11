@@ -477,10 +477,15 @@ fn emit_design(
     // loader's XML reader skips processing instructions.
     let to_root = "../".repeat(design_dir.components().count());
     let css_name = svg_name.replace(".svg", ".css");
+    // data-fanta marks the file as Fanta source and says which design kind it
+    // is, so a tool handed the bare file can route it without relying on the
+    // directory shape. The loader ignores unknown root attributes.
+    let kind = svg_name.strip_suffix(".svg").unwrap_or(svg_name);
     let svg = format!(
         "<?xml-stylesheet type=\"text/css\" href=\"{to_root}tokens.css\"?>\n\
          <?xml-stylesheet type=\"text/css\" href=\"{css_name}\"?>\n\
-         <svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" \
+         <svg xmlns=\"http://www.w3.org/2000/svg\" data-fanta=\"{kind}\" \
+         width=\"{width}\" height=\"{height}\" \
          viewBox=\"{} {} {width} {height}\">\n{defs}{body}</svg>\n",
         number(bounds.min_x),
         number(bounds.min_y),
