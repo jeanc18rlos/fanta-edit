@@ -768,7 +768,14 @@ impl WorkspaceSession {
                             // current-schema semantic comparison at open.
                             matches!(
                                 name.as_str(),
-                                "page.fnx" | "page.ids.json" | "master.fnx" | "master.ids.json"
+                                "page.fnx"
+                                    | "page.ids.json"
+                                    | "master.fnx"
+                                    | "master.ids.json"
+                                    | "page.svg"
+                                    | "master.svg"
+                                    | "nodes.json"
+                                    | "map.json"
                             ) || (name.as_str() == DEF_JSON
                                 && self.schema_version == SCHEMA_VERSION)
                         })
@@ -778,7 +785,8 @@ impl WorkspaceSession {
         }
         for (path, hash) in &self.other_singleton_disk_hashes {
             if self.schema_version == SCHEMA_VERSION
-                && path.starts_with(COMPONENTS_DIR)
+                && (path.starts_with(COMPONENTS_DIR)
+                    || path == Path::new(crate::project::web::DESIGN_CSS))
                 && let Some(hash) = hash
             {
                 hashes.insert(path.clone(), *hash);
@@ -2630,6 +2638,9 @@ fn component_sidecar_with_document_parent(
 /// `components/sets.json`).
 fn singleton_disk_hashes(root: &Path) -> Result<BTreeMap<PathBuf, Option<[u8; 32]>>, SessionError> {
     let mut paths = vec![
+        // The one shared web source file the reader consumes; hand edits to it
+        // must register as external changes.
+        PathBuf::from(crate::project::web::DESIGN_CSS),
         PathBuf::from(DOC_DIR).join(crate::project::layout::ASSET_LIBRARY_JSON),
         PathBuf::from(DOC_DIR).join(STYLES_JSON),
         PathBuf::from(DOC_DIR).join(MOTION_JSON),
@@ -2941,11 +2952,29 @@ fn read_indexed_file_set(
     if !matches!(kind, ArtifactKind::Page | ArtifactKind::Component) {
         return Ok(files);
     }
-    let source_name = match kind {
-        ArtifactKind::Page => crate::project::layout::PAGE_FNX,
-        ArtifactKind::Component => crate::project::layout::MASTER_FNX,
+    let (source_name, web_source) = match kind {
+        ArtifactKind::Page => (
+            crate::project::layout::PAGE_FNX,
+            crate::project::web::PAGE_SVG,
+        ),
+        ArtifactKind::Component => (
+            crate::project::layout::MASTER_FNX,
+            crate::project::web::MASTER_SVG,
+        ),
         _ => return Ok(files),
     };
+    // Web storage is the artifact's source of truth, so external edits to its
+    // projection files must change the indexed disk hash.
+    for name in [
+        web_source,
+        crate::project::web::NODES_JSON,
+        crate::project::web::MAP_JSON,
+    ] {
+        let path = design_dir.join(name);
+        if path.is_file() {
+            files.push((name.to_owned(), std::fs::read(path)?));
+        }
+    }
     if files.iter().any(|(name, _)| name == source_name) {
         return Ok(files);
     }

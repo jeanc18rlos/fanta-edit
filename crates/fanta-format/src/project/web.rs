@@ -56,7 +56,7 @@ pub(crate) const PAGE_SVG: &str = "page.svg";
 pub(crate) const MASTER_SVG: &str = "master.svg";
 pub(crate) const DESIGN_CSS: &str = "design.css";
 pub(crate) const NODES_JSON: &str = "nodes.json";
-const MAP_JSON: &str = "map.json";
+pub(crate) const MAP_JSON: &str = "map.json";
 const INDEX_TEMPLATE: &str = include_str!("../../assets/web/index.html");
 const VIEWER_JS: &str = include_str!("../../assets/web/viewer.js");
 /// Aliases may chain; past this many hops the chain is reported, not followed.
@@ -430,25 +430,23 @@ fn emit_design(
     design_css: &mut String,
 ) -> Result<WebDesignReport> {
     let design_dir_href = design_dir.to_string_lossy().replace('\\', "/");
+    // A design that draws nothing (an empty page) still gets its SVG: the
+    // root element is where a hand edit adds the first content.
     let bounds = render
         .and_then(|render| render.design_bounds(root))
         .or_else(|| resolved.scene.world_bounds(root))
         .filter(|bounds| {
             bounds.min_x.is_finite()
                 && bounds.min_y.is_finite()
-                && bounds.max_x > bounds.min_x
-                && bounds.max_y > bounds.min_y
+                && bounds.max_x >= bounds.min_x
+                && bounds.max_y >= bounds.min_y
+        })
+        .unwrap_or(Bounds {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 0.0,
+            max_y: 0.0,
         });
-    let Some(bounds) = bounds else {
-        return Ok(WebDesignReport {
-            slug: slug.to_owned(),
-            name: name.to_owned(),
-            width: 0,
-            height: 0,
-            approximations: Vec::new(),
-            error: Some("the design draws nothing to emit".to_owned()),
-        });
-    };
     let mut emitter = Emitter {
         resolved,
         authored,

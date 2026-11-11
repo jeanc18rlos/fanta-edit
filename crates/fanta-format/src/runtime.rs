@@ -443,6 +443,23 @@ fn compile_project(source: &SourceBundle) -> Result<Doc, RuntimeError> {
         hydrate_geometry(&mut node);
         insert_identified(&mut nodes, node, path)?;
     }
+    // Web storage (spec 0007): each design's complete records live in its
+    // `nodes.json` map, keyed by the persisted (bare ULID) id form.
+    for path in files
+        .keys()
+        .filter(|path| path.ends_with("/nodes.json"))
+    {
+        let records = json_file(files, path, None)?;
+        let records = records
+            .as_object()
+            .ok_or_else(|| source_error(path, "node records must be an object"))?;
+        for record in records.values() {
+            let mut node = record.clone();
+            compile_node_styles(&mut node, &styles, path)?;
+            hydrate_geometry(&mut node);
+            insert_identified(&mut nodes, node, path)?;
+        }
+    }
     for path in files
         .keys()
         .filter(|path| path.starts_with("pages/") && path.ends_with("/page.json"))

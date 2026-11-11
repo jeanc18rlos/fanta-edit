@@ -1709,6 +1709,7 @@ pub fn component_id_of_dir(design_dir: &Path) -> Option<ComponentId> {
 
 fn locate_design_source<Id: Copy + PartialEq>(
     designs_dir: &Path,
+    web_name: &str,
     fnx_name: &str,
     target: Id,
     id_of_dir: impl Fn(&Path) -> Option<Id>,
@@ -1720,38 +1721,45 @@ fn locate_design_source<Id: Copy + PartialEq>(
             continue;
         }
         if id_of_dir(&design_dir) == Some(target) {
-            let fnx_path = design_dir.join(fnx_name);
-            if fnx_path.is_file() {
-                return Some(fnx_path);
+            // Web storage first (spec 0007): a converted project keeps its
+            // legacy layout but its readable source is the SVG projection.
+            for name in [web_name, fnx_name] {
+                let path = design_dir.join(name);
+                if path.is_file() {
+                    return Some(path);
+                }
             }
         }
     }
     None
 }
 
-/// Find the `page.fnx` source of `page` under `project_root`, whatever the
-/// page's directory is named (v3 slug or v2 id). `None` when the page has no
-/// source file on disk.
+/// Find the readable source of `page` under `project_root` — `page.svg` in
+/// web storage, else the legacy `page.fnx` — whatever the page's directory is
+/// named (v3 slug or v2 id). `None` when the page has no source file on disk.
 pub fn locate_page_source(project_root: &Path, page: NodeId) -> Option<PathBuf> {
     locate_design_source(
         &project_root.join(PAGES_DIR),
+        crate::project::web::PAGE_SVG,
         PAGE_FNX,
         page,
         page_id_of_dir,
     )
 }
 
-/// Find the `master.fnx` source of `component` under `project_root`, whatever
-/// the component's directory is named (v3 slug or v2 id), standalone or a
-/// variant inside its set's folder (v5).
+/// Find the readable source of `component` — `master.svg` in web storage,
+/// else the legacy `master.fnx` — whatever the component's directory is named
+/// (v3 slug or v2 id), standalone or a variant inside its set's folder (v5).
 pub fn locate_master_source(project_root: &Path, component: ComponentId) -> Option<PathBuf> {
-    super::component_dirs::scan_component_dirs(project_root)
+    let dir = super::component_dirs::scan_component_dirs(project_root)
         .ok()?
         .component_dirs
         .into_iter()
-        .find(|dir| component_id_of_dir(dir) == Some(component))
-        .map(|dir| dir.join(MASTER_FNX))
-        .filter(|path| path.is_file())
+        .find(|dir| component_id_of_dir(dir) == Some(component))?;
+    [crate::project::web::MASTER_SVG, MASTER_FNX]
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
 }
 
 /// Resolve which project and design a `.fnx` source path belongs to.
@@ -1765,8 +1773,10 @@ pub fn page_scope_of_source(path: &Path) -> Option<(PathBuf, ScopedDesign)> {
     let file_name = path.file_name()?.to_str()?;
     let design_dir = path.parent()?;
     let mut designs_dir = design_dir.parent()?;
+    let page_source = file_name == PAGE_FNX || file_name == crate::project::web::PAGE_SVG;
+    let master_source = file_name == MASTER_FNX || file_name == crate::project::web::MASTER_SVG;
     // A variant's master sits one folder deeper, in its set's folder (v5).
-    if file_name == MASTER_FNX
+    if master_source
         && designs_dir.join(SET_JSON).is_file()
         && let Some(components) = designs_dir.parent()
         && components
@@ -1777,14 +1787,12 @@ pub fn page_scope_of_source(path: &Path) -> Option<(PathBuf, ScopedDesign)> {
     }
     let designs_dir_name = designs_dir.file_name()?.to_str()?;
     let project_root = designs_dir.parent()?;
-    let design = match (designs_dir_name, file_name) {
-        (n, f) if n == PAGES_DIR && f == PAGE_FNX => {
-            ScopedDesign::Page(page_id_of_dir(design_dir)?)
-        }
-        (n, f) if n == COMPONENTS_DIR && f == MASTER_FNX => {
-            ScopedDesign::Component(component_id_of_dir(design_dir)?)
-        }
-        _ => return None,
+    let design = if designs_dir_name == PAGES_DIR && page_source {
+        ScopedDesign::Page(page_id_of_dir(design_dir)?)
+    } else if designs_dir_name == COMPONENTS_DIR && master_source {
+        ScopedDesign::Component(component_id_of_dir(design_dir)?)
+    } else {
+        return None;
     };
     if !is_project_dir(project_root) {
         return None;
