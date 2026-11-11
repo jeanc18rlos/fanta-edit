@@ -28,3 +28,10 @@ request when it merges.
 - [ ] **T6.** Live-app attach: when the project is open in the desktop
   app, canvas hosts route edits through the live MCP server instead of
   writing files (R6). Verify: A5.
+- [ ] **T7.** Headless MCP server (R7): serve the live app's tool
+  vocabulary over MCP stdio against a project directory using
+  `fanta-headless` (load, apply, save, `render_png` screenshots); the
+  plugin bridge and the Codex config fall back to it when no live app is
+  discovered. Verify: the plugin's edit loop end to end with no app
+  installed, on Claude Code and Codex. Implemented after T1 in
+  dependency order: T1, T7, T2, T3, T4, T5, T6.

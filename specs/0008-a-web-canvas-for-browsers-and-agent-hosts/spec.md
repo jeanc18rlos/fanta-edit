@@ -1,5 +1,5 @@
 ---
-status: draft
+status: accepted
 date: 2026-11-11
 owner: Jean Rojas
 decisions: []
@@ -82,6 +82,11 @@ Feasibility, probed on this checkout (2026-11-11):
 - **R6.** When the desktop app has the same project open, canvas hosts
   attach through the live MCP server instead of writing files directly,
   so the app's session stays the owner of unsaved state.
+- **R7.** A headless MCP server serves the live app's tool vocabulary
+  (`get_editor_state`, `batch_get`, `batch_design`, `get_screenshot`, …)
+  against a project directory with no app installed, over MCP stdio, so
+  Claude Code and Codex work standalone. The agent bridges prefer the
+  running app (R6) and fall back to this server.
 
 ## Acceptance criteria
 
@@ -113,4 +118,9 @@ Feasibility, probed on this checkout (2026-11-11):
 
 ## Changes after acceptance
 
-- None.
+- 2026-11-11, founder: accepted as "Go with all Ts", with the
+  requirement sharpened to "the app can work independently inside
+  claude and codex, without needing the fanta app" — recorded as R7 and
+  Codex added as a host. `fanta-headless` already renders PNG/JPEG/SVG
+  and `fanta-engine` already applies design steps without the app, so
+  R7 wraps existing machinery.
