@@ -54,6 +54,7 @@ members = [
     "crates/fanta-present",
     "crates/fanta-render",
     "crates/fanta-runtime",
+    "crates/fanta-wasm-engine",
     "crates/fanta-site",
     "crates/fanta-text",
     "crates/fanta-tools",

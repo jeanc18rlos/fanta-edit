@@ -41,6 +41,9 @@
 //! ```
 
 #![forbid(unsafe_code)]
+// The wasm build compiles out the disk writers; their std-only helpers go
+// dead there while the default build keeps full dead-code analysis.
+#![cfg_attr(not(feature = "native"), allow(dead_code))]
 
 #[cfg(feature = "native")]
 mod container;
@@ -50,16 +53,15 @@ pub mod formats;
 #[cfg(feature = "native")]
 mod manifest;
 mod migrate;
-#[cfg(feature = "native")]
 mod project;
 pub mod runtime;
 
 #[cfg(feature = "native")]
-pub use container::{FantaFile, asset_id_for_bytes};
+pub use container::FantaFile;
 pub use error::{FormatError, Result};
 #[cfg(feature = "native")]
 pub use formats::{
-    FormatCapabilities, FormatDescriptor, FormatHandler, FormatHandlerResult, FormatOperation,
+    FormatDescriptor, FormatHandler, FormatHandlerResult, FormatOperation,
     FormatPath, FormatRegistry, FormatRegistryError, FormatRegistryResult, ImportedDesign,
 };
 #[cfg(feature = "native")]
@@ -67,29 +69,33 @@ pub use manifest::Manifest;
 pub use migrate::migrate;
 #[cfg(feature = "native")]
 pub use project::session;
+pub use project::{
+    ArtifactAddress, ArtifactMerge, DocMerge, FormatCapabilities, JsonPathSegment, NodeMapEdition,
+    PresenceValue,
+    ProjectManifest, ProjectWriteCache, PropertyConflict, ScopedDesign, WebDesignReport,
+    WebProjection, WebRaster, WebReport, WebRenderSource, WriteReport,
+    asset_id_for_bytes, canonicalize_legacy_source, emit_web_project_tree,
+    is_project_managed_path, merge_artifact,
+    merge_docs, read_project_files, web_project_files,
+};
 #[cfg(feature = "native")]
 pub use project::{
-    ApplyReport, ArtifactAddress, ArtifactDirty, ArtifactId, ArtifactMerge, ArtifactMeta,
-    ArtifactOpImpact, ArtifactRenderRevision, ArtifactRenderSnapshot, ArtifactSession, ClosePolicy,
-    ConflictResolution, ContentHash, DependencyGraph, DocMerge, DocMutGuard, FsEvent,
-    IncrementalDocApply, JsonPathSegment, MediaFormat, MediaRegistry, MediaRegistryError,
-    MergeReview, MotionIndex, MotionSource, NodeMapEdition, PresenceValue, ProjectManifest,
-    ProjectSourceEdit, ProjectUpgrade, ProjectWriteCache, PropertyConflict, ProposalApplied,
-    ReviewConflict, ReviewResolution, SaveBlocked, SaveResult, ScopedDesign, ScopedDoc,
-    SessionError, SessionEvent, SourceDiagnostic, SourceProposalOutcome, SourceRebuildReason,
-    SourceSeverity, SourceSync, WebDesignReport, WebProjection, WebRaster, WebReport,
-    WebRenderSource, WorkspaceDirty, WorkspaceDiskSnapshot, WorkspaceIr,
-    WorkspaceSession, WorkspaceSharedState, WriteReport, apply_project_json_edit,
-    apply_project_source_edit, apply_project_source_edit_with_diagnostics, artifact_op_impact,
-    canonicalize_legacy_source, component_id_of_dir, ensure_project_editor_support,
-    export_fant_snapshot, hash_file_set, import_fant_snapshot, is_project_dir,
-    is_project_managed_path, locate_master_source, locate_page_source, merge_artifact, merge_docs,
-    page_id_of_dir, page_scope_of_source, projected_design_dirs, read_motion_dual,
-    read_project_tree, read_project_tree_with_warnings, scaffold_project_tree,
-    stage_new_project_tree,
+    ApplyReport, ArtifactDirty, ArtifactId, ArtifactMeta, ArtifactOpImpact,
+    ArtifactRenderRevision, ArtifactRenderSnapshot, ArtifactSession, ClosePolicy,
+    ConflictResolution, ContentHash, DependencyGraph, DocMutGuard, FsEvent, IncrementalDocApply,
+    MediaFormat, MediaRegistry, MediaRegistryError, MergeReview, MotionIndex, MotionSource,
+    ProjectSourceEdit, ProjectUpgrade, ProposalApplied, ReviewConflict, ReviewResolution,
+    SaveBlocked, SaveResult, ScopedDoc, SessionError, SessionEvent, SourceDiagnostic,
+    SourceProposalOutcome, SourceRebuildReason, SourceSeverity, SourceSync, WorkspaceDirty,
+    WorkspaceDiskSnapshot, WorkspaceIr, WorkspaceSession, WorkspaceSharedState,
+    apply_project_json_edit, apply_project_source_edit,
+    apply_project_source_edit_with_diagnostics, artifact_op_impact, component_id_of_dir,
+    ensure_project_editor_support, export_fant_snapshot, hash_file_set, import_fant_snapshot,
+    is_project_dir, locate_master_source, locate_page_source, page_id_of_dir,
+    page_scope_of_source, projected_design_dirs, read_motion_dual, read_project_tree,
+    read_project_tree_with_warnings, scaffold_project_tree, stage_new_project_tree,
     synthesize_workspace_fnx, upgrade_project, validate_project_json_edit,
     validate_project_source_edit, validate_project_source_edit_with_diagnostics,
-    web_project_files, write_artifact_files, write_legacy_project_tree,
-    write_legacy_project_tree_checked, write_project_tree, write_project_tree_cached,
-    write_web_project_tree,
+    write_artifact_files, write_legacy_project_tree, write_legacy_project_tree_checked,
+    write_project_tree, write_project_tree_cached, write_web_project_tree,
 };

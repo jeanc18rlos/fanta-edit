@@ -3,12 +3,17 @@
 //! render resolver), and the overlay that makes a new image drawable without
 //! re-decoding every embedded asset.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, PoisonError, RwLock, Weak};
+use std::collections::BTreeMap;
+#[cfg(feature = "render")]
+use std::collections::HashMap;
+use std::sync::Arc;
+#[cfg(feature = "render")]
+use std::sync::{PoisonError, RwLock, Weak};
 
 use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
 use fanta_doc::AssetId;
+#[cfg(feature = "render")]
 use fanta_render::{AssetResolver, DecodeListener, DecodedImage, LevelLookup, LeveledImage};
 
 /// Cap on the encoded bytes of one image ingested as a project asset (a paste,
@@ -117,12 +122,14 @@ impl PreparedImage {
 /// one image is O(1) instead of a re-decode of every embedded asset. Interior
 /// mutability because the resolver is shared as an `Arc<dyn AssetResolver>`
 /// with background renders; reads take the lock only on the overlay map.
+#[cfg(feature = "render")]
 pub struct OverlayAssetResolver {
     base: Option<Arc<dyn AssetResolver>>,
     added: RwLock<HashMap<AssetId, DecodedImage>>,
     added_bytes: RwLock<HashMap<AssetId, Arc<Vec<u8>>>>,
 }
 
+#[cfg(feature = "render")]
 impl OverlayAssetResolver {
     /// Whether no ingested image is layered over the base resolver.
     pub fn is_empty(&self) -> bool {
@@ -138,6 +145,7 @@ impl OverlayAssetResolver {
     }
 }
 
+#[cfg(feature = "render")]
 impl AssetResolver for OverlayAssetResolver {
     fn resolve(&self, id: AssetId) -> Option<DecodedImage> {
         if let Some(image) = self
@@ -211,19 +219,23 @@ impl AssetResolver for OverlayAssetResolver {
 /// new images over it.
 pub struct AssetStores<'a> {
     raw_assets: &'a mut Arc<BTreeMap<AssetId, Vec<u8>>>,
+    #[cfg(feature = "render")]
     asset_resolver: &'a mut Option<Arc<dyn AssetResolver>>,
+    #[cfg(feature = "render")]
     overlay: &'a mut Option<Arc<OverlayAssetResolver>>,
 }
 
 impl<'a> AssetStores<'a> {
     pub fn new(
         raw_assets: &'a mut Arc<BTreeMap<AssetId, Vec<u8>>>,
-        asset_resolver: &'a mut Option<Arc<dyn AssetResolver>>,
-        overlay: &'a mut Option<Arc<OverlayAssetResolver>>,
+        #[cfg(feature = "render")] asset_resolver: &'a mut Option<Arc<dyn AssetResolver>>,
+        #[cfg(feature = "render")] overlay: &'a mut Option<Arc<OverlayAssetResolver>>,
     ) -> Self {
         Self {
             raw_assets,
+            #[cfg(feature = "render")]
             asset_resolver,
+            #[cfg(feature = "render")]
             overlay,
         }
     }
@@ -238,19 +250,24 @@ impl<'a> AssetStores<'a> {
             return Ok((id, false));
         }
         Arc::make_mut(self.raw_assets).insert(id, bytes.clone());
-        let overlay = self.overlay.get_or_insert_with(|| {
-            Arc::new(OverlayAssetResolver {
-                base: self.asset_resolver.clone(),
-                added: RwLock::new(HashMap::default()),
-                added_bytes: RwLock::new(HashMap::default()),
-            })
-        });
-        overlay
-            .added_bytes
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id, Arc::new(bytes));
-        *self.asset_resolver = Some(overlay.clone() as Arc<dyn AssetResolver>);
+        #[cfg(feature = "render")]
+        {
+            let overlay = self.overlay.get_or_insert_with(|| {
+                Arc::new(OverlayAssetResolver {
+                    base: self.asset_resolver.clone(),
+                    added: RwLock::new(HashMap::default()),
+                    added_bytes: RwLock::new(HashMap::default()),
+                })
+            });
+            overlay
+                .added_bytes
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(id, Arc::new(bytes));
+            *self.asset_resolver = Some(overlay.clone() as Arc<dyn AssetResolver>);
+        }
+        #[cfg(not(feature = "render"))]
+        let _ = bytes;
         Ok((id, true))
     }
 
@@ -280,16 +297,21 @@ impl<'a> AssetStores<'a> {
         }
 
         self.add_raw_bytes_tracked(bytes)?;
-        let overlay = self
-            .overlay
-            .as_ref()
-            .context("ingested image has no resolver")?;
-        overlay
-            .added
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id, DecodedImage::new(&rgba, width, height));
-        *self.asset_resolver = Some(overlay.clone() as Arc<dyn AssetResolver>);
+        #[cfg(feature = "render")]
+        {
+            let overlay = self
+                .overlay
+                .as_ref()
+                .context("ingested image has no resolver")?;
+            overlay
+                .added
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(id, DecodedImage::new(&rgba, width, height));
+            *self.asset_resolver = Some(overlay.clone() as Arc<dyn AssetResolver>);
+        }
+        #[cfg(not(feature = "render"))]
+        let _ = rgba;
         Ok((id, [width, height], true))
     }
 
@@ -299,6 +321,7 @@ impl<'a> AssetStores<'a> {
         if self.raw_assets.contains_key(&id) {
             Arc::make_mut(self.raw_assets).remove(&id);
         }
+        #[cfg(feature = "render")]
         if let Some(overlay) = self.overlay.as_ref() {
             overlay
                 .added

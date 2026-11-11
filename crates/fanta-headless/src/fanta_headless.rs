@@ -5,6 +5,11 @@
 //!
 //! The facade is frozen by `docs/cloud-engine-contracts.md`.
 
+// The wasm engine build compiles out the project facade and the renderer;
+// their imports and helpers go dead there while the default build keeps
+// full analysis.
+#![cfg_attr(not(feature = "native"), allow(dead_code, unused_imports))]
+
 pub mod apply;
 pub mod assets;
 pub mod clipboard;
@@ -13,10 +18,13 @@ pub mod component_properties;
 pub mod componentize;
 pub mod document;
 pub mod edit_operations;
+#[cfg(feature = "render")]
 pub mod export;
 pub mod layout;
 pub mod pages;
+#[cfg(feature = "render")]
 pub mod render;
+#[cfg(feature = "native")]
 pub mod save;
 pub mod scene;
 pub mod structure;
@@ -33,7 +41,9 @@ use fanta_design_ops::{
     CommentDraft, DEFAULT_CHILD_LIMIT, DesignOp, DesignSystemQuery, ScreenshotTarget,
 };
 use fanta_doc::{Doc, NodeData, NodeId, Operation};
-use fanta_format::{ArtifactId, ScopedDesign, WorkspaceSession};
+use fanta_format::ScopedDesign;
+#[cfg(feature = "native")]
+use fanta_format::{ArtifactId, WorkspaceSession};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -116,6 +126,7 @@ pub struct ChangedFile {
 const INSPECT_FRAME_LIMIT: usize = 200;
 
 /// An open project and the edits made to it since it was opened.
+#[cfg(feature = "native")]
 pub struct HeadlessProject {
     root: PathBuf,
     document: HeadlessDocument,
@@ -133,6 +144,7 @@ pub struct HeadlessProject {
     warnings: Vec<String>,
 }
 
+#[cfg(feature = "native")]
 impl HeadlessProject {
     /// Read the project at `root` the way the editor opens it, solve the
     /// geometry its sources leave out, and record the hash of every file so
@@ -601,6 +613,7 @@ impl HeadlessProject {
 
 /// Compare the files under `work_dir` with the hashes they had when the
 /// project was opened.
+#[cfg(feature = "native")]
 pub fn changeset(
     loaded_hashes: &BTreeMap<String, [u8; 32]>,
     work_dir: &Path,
@@ -634,6 +647,7 @@ pub fn changeset(
 
 /// The SHA-256 of every file under `root`, keyed by its `/`-separated path.
 /// Hidden entries (`.git`, editor caches) are not project content.
+#[cfg(feature = "native")]
 fn hash_project_files(root: &Path) -> Result<BTreeMap<String, [u8; 32]>> {
     let mut hashes = BTreeMap::new();
     let mut pending = vec![(root.to_path_buf(), String::new())];
@@ -663,6 +677,7 @@ fn hash_project_files(root: &Path) -> Result<BTreeMap<String, [u8; 32]>> {
     Ok(hashes)
 }
 
+#[cfg(feature = "native")]
 fn hex_digest(hash: &[u8; 32]) -> String {
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }

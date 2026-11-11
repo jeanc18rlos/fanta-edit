@@ -49,26 +49,42 @@ mod media;
 mod merge;
 mod read;
 mod refs_ctx;
+// The editing session, the disk writer's transactional half, scaffolding and
+// media import registry are filesystem machinery; the non-native build keeps
+// only the pure read/emit core (spec 0008 R1).
+#[cfg(feature = "native")]
 pub mod session;
+// `.fant` snapshots ride on the zip container, which stays native-only.
+#[cfg(feature = "native")]
 mod snapshot;
+// Source edits persist through `tempfile`, the one non-native dependency.
+#[cfg(feature = "native")]
 mod source_edit;
+mod tree_source;
 mod web;
 mod web_read;
 mod write;
 
 pub use fanta_fnx::canonicalize_legacy_source;
-pub use layout::{
-    ProjectManifest, ensure_project_editor_support, is_project_dir, scaffold_project_tree,
-};
+pub use layout::ProjectManifest;
+#[cfg(feature = "native")]
+pub use layout::{ensure_project_editor_support, is_project_dir, scaffold_project_tree};
+pub use media::{FormatCapabilities, asset_id_for_bytes};
+#[cfg(feature = "native")]
+pub(crate) use media::compute_asset_id;
+#[cfg(feature = "native")]
 pub use media::{MediaFormat, MediaRegistry, MediaRegistryError};
 pub use merge::{
     ArtifactAddress, ArtifactMerge, DocMerge, JsonPathSegment, NodeMapEdition, PresenceValue,
     PropertyConflict, merge_artifact, merge_docs,
 };
+pub use read::ScopedDesign;
+#[cfg(feature = "native")]
 pub use read::{
-    ScopedDesign, component_id_of_dir, locate_master_source, locate_page_source, page_id_of_dir,
+    component_id_of_dir, locate_master_source, locate_page_source, page_id_of_dir,
     page_scope_of_source, read_project_tree, read_project_tree_with_warnings,
 };
+#[cfg(feature = "native")]
 pub use session::{
     ApplyReport, ArtifactDirty, ArtifactId, ArtifactMeta, ArtifactOpImpact, ArtifactRenderRevision,
     ArtifactRenderSnapshot, ArtifactSession, ClosePolicy, ConflictResolution, ContentHash,
@@ -79,20 +95,27 @@ pub use session::{
     WorkspaceIr, WorkspaceSession, WorkspaceSharedState, artifact_op_impact, hash_file_set,
     read_motion_dual, synthesize_workspace_fnx, write_artifact_files,
 };
+#[cfg(feature = "native")]
 pub use snapshot::{export_fant_snapshot, import_fant_snapshot};
+pub use read::read_project_files;
 pub use web::{
     WebDesignReport, WebProjection, WebRaster, WebReport, WebRenderSource,
-    web_project_files, write_web_project_tree,
+    emit_web_project_tree, web_project_files,
 };
+#[cfg(feature = "native")]
+pub use web::write_web_project_tree;
+#[cfg(feature = "native")]
 pub use source_edit::{
     ProjectSourceEdit, apply_project_json_edit, apply_project_source_edit,
     apply_project_source_edit_with_diagnostics, validate_project_json_edit,
     validate_project_source_edit, validate_project_source_edit_with_diagnostics,
 };
+pub use write::{ProjectWriteCache, WriteReport, is_project_managed_path};
+#[cfg(feature = "native")]
 pub use write::{
-    ProjectUpgrade, ProjectWriteCache, WriteReport, is_project_managed_path, projected_design_dirs,
-    stage_new_project_tree, upgrade_project, write_legacy_project_tree,
-    write_legacy_project_tree_checked, write_project_tree, write_project_tree_cached,
+    ProjectUpgrade, projected_design_dirs, stage_new_project_tree, upgrade_project,
+    write_legacy_project_tree, write_legacy_project_tree_checked, write_project_tree,
+    write_project_tree_cached,
 };
 
 #[cfg(test)]
@@ -100,6 +123,7 @@ mod tests {
     use super::*;
     use crate::asset_id_for_bytes;
     use crate::error::FormatError;
+    use std::path::PathBuf;
     use fanta_doc::{
         AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, AssetId, CanvasNode,
         ComponentDef, ComponentId, Doc, Easing, GroupNode, History, Interpolation, Keyframe,
@@ -2571,5 +2595,156 @@ mod tests {
         );
         assert!(dir.path().join("previews/p.png").is_file());
         assert!(dir.path().join("exports/e.fant").is_file());
+    }
+
+    /// Files as the in-memory reader takes them: every regular file under
+    /// `root`, keyed by its relative path.
+    fn mem_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        tree_snapshot(root)
+            .into_iter()
+            .filter(|(path, _)| !path.ends_with('/'))
+            .map(|(path, bytes)| (PathBuf::from(path), bytes))
+            .collect()
+    }
+
+    /// R1 (spec 0008 T1): the in-memory reader assembles the same document,
+    /// assets and warnings from the written bytes as the disk reader does.
+    #[test]
+    fn mem_reader_agrees_with_disk_reader() {
+        let f = fixture();
+        let (assets, _) = fixture_assets();
+        let dir = tempdir().unwrap();
+        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+
+        let (mem_doc, mem_assets, mem_warnings) = read_project_files(&mem_tree(dir.path())).unwrap();
+        let (disk_doc, disk_assets, disk_warnings) =
+            read_project_tree_with_warnings(dir.path()).unwrap();
+        assert_eq!(persisted(&mem_doc), persisted(&disk_doc));
+        assert_eq!(mem_assets, disk_assets);
+        assert_eq!(mem_doc.pages(), disk_doc.pages(), "page order agrees");
+        assert_eq!(mem_warnings, disk_warnings);
+    }
+
+    /// R3 (spec 0008 T1): one writer — the in-memory emitter produces exactly
+    /// the disk writer's bytes, and emit after a read of those bytes is a
+    /// fixed point, with no filesystem involved.
+    #[test]
+    fn emit_web_project_tree_matches_the_disk_writer_and_is_a_fixed_point() {
+        let f = fixture();
+        let (assets, _) = fixture_assets();
+        let dir = tempdir().unwrap();
+        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+
+        let (emitted, _) = emit_web_project_tree(&f.doc, &assets, None, &[]).unwrap();
+        let emitted: BTreeMap<PathBuf, Vec<u8>> = emitted
+            .into_iter()
+            .map(|(path, bytes)| (path, bytes.to_vec()))
+            .collect();
+        let assert_trees_equal = |left: &BTreeMap<PathBuf, Vec<u8>>,
+                                  right: &BTreeMap<PathBuf, Vec<u8>>,
+                                  what: &str| {
+            assert_eq!(
+                left.keys().collect::<Vec<_>>(),
+                right.keys().collect::<Vec<_>>(),
+                "{what}: file lists differ"
+            );
+            for (path, bytes) in left {
+                assert_eq!(
+                    String::from_utf8_lossy(bytes),
+                    String::from_utf8_lossy(&right[path]),
+                    "{what}: {} differs",
+                    path.display()
+                );
+            }
+        };
+        // The disk sync also seeds editor support (AGENTS.md, .gitignore, …).
+        // Those are stateful on disk — a fresh copy in the emitted map would
+        // clobber a user-customized seed on write-back — so emit leaves them
+        // out and everything else matches byte for byte.
+        let mut disk = mem_tree(dir.path());
+        for (relative, _) in layout::fresh_project_editor_support() {
+            assert!(disk.remove(Path::new(relative)).is_some(), "{relative} seeded");
+        }
+        assert_trees_equal(&emitted, &disk, "emit vs disk writer");
+
+        let (loaded, loaded_assets, _) = read_project_files(&emitted).unwrap();
+        let (second, _) = emit_web_project_tree(&loaded, &loaded_assets, None, &[]).unwrap();
+        let second: BTreeMap<PathBuf, Vec<u8>> = second
+            .into_iter()
+            .map(|(path, bytes)| (path, bytes.to_vec()))
+            .collect();
+        assert_trees_equal(&second, &emitted, "emit after a read");
+    }
+
+    /// R1 + spec 0007 R7 in memory: a hand edit inside the map — a CSS fill,
+    /// SVG text content — takes the same overlay path as a disk hand edit.
+    #[test]
+    fn mem_reader_adopts_hand_edits() {
+        use fanta_doc::{Color, TextNode, Transform2D, VectorNode};
+
+        let mut doc = Doc::new();
+        doc.metadata.title = "Hand Edits In Memory".into();
+        let page = {
+            let node = group(None, "Home");
+            let id = node.id;
+            doc.scene.insert(node).unwrap();
+            id
+        };
+        let mut place = |data: NodeData, name: &str, x: f64| -> NodeId {
+            let mut node = CanvasNode::new(data);
+            node.name = name.into();
+            node.parent = Some(page);
+            node.transform = Transform2D::translation(x, 0.0);
+            let id = node.id;
+            doc.scene.insert(node).unwrap();
+            id
+        };
+        let panel = place(
+            NodeData::Vector(VectorNode::rect_solid(
+                0.0,
+                0.0,
+                64.0,
+                32.0,
+                Color::from_hex("#123456").unwrap(),
+            )),
+            "Panel",
+            0.0,
+        );
+        let label = place(NodeData::Text(TextNode::new("Hello", 100.0, 20.0)), "Label", 80.0);
+        doc.add_page(page);
+
+        let (emitted, _) = emit_web_project_tree(&doc, &BTreeMap::new(), None, &[]).unwrap();
+        let mut files: BTreeMap<PathBuf, Vec<u8>> = emitted
+            .into_iter()
+            .map(|(path, bytes)| (path, bytes.to_vec()))
+            .collect();
+        let css_path = PathBuf::from("pages/home/page.css");
+        let css = String::from_utf8(files[&css_path].clone()).unwrap();
+        assert!(css.contains("fill: #123456;"), "{css}");
+        files.insert(
+            css_path,
+            css.replace("fill: #123456;", "fill: #FF0000;").into_bytes(),
+        );
+        let svg_path = PathBuf::from("pages/home/page.svg");
+        let svg = String::from_utf8(files[&svg_path].clone()).unwrap();
+        assert!(svg.contains(">Hello<"), "{svg}");
+        files.insert(svg_path, svg.replace(">Hello<", ">Edited<").into_bytes());
+
+        let (loaded, _, warnings) = read_project_files(&files).unwrap();
+        assert_eq!(warnings, Vec::<String>::new());
+        let NodeData::Vector(vector) = &loaded.scene.get(panel).unwrap().data else {
+            panic!("panel stays a vector");
+        };
+        assert_eq!(
+            vector.fills.first(),
+            Some(&fanta_doc::Fill::Solid {
+                color: Color::from_hex("#FF0000").unwrap(),
+                blend: fanta_doc::BlendMode::Normal,
+            })
+        );
+        let NodeData::Text(text) = &loaded.scene.get(label).unwrap().data else {
+            panic!("label stays text");
+        };
+        assert_eq!(text.content, "Edited");
     }
 }

@@ -20,6 +20,7 @@ use serde_json::{Map, Value};
 use crate::error::Result;
 
 use super::layout::{COMPONENTS_DIR, PAGES_DIR, id_from_key, json_key, slugify};
+use super::tree_source::TreeSource;
 use super::web::{DESIGN_CSS, MASTER_SVG, PAGE_SVG, css_blend_mode, css_color, number};
 
 /// Parse the project's `design.css` and every design SVG, and apply what they
@@ -28,6 +29,7 @@ use super::web::{DESIGN_CSS, MASTER_SVG, PAGE_SVG, css_blend_mode, css_color, nu
 /// `pending_layout` (with their children) so the solver regenerates the
 /// derived geometry (R8).
 pub(crate) fn apply_web_overlay(
+    source: &TreeSource<'_>,
     dir: &Path,
     nodes: &mut Map<String, Value>,
     variables: &Value,
@@ -35,14 +37,14 @@ pub(crate) fn apply_web_overlay(
     warnings: &mut Vec<String>,
 ) -> Result<()> {
     let tokens = TokenTable::new(variables, warnings);
-    let mut rules = match std::fs::read_to_string(dir.join(DESIGN_CSS)) {
+    let mut rules = match source.read_to_string(&dir.join(DESIGN_CSS)) {
         Ok(css) => parse_rules(&css, warnings),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
         Err(error) => return Err(error.into()),
     };
     let mut elements = BTreeMap::new();
-    for path in design_svgs(dir)? {
-        let svg = std::fs::read_to_string(&path)?;
+    for path in design_svgs(source, dir)? {
+        let svg = source.read_to_string(&path)?;
         let context = path
             .strip_prefix(dir)
             .unwrap_or(&path)
@@ -54,7 +56,7 @@ pub(crate) fn apply_web_overlay(
         // amended), but a root-only declaration still applies: append the
         // scoped declarations so the later value wins per property.
         let scoped = path.with_extension("css");
-        match std::fs::read_to_string(&scoped) {
+        match source.read_to_string(&scoped) {
             Ok(css) => {
                 for (id, declarations) in parse_rules(&css, warnings) {
                     rules.entry(id).or_default().extend(declarations);
@@ -194,25 +196,24 @@ struct SvgElement {
 
 /// Every design SVG in the tree: `pages/*/page.svg` and each `master.svg`
 /// under `components/` (variants nest one level deeper).
-fn design_svgs(dir: &Path) -> Result<Vec<PathBuf>> {
+fn design_svgs(source: &TreeSource<'_>, dir: &Path) -> Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     let pages = dir.join(PAGES_DIR);
-    if pages.is_dir() {
-        for entry in std::fs::read_dir(&pages)? {
-            let candidate = entry?.path().join(PAGE_SVG);
-            if candidate.is_file() {
+    if source.is_dir(&pages) {
+        for entry in source.sorted_entries(&pages)? {
+            let candidate = entry.join(PAGE_SVG);
+            if source.is_file(&candidate) {
                 found.push(candidate);
             }
         }
     }
     let mut stack = vec![dir.join(COMPONENTS_DIR)];
     while let Some(directory) = stack.pop() {
-        if !directory.is_dir() {
+        if !source.is_dir(&directory) {
             continue;
         }
-        for entry in std::fs::read_dir(&directory)? {
-            let path = entry?.path();
-            if path.is_dir() {
+        for path in source.sorted_entries(&directory)? {
+            if source.is_dir(&path) {
                 stack.push(path);
             } else if path.file_name().is_some_and(|name| name == MASTER_SVG) {
                 found.push(path);
