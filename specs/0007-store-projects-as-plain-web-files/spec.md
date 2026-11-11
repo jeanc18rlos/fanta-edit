@@ -53,11 +53,16 @@ part — the tree and geometry markup — is what SVG does natively, and spec
   `set.json`), `doc/*.json`, `assets/`. No `.fnx`, no `.fss`, anywhere.
 - **R2.** The SVG is the authoritative scene tree: element order, node ids
   (`id`), names (`data-name`), geometry, path data, text content.
-- **R3.** CSS is the authoritative styling: one `design.css` rule per node;
-  variable-bound properties as `var(--token, literal)`; `tokens.css` carries
-  collections and modes. Engine concepts without a CSS property use
+- **R3.** CSS is the authoritative styling, scoped like the SVG it styles
+  (founder direction, 2026-11-11): each design carries its own stylesheet
+  beside its SVG (`pages/<slug>/page.css`, `components/…/master.css`), one
+  rule per node; the root `design.css` imports every design's stylesheet and
+  is the home for project-wide rules; `tokens.css` carries collections and
+  modes at the root. Variable-bound properties emit as
+  `var(--token, literal)`. Engine concepts without a CSS property use
   `--fanta-*` custom properties (layout direction, gap, padding, per-corner
-  radii, …) — the vocabulary `.fss` carries today.
+  radii, …) — the vocabulary `.fss` carries today. Each SVG references
+  `tokens.css` and its own stylesheet, so a standalone open renders styled.
 - **R4.** Semantics SVG/CSS cannot express stay JSON sidecars: reactions,
   flows, motion, component definitions and overrides, variable registries,
   bindings beyond CSS `var()`. (All of these are JSON already — today
