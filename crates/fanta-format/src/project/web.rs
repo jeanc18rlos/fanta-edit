@@ -1018,9 +1018,10 @@ impl Emitter<'_> {
         let transform = transform_attribute(&node.transform)
             .map(|transform| format!(" transform=\"{transform}\""))
             .unwrap_or_default();
+        let level_inline = level.inline();
         let style = match level.0.is_empty() {
             true => String::new(),
-            false => format!(" style=\"{}\"", level.inline()),
+            false => format!(" style=\"{level_inline}\""),
         };
         match &node.data {
             NodeData::Group(group) => {
@@ -1093,7 +1094,15 @@ impl Emitter<'_> {
                 out.push_str("</g>\n");
             }
             NodeData::Vector(vector) => {
-                self.emit_virtual_vector(node, vector, instance, &transform, &style, out, depth);
+                self.emit_virtual_vector(
+                    node,
+                    vector,
+                    instance,
+                    &transform,
+                    &level_inline,
+                    out,
+                    depth,
+                );
             }
             NodeData::Boolean(boolean) => match &boolean.baked {
                 Some(baked) => {
@@ -1104,7 +1113,13 @@ impl Emitter<'_> {
                         ..VectorNode::default()
                     };
                     self.emit_virtual_vector(
-                        node, &vector, instance, &transform, &style, out, depth,
+                        node,
+                        &vector,
+                        instance,
+                        &transform,
+                        &level_inline,
+                        out,
+                        depth,
                     );
                 }
                 None => {
@@ -1197,7 +1212,7 @@ impl Emitter<'_> {
         vector: &VectorNode,
         instance: &str,
         transform: &str,
-        style: &str,
+        level: &str,
         out: &mut String,
         depth: usize,
     ) {
@@ -1248,15 +1263,18 @@ impl Emitter<'_> {
             } else {
                 ""
             };
+            // The level declarations (opacity, filter, blend) share the one
+            // style attribute with the fill: a second style="" on the same
+            // element is malformed XML.
+            let level_part = if index == 0 && !level.is_empty() {
+                format!("{level}; ")
+            } else {
+                String::new()
+            };
             indent(out, depth);
             let _ = writeln!(
                 out,
-                "<{tag} data-virtual=\"true\"{}{geometry} style=\"fill: {paint}{stroke_part}\"/>",
-                if index == 0 {
-                    format!("{transform}{style}")
-                } else {
-                    transform.to_string()
-                },
+                "<{tag} data-virtual=\"true\"{transform}{geometry} style=\"{level_part}fill: {paint}{stroke_part}\"/>",
             );
         }
     }

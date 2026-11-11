@@ -1225,6 +1225,9 @@ mod tests {
         )));
         chip_shape.name = "Chip / Shape".into();
         chip_shape.parent = Some(comp_root);
+        // A level style on instance content must share the fill's one style
+        // attribute; a second style="" made the SVG malformed XML.
+        chip_shape.opacity = fanta_doc::UnitInterval::new(0.5);
         insert(chip_shape);
         let mut chip_label = CanvasNode::new(NodeData::Text(TextNode::new("Chip", 40.0, 12.0)));
         if let NodeData::Text(text) = &mut chip_label.data {
@@ -1391,6 +1394,10 @@ mod tests {
         assert!(
             svg.contains("<svg xmlns=\"http://www.w3.org/2000/svg\" data-fanta=\"page\""),
             "the root element identifies the file as Fanta source and its kind: {svg}"
+        );
+        assert!(
+            svg.contains("style=\"opacity: 0.5; fill:"),
+            "a level style on instance content shares the fill's style attribute: {svg}"
         );
         let master = fs::read_to_string(dir.path().join("components/chip/master.svg")).unwrap();
         assert!(master.contains("data-fanta=\"master\""), "{master}");
