@@ -39,6 +39,11 @@ request when it merges.
   the import suite pass against the new save path. The FNX writer remains
   as `write_legacy_project_tree` for R9 conversion fixtures and the kept
   readers' tests; see "T5 decisions" in design.md.
-- [ ] **T6.** Docs and schema: project-schema doc rewritten for the web
+- [x] **T6.** Docs and schema: project-schema doc rewritten for the web
   layout, support matrix for hand-editing tools, deprecation note for the
-  FNX/FSS readers' future.
+  FNX/FSS readers' future. Verified: fanta-format seed-upgrade tests (the
+  replaced guide's SHA-256 joins `previous_seeds`) and the agent prompt
+  gates pass; the design_surface sync checklist walked (guidelines,
+  templates, MCP and built-in tool text, quickstart, README). The
+  `read_fnx_source`/`validate_fnx_source` tool *names* stay until a rename
+  is worth breaking connected agents. PR #191.
