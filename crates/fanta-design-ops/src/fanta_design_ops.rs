@@ -1159,9 +1159,10 @@ fn activity_active() -> bool {
 /// prompt. Kept next to the op vocabulary so the two stay in step.
 pub const DESIGN_GUIDELINES: &str = r#"# Designing in Fanta
 
-Fanta is an agent-native design tool: the design is `.fnx` source files and a
-live canvas at once. These guidelines apply whether you drive the canvas
-(`design_edit` / `batch_design`) or edit `.fnx` files directly.
+Fanta is an agent-native design tool: the design is web-standard source files
+(SVG + CSS + JSON) and a live canvas at once. These guidelines apply whether
+you drive the canvas (`design_edit` / `batch_design`) or edit the source
+files directly.
 
 Read the project-local `fanta.md` specification before designing and follow its
 product, visual, layout and acceptance requirements. Direct user instructions,
@@ -1169,9 +1170,10 @@ AGENTS.md and current mode/tool restrictions take precedence. In Edit Visual
 mode use canvas operations; source file mutation is unavailable.
 
 ## Safe source edits
-- FNX attributes contain strict JSON: double quote every object key, including nested keys (`style={{"size_px": 16, "weight": 400}}`). Read existing source and types first.
-- Save complete documents with balanced tags and complete JSON values. Build large designs through small, complete frame/component edits so tool output limits cannot truncate the page.
-- Repair parser diagnostics and retry instead of force-saving partial drafts. External file agents can call `validate_fnx_source` with the complete candidate before writing; native and ACP tools validate managed FNX before saving.
+- A design's SVG is its tree (element order, `id`, `data-name`, geometry, text) and `design.css` its styling; `nodes.json` beside the SVG holds the complete node records. Parsed SVG/CSS fields win over the records on load; anything a load cannot keep is reported per node in `report.json`, and the next save canonicalizes formatting.
+- Edit values inside the emitted dialect: geometry attributes, `data-name`, text content, CSS declaration values, `var(--token, literal)` swaps, and `--fanta-layout`/`--fanta-gap`/`--fanta-padding` intent. Leave derived output alone (`-grad`/`-mask` defs, `url(#…)` paints, stacked-fill clones, `data-virtual` instance content, boolean outlines); edit those through `nodes.json` or canvas ops.
+- Save complete, well-formed documents. Build large designs through small, complete frame/component edits so tool output limits cannot truncate the page.
+- A legacy project may still hold `.fnx` sources (it converts on its first save): repair parser diagnostics and retry instead of force-saving partial drafts, and external file agents can call `validate_fnx_source` with the complete candidate before writing one.
 
 ## Coordinates and geometry
 - World coordinates, in px, y grows DOWN. `x`/`y` of an op is the node's
@@ -1183,7 +1185,7 @@ mode use canvas operations; source file mutation is unavailable.
   and place it there; do not stack new work on top of existing frames.
 
 ## Animations
-- Authored animation clips live in `doc/motion.json`, separately from page nodes. Inspect the existing JSON schema before editing clips, tracks, and keyframes. Targets use exact node ids; preserve clip, track, and keyframe identities. A clip also carries `fps`, `loop_mode` (`once`, `repeat`, `ping_pong`), `scope` (its stage frame), `background` and `transform_origins` (per node, the rotation and scale pivot as a fraction of its bounds, `[0.5, 0.5]` for the centre); all are optional. Save and verify screenshots at multiple `motion_clip` / `playhead_ms` samples, and check the Motion preview when available; do not invent animation attributes on page `.fnx` elements.
+- Authored animation clips live in `doc/motion.json`, separately from page nodes. Inspect the existing JSON schema before editing clips, tracks, and keyframes. Targets use exact node ids; preserve clip, track, and keyframe identities. A clip also carries `fps`, `loop_mode` (`once`, `repeat`, `ping_pong`), `scope` (its stage frame), `background` and `transform_origins` (per node, the rotation and scale pivot as a fraction of its bounds, `[0.5, 0.5]` for the centre); all are optional. Save and verify screenshots at multiple `motion_clip` / `playhead_ms` samples, and check the Motion preview when available; do not invent animation attributes on page source elements.
 - Import generated images from their local path, URL or base64 using `import_image`; use the returned asset id/path in source edits. Generated MCP image blocks are saved automatically when possible.
 
 ## Structure
@@ -1210,7 +1212,7 @@ mode use canvas operations; source file mutation is unavailable.
   its `options`, or an `image` asset), bind applicable properties with
   `bind_variable` (`image_fill` takes an image variable), then
   reuse component instances. Source equivalents are `doc/variables.json`,
-  `doc/active_modes.json` and component master FNX; preserve ids.
+  `doc/active_modes.json` and each design's `nodes.json`; preserve ids.
 - Reusable component APIs include combine_variants, create_component_property,
   bind_component_property and set_instance_property. A component with
   variants is ONE variant set: name each master after its values
@@ -1253,7 +1255,7 @@ mode use canvas operations; source file mutation is unavailable.
   import_project_image; SVG remains vector source/placement, not raster import.
 
 ## Working method
-- Prioritize visible progress: build one component or screen section at a time with small streamed canvas batches. Keep each new component visible on the current page or its own named component page, then place an instance on the screen before starting the next component. Use small complete FNX source edits when they help, preserving identities; save and verify each milestone. Never claim missing tool access without trying the available tools and reporting the real error.
+- Prioritize visible progress: build one component or screen section at a time with small streamed canvas batches. Keep each new component visible on the current page or its own named component page, then place an instance on the screen before starting the next component. Use small complete source edits when they help, preserving identities; save and verify each milestone. Never claim missing tool access without trying the available tools and reporting the real error.
 - Read unresolved comments with `list_comments` / `design_comments`, use them during reviews, and reply in their original canvas threads. Only resolve verified requests.
 - Post review findings as their own comments with `add_comment` (native: `design_comments` with `create`): anchor each to the layer it concerns (`node`), give it a `severity` (info, minor, major, blocker) and a `category` (layout, typography, color, accessibility, consistency, content, interaction, motion, other), the run's `review_run_id`, and a `suggested_fix` ops list when a concrete change would address it. Suggested fixes contain content edits only; omit select and set_viewport. Finish a review with one summary comment. A review never edits the design.
 - Report agent focus with `report_agent_activity` (stable agent id, mage name, action, page and node/world position); update it for every placement or adjustment. Include `workspace` (canvas, variables or code) and `source_path` when moving between files or tabs so Follow can track your actual work. External MCP agents must pass the same identity in `batch_design.activity` to preserve Follow through each streamed placement. Clear it with `active: false` when done.
@@ -1278,11 +1280,12 @@ mode use canvas operations; source file mutation is unavailable.
 - Use streamed canvas ops for visible element creation and placement. Use
   source edits for small complete subtrees or typed JSON changes; verify each
   save on the live canvas before moving to the next component or section.
-- `.fnx` files: each page is `pages/<slug>/page.fnx`, each component master
-  `components/<slug>/master.fnx` (paths are in the state's `pages[].source`
-  and `components[].source`). Read and edit these files with normal file tools for design creation,
-  styling, layout, components and structural changes; the open canvas hot-reloads about 300 ms after save. Keep the
-  JSX well-formed.
+- Source files: each page is `pages/<slug>/page.svg` with its `nodes.json`,
+  each component master `components/<slug>/master.svg` (paths are in the
+  state's `pages[].source` and `components[].source`); styling is in the root
+  `design.css`. Read and edit these files with normal file tools for design
+  creation, styling, layout and structural changes; the open canvas
+  hot-reloads about 300 ms after save. Keep every file well-formed.
 - JSON metadata and identity sidecars are editable: inspect their schema,
   preserve existing identities, and validate the complete project after edits.
   Generated previews and exports are outputs, not authoring source.

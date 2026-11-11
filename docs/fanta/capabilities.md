@@ -48,11 +48,14 @@ These source additions have not been exercised in the installed app.
 ## Projects, pages and source
 
 Create a design from **New Design**, open a Fanta project folder, or import a
-`.fig` file or `.fant` snapshot. A saved project contains `fanta.json`, page and
-component FNX source, identity sidecars, metadata and assets. See
+`.fig` file or `.fant` snapshot. A saved project contains `fanta.json`, one SVG
+plus a `nodes.json` record file per page and component master, styling in
+`design.css`, a browser viewer, metadata and assets (spec 0007). A legacy
+project with FNX source and identity sidecars opens unchanged and converts to
+the web layout on its first save. See
 [project-schema.md](project-schema.md) for the layout.
 
-Keep the manifest, source, identity sidecars and referenced assets together when
+Keep the manifest, source files and referenced assets together when
 copying a project. A received folder can open in Restricted Mode if its `.fanta`
 settings or Git configuration could run commands. Review its origin and trust
 prompt; do not remove its Git history or enable global trust just to suppress
@@ -187,10 +190,12 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   All, OS-error Discard and cold recovery are not covered by that route. These
   internal QA results do not establish fa47 or shipping acceptance. See the
   [current scoped results](../alpha/CAPABILITY_COVERAGE.md#current-fa47-hosted-results-and-build44-native-samples--11-october).
-- The **Code** workspace edits FNX and supported JSON sources, and lists the
-  project's `doc/variables.json` (editable) and `fanta.json` and `workspace.fnx`
+- The **Code** workspace shows each design's SVG source and edits managed JSON
+  (and, in legacy projects, FNX), and lists the
+  project's `doc/variables.json` (editable) and `fanta.json`
   (read-only) beside the page pair; opening it from Variables shows
-  `variables.json`. Saving valid
+  `variables.json`. SVG buffers have no in-app save path yet; external edits
+  reconcile at reload. Saving valid
   source updates the canvas; invalid drafts preserve the last valid file and
   scene. Multi-buffer Save is sequential, not atomic: in a bounded build39 check,
   valid FNX was saved before a second invalid JSON draft was rejected. Cancel
@@ -563,7 +568,8 @@ editing its text and more. The lock button in the canvas controls switches the
 window to Fill mode, where the canvas, Delete, Duplicate, text editing and the
 Design inspector's edits keep to those rules; arranging or transforming a
 multi-selection, variable bindings and grouping do not check them yet. Rules
-are set in FNX source (`editing={{…}}`) or through `fanta-api`; the inspector
+are set in source (the node record's `editing` field in `nodes.json`, or
+legacy FNX `editing={{…}}`) or through `fanta-api`; the inspector
 does not show them yet.
 
 Bound solid fills show their resolved mode color and variable name in the

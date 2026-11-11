@@ -136,7 +136,7 @@ This project-local specification records design intent. Update it as the brief b
 - Generation preparation opens the existing composer for review. It does not submit a paid request or promise an unavailable model.
 
 ## Acceptance checks
-- Save complete valid FNX documents and inspect parser diagnostics.
+- Save complete, valid source documents and inspect diagnostics.
 - Verify screenshots of changed frames at representative sizes; fix misalignment, overlaps, clipping, typography and contrast before reporting completion.
 - Check component reuse and bound variable modes. Preserve user content and existing project rules.
 "#;
@@ -153,15 +153,17 @@ pub(crate) const FNX_PRETTIER: &str = include_str!("fnx.prettierrc.json");
 /// The seed contents of [`AGENTS_MD_NAME`]. Written only when absent so a
 /// user's edits are never clobbered; untouched previous seeds are upgraded.
 /// The guide is intentionally practical and format-accurate — it is derived
-/// from the real `.fnx` projection, not invented.
+/// from the real web projection (spec 0007), not invented.
 pub(crate) const AGENTS_MD: &str = r##"# Working on this Fanta design project
 
 This directory is a Fanta *design project*: a Figma-class design stored as
-editable source files. **The design is the source of truth.** Editing these
-files edits the design. When this project is open in the editor, saving your
-edits to the `.fnx` files update the canvas about 300 ms later, and edits made
-on the canvas save back to these same files. So working here as a text agent
-*is* the design-to-canvas loop — no export step.
+editable web-standard source files — SVG, CSS, HTML, JS and JSON. **The design
+is the source of truth.** Editing these files edits the design. When this
+project is open in the editor, saving your edits to these files updates the
+canvas about 300 ms later, and edits made on the canvas save back to these
+same files. So working here as a text agent *is* the design-to-canvas loop —
+no export step. Opening `index.html` in any browser views the project without
+Fanta at all.
 
 If Fanta is running with this project open you also have a more direct route: a
 live MCP server that reads and edits the focused canvas. Prefer reading and
@@ -171,7 +173,7 @@ operations that require editor state. Try available tools before claiming
 missing access. Read *Driving the open canvas over MCP* below and call
 `get_guidelines` before designing.
 
-## Safe FNX edits
+## Safe source edits
 
 Read `fanta.md` for this project’s product, visual direction, layout and acceptance
 criteria. Preserve customized specifications. Inspect the live `get_design_system`
@@ -185,23 +187,28 @@ inside padded, min-constrained aligned frames; card paragraphs should auto-heigh
 at their assigned width. Do not compensate for container errors with manual
 child-coordinate nudges. Verify wrapping and alignment at representative sizes.
 
-FNX is JSX with JSON attribute values. Every object key inside `{{...}}` must
-be double quoted, including nested objects: `style={{"size_px": 16, "weight": 400}}`.
-Do not use JavaScript object syntax with unquoted keys. Read the existing source
-and types before editing. Save only complete documents with balanced tags and
-complete JSON values. Build large designs through small, complete frame or
-component edits; do not stream a whole large page in one tool response.
-Parser diagnostics are repair instructions: correct the candidate and retry,
-without force-saving an incomplete draft. Native and ACP file tools validate
-managed FNX before saving; external file agents can call `validate_fnx_source`
-with a complete candidate before writing it.
+The SVG and CSS are generated, canonical source: edit values inside the emitted
+dialect (see *Editing the web sources* below) rather than reformatting whole
+files, and save only complete, well-formed documents. Structure lives in each
+design's SVG, styling in `design.css`, and the complete node records in the
+neighboring `nodes.json`; anything a load cannot keep is reported per node in
+`report.json` on the next save — nothing is silently dropped. Build large
+designs through small, complete frame or component edits; do not stream a
+whole large page in one tool response. A project that still holds `.fnx`
+sources is a legacy project: it opens normally and converts to the web layout
+on its first save. For a legacy `.fnx` edit, external file agents can call
+`validate_fnx_source` with a complete candidate before writing it.
 
 ## Directory layout
 
 ```
-fanta.json                       # project manifest (format tag, versions, ids) — do not hand-edit
-fnx.d.ts                         # project-local FNX tag and property types for editor tooling
-.prettierrc.json                 # FNX-safe Prettier defaults; user-editable
+fanta.json                       # project manifest (format tag, versions, "storage": "web") — do not hand-edit
+index.html, viewer.js            # dependency-free viewer: open index.html in a browser — generated
+design.css                       # one CSS rule per node, selected by node id   <- edit values here
+tokens.css                       # variable collections/modes as CSS custom properties — generated
+                                 #   from doc/variables.json; not a hand-edit surface
+pages.js                         # the viewer's page manifest — generated
+report.json                      # last save's warnings and anything a load could not keep — generated
 doc/
   metadata.json                  # title + timestamps
   variables.json                 # design variables / tokens and their modes
@@ -212,23 +219,27 @@ doc/
   presentation.json              # prototype device and surround color
 pages/<page-slug>/
   page.json                      # { "id": "n_…", "name": ..., "order": N }
-  page.fnx                       # the page's node tree as readable source  <- edit this
-  page.ids.json                  # legacy id/order sidecar kept in sync  — do not hand-edit
+  page.svg                       # the page's tree: element order, ids, names, geometry, text  <- edit this
+  nodes.json                     # the complete node records, keyed by bare node id — editable JSON
+  map.json                       # node id -> name and world bounds for outside tools — generated
 components/<component-slug>/     # a component without variants
   def.json                       # component definition (id, root, name)  — do not hand-edit
-  master.fnx                     # the component master's tree as source    <- edit this
-  master.ids.json                # legacy id/order sidecar kept in sync  — do not hand-edit
+  master.svg                     # the component master's tree              <- edit this
+  nodes.json                     # the master's node records — editable JSON
 components/<set-slug>/           # a component WITH variants: one folder
   set.json                       # its axes, values and default variant    — do not hand-edit
   <variant-slug>/                # one per variant, named by its values (primary-hover)
     def.json                     # the variant's definition               — do not hand-edit
-    master.fnx                   # the variant master's tree as source      <- edit this
-    master.ids.json              # legacy id/order sidecar kept in sync  — do not hand-edit
+    master.svg                   # the variant master's tree                <- edit this
+    nodes.json                   # the variant's node records — editable JSON
 assets/index.json                # asset sizes and full SHA-256 digests
 assets/<family>/<AssetId>.<ext>  # shared binary assets, one folder per family:
                                  #   images/ video/ audio/ models/ svg/ fonts/ other/
 previews/  exports/              # generated output — git-ignored, never an input
 ```
+
+A converted legacy project may also hold `fnx.d.ts`, `.prettierrc.json` and
+`.prettierignore` — editor support for `.fnx` sources; they are harmless here.
 
 A component with variants (a component set) is ONE folder: never create a
 top-level `components/<slug>/` per variant. Variants are made, added, removed
@@ -237,143 +248,82 @@ and renamed with the canvas ops (`combine_variants`, `add_variants`,
 
 Directory names under `pages/` and `components/` are human-readable slugs of
 the design's name (two pages named the same get `-2`, `-3` suffixes). The
-design's *identity* lives in the JSON header and root source element: `page.json`'s
-`"id"`, `def.json`'s `id`, and the root element's bare ULID must identify the
-same node. Renaming the folder is
-not how you rename a page — edit the root element's `name` attribute and the
-app re-derives the folder name on the next save.
+design's *identity* lives in the JSON header and root SVG element:
+`page.json`'s `"id"`, `def.json`'s `id`, and the root element's `id` must
+identify the same node. Renaming the folder is not how you rename a page —
+edit the root element's `data-name` attribute and the app re-derives the
+folder name on the next save.
 
-Pages name the components they instance (`<Instance component="Button">`), so
-renaming a component in `def.json` breaks every page that names it and the
-whole project stops loading. Rename components, and build or change variant
-sets, with the canvas ops below (`rename_component`, `combine_variants`,
-`add_variants`, `remove_variant`, `arrange_variants`); the app then rewrites
-`def.json`, `set.json` and every page that names the component together.
+Instances link to their component by id inside `nodes.json`, and the SVG shows
+the expanded result as derived content. Rename components, and build or change
+variant sets, with the canvas ops below (`rename_component`,
+`combine_variants`, `add_variants`, `remove_variant`, `arrange_variants`); the
+app then rewrites `def.json`, `set.json` and every affected design together.
+Do not hand-rename a component in `def.json`.
 
-## The `.fnx` language
+## Editing the web sources
 
-A `.fnx` file is the readable, JSX/TSX-style projection of one page or component
-subtree. It opens with `// @generated fanta source …` — treat it as generated
-source you may edit, not as a file to reformat. Each scene node is one JSX
-element:
+A design's SVG (`page.svg` / `master.svg`) is its readable tree. Each scene
+node is one element whose `id` is the node id in display form (`n_…`) and
+whose `data-name` is the layer name; children nest in render (z) order. All
+styling is in `design.css`, one rule per node, selected by that same id. The
+neighboring `nodes.json` holds every node's complete record (keyed by the
+bare 26-character id), so nothing is lost when a property has no SVG/CSS
+spelling yet.
 
-- The **tag** is the node kind: `Frame` (group/frame), `Vector` (shape),
-  `Text`, `Image`, `Video`, `Audio`, `Model3D`, `NodeGraph`, `AiArtifact`,
-  `Instance` (a component instance), `Embed`. Two **authoring shorthands**
-  also parse: `<Rect width={100} height={50} …/>` and
-  `<Ellipse width={64} height={64} …/>` — each is sugar for a `<Vector>` with
-  the equivalent generated `path`, and simple shapes print back in the sugar
-  form. Give a sugar tag `width`/`height` (required) plus any normal vector
-  attributes (`fills`, `strokes`, `corner_radius`, `x`, `y`, …); do not give
-  it an explicit `path`.
-- **Attributes** are the node's fields, verbatim. String attributes render as
-  `name="Header"`; everything else renders inside braces, e.g. `opacity={1.0}`,
-  `x={280.0}`, `corner_radius={2.0}`. Nesting is by hierarchy: an element's
-  children are its child nodes, in render (z) order.
-- **Colors** render through `fnxColor("#RRGGBB")`, or an eight-digit hex when
-  not fully opaque (e.g. `fnxColor("#FFFFFF1A")`).
-- **Components by name**: `<Instance component="Button" />` references the
-  component named "Button" (a bare 26-character id is also always accepted).
-  If two components share a name, the id form is required — the app prints
-  ids for ambiguous names.
-- **Design tokens by path**: variable bindings accept `$Collection/Name`
-  paths and a readable map form:
-  `bindings={{"fill_color": "$Theme/bg", "text_style": "$Type/Heading"}}`.
-  The tokens themselves are defined in `doc/variables.json`.
-- A typo in an attribute name, component name, or token path fails with a
-  `line:column` error and a suggestion — a `.fnx` that loads has resolved
-  every reference.
+On load the records are read first, then the parsed SVG and CSS fields win
+over them. Edits inside this emitted dialect survive load and the next save:
 
-A short real snippet:
-
-```jsx
-<Frame id="00000000000000000000000001" background={{"kind": "solid", "color": fnxColor("#444444")}} blend_mode="normal"
-       corner_radius={2.0} name="Header" opacity={1.0} x={-734.0} y={-491.0}>
-  <Text id="00000000000000000000000002" align="left" content="Little Lemon" name="Title" opacity={1.0}
-        style={{"font_family": "Inter", "size_px": 64.0, "weight": 700, "color": fnxColor("#1E1E1E")}}
-        x={275.0} y={146.0} />
-</Frame>
-```
-
-Common attributes: `name`, `x`/`y` (position, see below), `opacity`,
-`blend_mode`, `background`/`fills`/`strokes` (paints, with colors as hex),
-`corner_radius`, `clip_size`, `content` and `style` (Text), `path` (Vector),
-`auto_layout` (auto-layout frames), `meta` (source metadata like
-`figma_type`/`figma_id`). Component instances carry `component` (the master's
-id), `overrides` (per-instance changes such as swapped text or colors),
-`prop_values`, and `derived`/`local_size` (solver-computed geometry).
-
-### Coordinates
-
-`x`/`y` are the node's translation in pixels relative to its parent (they are
-the pure-translation part of the node's transform). Change them to move a node;
-change `clip_size` / `local_size` to resize. You may also write `width={…}`
-`height={…}`: on load they fold into `clip_size` on a `Frame` and into
-`local_size` on every other sized tag, and an explicit `clip_size`/`local_size`
-already on the element wins over the sugar. The one exception is `Vector`, whose
-`local_size` is the SVG-viewport *clip* rather than the shape's geometry —
-`width`/`height` on a `<Vector>` are ignored, so resize a vector by editing its
-`path`, or author it as `<Rect>`/`<Ellipse>` sugar where `width`/`height` do
-generate the path. If you spell a size as `width`/`height`, an in-place edit of
-that element keeps your spelling; a full reprint of the file emits the canonical
-field instead.
-
-Leaving the size off entirely is tolerated, not encouraged: a `Text`, media or
-`Instance` element with neither `local_size` nor `width`/`height` is backfilled
-on read — media from its intrinsic `natural_size`, text from an estimate of its
-style and content, anything else with a 200 x 100 placeholder box — instead of
-failing the whole design. Expect the next save to write that guess back as a
-real `local_size`.
-
-A node with rotation, scale, or skew shows a raw
-`transform={[a, b, c, d, tx, ty]}` array instead of `x`/`y` — leave that
-verbatim unless you mean to change the matrix.
-
-### Stable node IDs
-
-Every element has a stable bare-ULID `id="…"` in `.fnx`. Keep that ID when changing or
-moving an element. To duplicate one, remove `id` from the copy so the editor
-assigns and writes a fresh ID; two elements with the same explicit ID fail to
-parse. The neighboring `.ids.json` file is a compatibility/order sidecar kept
-in sync by the editor. JSON files are editable; preserve identities and validate
-their schema and references before saving. Modern FNX with explicit IDs can
-recover a missing or damaged identity sidecar without changing those IDs.
-
-## What you can do by editing `.fnx`
-
-Editing the readable source changes the design directly:
-
-- **Rename a layer** — change its `name="…"`.
-- **Edit text** — change a `Text` element's `content="…"`, or an instance's
-  `text_content` override.
-- **Recolor** — change a hex color inside `fills` / `background` / `strokes` /
-  Text `style.color`. Colors use the TSX-valid `fnxColor("#RRGGBB")` helper.
-- **Move / resize** — change `x` / `y` (and size-related attributes).
+- **Rename a layer** — change its `data-name="…"`.
+- **Edit text** — change a text element's content.
+- **Move / resize** — change the element's geometry attributes (`x`, `y`,
+  `width`, `height`, `transform`, a path's `d`).
+- **Restyle** — change a declaration value in the node's `design.css` rule,
+  or swap a literal for `var(--token, literal)` to bind a variable. The
+  literal inside a `var()` is the token's resolved value under the active
+  modes.
 - **Reorder** — change an element's position among its siblings.
-- **Duplicate / delete** — copy an element, remove `id` from the copy, or
-  remove the element. The editor inserts a fresh ID for the copy.
+- **Auto layout** — intent lives on the frame's CSS rule as `--fanta-layout`,
+  `--fanta-gap` and `--fanta-padding`. Edit the intent and the app re-solves
+  the children on load: solved coordinates written into the SVG are derived
+  for auto-layout children, so change the rule, not the children's numbers.
+- **Everything else** — gradients beyond the emitted linear/radial dialect,
+  per-run rich text, bindings, component structure, instance overrides,
+  metadata — is edited in `nodes.json`; keep each record's id key.
+
+The writer canonicalizes on the next save, like a formatter: your values
+survive, your whitespace does not.
+
+### Derived output — leave it alone
+
+Some of the SVG is derived and ignored (never applied back) on load:
+
+- `<defs>` entries with ids ending `-grad` or `-mask`, and the `url(#…)`
+  paints referencing them: gradient edits go through `nodes.json`.
+- Stacked-fill clones (`<id>-f1`, `-f2`, …): only a clone's `fill` is read;
+  its mirrored geometry is regenerated.
+- Instance content marked `data-virtual="true"`: it is expanded from the
+  component master and carries no node ids. Edit the master, or the
+  instance's overrides in `nodes.json`.
+- A boolean node's flattened outline: its operands live in `nodes.json`.
 
 ## Guardrails
 
-- Keep the JSX well-formed: balanced tags, valid attribute values. A `.fnx`
-  that fails to parse will not load.
-- Preserve each existing element's explicit `id` in `.fnx` and identity
-  references in JSON. Inspect the current schema before editing sidecars or
-  manifest metadata. A JSON file parsing successfully does not prove its
-  typed values and references are valid; validate the complete project.
-- Assets are shared **by reference**: they live under `assets/<family>/` and are
-  named by content id. `assets/index.json` records full SHA-256 digests and
-  sizes. Reference assets by id; never paste binary data inline into `.fnx`.
-- For **auto-layout** frames (those with an `auto_layout={…}` attribute), the
-  app solves child positions from the layout rules — set the auto-layout
-  properties and let the solver place children rather than fighting it with
-  manual `x`/`y`.
+- Keep every file well-formed (XML, CSS, JSON). If a design's SVG cannot be
+  parsed, the design still loads from `nodes.json` and the problem is
+  reported — but the broken edit is overwritten on the next save.
+- Preserve each element's `id` and the matching record key in `nodes.json`.
+  To add or duplicate nodes, prefer the canvas ops below; a hand edit outside
+  the dialect above lands in `report.json` rather than being guessed at.
+- `tokens.css`, `pages.js`, `map.json`, `report.json`, `index.html` and
+  `viewer.js` are regenerated on every save. Edit variable values in
+  `doc/variables.json` (or with the variable ops), never in `tokens.css`.
+- Assets are shared **by reference**: they live under `assets/<family>/` and
+  are named by content id. `assets/index.json` records full SHA-256 digests
+  and sizes. Reference assets by id; never paste binary data inline.
 - `previews/` and `exports/` are generated; they are never read back.
 - `.fanta-transaction/` is a temporary recovery journal. If a save stops
   midway, opening the project replays it. Leave it for the editor to recover.
-- Positioning: `x`/`y` are sugar for a translation-only transform. A node with
-  rotation/scale shows a raw `transform={[a,b,c,d,tx,ty]}` instead — writing
-  BOTH `x`/`y` and `transform` on one element is an error, not a merge.
 
 ## Driving the open canvas over MCP
 
@@ -412,8 +362,8 @@ returns are what every other tool takes.
 
 **`get_guidelines`** — takes no arguments. Returns Fanta's design guidelines
 for agents (coordinates, frames vs groups, auto layout, spacing and type
-scales, naming, components, the working method, and when to edit `.fnx`
-instead). Read it once per session before designing.
+scales, naming, components, the working method, and when to edit the source
+files instead). Read it once per session before designing.
 
 **`batch_get`** — `{ ids?, page?, depth?, include_geometry?, detail? }`. With
 `ids`, returns those nodes' editable style (`detail: "style"`, the default) in
@@ -557,10 +507,10 @@ unpins it. `set_text_style.sizing` is `fixed`, `auto_height` or
 Hug axes, padding [8,16], min_size [128,48], auto-width label. A wrapping card:
 vertical Hug height, fixed width, Stretch children and auto-height paragraphs.
 
-Gradients and per-run rich text still require source editing.
-For those, read the page's `.fnx`, edit the file with your normal file tools,
-and let the canvas reload — that edit is also a reviewable git diff, which a
-`batch_design` call is not until the editor saves.
+Gradients beyond the emitted SVG dialect and per-run rich text still require
+source editing. For those, edit the page's `nodes.json` records with your
+normal file tools and let the canvas reload — that edit is also a reviewable
+git diff, which a `batch_design` call is not until the editor saves.
 
 **`get_screenshot`** — `{ page?, node?, max_dimension? }`, all optional. Renders
 a PNG of the active page, of another page by index, or of a single node's region,
@@ -569,7 +519,7 @@ it to check your own work before telling the user it is done.
 
 **`read_fnx_source`** — `{ path?, offset?, limit?, max_bytes? }`. Omit `path`
 for the project `root` and the list of its source files; pass a project-relative
-path (for example `pages/<page-slug>/page.fnx`) for that file's text, returned
+path (for example `pages/<page-slug>/page.svg`) for that file's text, returned
 in slices (64 KiB by default) with `total_lines`, `total_bytes`, `truncated` and
 a notice naming the next slice's arguments. Paths that escape the project
 root are rejected. This tool only reads — write with your own file tools. On a
@@ -663,10 +613,10 @@ when creating task branches and checkpoints.
 The two directions have different latencies, and mixing them up is the usual way
 to commit a broken tree:
 
-- **You edit a `.fnx`; the canvas follows.** The editor watches this directory
-  and reloads roughly **300 ms** after a burst of external writes settles, so a
-  multi-file rewrite lands as one reload rather than several. A parse error
-  keeps the old canvas and surfaces the `line:column` error instead.
+- **You edit a source file; the canvas follows.** The editor watches this
+  directory and reloads roughly **300 ms** after a burst of external writes
+  settles, so a multi-file rewrite lands as one reload rather than several.
+  An unloadable file keeps the old canvas and surfaces a diagnostic instead.
 - **The canvas edits; the files follow.** Canvas edits — including everything
   `batch_design` does — are held in the editor's document until it saves, so
   treat the on-disk tree as *behind* the canvas until you have checked. Cmd-S
@@ -675,11 +625,12 @@ to commit a broken tree:
 
 `get_editor_state`'s `dirty` field is how you check: while it is `true` the
 editor is still holding changes that have not reached disk, and re-reading the
-`.fnx` will show you the state *before* those edits.
+files will show you the state *before* those edits.
 
-Saving updates only changed project files and keeps the `.ids.json` sidecars in
-sync. After an edit, let the editor save before `git add`. Committing while
-`dirty` is `true` can capture source and sidecars from different revisions.
+Saving updates only changed project files and keeps each design's SVG, CSS
+rules and `nodes.json` in step. After an edit, let the editor save before
+`git add`. Committing while `dirty` is `true` can capture source and records
+from different revisions.
 
 ## Finding the node the user means
 
@@ -687,10 +638,10 @@ When the user says "the selected frame" or "this button", call
 `get_editor_state` and read `selection` — those are the node ids the canvas has
 selected right now, and `batch_get` turns them into names, geometry and parents.
 If the app is not running there is no live selection to read: ask the user for
-the **layer name** (the `name="…"` attribute) or the page name and find it in
-the relevant `page.fnx` / `master.fnx`. Names are not unique, so when several
-elements share one, confirm the match by its parent frame, position or
-surrounding text before editing.
+the **layer name** (the `data-name="…"` attribute) or the page name and find
+it in the relevant `page.svg` / `master.svg`, or in `map.json`. Names are not
+unique, so when several elements share one, confirm the match by its parent
+frame, position or surrounding text before editing.
 "##;
 
 /// `fanta.json` — the root manifest of a project directory.
@@ -867,6 +818,7 @@ fn seed_agents_md(dir: &Path) -> Result<()> {
         "057778f31c69d024845123c01ee02d5a91d0736e2743806b47234cc99670007d",
         "71d49782238e8e17464761de73b4b71a807e1d9346582a1c00e38f00e7993065",
         "b95dd139e72304af8d38947f10b594bb70c455db8c75f2332ff45b33423ec756",
+        "cb02692ceaa70322e52d03b14a2b7ffa029ebce479f3216645b45eb65a1d52b3",
     ];
     let should_write = match fs::read(&path) {
         Ok(contents) => {
