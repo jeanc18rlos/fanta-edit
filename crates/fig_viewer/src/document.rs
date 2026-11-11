@@ -4984,15 +4984,8 @@ mod tests {
                     })
                     .collect::<BTreeMap<_, _>>();
                 assert_eq!(assets.len(), asset_count);
-                let mut cache = fanta_format::ProjectWriteCache::default();
-                let report =
-                    write_new_project_materialized(&target, &document, &assets, &mut cache)?;
-                write_project_cached(
-                    &old_target,
-                    &document,
-                    &assets,
-                    &mut fanta_format::ProjectWriteCache::default(),
-                )?;
+                let report = write_new_project_materialized(&target, &document, &assets)?;
+                write_project(&old_target, &document, &assets)?;
                 assert_eq!(inventory(&target)?, inventory(&old_target)?);
                 assert_eq!(
                     report.completed,
@@ -5006,7 +4999,6 @@ mod tests {
                     report.project.sync_count, 0,
                     "no per-file or journal flush in the unpublished tree"
                 );
-                assert!(cache.cached_designs() > 0);
                 assert!(
                     !target.join(".git").exists(),
                     "use the final parent repository"
@@ -5026,7 +5018,7 @@ mod tests {
                 assert_eq!(expected_assets, assets);
                 let before_second_save = inventory(&target)?;
                 assert_eq!(
-                    write_project_cached_report(&target, &document, &assets, &mut cache)?,
+                    write_project_cached_report(&target, &document, &assets, &[])?,
                     fanta_format::WriteReport::default()
                 );
                 assert_eq!(inventory(&target)?, before_second_save);
