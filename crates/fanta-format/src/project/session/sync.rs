@@ -335,21 +335,65 @@ impl WorkspaceSession {
     pub fn reconcile_disk_snapshot(&mut self) -> Result<ApplyReport, SessionError> {
         let root = self.root.clone();
         crate::project::layout::with_project_read_lock(&root, || {
-            self.reconcile_disk_snapshot_locked()
+            self.reconcile_disk_snapshot_locked(None)
         })
     }
 
-    fn reconcile_disk_snapshot_locked(&mut self) -> Result<ApplyReport, SessionError> {
+    /// Reconcile after this session's own completed write. A disk difference
+    /// the write report explains (the writer produced or removed that file)
+    /// is adopted instead of counting as a foreign edit that demands a full
+    /// reload — the full writer is the only path that changes singletons like
+    /// `design.css` or a set's `set.json`, and treating its own output as
+    /// foreign left the session permanently stale after such a save.
+    pub fn accept_own_write(
+        &mut self,
+        report: &crate::project::write::WriteReport,
+    ) -> Result<ApplyReport, SessionError> {
+        let root = self.root.clone();
+        crate::project::layout::with_project_read_lock(&root, || {
+            self.reconcile_disk_snapshot_locked(Some(report))
+        })
+    }
+
+    fn reconcile_disk_snapshot_locked(
+        &mut self,
+        own_write: Option<&crate::project::write::WriteReport>,
+    ) -> Result<ApplyReport, SessionError> {
         let snapshot = WorkspaceSession::open(&self.root)?;
         if snapshot.project_id != self.project_id {
             return Err(SessionError::InvalidState(
                 "project identity changed during branch switch".into(),
             ));
         }
-        let requires_full_reload = snapshot.manifest_disk_hash != self.manifest_disk_hash
-            || snapshot.asset_index_disk_hash != self.asset_index_disk_hash
-            || snapshot.workspace_fnx_disk_hash != self.workspace_fnx_disk_hash
-            || snapshot.other_singleton_disk_hashes != self.other_singleton_disk_hashes;
+        let own = |path: &Path, disk: Option<[u8; 32]>| -> bool {
+            own_write.is_some_and(|report| match disk {
+                Some(hash) => report.written_hashes.get(path) == Some(&hash),
+                None => report.removed.iter().any(|removed| removed == path),
+            })
+        };
+        let singleton_paths: BTreeSet<&PathBuf> = snapshot
+            .other_singleton_disk_hashes
+            .keys()
+            .chain(self.other_singleton_disk_hashes.keys())
+            .collect();
+        let requires_full_reload = (snapshot.manifest_disk_hash != self.manifest_disk_hash
+            && !own(
+                Path::new(crate::project::layout::FANTA_JSON),
+                Some(snapshot.manifest_disk_hash),
+            ))
+            || (snapshot.asset_index_disk_hash != self.asset_index_disk_hash
+                && !own(
+                    &Path::new(crate::project::layout::ASSETS_DIR)
+                        .join(crate::project::media::ASSET_INDEX_FILE),
+                    snapshot.asset_index_disk_hash,
+                ))
+            || (snapshot.workspace_fnx_disk_hash != self.workspace_fnx_disk_hash
+                && !own(Path::new("workspace.fnx"), snapshot.workspace_fnx_disk_hash))
+            || singleton_paths.into_iter().any(|path| {
+                let disk = snapshot.other_singleton_disk_hashes.get(path).copied().flatten();
+                let known = self.other_singleton_disk_hashes.get(path).copied().flatten();
+                disk != known && !own(path, disk)
+            });
         if requires_full_reload {
             return Ok(ApplyReport {
                 requires_full_reload: true,
@@ -358,6 +402,10 @@ impl WorkspaceSession {
         }
         self.manifest = snapshot.manifest.clone();
         self.schema_version = snapshot.schema_version;
+        self.manifest_disk_hash = snapshot.manifest_disk_hash;
+        self.asset_index_disk_hash = snapshot.asset_index_disk_hash;
+        self.workspace_fnx_disk_hash = snapshot.workspace_fnx_disk_hash;
+        self.other_singleton_disk_hashes = snapshot.other_singleton_disk_hashes.clone();
         let mut changed = BTreeSet::new();
         let mut events = Vec::new();
         if snapshot.shared.disk_hash != self.shared.disk_hash {

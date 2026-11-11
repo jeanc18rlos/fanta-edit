@@ -1110,7 +1110,7 @@ mod tests {
 
         // Hand edits: unbind the card's fill to a literal, bind the panel's
         // literal to the token, widen the gap, plus one unknown declaration.
-        let css_path = dir.path().join("design.css");
+        let css_path = dir.path().join("pages/home/page.css");
         let css = fs::read_to_string(&css_path).unwrap();
         assert!(css.contains("fill: var(--theme-surface, #FFFFFF);"), "{css}");
         let css = css
@@ -1123,8 +1123,14 @@ mod tests {
                 "fill: var(--theme-surface, #123456);",
             )
             .replace("--fanta-gap: 10;", "--fanta-gap: 24;");
-        let css = format!("{css}\n#{card} {{ zzz-unknown: 1; }}\n");
         fs::write(&css_path, css).unwrap();
+        // A project-wide rule hand-added to the root design.css (after the
+        // generated @import lines) applies on load too.
+        let root_css_path = dir.path().join("design.css");
+        let root_css = fs::read_to_string(&root_css_path).unwrap();
+        assert!(root_css.contains("@import url(\"pages/home/page.css\");"), "{root_css}");
+        let root_css = format!("{root_css}\n#{card} {{ zzz-unknown: 1; }}\n");
+        fs::write(&root_css_path, root_css).unwrap();
         let svg_path = dir.path().join("pages/home/page.svg");
         let svg = fs::read_to_string(&svg_path).unwrap();
         assert!(svg.contains("width=\"120\""), "{svg}");
@@ -1345,6 +1351,13 @@ mod tests {
         );
 
         let svg = fs::read_to_string(dir.path().join("pages/home/page.svg")).unwrap();
+        assert!(
+            svg.starts_with(
+                "<?xml-stylesheet type=\"text/css\" href=\"../../tokens.css\"?>\n\
+                 <?xml-stylesheet type=\"text/css\" href=\"page.css\"?>\n<svg "
+            ),
+            "a standalone open of the SVG must load the project's styling: {svg}"
+        );
         assert!(svg.contains("<linearGradient id=\""), "{svg}");
         assert!(
             svg.contains(&format!("id=\"{gradient_id}-f1\"")),
@@ -1364,7 +1377,7 @@ mod tests {
             svg.contains("data-virtual=\"true\""),
             "instance content emits inline, without ids: {svg}"
         );
-        let css = fs::read_to_string(dir.path().join("design.css")).unwrap();
+        let css = fs::read_to_string(dir.path().join("pages/home/page.css")).unwrap();
         assert!(
             css.contains(&format!("fill: url(#{gradient_id}-grad);")),
             "{css}"
@@ -1388,7 +1401,7 @@ mod tests {
         );
 
         // A hand edit on the stacked-fill clone element wins (R7).
-        let css_path = second.path().join("design.css");
+        let css_path = second.path().join("pages/home/page.css");
         let css = fs::read_to_string(&css_path).unwrap();
         let marker = format!("#{gradient_id}-f1 {{\n  fill: rgba(255, 0, 0, 0.502);");
         assert!(css.contains(&marker), "{css}");

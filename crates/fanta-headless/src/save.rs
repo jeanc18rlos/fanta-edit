@@ -22,6 +22,6 @@ pub fn save_project(
 ) -> Result<WriteReport> {
     let (report, _) = fanta_format::write_web_project_tree(root, doc, raw_assets, render, warnings)
         .with_context(|| format!("writing Fanta project at {}", root.display()))?;
-    session.reconcile_disk_snapshot()?;
+    session.accept_own_write(&report)?;
     Ok(report)
 }

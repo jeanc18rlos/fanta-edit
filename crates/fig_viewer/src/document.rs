@@ -3303,9 +3303,11 @@ impl FigItem {
                             let report =
                                 write_project_cached_report(&target, &doc, &raw_assets, &warnings)?;
                             // The web write prunes the FNX sources it replaces
-                            // on a legacy project's first save (spec 0007 R9),
-                            // so the session's disk view is rebuilt.
-                            session.reconcile_disk_snapshot()?;
+                            // on a legacy project's first save (spec 0007 R9)
+                            // and rewrites shared files like design.css, so
+                            // the session adopts its own write while
+                            // rebuilding its disk view.
+                            session.accept_own_write(&report)?;
                             Ok(report)
                         })();
                         #[cfg(test)]
