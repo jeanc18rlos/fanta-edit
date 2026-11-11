@@ -98,3 +98,34 @@ CI regression suites against the new save path.
 - **Report channel**: loader warnings flow `read` → `LoadedProjectEvidence`
   → `WorkspaceSession::open_warnings` → `HeadlessProject::warnings()` → the
   next save's `report.json`.
+
+## T4 decisions (recorded after implementation, PR #189)
+
+- **Gradient dialect**: linear and axis-aligned radial gradients emit as
+  `<defs>` paint servers with ids ending `-grad`, referenced by `url(#…)`
+  from CSS; the document's node-local 0–1 coordinates are SVG's default
+  `objectBoundingBox` space, so they copy straight across. Angular, diamond
+  and handle-rotated radial have no SVG form and still rasterize (reported).
+  `url(…)` paints and `-grad`/`-mask` ids are canonical output: the loader
+  skips them silently, and gradient edits go through `nodes.json`.
+- **Stacked fills**: fills beyond the first clone the base geometry as
+  `{id}-f<n>` elements sharing its transform and clip. On load, only a
+  clone's `fill` is authoritative (applied to `fills[n]`); its mirrored
+  geometry and literal `rx`/`opacity` are ignored so they cannot unbind the
+  base element's variables.
+- **Masks**: a mask node emits `<mask style="mask-type:alpha">` and its
+  following siblings nest in a `<g mask="url(#…)">` wrapper, matching the
+  canvas rule that a mask clips its following siblings.
+- **Booleans**: the SVG holds the flattened outline (the baked import
+  geometry when present, else the renderer's fold through the new
+  `boolean_outline` seam); operands stay in `nodes.json`, and the outline is
+  derived, so hand edits to it are ignored rather than applied — the one
+  deliberate exception to "parsed fields win", because the reader has no
+  renderer to re-fold with. The raster handshake widened to
+  `NeedsRenderData { rasters, outlines }`.
+- **Instances**: derived content emits with **no element ids** — expansion
+  mints fresh node ids on every call, so ids would break byte determinism —
+  styled inline, marked `data-virtual="true"`, clipped to the instance size,
+  with counter-keyed def ids (`{instance}-v<n>-…`) for inner clips, masks
+  and gradients. Derived content is invisible to the loader; the instance
+  node itself keeps its id, transform and record.

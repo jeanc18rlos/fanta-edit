@@ -21,9 +21,14 @@ request when it merges.
   canonicalizing save, per-node report of what could not be kept (R7, R8).
   Verified: A4 end to end; A6 at the format layer (intent edits re-solve via
   `pending_layout`; the editor-visible half lands with T5).
-- [ ] **T4.** Source parity for gradients, masks, booleans and instances —
-  no raster stand-ins in storage (R11; shared with spec 0005 T6). Verify:
-  round-trip fixtures per feature; canvas golden against the written form.
+- [x] **T4.** Source parity for gradients, masks, booleans and instances —
+  no raster stand-ins in storage (R11; shared with spec 0005 T6). Verified:
+  one fixture holding all four features writes with no renderer requests and
+  no PNGs, reloads with zero warnings, and rewrites byte-identical; the A3
+  all-kinds round trip now exercises the boolean-outline handshake and
+  native instances. Canvas golden against the written form moves to T5 with
+  the editor flip, which makes the written form the one the canvas opens.
+  ([#189](https://github.com/jeanc18rlos/fanta-edit/pull/189))
 - [ ] **T5.** The flip: editor save, headless engine and `.fig` import
   write the web format; legacy FNX/FSS projects convert on save; FNX/FSS
   writers removed, readers kept (R1, R9, R10). Verify: A1, A2, A5, A7.
