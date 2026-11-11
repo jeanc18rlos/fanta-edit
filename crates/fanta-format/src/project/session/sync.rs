@@ -506,7 +506,7 @@ mod tests {
             ComponentDef::new(component_id, master_root, "Button"),
         );
 
-        crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+        crate::write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())
             .expect("project files");
         let mut session = WorkspaceSession::open(directory.path()).expect("project session");
         let report = ApplyReport {

@@ -177,82 +177,56 @@ impl ProjectWriteCache {
 ///
 /// Projects from scratch; a caller that saves the same document repeatedly
 /// should use [`write_project_tree_cached`].
+/// Write `doc` as web storage (spec 0007): THE project writer since the T5
+/// flip. Callers with a renderer should use
+/// [`crate::project::web::write_web_project_tree`] directly so nodes beyond
+/// the SVG subset get their raster fallbacks; this renderer-less form still
+/// writes a complete, lossless tree (`nodes.json` carries every record) and
+/// reports the nodes it could not draw.
 pub fn write_project_tree(
     dir: &Path,
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
 ) -> Result<WriteReport> {
-    write_project_tree_cached(dir, doc, assets, &mut ProjectWriteCache::default())
+    Ok(crate::project::web::write_web_project_tree(dir, doc, assets, None, &[])?.0)
 }
 
-/// [`write_project_tree`] reusing the per-design projection memoized in
-/// `cache` from the previous write of this document. Output and disk
-/// semantics are identical to the uncached call — including rewriting a file
-/// someone edited externally back to the projected bytes.
+/// [`write_project_tree`] with the FNX-era projection cache. The web
+/// projection is not cached yet, so the cache is accepted and ignored.
+// shortcut: full web projection on every save; add per-design caching when
+// large-project save profiles call for it.
 pub fn write_project_tree_cached(
     dir: &Path,
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
-    cache: &mut ProjectWriteCache,
+    _cache: &mut ProjectWriteCache,
 ) -> Result<WriteReport> {
-    write_project_tree_cached_impl(dir, doc, assets, cache, None, &BTreeMap::new(), None)
+    write_project_tree(dir, doc, assets)
 }
 
-/// Write using registered binary probes to choose asset extensions and family
-/// folders. The default writer uses the built-in probes.
-pub fn write_project_tree_cached_with_media_registry(
+/// The legacy FNX/FSS tree writer, kept for the R9 migration story and for
+/// fixtures that exercise the legacy readers. No product save path reaches
+/// it: every save writes web storage.
+pub fn write_legacy_project_tree(
     dir: &Path,
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
-    cache: &mut ProjectWriteCache,
-    media_registry: &MediaRegistry,
 ) -> Result<WriteReport> {
-    write_project_tree_cached_impl(
-        dir,
-        doc,
-        assets,
-        cache,
-        Some(media_registry),
-        &BTreeMap::new(),
-        None,
-    )
-}
-
-/// Write with a custom media registry without keeping a projection cache.
-pub fn write_project_tree_with_media_registry(
-    dir: &Path,
-    doc: &Doc,
-    assets: &BTreeMap<AssetId, Vec<u8>>,
-    media_registry: &MediaRegistry,
-) -> Result<WriteReport> {
-    write_project_tree_cached_impl(
+    write_legacy_project_tree_impl(
         dir,
         doc,
         assets,
         &mut ProjectWriteCache::default(),
-        Some(media_registry),
         &BTreeMap::new(),
         None,
     )
 }
 
-/// Persist validated `.fnx` source and ID sidecars from a live source session.
-/// Keys must name a projected `pages/<slug>` or `components/<slug>` directory;
-/// other paths are rejected before any project file is touched.
-pub fn write_project_tree_cached_with_sources(
-    dir: &Path,
-    doc: &Doc,
-    assets: &BTreeMap<AssetId, Vec<u8>>,
-    cache: &mut ProjectWriteCache,
-    sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
-) -> Result<WriteReport> {
-    write_project_tree_cached_impl(dir, doc, assets, cache, None, sources, None)
-}
-
-/// Save retained source bytes only if the caller's last reconciled disk hashes
-/// still match. A `None` value requires the path to remain absent. This can
-/// also guard singleton JSON and the asset index during a live canvas save.
-pub fn write_project_tree_cached_with_sources_checked(
+/// [`write_legacy_project_tree`] with the projection cache, validated authored
+/// source overrides and disk preconditions — the complete FNX-era editor save.
+/// Kept with the legacy writer so the legacy reconciliation tests keep their
+/// coverage until the FNX readers are deprecated.
+pub fn write_legacy_project_tree_checked(
     dir: &Path,
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
@@ -260,7 +234,7 @@ pub fn write_project_tree_cached_with_sources_checked(
     sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
     expected_disk: &BTreeMap<PathBuf, Option<[u8; 32]>>,
 ) -> Result<WriteReport> {
-    write_project_tree_cached_impl(dir, doc, assets, cache, None, sources, Some(expected_disk))
+    write_legacy_project_tree_impl(dir, doc, assets, cache, sources, Some(expected_disk))
 }
 
 pub(crate) fn write_project_artifacts_checked(
@@ -343,48 +317,17 @@ pub(crate) fn write_project_artifacts_checked(
     Ok((report, projected_hashes))
 }
 
-/// Apply live source and disk preconditions with a custom media registry.
-pub fn write_project_tree_cached_with_sources_checked_and_media_registry(
-    dir: &Path,
-    doc: &Doc,
-    assets: &BTreeMap<AssetId, Vec<u8>>,
-    cache: &mut ProjectWriteCache,
-    sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
-    expected_disk: &BTreeMap<PathBuf, Option<[u8; 32]>>,
-    media_registry: &MediaRegistry,
-) -> Result<WriteReport> {
-    write_project_tree_cached_impl(
-        dir,
-        doc,
-        assets,
-        cache,
-        Some(media_registry),
-        sources,
-        Some(expected_disk),
-    )
-}
-
-/// Preserve live sources while using registered binary format probes.
-pub fn write_project_tree_cached_with_sources_and_media_registry(
-    dir: &Path,
-    doc: &Doc,
-    assets: &BTreeMap<AssetId, Vec<u8>>,
-    cache: &mut ProjectWriteCache,
-    sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
-    media_registry: &MediaRegistry,
-) -> Result<WriteReport> {
-    write_project_tree_cached_impl(dir, doc, assets, cache, Some(media_registry), sources, None)
-}
 
 /// Populate an owned, empty, unpublished staging directory without durability
 /// calls. The caller must durably flush the complete staged filesystem before
 /// exclusively publishing this directory, then durably flush its parent.
-/// Existing projects must use the checked, transactional writer instead.
-pub fn stage_new_project_tree_cached(
+/// Existing projects must use the transactional writer instead.
+pub fn stage_new_project_tree(
     dir: &Path,
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
-    cache: &mut ProjectWriteCache,
+    render: Option<&dyn crate::project::web::WebRenderSource>,
+    warnings: &[String],
 ) -> Result<WriteReport> {
     if !fs::symlink_metadata(dir)?.file_type().is_dir()
         || fs::read_dir(dir)?.next().transpose()?.is_some()
@@ -394,7 +337,9 @@ pub fn stage_new_project_tree_cached(
         ));
     }
     let syncs_before = SUCCESSFUL_PROJECT_SYNCS.get();
-    let mut files = project_files_cached_with_sources(doc, cache, &BTreeMap::new())?;
+    let asset_hrefs = crate::project::web::asset_hrefs(assets);
+    let mut files =
+        crate::project::web::web_project_files(doc, &asset_hrefs, render, warnings)?.files;
     files.insert(
         PathBuf::from(ASSETS_DIR).join(ASSET_INDEX_FILE),
         Arc::new(asset_index_bytes(assets)?),
@@ -439,15 +384,15 @@ fn write_unpublished_file(
     Ok(())
 }
 
-fn write_project_tree_cached_impl(
+fn write_legacy_project_tree_impl(
     dir: &Path,
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
     cache: &mut ProjectWriteCache,
-    media_registry: Option<&MediaRegistry>,
     sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
     expected_disk: Option<&BTreeMap<PathBuf, Option<[u8; 32]>>>,
 ) -> Result<WriteReport> {
+    let media_registry: Option<&MediaRegistry> = None;
     validate_source_override_keys(sources)?;
     if let Some(expected_disk) = expected_disk {
         validate_expected_disk_paths(expected_disk)?;
@@ -2233,9 +2178,7 @@ mod tests {
                 })
                 .collect::<BTreeMap<_, _>>();
             assert_eq!(assets.len(), asset_count);
-            let mut cache = ProjectWriteCache::default();
-            let report =
-                stage_new_project_tree_cached(staged.path(), &document, &assets, &mut cache)?;
+            let report = stage_new_project_tree(staged.path(), &document, &assets, None, &[])?;
             super::super::scaffold_project_tree(existing.path())?;
             write_project_tree(existing.path(), &document, &assets)?;
             let mut actual = BTreeMap::new();
@@ -2251,7 +2194,6 @@ mod tests {
                 report.sync_count, 0,
                 "publication must supply the durability barrier"
             );
-            assert!(cache.cached_designs() > 0);
             assert!(report.removed.is_empty());
             assert_eq!(report.written.len(), report.written_hashes.len());
             for (relative, hash) in &report.written_hashes {
@@ -2263,7 +2205,7 @@ mod tests {
             assert_eq!(project_files(&reopened)?, project_files(&document)?);
             assert_eq!(reopened_assets, assets);
             assert_eq!(
-                write_project_tree_cached(staged.path(), &document, &assets, &mut cache)?,
+                write_project_tree(staged.path(), &document, &assets)?,
                 WriteReport::default()
             );
         }
@@ -2275,12 +2217,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let sentinel = directory.path().join("sentinel");
         fs::write(&sentinel, b"existing bytes")?;
-        let result = stage_new_project_tree_cached(
-            directory.path(),
-            &Doc::new(),
-            &BTreeMap::new(),
-            &mut ProjectWriteCache::default(),
-        );
+        let result =
+            stage_new_project_tree(directory.path(), &Doc::new(), &BTreeMap::new(), None, &[]);
         assert!(result.is_err());
         assert_eq!(fs::read(&sentinel)?, b"existing bytes");
         assert_eq!(
@@ -2300,15 +2238,7 @@ mod tests {
         let linked = parent.path().join("linked");
         fs::create_dir(&target)?;
         std::os::unix::fs::symlink(&target, &linked)?;
-        assert!(
-            stage_new_project_tree_cached(
-                &linked,
-                &Doc::new(),
-                &BTreeMap::new(),
-                &mut ProjectWriteCache::default()
-            )
-            .is_err()
-        );
+        assert!(stage_new_project_tree(&linked, &Doc::new(), &BTreeMap::new(), None, &[]).is_err());
         assert_eq!(
             fs::read_dir(target)?
                 .collect::<std::io::Result<Vec<_>>>()?
@@ -2350,7 +2280,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let document = Doc::new();
         let assets = BTreeMap::new();
-        let fresh = write_project_tree(directory.path(), &document, &assets)?;
+        let fresh = write_legacy_project_tree(directory.path(), &document, &assets)?;
         assert_eq!(fresh.written.len(), 10);
         assert!(fresh.removed.is_empty());
         // Ten projected files, one journal, six support files; Unix additionally
@@ -2368,11 +2298,11 @@ mod tests {
             assert!(directory.path().join(relative).is_file());
         }
 
-        let unchanged = write_project_tree(directory.path(), &document, &assets)?;
+        let unchanged = write_legacy_project_tree(directory.path(), &document, &assets)?;
         assert_eq!(unchanged, WriteReport::default());
 
         fs::remove_file(directory.path().join("fanta.md"))?;
-        let repaired_support = write_project_tree(directory.path(), &document, &assets)?;
+        let repaired_support = write_legacy_project_tree(directory.path(), &document, &assets)?;
         assert!(repaired_support.written.is_empty());
         assert!(repaired_support.removed.is_empty());
         assert_eq!(repaired_support.sync_count, 1);
@@ -2387,10 +2317,10 @@ mod tests {
     fn sync_count_tracks_single_file_save_and_parent_directories() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut document = Doc::new();
-        write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         document.metadata.title = "Changed title".into();
 
-        let changed = write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        let changed = write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         assert_eq!(changed.written, vec![PathBuf::from("doc/metadata.json")]);
         assert!(changed.removed.is_empty());
         assert_eq!(changed.sync_count, if cfg!(unix) { 3 } else { 1 });
@@ -2404,7 +2334,7 @@ mod tests {
     fn sync_count_tracks_multi_file_transaction_without_double_counting_parents() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let document = Doc::new();
-        write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         let mut originals = BTreeMap::new();
         for relative in ["doc/active_modes.json", "doc/variables.json"] {
             let path = directory.path().join(relative);
@@ -2415,7 +2345,7 @@ mod tests {
             originals.insert(PathBuf::from(relative), original);
         }
 
-        let repaired = write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        let repaired = write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         assert_eq!(
             repaired.written,
             originals.keys().cloned().collect::<Vec<_>>()
@@ -2434,12 +2364,12 @@ mod tests {
     fn sync_count_tracks_removal_without_a_file_sync() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let document = Doc::new();
-        write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         let relative = PathBuf::from(format!("pages/_loose/nodes/{}.json", NodeId::from_u128(19)));
         fs::create_dir_all(directory.path().join("pages/_loose/nodes"))?;
         fs::write(directory.path().join(&relative), b"{}\n")?;
 
-        let removed = write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        let removed = write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         assert!(removed.written.is_empty());
         assert_eq!(removed.removed, vec![relative.clone()]);
         assert_eq!(removed.sync_count, if cfg!(unix) { 4 } else { 0 });
@@ -2452,7 +2382,7 @@ mod tests {
     fn sync_count_includes_pending_recovery_before_an_unchanged_save() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut document = Doc::new();
-        write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         let relative = PathBuf::from("doc/metadata.json");
         let old = fs::read(directory.path().join(&relative))?;
         document.metadata.title = "Recovered title".into();
@@ -2473,14 +2403,14 @@ mod tests {
             })?,
         )?;
 
-        let recovered = write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        let recovered = write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         assert!(recovered.written.is_empty());
         assert!(recovered.removed.is_empty());
         assert_eq!(recovered.sync_count, if cfg!(unix) { 3 } else { 0 });
         assert_eq!(fs::read(directory.path().join(relative))?, new);
         assert!(!journal.exists());
         assert_eq!(
-            write_project_tree(directory.path(), &document, &BTreeMap::new())?,
+            write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?,
             WriteReport::default()
         );
         Ok(())
@@ -2525,7 +2455,7 @@ mod tests {
         document.set_active_page(Some(first));
         let assets = BTreeMap::new();
         let mut cache = ProjectWriteCache::default();
-        write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+        write_legacy_project_tree_impl(directory.path(), &document, &assets, &mut cache, &BTreeMap::new(), None)
             .expect("initial save");
 
         let mut second = CanvasNode::new(NodeData::Group(GroupNode::default()));
@@ -2546,7 +2476,7 @@ mod tests {
                 ],
             })
             .expect("add page transaction");
-        write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+        write_legacy_project_tree_impl(directory.path(), &document, &assets, &mut cache, &BTreeMap::new(), None)
             .expect("save added page");
         let source =
             crate::locate_page_source(directory.path(), second_id).expect("second page source");
@@ -2562,7 +2492,7 @@ mod tests {
                 new_active_page: Some(second_id),
             })
             .expect("registry-only reorder");
-        let reordered = write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+        let reordered = write_legacy_project_tree_impl(directory.path(), &document, &assets, &mut cache, &BTreeMap::new(), None)
             .expect("save registry-only reorder");
         assert!(
             reordered
@@ -2590,7 +2520,7 @@ mod tests {
                 ],
             })
             .expect("delete page transaction");
-        let removed = write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+        let removed = write_legacy_project_tree_impl(directory.path(), &document, &assets, &mut cache, &BTreeMap::new(), None)
             .expect("save deleted page");
         assert!(!source.exists());
         assert!(
@@ -2602,7 +2532,7 @@ mod tests {
         let (saved, _) = crate::read_project_tree(directory.path()).expect("reopen deleted page");
         assert_eq!(saved.pages(), &[first]);
         assert!(document.undo().expect("undo deletion"));
-        write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+        write_legacy_project_tree_impl(directory.path(), &document, &assets, &mut cache, &BTreeMap::new(), None)
             .expect("save restored page");
         assert_eq!(
             fs::read(&source).expect("restored page source"),
@@ -2615,7 +2545,7 @@ mod tests {
             document.scene.get(second_id).expect("live page").meta
         );
         assert!(document.redo().expect("redo deletion"));
-        write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+        write_legacy_project_tree_impl(directory.path(), &document, &assets, &mut cache, &BTreeMap::new(), None)
             .expect("save redone deletion");
         assert!(!source.exists());
     }
@@ -2640,7 +2570,7 @@ mod tests {
             landscape: false,
             frame_color: Some(fanta_doc::Color::rgb(0x12, 0x34, 0x56)),
         });
-        write_project_tree(directory.path(), &document, &BTreeMap::new())
+        write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())
             .expect("save presentation");
         let (reopened, _) =
             super::super::read_project_tree(directory.path()).expect("reopen presentation");
@@ -2727,7 +2657,7 @@ mod tests {
         assert!(error.to_string().contains("injected asset write failure"));
 
         let assets = BTreeMap::from([(asset, bytes)]);
-        write_project_tree(directory.path(), &Doc::new(), &assets).expect("retry project save");
+        write_legacy_project_tree(directory.path(), &Doc::new(), &assets).expect("retry project save");
         let (_, reopened_assets) =
             super::super::read_project_tree(directory.path()).expect("reopen saved project");
         assert_eq!(
@@ -2743,11 +2673,11 @@ mod tests {
         let asset = crate::asset_id_for_bytes(&bytes);
         let relative = PathBuf::from(format!("assets/images/{asset}.png"));
         let assets = BTreeMap::from([(asset, bytes.clone())]);
-        write_project_tree(directory.path(), &Doc::new(), &assets).expect("initial project save");
+        write_legacy_project_tree(directory.path(), &Doc::new(), &assets).expect("initial project save");
         fs::write(directory.path().join(&relative), &bytes[..8])
             .expect("simulate an interrupted write from an older app version");
 
-        let report = write_project_tree(directory.path(), &Doc::new(), &assets)
+        let report = write_legacy_project_tree(directory.path(), &Doc::new(), &assets)
             .expect("repair project save");
         let (_, reopened_assets) =
             super::super::read_project_tree(directory.path()).expect("reopen repaired project");
@@ -2765,12 +2695,12 @@ mod tests {
         let asset = crate::asset_id_for_bytes(&bytes);
         let relative = PathBuf::from(format!("assets/images/{asset}.png"));
         let assets = BTreeMap::from([(asset, bytes.clone())]);
-        write_project_tree(directory.path(), &Doc::new(), &assets).expect("initial save");
+        write_legacy_project_tree(directory.path(), &Doc::new(), &assets).expect("initial save");
         let mut damaged = bytes.clone();
         damaged[10] ^= 1;
         fs::write(directory.path().join(&relative), damaged).expect("damage existing asset");
 
-        let report = write_project_tree(directory.path(), &Doc::new(), &assets).expect("repair");
+        let report = write_legacy_project_tree(directory.path(), &Doc::new(), &assets).expect("repair");
         assert!(report.written.contains(&relative));
         assert_eq!(
             fs::read(directory.path().join(relative)).expect("asset"),
@@ -2782,7 +2712,7 @@ mod tests {
     fn regeneration_preserves_unmanaged_files_and_has_an_empty_second_diff() {
         let directory = tempfile::tempdir().expect("project directory");
         let (doc, _, _, _) = cache_fixture();
-        write_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
+        write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
         for relative in [
             "doc/README.md",
             "pages/home/notes.md",
@@ -2804,7 +2734,7 @@ mod tests {
             fs::create_dir_all(directory.path().join(relative)).expect("authored directory");
         }
 
-        let second = write_project_tree(directory.path(), &doc, &BTreeMap::new())
+        let second = write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new())
             .expect("second generation");
         assert_eq!(second, WriteReport::default());
         for relative in [
@@ -2854,7 +2784,7 @@ mod tests {
 
         let directory = tempfile::tempdir().expect("project directory");
         let doc = Doc::new();
-        write_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
+        write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
 
         let outside = tempfile::tempdir().expect("outside directory");
         let external_page = outside.path().join("ghost/page.json");
@@ -2863,7 +2793,7 @@ mod tests {
         fs::write(&external_page, b"external page").expect("external file");
         symlink(outside.path(), directory.path().join(PAGES_DIR)).expect("managed root link");
 
-        let report = write_project_tree(directory.path(), &doc, &BTreeMap::new())
+        let report = write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new())
             .expect("save does not traverse symlink");
         assert_eq!(report, WriteReport::default());
         assert_eq!(
@@ -2877,8 +2807,15 @@ mod tests {
         let directory = tempfile::tempdir().expect("project directory");
         let (doc, _, _, _) = cache_fixture();
         let mut cache = ProjectWriteCache::default();
-        write_project_tree_cached(directory.path(), &doc, &BTreeMap::new(), &mut cache)
-            .expect("initial save");
+        write_legacy_project_tree_impl(
+            directory.path(),
+            &doc,
+            &BTreeMap::new(),
+            &mut cache,
+            &BTreeMap::new(),
+            None,
+        )
+        .expect("initial save");
         let source_path = directory.path().join("pages/home/page.fnx");
         let mut source = b"// Author note retained across canvas saves\n".to_vec();
         source.extend(fs::read(&source_path).expect("generated source"));
@@ -2886,12 +2823,13 @@ mod tests {
             fs::read(directory.path().join("pages/home/page.ids.json")).expect("generated IDs");
         let sources = BTreeMap::from([(PathBuf::from("pages/home"), (source.clone(), sidecar))]);
 
-        let report = write_project_tree_cached_with_sources(
+        let report = write_legacy_project_tree_impl(
             directory.path(),
             &doc,
             &BTreeMap::new(),
             &mut cache,
             &sources,
+            None,
         )
         .expect("save authored source");
         assert_eq!(report.written, vec![PathBuf::from("pages/home/page.fnx")]);
@@ -2906,12 +2844,13 @@ mod tests {
             2,
             "override does not cache a reprint"
         );
-        let second = write_project_tree_cached_with_sources(
+        let second = write_legacy_project_tree_impl(
             directory.path(),
             &doc,
             &BTreeMap::new(),
             &mut cache,
             &sources,
+            None,
         )
         .expect("repeat save");
         assert_eq!(second, WriteReport::default());
@@ -2927,12 +2866,13 @@ mod tests {
                 PathBuf::from(relative),
                 (b"<Frame />".to_vec(), b"{}".to_vec()),
             )]);
-            let error = write_project_tree_cached_with_sources(
+            let error = write_legacy_project_tree_impl(
                 directory.path(),
                 &doc,
                 &BTreeMap::new(),
                 &mut ProjectWriteCache::default(),
                 &sources,
+                None,
             )
             .expect_err("unprojected source must be rejected");
             assert!(matches!(error, FormatError::InvalidProjectTree(_)));
@@ -3010,7 +2950,7 @@ mod tests {
     fn checked_write_rejects_an_external_source_edit_without_overwriting_it() {
         let directory = tempfile::tempdir().expect("project directory");
         let (doc, _, _, _) = cache_fixture();
-        write_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
+        write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
         let relative = PathBuf::from("pages/home/page.fnx");
         let source = fs::read(directory.path().join(&relative)).expect("source");
         let sidecar = fs::read(directory.path().join("pages/home/page.ids.json")).expect("sidecar");
@@ -3021,7 +2961,7 @@ mod tests {
         external.extend_from_slice(b"\n// external edit\n");
         fs::write(directory.path().join(&relative), &external).expect("external edit");
 
-        let error = write_project_tree_cached_with_sources_checked(
+        let error = write_legacy_project_tree_checked(
             directory.path(),
             &doc,
             &BTreeMap::new(),
@@ -3042,13 +2982,13 @@ mod tests {
     fn checked_write_guards_singleton_files_and_rejects_unsafe_paths() {
         let directory = tempfile::tempdir().expect("project directory");
         let doc = Doc::new();
-        write_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
+        write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
         let metadata = PathBuf::from("doc/metadata.json");
         let original = fs::read(directory.path().join(&metadata)).expect("metadata");
         fs::write(directory.path().join(&metadata), b"{}\n").expect("external metadata edit");
         let preconditions =
             BTreeMap::from([(metadata.clone(), Some(Sha256::digest(&original).into()))]);
-        let error = write_project_tree_cached_with_sources_checked(
+        let error = write_legacy_project_tree_checked(
             directory.path(),
             &doc,
             &BTreeMap::new(),
@@ -3064,7 +3004,7 @@ mod tests {
         );
 
         let unsafe_preconditions = BTreeMap::from([(PathBuf::from("doc/../../outside"), None)]);
-        let error = write_project_tree_cached_with_sources_checked(
+        let error = write_legacy_project_tree_checked(
             directory.path(),
             &doc,
             &BTreeMap::new(),
@@ -3080,7 +3020,7 @@ mod tests {
     fn checked_write_requires_a_baseline_for_each_generated_file_it_removes() {
         let directory = tempfile::tempdir().expect("project directory");
         let doc = Doc::new();
-        write_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
+        write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
         let relative = PathBuf::from(format!("pages/_loose/nodes/{}.json", NodeId::from_u128(19)));
         let path = directory.path().join(&relative);
         fs::create_dir_all(path.parent().expect("generated file parent"))
@@ -3088,7 +3028,7 @@ mod tests {
         let bytes = b"{\"id\":\"stale\"}\n";
         fs::write(&path, bytes).expect("external generated file");
 
-        let error = write_project_tree_cached_with_sources_checked(
+        let error = write_legacy_project_tree_checked(
             directory.path(),
             &doc,
             &BTreeMap::new(),
@@ -3106,7 +3046,7 @@ mod tests {
 
         let preconditions =
             BTreeMap::from([(relative.clone(), Some(Sha256::digest(bytes).into()))]);
-        let report = write_project_tree_cached_with_sources_checked(
+        let report = write_legacy_project_tree_checked(
             directory.path(),
             &doc,
             &BTreeMap::new(),
@@ -3123,7 +3063,7 @@ mod tests {
     fn deleted_design_prunes_generated_artifacts_but_keeps_unmanaged_files() {
         let directory = tempfile::tempdir().expect("project directory");
         let (doc, _, _, _) = cache_fixture();
-        write_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
+        write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
         fs::write(directory.path().join("pages/home/notes.md"), b"keep")
             .expect("author page notes");
         fs::create_dir_all(directory.path().join("pages/custom-empty"))
@@ -3132,7 +3072,7 @@ mod tests {
         empty.id = doc.id;
         empty.metadata = doc.metadata;
         let report =
-            write_project_tree(directory.path(), &empty, &BTreeMap::new()).expect("remove designs");
+            write_legacy_project_tree(directory.path(), &empty, &BTreeMap::new()).expect("remove designs");
 
         for generated in ["page.json", "page.fnx", "page.ids.json"] {
             assert!(
@@ -3156,7 +3096,7 @@ mod tests {
     #[test]
     fn opening_replays_an_interrupted_multi_file_transaction() {
         let directory = tempfile::tempdir().expect("project directory");
-        write_project_tree(directory.path(), &Doc::new(), &BTreeMap::new()).expect("initial save");
+        write_legacy_project_tree(directory.path(), &Doc::new(), &BTreeMap::new()).expect("initial save");
         let journal = directory.path().join(TRANSACTION_DIR);
         fs::create_dir_all(journal.join("staged")).expect("journal staging");
         let mut writes = Vec::new();

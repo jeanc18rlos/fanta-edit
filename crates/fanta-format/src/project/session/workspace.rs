@@ -3116,7 +3116,7 @@ mod tests {
             )))
             .expect("page");
         document.add_page(page);
-        crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+        crate::write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())
             .expect("project files");
         let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
         let artifact = ArtifactId::Page(page);
@@ -3193,7 +3193,7 @@ mod tests {
                 fanta_doc::ComponentDef::new(component, root, format!("Master {position:04}")),
             );
         }
-        crate::write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        crate::write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         let fresh = WorkspaceSession::open(directory.path())?;
         assert!(fresh.open.is_empty());
         assert_eq!(fresh.components.defs, document.components);
@@ -3304,7 +3304,7 @@ mod tests {
         let document = fanta_doc::Doc::new();
         let asset = fanta_doc::AssetId::new();
         let bytes = b"\x89PNG\r\n\x1a\nexact loaded asset".to_vec();
-        crate::write_project_tree(
+        crate::write_legacy_project_tree(
             directory.path(),
             &document,
             &BTreeMap::from([(asset, bytes.clone())]),
@@ -3352,7 +3352,7 @@ mod tests {
         child.name = "Authored child".into();
         child.parent = Some(page);
         let child_id = document.scene.insert(child)?;
-        crate::write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        crate::write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         let root = directory.path().canonicalize()?;
         let first = WorkspaceSession::open(&root)?;
         let original_dir = root.join(
@@ -3535,7 +3535,7 @@ mod tests {
                     component,
                     fanta_doc::ComponentDef::new(component, master, "Master"),
                 );
-                crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+                crate::write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())
                     .expect("initial project");
                 let (mut document, _) =
                     crate::read_project_tree(directory.path()).expect("project");

@@ -2359,7 +2359,7 @@ mod tests {
             .scene
             .insert(CanvasNode::new(NodeData::Group(GroupNode::default())))?;
         doc.add_page(page);
-        crate::write_project_tree(directory.path(), &doc, &BTreeMap::new())?;
+        crate::write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new())?;
         let source_path = crate::locate_page_source(directory.path(), page).ok_or("page source")?;
         let sidecar_path = source_path.with_file_name(PAGE_IDS);
         let mut sidecar: fanta_fnx::FnxSidecar =

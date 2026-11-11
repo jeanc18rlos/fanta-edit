@@ -162,7 +162,7 @@ pub fn write_web_project_tree(
 
 /// `assets/<family>/<id>.<ext>` for every asset — the same naming
 /// [`project_asset_files`] uses, as href strings for `<image>` elements.
-fn asset_hrefs(assets: &BTreeMap<AssetId, Vec<u8>>) -> BTreeMap<AssetId, String> {
+pub(crate) fn asset_hrefs(assets: &BTreeMap<AssetId, Vec<u8>>) -> BTreeMap<AssetId, String> {
     assets
         .iter()
         .map(|(id, bytes)| {

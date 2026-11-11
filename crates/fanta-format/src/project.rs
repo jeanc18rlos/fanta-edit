@@ -91,12 +91,8 @@ pub use source_edit::{
 };
 pub use write::{
     ProjectUpgrade, ProjectWriteCache, WriteReport, is_project_managed_path, projected_design_dirs,
-    stage_new_project_tree_cached, upgrade_project, write_project_tree, write_project_tree_cached,
-    write_project_tree_cached_with_media_registry, write_project_tree_cached_with_sources,
-    write_project_tree_cached_with_sources_and_media_registry,
-    write_project_tree_cached_with_sources_checked,
-    write_project_tree_cached_with_sources_checked_and_media_registry,
-    write_project_tree_with_media_registry,
+    stage_new_project_tree, upgrade_project, write_legacy_project_tree,
+    write_legacy_project_tree_checked, write_project_tree, write_project_tree_cached,
 };
 
 #[cfg(test)]
@@ -282,7 +278,7 @@ mod tests {
                     serde_json::json!(phase.elapsed().as_secs_f64()),
                 );
                 let phase = Instant::now();
-                let report = write_project_tree_cached_with_sources_checked(
+                let report = write_legacy_project_tree_checked(
                     &project,
                     &document,
                     &assets,
@@ -630,7 +626,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let p = dir.path();
         assert!(p.join("pages/page-1/page.json").is_file());
@@ -674,7 +670,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let p = dir.path();
         // v3: the component dir is the def name's slug; def.json's id is the
@@ -725,7 +721,7 @@ mod tests {
         let f = fixture();
         let (assets, expected_paths) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let p = dir.path();
         for (id, family, ext) in &expected_paths {
@@ -748,7 +744,7 @@ mod tests {
             },
         );
         let assets = BTreeMap::from([(asset, bytes.clone())]);
-        write_project_tree(directory.path(), &doc, &assets).expect("write project");
+        write_legacy_project_tree(directory.path(), &doc, &assets).expect("write project");
         let (reloaded, reloaded_assets) =
             read_project_tree(directory.path()).expect("reopen project");
         assert_eq!(reloaded.asset_library, doc.asset_library);
@@ -760,7 +756,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let (doc2, assets2) = read_project_tree(dir.path()).unwrap();
         assert_eq!(persisted(&doc2), persisted(&f.doc));
@@ -1424,7 +1420,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
         assert!(
             tree_snapshot(dir.path())
                 .keys()
@@ -1486,7 +1482,7 @@ mod tests {
         doc.scene.insert(node).unwrap();
 
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
         let page_dir = dir.path().join("pages/page-1");
         let source = fs::read_to_string(page_dir.join("page.fnx")).unwrap();
@@ -1518,7 +1514,7 @@ mod tests {
         let expected_motion = fixture.doc.motion.clone();
         let dir = tempdir().unwrap();
 
-        write_project_tree(dir.path(), &fixture.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &fixture.doc, &BTreeMap::new()).unwrap();
 
         let motion_path = dir.path().join("doc/motion.json");
         let written_motion: Value =
@@ -1537,7 +1533,7 @@ mod tests {
         let target = fixture.frame;
         add_motion_fixture(&mut fixture.doc, target);
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &fixture.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &fixture.doc, &BTreeMap::new()).unwrap();
         fs::remove_file(dir.path().join("doc/motion.json")).unwrap();
 
         let (restored, _) = read_project_tree(dir.path()).unwrap();
@@ -1570,7 +1566,7 @@ mod tests {
         }
 
         let first = tempdir().unwrap();
-        write_project_tree(first.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(first.path(), &f.doc, &assets).unwrap();
         assert!(
             fs::read_to_string(first.path().join("pages/page-1/page.fnx"))
                 .unwrap()
@@ -1580,7 +1576,7 @@ mod tests {
 
         let (reloaded, reloaded_assets) = read_project_tree(first.path()).unwrap();
         let second = tempdir().unwrap();
-        write_project_tree(second.path(), &reloaded, &reloaded_assets).unwrap();
+        write_legacy_project_tree(second.path(), &reloaded, &reloaded_assets).unwrap();
 
         let before = tree_snapshot(first.path());
         let after = tree_snapshot(second.path());
@@ -1627,7 +1623,7 @@ mod tests {
         doc.scene.insert(rect).unwrap();
 
         let first = tempdir().unwrap();
-        write_project_tree(first.path(), &doc, &assets).unwrap();
+        write_legacy_project_tree(first.path(), &doc, &assets).unwrap();
         let source = first.path().join("pages/page-1/page.fnx");
         assert!(
             fs::read_to_string(&source).unwrap().contains("<Rect "),
@@ -1639,7 +1635,7 @@ mod tests {
         let (mut reloaded, reloaded_assets) = read_project_tree(first.path()).unwrap();
         fanta_doc::backfill_vector_viewports(&mut reloaded.scene);
         let second = tempdir().unwrap();
-        write_project_tree(second.path(), &reloaded, &reloaded_assets).unwrap();
+        write_legacy_project_tree(second.path(), &reloaded, &reloaded_assets).unwrap();
         let after_reload = fs::read_to_string(second.path().join("pages/page-1/page.fnx")).unwrap();
         assert!(
             after_reload.contains("<Rect ") && !after_reload.contains("path="),
@@ -1650,7 +1646,7 @@ mod tests {
         let (mut again, again_assets) = read_project_tree(second.path()).unwrap();
         fanta_doc::backfill_vector_viewports(&mut again.scene);
         let third = tempdir().unwrap();
-        write_project_tree(third.path(), &again, &again_assets).unwrap();
+        write_legacy_project_tree(third.path(), &again, &again_assets).unwrap();
         assert_eq!(tree_snapshot(second.path()), tree_snapshot(third.path()));
     }
 
@@ -1660,8 +1656,8 @@ mod tests {
         let (assets, _) = fixture_assets();
         let a = tempdir().unwrap();
         let b = tempdir().unwrap();
-        write_project_tree(a.path(), &f.doc, &assets).unwrap();
-        write_project_tree(b.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(a.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(b.path(), &f.doc, &assets).unwrap();
         assert_eq!(tree_snapshot(a.path()), tree_snapshot(b.path()));
     }
 
@@ -1670,7 +1666,7 @@ mod tests {
         let mut f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let page1_ids = dir.path().join("pages/page-1/page.ids.json");
         let page2_dir = dir.path().join("pages/page-2");
@@ -1686,7 +1682,7 @@ mod tests {
         f.doc.scene.remove(f.inner).unwrap();
         f.doc.remove_page(f.page2);
         f.doc.scene.remove(f.page2).unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         assert!(
             !read_sidecar(&page1_ids)
@@ -1708,7 +1704,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let page_dir = dir.path().join("pages/page-1");
         fs::remove_file(page_dir.join("page.fnx")).unwrap();
@@ -1732,7 +1728,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
         let baseline = {
             let (doc2, _) = read_project_tree(dir.path()).unwrap();
             persisted(&doc2)
@@ -1838,7 +1834,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
         let baseline = {
             let (doc2, _) = read_project_tree(dir.path()).unwrap();
             persisted(&doc2)
@@ -1863,7 +1859,7 @@ mod tests {
             "v2 id-named dirs must read identically to the v3 slug tree"
         );
 
-        write_project_tree(dir.path(), &doc_v2, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &doc_v2, &assets).unwrap();
         assert!(
             dir.path().join("pages/page-1/page.fnx").is_file(),
             "save upgrades page dirs to slugs"
@@ -1895,7 +1891,7 @@ mod tests {
         let child = insert(group(Some(page), "Old Child"));
         doc.add_page(page);
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
         let snapshot = tempdir().unwrap();
         copy_design_dir(
@@ -1905,7 +1901,7 @@ mod tests {
 
         doc.scene.get_mut(page).unwrap().name = "Home Renamed".to_owned();
         doc.scene.get_mut(child).unwrap().name = "New Child".to_owned();
-        write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
         assert!(
             !dir.path().join("pages/home").exists(),
             "the rename save pruned the old dir"
@@ -1974,7 +1970,7 @@ mod tests {
             .defs
             .insert(cid, ComponentDef::new(cid, comp_root, "Button"));
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
         let snapshot = tempdir().unwrap();
         copy_design_dir(
@@ -1984,7 +1980,7 @@ mod tests {
 
         doc.components.defs.get_mut(&cid).unwrap().name = "Button Renamed".to_owned();
         doc.scene.get_mut(label).unwrap().name = "New Label".to_owned();
-        write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
         assert!(!dir.path().join("components/button").exists());
 
         // The v2-style leftover: id-named dir whose def.json still carries the
@@ -2018,14 +2014,14 @@ mod tests {
         let mut f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         f.doc.remove_page(f.page2);
         f.doc.scene.remove(f.page2).unwrap();
 
         let pages_root = dir.path().join("pages");
         fs::set_permissions(&pages_root, fs::Permissions::from_mode(0o555)).unwrap();
-        let result = write_project_tree(dir.path(), &f.doc, &assets);
+        let result = write_legacy_project_tree(dir.path(), &f.doc, &assets);
         fs::set_permissions(&pages_root, fs::Permissions::from_mode(0o755)).unwrap();
 
         let report = result.expect("a failed dir removal must not abort the save");
@@ -2046,7 +2042,7 @@ mod tests {
         // Once the generated files are gone, an empty directory has no
         // ownership marker. Keep it rather than deleting an indistinguishable
         // user-created empty directory on a later save.
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
         assert!(dir.path().join("pages/page-2").is_dir());
         let (reread, _) = read_project_tree(dir.path()).unwrap();
         assert_eq!(persisted(&reread), persisted(&f.doc));
@@ -2069,7 +2065,7 @@ mod tests {
         let high = add_page(2, "Home");
         let symbols = add_page(3, "🎨🎨");
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
         // Collisions get -2, -3 suffixes in id order; unsluggable names use
         // the fallback.
@@ -2104,7 +2100,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         // v3 slug dirs: identity comes from the headers.
         assert_eq!(
@@ -2138,7 +2134,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let root = dir.path().to_path_buf();
         assert_eq!(
@@ -2171,7 +2167,7 @@ mod tests {
     fn presence_state_never_reaches_disk_and_reads_back_as_defaults() {
         let f = fixture();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
 
         for (rel, bytes) in tree_snapshot(dir.path()) {
             let text = String::from_utf8_lossy(&bytes);
@@ -2208,7 +2204,7 @@ mod tests {
     fn orphan_nodes_round_trip_via_loose() {
         let f = fixture();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
 
         for id in [f.orphan, f.orphan_child] {
             assert!(
@@ -2246,7 +2242,7 @@ mod tests {
     fn newer_doc_schema_is_rejected_older_is_migrated() {
         let f = fixture();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
         let manifest_path = dir.path().join("fanta.json");
         let manifest_text = fs::read_to_string(&manifest_path).unwrap();
 
@@ -2299,7 +2295,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
         let slugged = dir.path().join("pages/page-1");
         assert!(slugged.join("page.fnx").is_file());
 
@@ -2308,7 +2304,7 @@ mod tests {
         fs::rename(&slugged, &via).unwrap();
         fs::rename(&via, dir.path().join("pages/Page-1")).unwrap();
 
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         assert!(
             slugged.join("page.fnx").is_file(),
@@ -2331,7 +2327,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let outside = tempdir().unwrap();
         let target = outside.path().join("precious.txt");
@@ -2340,7 +2336,7 @@ mod tests {
         fs::remove_file(&fnx).unwrap();
         std::os::unix::fs::symlink(&target, &fnx).unwrap();
 
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         assert_eq!(
             fs::read(&target).unwrap(),
@@ -2363,7 +2359,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let design = dir.path().join("pages/page-1");
         let external = tempdir().unwrap();
@@ -2371,7 +2367,7 @@ mod tests {
         fs::rename(&design, &moved).unwrap();
         std::os::unix::fs::symlink(&moved, &design).unwrap();
 
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let metadata = fs::symlink_metadata(&design).unwrap();
         assert!(metadata.file_type().is_dir(), "real directory again");
@@ -2385,12 +2381,12 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
         let before = tree_snapshot(dir.path());
         let probe = dir.path().join("pages/page-1/page.fnx");
         let probe_mtime = mtime(&probe);
 
-        let report = write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        let report = write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         assert!(report.written.is_empty(), "written: {:?}", report.written);
         assert!(report.removed.is_empty(), "removed: {:?}", report.removed);
@@ -2403,7 +2399,7 @@ mod tests {
         let mut f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let untouched = [
             "pages/page-1/page.fnx",
@@ -2418,7 +2414,7 @@ mod tests {
 
         f.doc.scene.get_mut(f.comp_child).unwrap().name = "Button / Relabeled".to_owned();
         f.doc.metadata.modified_at = 1_700_000_002;
-        let report = write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        let report = write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         // The sidecar rewrites too: it fingerprints element names. `fanta.json`
         // does NOT: the manifest carries no per-save timestamp, so the project's
@@ -2443,7 +2439,7 @@ mod tests {
 
         // The net disk state is byte-identical to a fresh full projection.
         let fresh = tempdir().unwrap();
-        write_project_tree(fresh.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(fresh.path(), &f.doc, &assets).unwrap();
         assert_eq!(tree_snapshot(dir.path()), tree_snapshot(fresh.path()));
     }
 
@@ -2451,11 +2447,11 @@ mod tests {
     fn renaming_a_page_moves_its_directory_and_prunes_the_old() {
         let mut f = fixture();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
         assert!(dir.path().join("pages/page-2/page.fnx").is_file());
 
         f.doc.scene.get_mut(f.page2).unwrap().name = "Landing".to_owned();
-        let report = write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+        let report = write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
 
         assert!(
             !dir.path().join("pages/page-2").exists(),
@@ -2480,7 +2476,7 @@ mod tests {
         );
 
         let fresh = tempdir().unwrap();
-        write_project_tree(fresh.path(), &f.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(fresh.path(), &f.doc, &BTreeMap::new()).unwrap();
         assert_eq!(tree_snapshot(dir.path()), tree_snapshot(fresh.path()));
     }
 
@@ -2489,7 +2485,7 @@ mod tests {
         let f = fixture();
         let (mut assets, expected) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
         let (png_id, png_family, png_ext) = expected[0];
         let png_path = dir
             .path()
@@ -2497,7 +2493,7 @@ mod tests {
         let png_mtime = mtime(&png_path);
 
         // Content-addressed: an existing asset file is never rewritten.
-        let report = write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        let report = write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
         assert!(report.written.is_empty(), "written: {:?}", report.written);
         assert_eq!(mtime(&png_path), png_mtime);
 
@@ -2505,7 +2501,7 @@ mod tests {
         // and now-empty family directory.
         let (gone_id, gone_family, gone_ext) = expected[1];
         assets.remove(&gone_id);
-        let report = write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        let report = write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
         assert_eq!(
             report.written,
             vec![std::path::PathBuf::from("assets/index.json")]
@@ -2517,7 +2513,7 @@ mod tests {
         assert!(!dir.path().join(format!("assets/{gone_family}")).exists());
 
         let fresh = tempdir().unwrap();
-        write_project_tree(fresh.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(fresh.path(), &f.doc, &assets).unwrap();
         assert_eq!(tree_snapshot(dir.path()), tree_snapshot(fresh.path()));
     }
 
@@ -2527,11 +2523,11 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".git")).unwrap();
         fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/dev\n").unwrap();
-        write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
         fs::write(dir.path().join("previews/p.png"), b"png").unwrap();
         fs::write(dir.path().join("exports/e.fant"), b"zip").unwrap();
 
-        write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
         assert_eq!(
             fs::read_to_string(dir.path().join(".git/HEAD")).unwrap(),
             "ref: refs/heads/dev\n"

@@ -1534,7 +1534,7 @@ import "../../styles/other.fss";
         }
         let program = sources().compile().expect("source program");
         let directory = tempfile::tempdir().expect("project directory");
-        crate::write_project_tree(directory.path(), program.document(), program.resources())
+        crate::write_legacy_project_tree(directory.path(), program.document(), program.resources())
             .expect("desktop projection");
         let (desktop, _) = crate::read_project_tree(directory.path()).expect("desktop reload");
         let mut source = SourceBundle::default();

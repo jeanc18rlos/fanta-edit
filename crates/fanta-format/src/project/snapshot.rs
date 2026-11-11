@@ -350,6 +350,11 @@ mod tests {
         import_fant_snapshot(&legacy_path, &dest_dir).unwrap();
 
         for (rel, bytes) in files_under(&dest_dir) {
+            // The seeded viewer page carries `<meta name="viewport" …>`;
+            // presence could only leak through projected records.
+            if !rel.ends_with(".json") && !rel.ends_with(".fnx") {
+                continue;
+            }
             let text = String::from_utf8_lossy(&bytes);
             for needle in [
                 "\"active_page\"",
