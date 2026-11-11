@@ -9,83 +9,24 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use fanta_doc::{AssetId, Doc, NodeId};
-use fanta_format::{ArtifactId, ProjectWriteCache, WorkspaceSession, WriteReport};
+use fanta_format::{ArtifactId, WebRenderSource, WorkspaceSession, WriteReport};
 
-/// Write `doc` over the project at `root`, which `session` indexes and
-/// `baseline` was last read or saved as. An edit confined to known artifacts
-/// rewrites only their files. Anything broader goes through the
-/// whole-project writer with the session's retained sources.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the editor's save inputs, passed apart so callers keep ownership of each"
-)]
+/// Write `doc` over the project at `root` as web storage (spec 0007 R1). A
+/// legacy FNX project converts on its first save: the web writer prunes the
+/// FNX sources it replaces (R9), so the session's disk snapshot is
+/// reconciled afterwards. `warnings` are the open-time loader reports that
+/// belong in the written `report.json` (R7).
 pub fn save_project(
     root: &Path,
     session: &mut WorkspaceSession,
     doc: &Doc,
-    baseline: &Doc,
     raw_assets: &BTreeMap<AssetId, Vec<u8>>,
-    assets_changed: bool,
-    changed_artifacts: &BTreeSet<ArtifactId>,
-    cache: &mut ProjectWriteCache,
+    render: Option<&dyn WebRenderSource>,
+    warnings: &[String],
 ) -> Result<WriteReport> {
-    if !assets_changed
-        && let Some(report) = session.try_save_document_artifacts(
-            doc,
-            baseline,
-            changed_artifacts,
-            &BTreeMap::new(),
-        )?
-    {
-        *cache = ProjectWriteCache::default();
-        return Ok(report);
-    }
-    for id in changed_artifacts {
-        let Some(indexed_hash) = session.file_index.get(id).copied() else {
-            continue;
-        };
-        if !session.has_indexed_source(id) {
-            continue;
-        }
-        session.open_artifact(id.clone())?;
-        anyhow::ensure!(
-            session.artifact(id).map(|artifact| artifact.disk_hash) == Some(indexed_hash),
-            "{} changed on disk while opening its source",
-            id.debug_label(),
-        );
-    }
-    session.adopt_document_shared(doc);
-    session.adopt_document_artifacts(doc, changed_artifacts)?;
-    let sources = session.validated_source_overrides_for_document(doc)?;
-    let expected_disk = session.source_write_preconditions(doc)?;
-    let report = fanta_format::write_project_tree_cached_with_sources_checked(
-        root,
-        doc,
-        raw_assets,
-        cache,
-        &sources,
-        &expected_disk,
-    )
-    .with_context(|| format!("writing Fanta project at {}", root.display()))?;
-    let asset_index_hash = report
-        .written_hashes
-        .get(Path::new("assets/index.json"))
-        .copied()
-        .or_else(|| session.asset_index_disk_hash())
-        .context("the project asset index has no committed hash")?;
-    session.accept_written_sources(doc, asset_index_hash, &sources, &report.written_hashes)?;
-    if doc
-        .pages()
-        .iter()
-        .any(|id| !session.artifacts.contains_key(&ArtifactId::Page(*id)))
-        || doc
-            .components
-            .defs
-            .keys()
-            .any(|id| !session.artifacts.contains_key(&ArtifactId::Component(*id)))
-    {
-        session.reconcile_disk_snapshot()?;
-    }
+    let (report, _) = fanta_format::write_web_project_tree(root, doc, raw_assets, render, warnings)
+        .with_context(|| format!("writing Fanta project at {}", root.display()))?;
+    session.reconcile_disk_snapshot()?;
     Ok(report)
 }
 
