@@ -83,3 +83,18 @@ CI regression suites against the new save path.
   component scan, assets and winner dedup are unchanged. The SVG+CSS parse
   belongs to T3: a strict parser for the canonical dialect would be replaced
   wholesale by T3's tolerant one.
+
+## T3 decisions (recorded after implementation, PR #188)
+
+- **Auto-layout intent dialect**: `--fanta-layout` (the `LayoutMode` serde
+  name), `--fanta-gap`, and `--fanta-padding` (one or four numbers, in the
+  `AutoLayout.padding` array order) on the frame's rule. Other `AutoLayout`
+  fields stay in `nodes.json` until they earn a property.
+- **Resolved fallbacks**: the literal inside `var(--token, literal)` is the
+  token's resolved value under the active modes, and a load applies it back
+  to the authored color — the authored base under a binding is shadow state.
+- **tokens.css is not a hand-edit surface**: its header says so; variable
+  values are edited in the project (doc/variables.json or the editor).
+- **Report channel**: loader warnings flow `read` → `LoadedProjectEvidence`
+  → `WorkspaceSession::open_warnings` → `HeadlessProject::warnings()` → the
+  next save's `report.json`.
