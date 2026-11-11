@@ -656,7 +656,7 @@ impl Edit<'_> {
             }
             "font-family" => {
                 if let NodeData::Text(text) = &mut self.node.data {
-                    let family = value.trim().trim_matches('"').to_string();
+                    let family = value.trim().trim_matches(['"', '\'']).to_string();
                     if family != text.style.font_family {
                         text.style.font_family = family;
                         self.changed = true;

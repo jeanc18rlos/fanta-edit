@@ -1203,7 +1203,7 @@ mod tests {
     fn web_t4_features_emit_natively_without_rasters() {
         use fanta_doc::{
             BlendMode, BooleanBakedGeometry, BooleanNode, Color, Fill, Gradient, GradientStop,
-            InstanceNode, PathData, Transform2D, VectorNode,
+            InstanceNode, PathData, TextNode, Transform2D, VectorNode,
         };
 
         let mut doc = Doc::new();
@@ -1226,6 +1226,13 @@ mod tests {
         chip_shape.name = "Chip / Shape".into();
         chip_shape.parent = Some(comp_root);
         insert(chip_shape);
+        let mut chip_label = CanvasNode::new(NodeData::Text(TextNode::new("Chip", 40.0, 12.0)));
+        if let NodeData::Text(text) = &mut chip_label.data {
+            text.style.font_family = "Source Serif Pro".into();
+        }
+        chip_label.name = "Chip / Label".into();
+        chip_label.parent = Some(comp_root);
+        insert(chip_label);
         let comp_id = ComponentId::new();
 
         let mut gradient_rect = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
@@ -1376,6 +1383,10 @@ mod tests {
         assert!(
             svg.contains("data-virtual=\"true\""),
             "instance content emits inline, without ids: {svg}"
+        );
+        assert!(
+            svg.contains("font-family: 'Source Serif Pro'"),
+            "a spaced family in an inline style must stay XML-safe (single quotes): {svg}"
         );
         let css = fs::read_to_string(dir.path().join("pages/home/page.css")).unwrap();
         assert!(

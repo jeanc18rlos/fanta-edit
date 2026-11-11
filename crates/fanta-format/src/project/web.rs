@@ -1794,7 +1794,9 @@ pub(crate) fn css_color(color: Color) -> String {
 }
 
 fn css_font_family(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', ""))
+    // Single quotes: this value also lands in inline style="…" attributes,
+    // where a double quote breaks the SVG's XML well-formedness.
+    format!("'{}'", value.replace(['"', '\''], ""))
 }
 
 fn html_escape(text: &str) -> String {
