@@ -949,8 +949,8 @@ mod tests {
             loop {
                 match write_web_project_tree(dir, doc, &assets, inputs).expect("write") {
                     WebWriteOutcome::Written { .. } => return,
-                    WebWriteOutcome::NeedsRasters(nodes) => {
-                        for node in nodes {
+                    WebWriteOutcome::NeedsRenderData { rasters, outlines } => {
+                        for node in rasters {
                             let stale = inputs.rasters.insert(
                                 node,
                                 WebRaster {
@@ -963,6 +963,14 @@ mod tests {
                                     },
                                 },
                             );
+                            assert!(stale.is_none(), "the writer re-requested {node}");
+                        }
+                        // The format layer has no renderer; stand in for
+                        // fanta-headless's `boolean_outline` with a fixed path.
+                        for node in outlines {
+                            let stale = inputs
+                                .outlines
+                                .insert(node, fanta_doc::PathData::rect(0.0, 0.0, 5.0, 5.0));
                             assert!(stale.is_none(), "the writer re-requested {node}");
                         }
                     }
@@ -1198,6 +1206,231 @@ mod tests {
         let svg = fs::read_to_string(&svg_path).unwrap();
         assert!(svg.contains("width=\"200\""), "{svg}");
         assert!(svg.contains(">Edited<"), "{svg}");
+    }
+
+    /// T4 (R11): gradients, stacked fills, masks, baked booleans and
+    /// instances emit natively — the writer asks for no renderer help and
+    /// stores no raster stand-ins — and the projection loads back with zero
+    /// warnings and rewrites byte-identical (R5).
+    #[test]
+    fn web_t4_features_emit_natively_without_rasters() {
+        use fanta_doc::{
+            BlendMode, BooleanBakedGeometry, BooleanNode, Bounds, Color, Fill, Gradient,
+            GradientStop, InstanceNode, PathData, Transform2D, VectorNode,
+        };
+
+        let mut doc = Doc::new();
+        doc.metadata.title = "Parity".into();
+        let mut insert = |node: CanvasNode| -> NodeId {
+            let id = node.id;
+            doc.scene.insert(node).unwrap();
+            id
+        };
+        let page = insert(group(None, "Home"));
+        let comp_page = insert(group(None, "Components"));
+        let comp_root = insert(group(Some(comp_page), "Chip"));
+        let mut chip_shape = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            8.0,
+            8.0,
+            Color::BLACK,
+        )));
+        chip_shape.name = "Chip / Shape".into();
+        chip_shape.parent = Some(comp_root);
+        insert(chip_shape);
+        let comp_id = ComponentId::new();
+
+        let mut gradient_rect = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            40.0,
+            40.0,
+            Color::WHITE,
+        )));
+        if let NodeData::Vector(vector) = &mut gradient_rect.data {
+            if let Some(first) = vector.fills.first_mut() {
+                *first = Fill::Gradient {
+                    gradient: Gradient::Linear {
+                        start: [0.0, 0.0],
+                        end: [1.0, 1.0],
+                        stops: vec![
+                            GradientStop {
+                                position: 0.0,
+                                color: Color::WHITE,
+                            },
+                            GradientStop {
+                                position: 1.0,
+                                color: Color::BLACK,
+                            },
+                        ],
+                    },
+                    blend: BlendMode::Normal,
+                };
+            }
+            vector.fills.push(Fill::Solid {
+                color: Color {
+                    r: 255,
+                    g: 0,
+                    b: 0,
+                    a: 128,
+                },
+                blend: BlendMode::Normal,
+            });
+        }
+        gradient_rect.name = "Gradient".into();
+        gradient_rect.parent = Some(page);
+        let gradient_id = insert(gradient_rect);
+
+        let mut frame = group(Some(page), "Masked");
+        if let NodeData::Group(data) = &mut frame.data {
+            data.local_size = Some([60.0, 60.0]);
+        }
+        frame.transform = Transform2D::translation(60.0, 0.0);
+        let frame_id = insert(frame);
+        let mut mask = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            30.0,
+            30.0,
+            Color::WHITE,
+        )));
+        mask.name = "Mask".into();
+        mask.parent = Some(frame_id);
+        mask.is_mask = true;
+        let mask_id = insert(mask);
+        let mut masked = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            60.0,
+            60.0,
+            Color::BLACK,
+        )));
+        masked.name = "Masked content".into();
+        masked.parent = Some(frame_id);
+        insert(masked);
+
+        let mut boolean_data = BooleanNode::default();
+        boolean_data.fills.push(Fill::Solid {
+            color: Color::BLACK,
+            blend: BlendMode::Normal,
+        });
+        boolean_data.baked = Some(BooleanBakedGeometry {
+            vector: VectorNode {
+                path: PathData::rect(0.0, 0.0, 12.0, 12.0),
+                ..VectorNode::default()
+            },
+            source: "import".into(),
+            stroke_outline: false,
+        });
+        let mut boolean = CanvasNode::new(NodeData::Boolean(boolean_data));
+        boolean.name = "Union".into();
+        boolean.parent = Some(page);
+        boolean.transform = Transform2D::translation(140.0, 0.0);
+        let boolean_id = insert(boolean);
+
+        let mut instance = CanvasNode::new(NodeData::Instance(InstanceNode {
+            component: comp_id,
+            overrides: Vec::new(),
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [8.0, 8.0],
+        }));
+        instance.name = "Chip instance".into();
+        instance.parent = Some(page);
+        instance.transform = Transform2D::translation(180.0, 0.0);
+        insert(instance);
+
+        doc.add_page(page);
+        doc.add_page(comp_page);
+        doc.components
+            .defs
+            .insert(comp_id, ComponentDef::new(comp_id, comp_root, "Chip"));
+
+        let bounds = Bounds {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 220.0,
+            max_y: 80.0,
+        };
+        let mut inputs = WebWriteInputs::default();
+        inputs.bounds.insert(page, bounds);
+        inputs.bounds.insert(comp_root, bounds);
+        let assets = BTreeMap::new();
+        let dir = tempdir().unwrap();
+        let outcome = write_web_project_tree(dir.path(), &doc, &assets, &inputs).unwrap();
+        assert!(
+            matches!(outcome, WebWriteOutcome::Written { .. }),
+            "R11: none of these features may ask for renderer help"
+        );
+
+        let svg = fs::read_to_string(dir.path().join("pages/home/page.svg")).unwrap();
+        assert!(svg.contains("<linearGradient id=\""), "{svg}");
+        assert!(
+            svg.contains(&format!("id=\"{gradient_id}-f1\"")),
+            "stacked fills clone the geometry: {svg}"
+        );
+        assert!(svg.contains(&format!("<mask id=\"{mask_id}-mask\"")), "{svg}");
+        assert!(
+            svg.contains(&format!("<g mask=\"url(#{mask_id}-mask)\">")),
+            "{svg}"
+        );
+        // The baked outline here is a rect, so it canonicalizes to <rect>.
+        assert!(
+            svg.contains(&format!("<rect id=\"{boolean_id}\" class=\"union\" data-name=\"Union\"")),
+            "a baked boolean emits its outline geometry: {svg}"
+        );
+        assert!(
+            svg.contains("data-virtual=\"true\""),
+            "instance content emits inline, without ids: {svg}"
+        );
+        let css = fs::read_to_string(dir.path().join("design.css")).unwrap();
+        assert!(
+            css.contains(&format!("fill: url(#{gradient_id}-grad);")),
+            "{css}"
+        );
+        assert!(
+            !tree_snapshot(dir.path())
+                .keys()
+                .any(|path| path.ends_with(".png")),
+            "no raster stand-ins in storage (R11)"
+        );
+
+        let (loaded, _, warnings) = read_project_tree_with_warnings(dir.path()).unwrap();
+        assert_eq!(warnings, Vec::<String>::new(), "a pristine projection loads clean");
+        assert_eq!(persisted(&loaded), persisted(&doc));
+        let second = tempdir().unwrap();
+        let rewritten = write_web_project_tree(second.path(), &loaded, &assets, &inputs).unwrap();
+        assert!(matches!(rewritten, WebWriteOutcome::Written { .. }));
+        assert_eq!(
+            tree_snapshot(second.path()),
+            tree_snapshot(dir.path()),
+            "byte identity across write → load → write (R5)"
+        );
+
+        // A hand edit on the stacked-fill clone element wins (R7).
+        let css_path = second.path().join("design.css");
+        let css = fs::read_to_string(&css_path).unwrap();
+        let marker = format!("#{gradient_id}-f1 {{\n  fill: rgba(255, 0, 0, 0.502);");
+        assert!(css.contains(&marker), "{css}");
+        fs::write(
+            &css_path,
+            css.replace("rgba(255, 0, 0, 0.502)", "#00FF00"),
+        )
+        .unwrap();
+        let (edited, _, warnings) = read_project_tree_with_warnings(second.path()).unwrap();
+        assert_eq!(warnings, Vec::<String>::new(), "{warnings:?}");
+        let NodeData::Vector(vector) = &edited.scene.get(gradient_id).unwrap().data else {
+            panic!("the gradient rect stays a vector");
+        };
+        assert_eq!(
+            vector.fills.get(1),
+            Some(&Fill::Solid {
+                color: Color::from_hex("#00FF00").unwrap(),
+                blend: BlendMode::Normal,
+            }),
+            "the second fill takes the hand-edited color"
+        );
     }
 
     /// A5 groundwork: writing web storage over an FNX tree converts it in

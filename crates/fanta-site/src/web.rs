@@ -12,7 +12,9 @@ use fanta_format::{
     WebRaster, WebReport, WebWriteInputs, WebWriteOutcome, write_web_project_tree,
 };
 use fanta_headless::HeadlessProject;
-use fanta_headless::export::{ExportEncoding, ExportSizing, export_node, page_visual_bounds};
+use fanta_headless::export::{
+    ExportEncoding, ExportSizing, boolean_outline, export_node, page_visual_bounds,
+};
 
 /// Project `project` into `output` (default `<project>/web`). The output must
 /// be missing, empty, or a previous web projection; anything else is refused
@@ -46,8 +48,8 @@ pub fn export_web(project: &Path, output: Option<&Path>) -> Result<WebReport> {
     loop {
         match write_web_project_tree(&output, doc, opened.document().raw_assets(), &inputs)? {
             WebWriteOutcome::Written { report, .. } => return Ok(report),
-            WebWriteOutcome::NeedsRasters(nodes) => {
-                for node in nodes {
+            WebWriteOutcome::NeedsRenderData { rasters, outlines } => {
+                for node in rasters {
                     if inputs.rasters.contains_key(&node) {
                         bail!("the writer rejected the raster rendered for {node}");
                     }
@@ -66,6 +68,14 @@ pub fn export_web(project: &Path, output: Option<&Path>) -> Result<WebReport> {
                             bounds: image.bounds,
                         },
                     );
+                }
+                for node in outlines {
+                    if inputs.outlines.contains_key(&node) {
+                        bail!("the writer rejected the outline flattened for {node}");
+                    }
+                    let outline = boolean_outline(doc, node)
+                        .with_context(|| format!("flattening the boolean outline for {node}"))?;
+                    inputs.outlines.insert(node, outline);
                 }
             }
         }
