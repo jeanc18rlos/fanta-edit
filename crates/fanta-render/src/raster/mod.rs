@@ -108,6 +108,16 @@ mod tests;
 // Public surface — preserves the exact paths `crate::raster::*` (and, via
 // `lib.rs`, `fanta_render::*`) resolved before the split.
 pub use camera_cache::{CameraCacheMetrics, CameraCacheResult};
+
+/// The flattened outline of a boolean node, as document path data: the
+/// operands folded with Skia path ops — the exact geometry the canvas paints.
+/// `None` when the node is not a boolean or no operand has a silhouette.
+pub fn boolean_outline(scene: &Scene, id: NodeId) -> Option<fanta_doc::PathData> {
+    let node = scene.get(id)?;
+    let boolean = node.data.as_boolean()?;
+    let path = boolean::fold_operands(scene, id, boolean.op)?;
+    fanta_doc::PathData::from_svg_d(&path.to_svg()).ok()
+}
 pub use instance::{measure_text_node, solve_doc_layout, solve_scene_layout};
 pub use renderer::{
     MediaPlayback, RasterRenderer, RenderError, RenderInputs, RenderMetrics, SvgRenderOptions,

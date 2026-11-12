@@ -60,6 +60,12 @@ jobs:
       - name: Check the app and command line tool build
         run: cargo check --locked -p fanta -p cli
 
+      - name: Check the browser wasm engine builds
+        run: |
+          rustup target add wasm32-unknown-unknown
+          RUSTFLAGS='--cfg getrandom_backend="wasm_js"' \
+            cargo check --locked -p fanta-wasm-engine --target wasm32-unknown-unknown
+
       - name: Test design engines, import, editor interactions and UI components
         run: |
           ./script/verify-fanta-release \
@@ -200,6 +206,16 @@ jobs:
 
       - name: Test design source validation and saves
         run: cargo test --locked -p fanta-bundle -p fanta-fnx -p fanta-format --lib
+
+      - name: Check the hostile-edit corpus
+        run: cargo test --locked -p fanta-format --test check_corpus
+
+      - name: Keep the editor and the renderer out of the project checker
+        run: |
+          if cargo tree --locked -p fanta-format -e normal --prefix none | grep -E '^(gpui|skia-safe|skia-bindings|fig_viewer) '; then
+            echo 'fanta-check must build without GPUI, Skia or the editor (spec 0009 R9)' >&2
+            exit 1
+          fi
 
       - name: Test sidebar behavior and project ownership
         run: cargo test --locked -p sidebar --lib

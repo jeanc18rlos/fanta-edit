@@ -30,9 +30,6 @@ use fanta_headless::layout;
 use fanta_headless::pages::{default_page_root, visible_page_roots};
 use fanta_headless::render::{decode_embedded_image, embedded_image_size};
 pub(crate) use fanta_headless::render::{page_bounds, try_page_bounds};
-use fanta_headless::save::{
-    changed_artifact_ids, changed_artifact_ids_from_baseline, extend_artifact_owners,
-};
 
 /// How long to let a burst of external writes (an agent rewriting several
 /// project files) settle before reloading from disk.
@@ -275,15 +272,13 @@ pub struct FigItem {
     sync_epoch: u64,
     reload_task: Option<Task<()>>,
     _load_task: Option<Task<()>>,
-    /// Per-design projection memo from the last project write, so an
-    /// autosave re-prints only the designs that changed. Taken by the
-    /// in-flight save and handed back when it completes; a save that finds
-    /// it absent starts from an empty one. Dropped whenever the document or
-    /// its project root is replaced.
-    write_cache: Option<fanta_format::ProjectWriteCache>,
     /// Retained artifact sources and their disk baselines. The live document
     /// is an editing/render cache; this session owns authored FNX text.
     workspace_session: Option<fanta_format::WorkspaceSession>,
+    /// What the project check found after the last change made outside
+    /// Fanta (spec 0009 R5), and the check still running, if any.
+    external_findings: Vec<fanta_format::SourceDiagnostic>,
+    external_check: Option<Task<()>>,
     /// Worktree-event subscriptions, one per [`Project`] that opened this
     /// item. The item is shared across windows and each window brings its OWN
     /// `Project` entity, so watching only the first opener's project would
@@ -602,12 +597,12 @@ impl PagePrewarm {
 
     const MAX_WORKERS: usize = 6;
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn len(&self) -> usize {
         self.assets.len()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn resolver(&self) -> Arc<LazyAssetResolver> {
         self.resolver.clone()
     }
@@ -836,6 +831,8 @@ impl FigDocument {
         }
     }
 
+    // The GPU canvas fingerprint input; that canvas is macOS-only.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn variables_generation(&self) -> u64 {
         self.variables_generation
     }
@@ -984,7 +981,7 @@ impl FigDocument {
 
     /// The document half of [`FigItem::apply`], for benchmarks that drive a
     /// bare document without an item entity.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn apply_for_benchmark(&mut self, operation: Operation) -> Result<()> {
         let registry_change = self.page_registry_change_for_operation(&operation);
         self.doc
@@ -999,7 +996,7 @@ impl FigDocument {
     }
 
     /// The document half of [`FigItem::undo`].
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn undo_for_benchmark(&mut self) -> Result<bool> {
         let did = self.doc.undo().context("undoing canvas operation")?;
         if did {
@@ -1642,6 +1639,13 @@ impl project::ProjectItem for FigItem {
                             if adopting_import && let Some(warning) = import_warning {
                                 crate::view::show_canvas_notice_deferred(warning, cx);
                             }
+                            if let Some(notice) = this
+                                .workspace_session
+                                .as_ref()
+                                .and_then(|session| unavailable_designs_notice(&session.open_warnings))
+                            {
+                                crate::view::show_unavailable_designs_notice_deferred(notice, cx);
+                            }
                         }) {
                             log::debug!("dropping loaded update for closed .fig item: {error:#}");
                             return;
@@ -1735,8 +1739,9 @@ impl project::ProjectItem for FigItem {
                     sync_epoch: 0,
                     reload_task: None,
                     _load_task: Some(load_task),
-                    write_cache: None,
                     workspace_session: None,
+                    external_findings: Vec::new(),
+                    external_check: None,
                     project_subscriptions: vec![(project.downgrade(), project_subscription)],
                 }
             });
@@ -1897,15 +1902,19 @@ impl FigItem {
         let root = self.project_root()?;
         let session = self.workspace_session.as_ref()?;
         let artifact = fanta_format::ArtifactId::from_scoped(design);
-        if !session.has_indexed_source(&artifact) {
-            return None;
-        }
         let metadata = session.artifacts.get(&artifact)?;
-        let file_name = match design {
-            fanta_format::ScopedDesign::Page(_) => "page.fnx",
-            fanta_format::ScopedDesign::Component(_) => "master.fnx",
+        let directory = root.join(&metadata.design_dir);
+        let (web, legacy) = match design {
+            fanta_format::ScopedDesign::Page(_) => ("page.svg", "page.fnx"),
+            fanta_format::ScopedDesign::Component(_) => ("master.svg", "master.fnx"),
         };
-        Some(root.join(&metadata.design_dir).join(file_name))
+        let web = directory.join(web);
+        if web.is_file() {
+            return Some(web);
+        }
+        session
+            .has_indexed_source(&artifact)
+            .then(|| directory.join(legacy))
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -2398,7 +2407,6 @@ impl FigItem {
         self.merge_base = Some(disk.doc);
         self.last_saved_assets = Some(disk.raw_assets);
         self.last_saved_scene = None;
-        self.write_cache = None;
         self.workspace_session = Some(session);
         self.source_reload_error = None;
         self.external_change_pending = false;
@@ -2430,6 +2438,12 @@ impl FigItem {
     /// Content gestures dirty the item on their first preview frame, so a
     /// mid-gesture reload can only interrupt selection-style gestures, which
     /// tolerate having their selection reset.
+    /// Read the project again after its files were replaced under the editor.
+    #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+    pub(crate) fn reload_after_restore(&mut self, cx: &mut Context<Self>) {
+        self.schedule_reload_with_full(true, cx);
+    }
+
     #[cfg(test)]
     fn schedule_reload(&mut self, cx: &mut Context<Self>) {
         self.schedule_reload_with_full(false, cx);
@@ -2575,7 +2589,6 @@ impl FigItem {
         ));
         self.document = FigDocumentState::Ready(document);
         self.source_reload_error = None;
-        self.write_cache = None;
         self.workspace_session = session;
         self.dirty = false;
         self.content_preview = None;
@@ -2589,7 +2602,43 @@ impl FigItem {
         if !self.source_edit_locked {
             self.mark_source_layout_unsaved(cx);
         }
+        self.check_after_external_change(cx);
         cx.notify();
+    }
+
+    /// Spec 0009 R5: the files changed outside Fanta, so check them and show
+    /// what is wrong before any save. Runs off the foreground; a newer change
+    /// replaces a check still running.
+    fn check_after_external_change(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.project_root.clone() else {
+            return;
+        };
+        self.external_check = Some(cx.spawn(async move |this, cx| {
+            let checked = cx
+                .background_spawn(async move { fanta_format::check_project(&root) })
+                .await;
+            let applied = this.update(cx, |this, cx| {
+                this.external_check = None;
+                match checked {
+                    Ok(findings) => {
+                        if let Some(notice) = external_findings_notice(&findings) {
+                            crate::view::show_external_findings_notice_deferred(notice, cx);
+                        }
+                        this.external_findings = findings;
+                        cx.notify();
+                    }
+                    Err(error) => log::error!("checking the project failed: {error:#}"),
+                }
+            });
+            if let Err(error) = applied {
+                log::debug!("dropping the project check for a closed item: {error:#}");
+            }
+        }));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn external_findings(&self) -> &[fanta_format::SourceDiagnostic] {
+        &self.external_findings
     }
 
     /// Reload the project from disk immediately, discarding unsaved canvas
@@ -3096,11 +3145,9 @@ impl FigItem {
                 }
             }
         }
-        self.write_cache = None;
         self.workspace_session = session;
-        if let Some(MaterializedProject { root, write_cache }) = materialized {
+        if let Some(MaterializedProject { root }) = materialized {
             self.project_root = Some(root.clone());
-            self.write_cache = Some(write_cache);
             // The project directory now exists; share this item so later
             // scoped opens reuse it.
             let key = root.canonicalize().unwrap_or(root);
@@ -3206,22 +3253,6 @@ impl FigItem {
             return Task::ready(Ok(None));
         }
 
-        let mut changed_artifacts = changed_artifact_ids(
-            &document.doc,
-            self.merge_base.as_ref(),
-            self.last_saved_scene,
-        );
-        extend_artifact_owners(
-            &document.doc,
-            &mut changed_artifacts,
-            document.pending_layout_output_nodes.iter().copied(),
-        );
-        let captured_saved_scene = self.last_saved_scene;
-        let pending_layout_nodes: Vec<_> = document
-            .pending_layout_output_nodes
-            .iter()
-            .copied()
-            .collect();
         // The write needs the content, not the presence state: the undo
         // stack's subtree snapshots can outweigh the scene, and cloning them
         // once per autosave was the save path's memory high-water mark.
@@ -3275,41 +3306,23 @@ impl FigItem {
                     target.display(),
                     this.abs_path.display()
                 );
-                // A queued write may commit a different baseline after this
-                // snapshot was captured, including a layer already undone here.
-                if this.last_saved_scene != captured_saved_scene {
-                    changed_artifacts = changed_artifact_ids_from_baseline(
-                        &doc,
-                        this.merge_base.as_ref(),
-                        None,
-                    );
-                    extend_artifact_owners(
-                        &doc,
-                        &mut changed_artifacts,
-                        pending_layout_nodes.iter().copied(),
-                    );
-                }
                 Ok::<_, anyhow::Error>(Some((
                     target,
                     materializing,
-                    this.write_cache.take().unwrap_or_default(),
                     this.workspace_session.take(),
-                    this.merge_base.as_ref().map(Doc::clone_for_persist),
-                    this.last_saved_assets.clone(),
                 )))
             })??;
-            let Some((target, materializing, write_cache, workspace_session, baseline_document, previous_assets)) = prepared else {
+            let Some((target, materializing, workspace_session)) = prepared else {
                 return Ok(None);
             };
             // The persisted clone travels through the write and comes back
             // to become the merge base — one clone per save, not two.
-            let (result, saved_doc, saved_assets, write_cache, workspace_session) = cx
+            let (result, saved_doc, saved_assets, workspace_session) = cx
                 .background_spawn({
                     let target = target.clone();
                     let write_lease = write_lease.clone();
                     async move {
                         let _write_lease = write_lease;
-                        let mut write_cache = write_cache;
                         let mut workspace_session = workspace_session;
                         #[cfg(test)]
                         let mut save_barrier = save_barrier;
@@ -3324,12 +3337,8 @@ impl FigItem {
                         );
                         let result = (|| -> Result<fanta_format::WriteReport> {
                             if materializing {
-                                let report = write_project_cached_report(
-                                    &target,
-                                    &doc,
-                                    &raw_assets,
-                                    &mut write_cache,
-                                )?;
+                                let report =
+                                    write_project_cached_report(&target, &doc, &raw_assets, &[])?;
                                 match open_workspace_session(&target) {
                                     Ok(session) => workspace_session = Some(session),
                                     Err(error) => log::error!(
@@ -3345,74 +3354,28 @@ impl FigItem {
                             let session = workspace_session
                                 .as_mut()
                                 .context("The Fanta source session is unavailable")?;
-                            let mut asset_preconditions = std::collections::BTreeMap::new();
-                            if let Some(previous_assets) = &previous_assets {
-                                add_asset_write_preconditions(
-                                    &target,
-                                    &mut asset_preconditions,
-                                    previous_assets,
-                                    &raw_assets,
-                                )?;
-                                if let Some(baseline_document) = &baseline_document
-                                    && (Arc::ptr_eq(previous_assets, &raw_assets)
-                                        || previous_assets.as_ref() == raw_assets.as_ref())
-                                    && let Some(report) = session.try_save_document_artifacts(
-                                        &doc,
-                                        baseline_document,
-                                        &changed_artifacts,
-                                        &asset_preconditions,
-                                    )?
-                                {
-                                    write_cache = fanta_format::ProjectWriteCache::default();
-                                    return Ok(report);
-                                }
-                            }
-                            for id in &changed_artifacts {
-                                let Some(indexed_hash) = session.file_index.get(id).copied() else {
-                                    continue;
-                                };
-                                if !session.has_indexed_source(id) {
-                                    continue;
-                                }
-                                session.open_artifact(id.clone())?;
-                                anyhow::ensure!(
-                                    session.artifact(&id).map(|artifact| artifact.disk_hash)
-                                        == Some(indexed_hash),
-                                    "{} changed on disk while opening its source; reconcile before saving",
-                                    id.debug_label(),
-                                );
-                            }
-                            session.adopt_document_shared(&doc);
-                            session.adopt_document_artifacts(&doc, &changed_artifacts)?;
-                            let sources = session.validated_source_overrides_for_document(&doc)?;
-                            let mut expected_disk = session.source_write_preconditions(&doc)?;
-                            expected_disk.extend(asset_preconditions);
-                            let report = write_project_cached_report_with_sources(
-                                &target,
-                                &doc,
-                                &raw_assets,
-                                &mut write_cache,
-                                Some(&sources),
-                                Some(&expected_disk),
-                            )?;
-                            let asset_index_hash = report
-                                .written_hashes
-                                .get(Path::new("assets/index.json"))
-                                .copied()
-                                .or_else(|| session.asset_index_disk_hash())
-                                .context("The project asset index has no committed hash")?;
-                            session.accept_written_sources(
-                                &doc,
-                                asset_index_hash,
-                                &sources,
-                                &report.written_hashes,
-                            )?;
-                            if doc.pages().iter().any(|id| {
-                                !session.artifacts.contains_key(&fanta_format::ArtifactId::Page(*id))
-                            }) || doc.components.defs.keys().any(|id| {
-                                !session.artifacts.contains_key(&fanta_format::ArtifactId::Component(*id))
-                            }) {
-                                session.reconcile_disk_snapshot()?;
+                            #[cfg_attr(
+                                all(target_os = "macos", feature = "mac_app_store"),
+                                expect(unused_mut)
+                            )]
+                            let mut warnings = session.open_warnings.clone();
+                            // Spec 0009 R6: a snapshot before the write when
+                            // the files changed outside Fanta, and one after.
+                            #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+                            let history = project_history(&target);
+                            #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+                            warnings.extend(history.before_save());
+                            let report =
+                                write_project_cached_report(&target, &doc, &raw_assets, &warnings)?;
+                            // The web write prunes the FNX sources it replaces
+                            // on a legacy project's first save (spec 0007 R9)
+                            // and rewrites shared files like design.css, so
+                            // the session adopts its own write while
+                            // rebuilding its disk view.
+                            session.accept_own_write(&report)?;
+                            #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+                            if let Some(finding) = history.after_save() {
+                                log::warn!("{}: {}", target.display(), finding.message);
                             }
                             Ok(report)
                         })();
@@ -3420,7 +3383,7 @@ impl FigItem {
                         if let Some(barrier) = save_barrier {
                             barrier.wait().await;
                         }
-                        (result, doc, raw_assets, write_cache, workspace_session)
+                        (result, doc, raw_assets, workspace_session)
                     }
                 })
                 .await;
@@ -3474,12 +3437,6 @@ impl FigItem {
                     this.schedule_resync(cx);
                 }
                 this.schedule_watcher_check(cx);
-                // The memo is only worth keeping for the tree it describes; a
-                // failed write leaves it valid too (entries are content
-                // fingerprints, not disk state).
-                if this.project_root.as_deref() == Some(target.as_path()) {
-                    this.write_cache = Some(write_cache);
-                }
             })?;
             drop(write_lease);
             result.map(|_| materializing.then_some(target))
@@ -3558,18 +3515,18 @@ impl FigItem {
         self.sync_epoch += 1;
         cx.spawn(async move |this, cx| {
             let result: Result<()> = async {
-                let (root, document, cache) = cx
+                let (root, document) = cx
                     .background_spawn({
                         let lease = lease.clone();
                         async move {
                             let _lease = lease;
-                            let (root, cache) = write_project_copy(
+                            let root = write_project_copy(
                                 &target,
                                 previous_root.as_deref(),
                                 &document,
                                 &assets,
                             )?;
-                            anyhow::Ok((root, document, cache))
+                            anyhow::Ok((root, document))
                         }
                     })
                     .await?;
@@ -3590,7 +3547,6 @@ impl FigItem {
                     this.merge_base = Some(document);
                     this.last_saved_assets = Some(saved_assets);
                     this.last_saved_scene = Some(scene_watermark);
-                    this.write_cache = Some(cache);
                     this.workspace_session = None;
                     this.own_write_hashes.clear();
                     this.own_write_removed.clear();
@@ -3728,8 +3684,9 @@ pub(crate) fn ready_item_with_root_for_test(
         sync_epoch: 0,
         reload_task: None,
         _load_task: None,
-        write_cache: None,
         workspace_session: None,
+        external_findings: Vec::new(),
+        external_check: None,
         project_subscriptions: Vec::new(),
     });
     item.update(cx, |item, cx| item.subscribe_to_project(project, cx));
@@ -3751,12 +3708,9 @@ pub enum DocChange {
     ContentPreview,
 }
 
-/// A project directory materialized while a bare `.fig` loaded, with the
-/// write cache that write warmed: every design's projection is memoized in
-/// it, so handing it to the item makes the first autosave incremental.
+/// A project directory materialized while a bare `.fig` loaded.
 struct MaterializedProject {
     root: PathBuf,
-    write_cache: fanta_format::ProjectWriteCache,
 }
 
 /// Materialize `document` (parsed from the bare `.fig` at `fig_path`) into a
@@ -3775,7 +3729,6 @@ fn materialize_project_on_open(
         return None;
     }
     let created_here = !target.exists();
-    let mut write_cache = fanta_format::ProjectWriteCache::default();
     let started = Instant::now();
     #[cfg(all(target_os = "macos", not(feature = "mac_app_store")))]
     let staged_new_project = created_here;
@@ -3783,7 +3736,7 @@ fn materialize_project_on_open(
     let staged_new_project = false;
     #[cfg(all(target_os = "macos", not(feature = "mac_app_store")))]
     let written = if staged_new_project {
-        write_new_project_materialized(&target, &document.doc, &document.raw_assets, &mut write_cache)
+        write_new_project_materialized(&target, &document.doc, &document.raw_assets)
             .map(|report| {
                 log::debug!(
                     "fresh project: {} projected writes, {} per-file syncs, completed durability steps {:?}",
@@ -3791,26 +3744,13 @@ fn materialize_project_on_open(
                 );
             })
     } else {
-        write_project_cached(
-            &target,
-            &document.doc,
-            &document.raw_assets,
-            &mut write_cache,
-        )
+        write_project(&target, &document.doc, &document.raw_assets)
     };
     #[cfg(not(all(target_os = "macos", not(feature = "mac_app_store"))))]
-    let written = write_project_cached(
-        &target,
-        &document.doc,
-        &document.raw_assets,
-        &mut write_cache,
-    );
+    let written = write_project(&target, &document.doc, &document.raw_assets);
     crate::report_slow("document load: materialize project", started);
     match written {
-        Ok(()) => Some(MaterializedProject {
-            root: target,
-            write_cache,
-        }),
+        Ok(()) => Some(MaterializedProject { root: target }),
         Err(error) => {
             log::error!(
                 "materializing Fanta project at {} on open failed: {error:#}",
@@ -3932,13 +3872,22 @@ fn write_new_project_materialized(
     target: &Path,
     doc: &Doc,
     raw_assets: &BTreeMap<AssetId, Vec<u8>>,
-    cache: &mut fanta_format::ProjectWriteCache,
 ) -> Result<FreshPublicationReport> {
+    let resolver = Arc::new(LazyAssetResolver::new(
+        Arc::new(raw_assets.clone()),
+        Arc::new(decode_embedded_image),
+    ));
+    let render = fanta_headless::export::ProjectRenderSource::new(doc, Some(resolver));
     let report = publish_new_project_with(
         target,
         |staging| {
-            let report =
-                fanta_format::stage_new_project_tree_cached(staging, doc, raw_assets, cache)?;
+            let report = fanta_format::stage_new_project_tree(
+                staging,
+                doc,
+                raw_assets,
+                Some(&render),
+                &[],
+            )?;
             #[cfg(feature = "fanta-gpui-ui")]
             if let Some(png) = project_thumbnail(doc, raw_assets)? {
                 use std::io::Write as _;
@@ -3976,12 +3925,7 @@ pub(crate) fn write_project(
     doc: &Doc,
     raw_assets: &BTreeMap<AssetId, Vec<u8>>,
 ) -> Result<()> {
-    write_project_cached(
-        root,
-        doc,
-        raw_assets,
-        &mut fanta_format::ProjectWriteCache::default(),
-    )
+    write_project_cached_report(root, doc, raw_assets, &[]).map(|_| ())
 }
 
 fn write_project_copy(
@@ -3989,20 +3933,19 @@ fn write_project_copy(
     source: Option<&Path>,
     document: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
-) -> Result<(PathBuf, fanta_format::ProjectWriteCache)> {
+) -> Result<PathBuf> {
     let requested_target = target.to_path_buf();
     let target = validate_project_copy_destination(target, source)?;
     #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
     let parent = target
         .parent()
         .context("Choose a destination folder with a parent directory.")?;
-    let mut cache = fanta_format::ProjectWriteCache::default();
     #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
     {
         // The Save panel grants the destination, not a sibling staging folder.
         std::fs::create_dir_all(&target)
             .with_context(|| format!("creating the copied design at {}", target.display()))?;
-        write_project_cached(&target, document, assets, &mut cache)?;
+        write_project(&target, document, assets)?;
     }
     #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
     {
@@ -4011,11 +3954,11 @@ fn write_project_copy(
         let staging = tempfile::Builder::new()
             .prefix(".fanta-save-as-")
             .tempdir_in(parent)?;
-        write_project_cached(staging.path(), document, assets, &mut cache)?;
+        write_project(staging.path(), document, assets)?;
         std::fs::rename(staging.path(), &target)
             .with_context(|| format!("saving the copied design at {}", target.display()))?;
     }
-    Ok((requested_target, cache))
+    Ok(requested_target)
 }
 
 pub(crate) fn validate_project_copy_destination(
@@ -4060,100 +4003,13 @@ pub(crate) fn validate_project_copy_destination(
     Ok(target)
 }
 
-/// [`write_project`] reusing the per-design projection memoized in `cache`
-/// by the previous write of this document, so a save after a small edit
-/// re-prints only the designs that changed.
-pub(crate) fn write_project_cached(
-    root: &Path,
-    doc: &Doc,
-    raw_assets: &BTreeMap<AssetId, Vec<u8>>,
-    cache: &mut fanta_format::ProjectWriteCache,
-) -> Result<()> {
-    write_project_cached_report(root, doc, raw_assets, cache).map(|_| ())
-}
-
+/// The editor's project write: the web projection drawn through the shared
+/// render source (spec 0007 R10), plus the thumbnail and git seeding.
 fn write_project_cached_report(
     root: &Path,
     doc: &Doc,
     raw_assets: &BTreeMap<AssetId, Vec<u8>>,
-    cache: &mut fanta_format::ProjectWriteCache,
-) -> Result<fanta_format::WriteReport> {
-    write_project_cached_report_with_sources(root, doc, raw_assets, cache, None, None)
-}
-
-fn add_asset_write_preconditions(
-    project_root: &Path,
-    expected_disk: &mut BTreeMap<PathBuf, Option<[u8; 32]>>,
-    previous_assets: &BTreeMap<AssetId, Vec<u8>>,
-    current_assets: &BTreeMap<AssetId, Vec<u8>>,
-) -> Result<()> {
-    let media = fanta_format::MediaRegistry::default();
-    let asset_path = |id: &AssetId, bytes: &[u8]| {
-        let (family, extension) = media
-            .sniff(bytes)
-            .map(|format| (format.family, format.extension))
-            .unwrap_or(("other", "bin"));
-        PathBuf::from("assets")
-            .join(family)
-            .join(format!("{id}.{extension}"))
-    };
-    let mut found = BTreeSet::new();
-    // Git does not track empty directories, so a cloned project without
-    // images has no `assets/` directory at all.
-    let families = match std::fs::read_dir(project_root.join("assets")) {
-        Ok(families) => Some(families),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    for family in families.into_iter().flatten() {
-        let family = family?;
-        if !family.file_type()?.is_dir() {
-            continue;
-        }
-        for file in std::fs::read_dir(family.path())? {
-            let file = file?;
-            let path = file.path();
-            let Some(id) = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .and_then(|stem| stem.parse::<AssetId>().ok())
-            else {
-                continue;
-            };
-            anyhow::ensure!(
-                file.file_type()?.is_file(),
-                "asset {} is not a regular file",
-                path.display()
-            );
-            let expected = previous_assets
-                .get(&id)
-                .with_context(|| format!("asset {id} appeared since the last saved snapshot"))?;
-            anyhow::ensure!(found.insert(id), "asset {id} has duplicate files");
-            expected_disk.insert(
-                PathBuf::from("assets")
-                    .join(family.file_name())
-                    .join(file.file_name()),
-                Some(Sha256::digest(expected).into()),
-            );
-        }
-    }
-    anyhow::ensure!(
-        found.len() == previous_assets.len(),
-        "an asset disappeared since the last saved snapshot"
-    );
-    for (id, bytes) in current_assets {
-        expected_disk.entry(asset_path(id, bytes)).or_insert(None);
-    }
-    Ok(())
-}
-
-fn write_project_cached_report_with_sources(
-    root: &Path,
-    doc: &Doc,
-    raw_assets: &BTreeMap<AssetId, Vec<u8>>,
-    cache: &mut fanta_format::ProjectWriteCache,
-    sources: Option<&BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>>,
-    expected_disk: Option<&BTreeMap<PathBuf, Option<[u8; 32]>>>,
+    warnings: &[fanta_format::SourceDiagnostic],
 ) -> Result<fanta_format::WriteReport> {
     if root.join("fanta.json").exists() {
         anyhow::ensure!(
@@ -4165,19 +4021,14 @@ fn write_project_cached_report_with_sources(
         fanta_format::scaffold_project_tree(root)
             .with_context(|| format!("scaffolding Fanta project at {}", root.display()))?;
     }
-    let report = if let (Some(sources), Some(expected_disk)) = (sources, expected_disk) {
-        fanta_format::write_project_tree_cached_with_sources_checked(
-            root,
-            doc,
-            raw_assets,
-            cache,
-            sources,
-            expected_disk,
-        )
-    } else {
-        fanta_format::write_project_tree_cached(root, doc, raw_assets, cache)
-    }
-    .with_context(|| format!("writing Fanta project at {}", root.display()))?;
+    let resolver = Arc::new(LazyAssetResolver::new(
+        Arc::new(raw_assets.clone()),
+        Arc::new(decode_embedded_image),
+    ));
+    let render = fanta_headless::export::ProjectRenderSource::new(doc, Some(resolver));
+    let (report, _) =
+        fanta_format::write_web_project_tree(root, doc, raw_assets, Some(&render), warnings)
+            .with_context(|| format!("writing Fanta project at {}", root.display()))?;
     #[cfg(feature = "fanta-gpui-ui")]
     if let Some(png) = project_thumbnail(doc, raw_assets)? {
         crate::generation_media::write_output(&root.join(".fant.preview.png"), &png)?;
@@ -4259,6 +4110,14 @@ fn git_init_if_needed(root: &Path) {
         ),
         Err(error) => log::warn!("running git init in {} failed: {error}", root.display()),
     }
+}
+
+/// The snapshot store of the project at `root`, run with the git the editor
+/// ships. The sandboxed App Store build runs no git, so it has none.
+#[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+pub(crate) fn project_history(root: &Path) -> fanta_format::history::History {
+    fanta_format::history::History::new(root)
+        .with_git(project_git_binary(std::env::current_exe().ok().as_deref()))
 }
 
 #[cfg(any(test, not(all(target_os = "macos", feature = "mac_app_store"))))]
@@ -4656,6 +4515,42 @@ pub(crate) fn load_project_document(root: &Path) -> Result<FigDocument> {
     let mut document = FigDocument::from_doc(doc, assets);
     document.prewarm_default_page_assets();
     Ok(document)
+}
+
+/// What to tell the user after files changed outside Fanta: how many
+/// problems the check found, and the first one. `None` when it found none.
+fn external_findings_notice(findings: &[fanta_format::SourceDiagnostic]) -> Option<String> {
+    let first = findings.first()?;
+    let errors = findings
+        .iter()
+        .filter(|finding| finding.severity == fanta_format::SourceSeverity::Error)
+        .count();
+    let place = match (&first.file, first.line) {
+        (Some(file), Some(line)) => format!("{file}:{line}: "),
+        (Some(file), None) => format!("{file}: "),
+        _ => String::new(),
+    };
+    Some(format!(
+        "The project's files changed outside Fanta and the check found {errors} errors and {} warnings. First: {place}{}. Run fanta-check on the project, or ask the agent to call check_project, for the rest.",
+        findings.len() - errors,
+        first.message
+    ))
+}
+
+/// What to tell the user about designs the load left out (spec 0009 R11).
+fn unavailable_designs_notice(findings: &[fanta_format::SourceDiagnostic]) -> Option<String> {
+    let designs: Vec<&str> = findings
+        .iter()
+        .filter(|finding| finding.code == fanta_format::DESIGN_UNAVAILABLE)
+        .filter_map(|finding| finding.file.as_deref())
+        .collect();
+    if designs.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Not loaded, because a file in it does not parse: {}. Saving leaves these folders as they are. Run fanta-check on the project to see what to repair.",
+        designs.join(", ")
+    ))
 }
 
 fn load_project_document_with_session(
@@ -5206,15 +5101,8 @@ mod tests {
                     })
                     .collect::<BTreeMap<_, _>>();
                 assert_eq!(assets.len(), asset_count);
-                let mut cache = fanta_format::ProjectWriteCache::default();
-                let report =
-                    write_new_project_materialized(&target, &document, &assets, &mut cache)?;
-                write_project_cached(
-                    &old_target,
-                    &document,
-                    &assets,
-                    &mut fanta_format::ProjectWriteCache::default(),
-                )?;
+                let report = write_new_project_materialized(&target, &document, &assets)?;
+                write_project(&old_target, &document, &assets)?;
                 assert_eq!(inventory(&target)?, inventory(&old_target)?);
                 assert_eq!(
                     report.completed,
@@ -5228,7 +5116,6 @@ mod tests {
                     report.project.sync_count, 0,
                     "no per-file or journal flush in the unpublished tree"
                 );
-                assert!(cache.cached_designs() > 0);
                 assert!(
                     !target.join(".git").exists(),
                     "use the final parent repository"
@@ -5248,7 +5135,7 @@ mod tests {
                 assert_eq!(expected_assets, assets);
                 let before_second_save = inventory(&target)?;
                 assert_eq!(
-                    write_project_cached_report(&target, &document, &assets, &mut cache)?,
+                    write_project_cached_report(&target, &document, &assets, &[])?,
                     fanta_format::WriteReport::default()
                 );
                 assert_eq!(inventory(&target)?, before_second_save);
@@ -5256,899 +5143,6 @@ mod tests {
             }
             Ok(())
         }
-    }
-
-    fn master_save_fixture(count: usize) -> (Doc, Vec<(fanta_doc::ComponentId, NodeId)>) {
-        let mut document = doc_with_one_page();
-        let page = *document.pages().first().expect("page");
-        document.set_active_page(Some(page));
-        let mut masters = Vec::new();
-        for index in 0..count {
-            let mut root =
-                fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(fanta_doc::GroupNode {
-                    clip_size: Some([40.0, 40.0]),
-                    ..Default::default()
-                }));
-            root.parent = Some(page);
-            root.index = document.scene.next_child_index(Some(page));
-            root.name = format!("Master {index}");
-            let root_id = root.id;
-            document
-                .apply(Operation::create_node(root))
-                .expect("master");
-            let component = fanta_doc::ComponentId::new();
-            document
-                .apply(Operation::DefineComponent {
-                    def: Box::new(fanta_doc::ComponentDef::new(
-                        component,
-                        root_id,
-                        format!("Master {index}"),
-                    )),
-                })
-                .expect("component definition");
-            masters.push((component, root_id));
-        }
-        document.history = Default::default();
-        (document, masters)
-    }
-
-    #[test]
-    fn master_save_invalidation_keeps_a_transform_scoped_in_a_large_library() {
-        let (mut document, masters) = master_save_fixture(128);
-        let &(component, root) = masters.first().expect("edited master");
-        let base = document.clone_for_persist();
-        let watermark = Some((document.scene.instance_id(), document.scene.revision()));
-        let old = document.scene.get(root).expect("master").transform;
-        document
-            .apply(Operation::SetTransform {
-                id: root,
-                old,
-                new: fanta_doc::Transform2D::translation(32.0, 16.0),
-            })
-            .expect("move master");
-        assert!(document.components.defs[&component].rev > base.components.defs[&component].rev);
-        assert_eq!(
-            changed_artifact_ids(&document, Some(&base), watermark),
-            BTreeSet::from([fanta_format::ArtifactId::Component(component)])
-        );
-    }
-
-    #[test]
-    fn master_save_invalidation_includes_revisions_without_scene_edits() {
-        let (mut document, masters) = master_save_fixture(4);
-        let component = masters.first().expect("master").0;
-        let preview = masters.get(1).expect("preview master").0;
-        let base = document.clone_for_persist();
-        let revision = document.scene.revision();
-        let watermark = Some((document.scene.instance_id(), revision));
-        document
-            .components
-            .defs
-            .get_mut(&component)
-            .expect("definition")
-            .rev += 1;
-        document
-            .components
-            .defs
-            .get_mut(&preview)
-            .expect("definition")
-            .preview_rev += 1;
-        assert!(
-            document
-                .scene
-                .changes_since(revision)
-                .expect("tracked delta")
-                .is_empty()
-        );
-        assert_eq!(
-            changed_artifact_ids(&document, Some(&base), watermark),
-            BTreeSet::from([
-                fanta_format::ArtifactId::Component(component),
-                fanta_format::ArtifactId::Component(preview)
-            ])
-        );
-    }
-
-    #[test]
-    fn master_save_invalidation_includes_nested_masters_and_page_edits() {
-        let (mut document, masters) = master_save_fixture(4);
-        let &(outer_component, outer) = masters.first().expect("outer");
-        let &(inner_component, inner) = masters.get(1).expect("inner");
-        let page = *document.pages().first().expect("page");
-        let inner_node = document.scene.get(inner).expect("inner");
-        document
-            .apply(Operation::Reparent {
-                id: inner,
-                old_parent: inner_node.parent,
-                old_index: inner_node.index,
-                new_parent: Some(outer),
-                new_index: fanta_doc::IndexKey::from_raw(1.0),
-            })
-            .expect("nest master");
-        let mut plain = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
-        plain.parent = Some(page);
-        plain.index = document.scene.next_child_index(Some(page));
-        let plain_id = plain.id;
-        document
-            .apply(Operation::create_node(plain))
-            .expect("ordinary page node");
-        let base = document.clone_for_persist();
-        let watermark = Some((document.scene.instance_id(), document.scene.revision()));
-        for id in [inner, plain_id] {
-            let old = document.scene.get(id).expect("node").transform;
-            document
-                .apply(Operation::SetTransform {
-                    id,
-                    old,
-                    new: fanta_doc::Transform2D::translation(5.0, 7.0),
-                })
-                .expect("move");
-        }
-        assert_eq!(
-            changed_artifact_ids(&document, Some(&base), watermark),
-            BTreeSet::from([
-                fanta_format::ArtifactId::Component(outer_component),
-                fanta_format::ArtifactId::Component(inner_component),
-                fanta_format::ArtifactId::Page(page),
-            ])
-        );
-    }
-
-    #[test]
-    fn master_save_invalidation_retains_all_artifacts_for_registry_or_structural_changes() {
-        for change in [
-            "name",
-            "root",
-            "property",
-            "membership",
-            "set",
-            "add",
-            "remove",
-            "page_order",
-            "mode",
-            "variables",
-            "structural",
-            "delete",
-            "reparent",
-            "missing_base",
-            "missing_watermark",
-            "scene_identity",
-        ] {
-            let (mut document, masters) = master_save_fixture(4);
-            let &(component, root) = masters.first().expect("master");
-            let base = document.clone_for_persist();
-            let watermark = Some((document.scene.instance_id(), document.scene.revision()));
-            match change {
-                "name" => {
-                    document
-                        .components
-                        .defs
-                        .get_mut(&component)
-                        .expect("definition")
-                        .name = "Master 1".into()
-                }
-                "root" => {
-                    document
-                        .components
-                        .defs
-                        .get_mut(&component)
-                        .expect("definition")
-                        .root = masters.get(1).expect("other master").1
-                }
-                "property" => document
-                    .components
-                    .defs
-                    .get_mut(&component)
-                    .expect("definition")
-                    .props
-                    .push(fanta_doc::ComponentPropDef {
-                        id: fanta_doc::ComponentPropId::new(),
-                        name: "Enabled".into(),
-                        kind: fanta_doc::ComponentPropKind::Bool,
-                        formatter: Default::default(),
-                        default: fanta_doc::VarValue::Boolean { value: true },
-                        bindings: Vec::new(),
-                    }),
-                "membership" => {
-                    document
-                        .components
-                        .defs
-                        .get_mut(&component)
-                        .expect("definition")
-                        .variant_of = Some(fanta_doc::ComponentSetMembership {
-                        set: fanta_doc::ComponentId::new(),
-                        axis_values: Default::default(),
-                    })
-                }
-                "set" => {
-                    let id = fanta_doc::ComponentId::new();
-                    document.components.sets.insert(
-                        id,
-                        fanta_doc::ComponentSet {
-                            id,
-                            name: "Set".into(),
-                            axes: Vec::new(),
-                            members: vec![component],
-                            default_variant: component,
-                            root: None,
-                        },
-                    );
-                }
-                "add" => {
-                    let id = fanta_doc::ComponentId::new();
-                    document
-                        .components
-                        .defs
-                        .insert(id, fanta_doc::ComponentDef::new(id, root, "Master 1"));
-                }
-                "remove" => {
-                    document
-                        .components
-                        .defs
-                        .remove(&component)
-                        .expect("remove definition");
-                }
-                "page_order" => document.pages.clear(),
-                "mode" => {
-                    document.active_modes.insert(
-                        fanta_doc::VariableCollectionId::new(),
-                        fanta_doc::ModeId::new(),
-                    );
-                }
-                "variables" => {
-                    let id = fanta_doc::VariableCollectionId::new();
-                    document.variables.collections.insert(
-                        id,
-                        fanta_doc::VariableCollection {
-                            id,
-                            name: "Tokens".into(),
-                            modes: Vec::new(),
-                            default_mode: fanta_doc::ModeId::new(),
-                            variable_order: Vec::new(),
-                        },
-                    );
-                }
-                "delete" => {
-                    let snapshot = vec![document.scene.get(root).expect("master").clone()];
-                    document
-                        .apply(Operation::DeleteSubtree { snapshot })
-                        .expect("delete master");
-                }
-                "reparent" => {
-                    let node = document.scene.get(root).expect("master");
-                    document
-                        .apply(Operation::Reparent {
-                            id: root,
-                            old_parent: node.parent,
-                            old_index: node.index,
-                            new_parent: Some(masters.get(1).expect("other master").1),
-                            new_index: fanta_doc::IndexKey::from_raw(1.0),
-                        })
-                        .expect("reparent master");
-                }
-                "structural" => {
-                    document
-                        .apply(Operation::create_node(fanta_doc::CanvasNode::new(
-                            fanta_doc::NodeData::Group(Default::default()),
-                        )))
-                        .expect("structural edit");
-                }
-                "scene_identity" => document.scene = document.scene.clone(),
-                _ => {}
-            }
-            let expected = document
-                .pages()
-                .iter()
-                .copied()
-                .map(fanta_format::ArtifactId::Page)
-                .chain(
-                    document
-                        .components
-                        .defs
-                        .keys()
-                        .copied()
-                        .map(fanta_format::ArtifactId::Component),
-                )
-                .collect::<BTreeSet<_>>();
-            assert_eq!(
-                changed_artifact_ids(
-                    &document,
-                    (change != "missing_base").then_some(&base),
-                    if change == "missing_watermark" {
-                        None
-                    } else {
-                        watermark
-                    }
-                ),
-                expected,
-                "{change}"
-            );
-        }
-    }
-
-    #[test]
-    fn master_save_invalidation_scopes_ordinary_structural_edits_in_a_large_library() {
-        for in_master in [false, true] {
-            for change in ["create", "delete", "reorder"] {
-                let (mut document, masters) = master_save_fixture(128);
-                let &(component, master) = masters.first().expect("master");
-                let page = *document.pages().first().expect("page");
-                let parent = if in_master { master } else { page };
-                let mut layer =
-                    fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
-                layer.parent = Some(parent);
-                layer.index = document.scene.next_child_index(Some(parent));
-                let layer_id = layer.id;
-                if change != "create" {
-                    document
-                        .apply(Operation::create_node(layer.clone()))
-                        .expect("baseline layer");
-                }
-                let base = document.clone_for_persist();
-                let watermark = (document.scene.instance_id(), document.scene.revision());
-                let operation = match change {
-                    "create" => Operation::create_node(layer),
-                    "delete" => Operation::DeleteSubtree {
-                        snapshot: vec![layer],
-                    },
-                    _ => Operation::SetIndex {
-                        id: layer_id,
-                        old: layer.index,
-                        new: fanta_doc::IndexKey::from_raw(1000.0),
-                    },
-                };
-                document.apply(operation).expect("structural layer edit");
-                assert!(document.scene.changes_since(watermark.1).is_none());
-                let expected = if in_master {
-                    fanta_format::ArtifactId::Component(component)
-                } else {
-                    fanta_format::ArtifactId::Page(page)
-                };
-                assert_eq!(
-                    changed_artifact_ids(&document, Some(&base), Some(watermark)),
-                    BTreeSet::from([expected]),
-                    "{change}, in master: {in_master}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn master_save_invalidation_includes_both_owners_of_a_moved_subtree() {
-        for destination in ["page", "master", "master_to_page"] {
-            let (mut document, masters) = master_save_fixture(8);
-            let first_page = *document.pages().first().expect("page");
-            let second_page =
-                fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
-            let second_page_id = second_page.id;
-            document
-                .apply(Operation::create_node(second_page))
-                .expect("second page root");
-            document.add_page(second_page_id);
-            let &(first_component, first_master) = masters.first().expect("first master");
-            let &(second_component, second_master) = masters.get(1).expect("second master");
-            let (old_parent, new_parent) = match destination {
-                "master" => (first_master, second_master),
-                "master_to_page" => (first_master, second_page_id),
-                _ => (first_page, second_page_id),
-            };
-            let mut layer =
-                fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
-            layer.parent = Some(old_parent);
-            layer.index = document.scene.next_child_index(Some(old_parent));
-            let layer_id = layer.id;
-            let old_index = layer.index;
-            document
-                .apply(Operation::create_node(layer))
-                .expect("layer");
-            let mut child =
-                fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
-            child.parent = Some(layer_id);
-            document
-                .apply(Operation::create_node(child))
-                .expect("nested child");
-            let base = document.clone_for_persist();
-            let watermark = Some((document.scene.instance_id(), document.scene.revision()));
-            document
-                .apply(Operation::Reparent {
-                    id: layer_id,
-                    old_parent: Some(old_parent),
-                    old_index,
-                    new_parent: Some(new_parent),
-                    new_index: document.scene.next_child_index(Some(new_parent)),
-                })
-                .expect("move subtree");
-            let expected = match destination {
-                "master" => BTreeSet::from([
-                    fanta_format::ArtifactId::Component(first_component),
-                    fanta_format::ArtifactId::Component(second_component),
-                ]),
-                "master_to_page" => BTreeSet::from([
-                    fanta_format::ArtifactId::Component(first_component),
-                    fanta_format::ArtifactId::Page(second_page_id),
-                ]),
-                _ => BTreeSet::from([
-                    fanta_format::ArtifactId::Page(first_page),
-                    fanta_format::ArtifactId::Page(second_page_id),
-                ]),
-            };
-            assert_eq!(
-                changed_artifact_ids(&document, Some(&base), watermark),
-                expected,
-                "destination: {destination}"
-            );
-        }
-    }
-
-    #[test]
-    fn master_save_invalidation_keeps_malformed_structures_conservative() {
-        let (mut document, _) = master_save_fixture(4);
-        let page = *document.pages().first().expect("page");
-        let mut layer = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
-        layer.parent = Some(page);
-        let layer_id = layer.id;
-        document
-            .apply(Operation::create_node(layer))
-            .expect("layer");
-        let base = document.clone_for_persist();
-        let watermark = Some((document.scene.instance_id(), document.scene.revision()));
-        document
-            .scene
-            .set_index(layer_id, fanta_doc::IndexKey::from_raw(2.0))
-            .expect("structural delta");
-        document.scene.get_mut(layer_id).expect("layer").parent = Some(NodeId::new());
-        let expected = document
-            .pages()
-            .iter()
-            .copied()
-            .map(fanta_format::ArtifactId::Page)
-            .chain(
-                document
-                    .components
-                    .defs
-                    .keys()
-                    .copied()
-                    .map(fanta_format::ArtifactId::Component),
-            )
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            changed_artifact_ids(&document, Some(&base), watermark),
-            expected
-        );
-    }
-
-    #[gpui::test]
-    async fn master_save_invalidation_preserves_sources_through_create_move_delete(
-        cx: &mut TestAppContext,
-    ) {
-        let project = empty_project(cx).await;
-        let directory = tempfile::tempdir().expect("temporary project");
-        let root = directory.path().join("Design");
-        let (mut document, masters) = master_save_fixture(16);
-        let first_page = *document.pages().first().expect("first page");
-        let mut second_page =
-            fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
-        second_page.name = "Destination".to_owned();
-        let second_page_id = second_page.id;
-        document
-            .apply(Operation::create_node(second_page))
-            .expect("second page root");
-        document.add_page(second_page_id);
-        let &(first_component, first_master) = masters.first().expect("first master");
-        let &(second_component, second_master) = masters.get(1).expect("second master");
-        let unrelated = masters.get(2).expect("unrelated master").0;
-        write_project(&root, &document, &BTreeMap::new()).expect("initial project");
-        let (_, paths) = fanta_format::projected_design_dirs(&document);
-        let unrelated_source = root
-            .join(paths.get(&unrelated).expect("component directory"))
-            .join("master.fnx");
-        let mut source = std::fs::read_to_string(&unrelated_source).expect("unrelated FNX");
-        source.push_str("\n// Retain authored trivia through ordinary structural edits.\n");
-        std::fs::write(&unrelated_source, &source).expect("authored source comment");
-        let item = ready_item(
-            &project,
-            root.join("fanta.json"),
-            Some(root.clone()),
-            document,
-            cx,
-        );
-        item.update(cx, |item, _| {
-            let document = item.document.ready().expect("ready document");
-            item.merge_base = Some(document.doc.clone_for_persist());
-            item.last_saved_scene = Some((
-                document.doc.scene.instance_id(),
-                document.doc.scene.revision(),
-            ));
-            item.last_saved_assets = Some(document.raw_assets.clone());
-            item.workspace_session =
-                Some(fanta_format::WorkspaceSession::open(&root).expect("indexed session"));
-        });
-        let mut layer =
-            fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(fanta_doc::GroupNode {
-                clip_size: Some([80.0, 40.0]),
-                ..Default::default()
-            }));
-        layer.name = "New layout".to_owned();
-        layer.parent = Some(first_page);
-        let layer_id = layer.id;
-        for step in [
-            "create",
-            "into_master",
-            "between_masters",
-            "to_page",
-            "delete",
-        ] {
-            item.update(cx, |item, cx| {
-                let operation = match step {
-                    "create" => Operation::create_node(layer.clone()),
-                    "into_master" | "between_masters" | "to_page" => {
-                        let document = item.doc().expect("document");
-                        let node = document.scene.get(layer_id).expect("created layer");
-                        let new_parent = match step {
-                            "into_master" => first_master,
-                            "between_masters" => second_master,
-                            _ => second_page_id,
-                        };
-                        Operation::Reparent {
-                            id: layer_id,
-                            old_parent: node.parent,
-                            old_index: node.index,
-                            new_parent: Some(new_parent),
-                            new_index: document.scene.next_child_index(Some(new_parent)),
-                        }
-                    }
-                    _ => {
-                        let document = item.doc().expect("document");
-                        Operation::DeleteSubtree {
-                            snapshot: document
-                                .scene
-                                .descendants_of(layer_id)
-                                .filter_map(|id| document.scene.get(id).cloned())
-                                .collect(),
-                        }
-                    }
-                };
-                item.apply(operation, cx).expect("structural edit");
-                if step == "create" {
-                    let mut child = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(
-                        fanta_doc::GroupNode {
-                            clip_size: Some([20.0, 20.0]),
-                            ..Default::default()
-                        },
-                    ));
-                    child.parent = Some(layer_id);
-                    child.name = "Nested content".to_owned();
-                    item.apply(Operation::create_node(child), cx)
-                        .expect("nested layer");
-                }
-            });
-            item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
-                .await
-                .expect("save structural edit");
-            let (saved, assets) =
-                fanta_format::read_project_tree(&root).expect("read saved project");
-            item.read_with(cx, |item, _| {
-                assert!(!item.is_dirty(), "{step}");
-                let expected_open = match step {
-                    "create" => BTreeSet::from([fanta_format::ArtifactId::Page(first_page)]),
-                    "into_master" => BTreeSet::from([
-                        fanta_format::ArtifactId::Page(first_page),
-                        fanta_format::ArtifactId::Component(first_component),
-                    ]),
-                    "between_masters" => BTreeSet::from([
-                        fanta_format::ArtifactId::Page(first_page),
-                        fanta_format::ArtifactId::Component(first_component),
-                        fanta_format::ArtifactId::Component(second_component),
-                    ]),
-                    _ => BTreeSet::from([
-                        fanta_format::ArtifactId::Page(first_page),
-                        fanta_format::ArtifactId::Page(second_page_id),
-                        fanta_format::ArtifactId::Component(first_component),
-                        fanta_format::ArtifactId::Component(second_component),
-                    ]),
-                };
-                assert_eq!(
-                    item.workspace_session
-                        .as_ref()
-                        .expect("source session")
-                        .open
-                        .keys()
-                        .cloned()
-                        .collect::<BTreeSet<_>>(),
-                    expected_open,
-                    "{step}"
-                );
-                let document = item.doc().expect("document");
-                assert_eq!(
-                    serde_json::to_value(&saved.scene).expect("saved scene"),
-                    serde_json::to_value(&document.scene).expect("live scene"),
-                    "{step}"
-                );
-                assert_eq!(saved.components, document.components, "{step}");
-                assert_eq!(saved.variables, document.variables, "{step}");
-            });
-            assert!(assets.is_empty(), "{step}");
-            assert_eq!(
-                std::fs::read_to_string(&unrelated_source).expect("retained source"),
-                source,
-                "{step}"
-            );
-        }
-    }
-
-    #[gpui::test]
-    async fn master_save_invalidation_opens_only_edited_source_and_preserves_other_fnx(
-        cx: &mut TestAppContext,
-    ) {
-        let project = empty_project(cx).await;
-        let directory = tempfile::tempdir().expect("temporary project");
-        let root = directory.path().join("Design");
-        let (document, masters) = master_save_fixture(16);
-        let &(component, master) = masters.first().expect("edited master");
-        let unrelated = masters.get(1).expect("unrelated master").0;
-        write_project(&root, &document, &BTreeMap::new()).expect("initial project");
-        let (_, paths) = fanta_format::projected_design_dirs(&document);
-        let unrelated_source = root
-            .join(paths.get(&unrelated).expect("component directory"))
-            .join("master.fnx");
-        let mut source = std::fs::read_to_string(&unrelated_source).expect("unrelated FNX");
-        source.push_str("\n// Retain this authored comment during another master edit.\n");
-        std::fs::write(&unrelated_source, &source).expect("authored source comment");
-        let item = ready_item(
-            &project,
-            root.join("fanta.json"),
-            Some(root.clone()),
-            document,
-            cx,
-        );
-        item.update(cx, |item, _| {
-            let document = item.document.ready().expect("ready document");
-            item.merge_base = Some(document.doc.clone_for_persist());
-            item.last_saved_scene = Some((
-                document.doc.scene.instance_id(),
-                document.doc.scene.revision(),
-            ));
-            item.last_saved_assets = Some(document.raw_assets.clone());
-            item.workspace_session =
-                Some(fanta_format::WorkspaceSession::open(&root).expect("indexed session"));
-        });
-        item.update(cx, |item, cx| {
-            let old = item
-                .doc()
-                .expect("document")
-                .scene
-                .get(master)
-                .expect("master")
-                .transform;
-            item.apply(
-                Operation::SetTransform {
-                    id: master,
-                    old,
-                    new: fanta_doc::Transform2D::translation(32.0, 16.0),
-                },
-                cx,
-            )
-            .expect("move master");
-        });
-        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
-            .await
-            .expect("save master edit");
-        let (saved, assets) = fanta_format::read_project_tree(&root).expect("read saved project");
-        item.read_with(cx, |item, _| {
-            assert!(!item.is_dirty());
-            let session = item.workspace_session.as_ref().expect("source session");
-            assert_eq!(
-                session.open.keys().cloned().collect::<BTreeSet<_>>(),
-                BTreeSet::from([fanta_format::ArtifactId::Component(component)])
-            );
-            let document = item.doc().expect("document");
-            assert_eq!(
-                serde_json::to_value(&saved.scene).expect("saved scene"),
-                serde_json::to_value(&document.scene).expect("live scene")
-            );
-            assert_eq!(saved.components, document.components);
-            assert_eq!(saved.variables, document.variables);
-        });
-        assert!(assets.is_empty());
-        assert_eq!(
-            std::fs::read_to_string(&unrelated_source).expect("retained source"),
-            source
-        );
-    }
-
-    #[gpui::test]
-    async fn master_save_invalidation_still_rejects_unopened_external_source_and_header_edits(
-        cx: &mut TestAppContext,
-    ) {
-        let project = empty_project(cx).await;
-        for external_file in ["master.fnx", "def.json"] {
-            let directory = tempfile::tempdir().expect("temporary project");
-            let root = directory.path().join("Design");
-            let (document, masters) = master_save_fixture(4);
-            let &(_, master) = masters.first().expect("edited master");
-            let unrelated = masters.get(1).expect("unrelated master").0;
-            write_project(&root, &document, &BTreeMap::new()).expect("initial project");
-            let (_, paths) = fanta_format::projected_design_dirs(&document);
-            let external_path = root
-                .join(paths.get(&unrelated).expect("component directory"))
-                .join(external_file);
-            let before_manifest = std::fs::read(root.join("fanta.json")).expect("manifest");
-            let item = ready_item(
-                &project,
-                root.join("fanta.json"),
-                Some(root.clone()),
-                document,
-                cx,
-            );
-            item.update(cx, |item, _| {
-                let document = item.document.ready().expect("ready document");
-                item.merge_base = Some(document.doc.clone_for_persist());
-                item.last_saved_scene = Some((
-                    document.doc.scene.instance_id(),
-                    document.doc.scene.revision(),
-                ));
-                item.last_saved_assets = Some(document.raw_assets.clone());
-                item.workspace_session =
-                    Some(fanta_format::WorkspaceSession::open(&root).expect("indexed session"));
-            });
-            let mut external_bytes = std::fs::read(&external_path).expect("unopened external file");
-            if external_file == "master.fnx" {
-                external_bytes.extend_from_slice(b"\n// External edit must not be overwritten.\n");
-            } else {
-                let mut header: serde_json::Value =
-                    serde_json::from_slice(&external_bytes).expect("component header");
-                header["name"] = serde_json::json!("External component name");
-                external_bytes = serde_json::to_vec_pretty(&header).expect("external header");
-            }
-            std::fs::write(&external_path, &external_bytes).expect("external edit");
-            item.update(cx, |item, cx| {
-                let old = item
-                    .doc()
-                    .expect("document")
-                    .scene
-                    .get(master)
-                    .expect("master")
-                    .transform;
-                item.apply(
-                    Operation::SetTransform {
-                        id: master,
-                        old,
-                        new: fanta_doc::Transform2D::translation(32.0, 16.0),
-                    },
-                    cx,
-                )
-                .expect("move master");
-            });
-            let error = item
-                .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
-                .await
-                .expect_err("external changes must block save");
-            assert!(
-                format!("{error:#}")
-                    .to_ascii_lowercase()
-                    .contains("changed"),
-                "{external_file}: {error:#}"
-            );
-            assert!(item.read_with(cx, |item, _| item.is_dirty()));
-            assert_eq!(
-                std::fs::read(&external_path).expect("external file remains"),
-                external_bytes
-            );
-            assert_eq!(
-                std::fs::read(root.join("fanta.json")).expect("unchanged manifest"),
-                before_manifest
-            );
-        }
-    }
-
-    #[test]
-    fn asset_preconditions_accept_a_project_without_an_assets_directory() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let document = Doc::new();
-        fanta_format::write_project_tree(directory.path(), &document, &BTreeMap::new())?;
-        match std::fs::remove_dir_all(directory.path().join("assets")) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-
-        let id = AssetId::from_u128(7);
-        let image = b"\x89PNG\r\n\x1a\nfirst image".to_vec();
-        let current_assets = BTreeMap::from([(id, image.clone())]);
-        let mut preconditions = BTreeMap::new();
-        add_asset_write_preconditions(
-            directory.path(),
-            &mut preconditions,
-            &BTreeMap::new(),
-            &current_assets,
-        )?;
-        let image_path = PathBuf::from(format!("assets/images/{id}.png"));
-        assert_eq!(preconditions.get(&image_path), Some(&None));
-
-        fanta_format::write_project_tree_cached_with_sources_checked(
-            directory.path(),
-            &document,
-            &current_assets,
-            &mut fanta_format::ProjectWriteCache::default(),
-            &BTreeMap::new(),
-            &preconditions,
-        )?;
-        assert_eq!(std::fs::read(directory.path().join(image_path))?, image);
-        Ok(())
-    }
-
-    #[test]
-    fn asset_preconditions_allow_checked_relocation_and_guard_both_paths() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let document = Doc::new();
-        let id = AssetId::from_u128(42);
-        let original = b"\x89PNG\r\n\x1a\noriginal".to_vec();
-        let replacement = b"replacement binary".to_vec();
-        let previous_assets = BTreeMap::from([(id, original.clone())]);
-        fanta_format::write_project_tree(directory.path(), &document, &previous_assets)?;
-
-        let previous_path = PathBuf::from(format!("assets/images/{id}.png"));
-        let relocated_path = PathBuf::from(format!("assets/other/{id}.bin"));
-        std::fs::create_dir_all(directory.path().join("assets/other"))?;
-        std::fs::rename(
-            directory.path().join(&previous_path),
-            directory.path().join(&relocated_path),
-        )?;
-        let mut preconditions = BTreeMap::new();
-        add_asset_write_preconditions(
-            directory.path(),
-            &mut preconditions,
-            &previous_assets,
-            &previous_assets,
-        )?;
-        assert_eq!(
-            preconditions.get(&relocated_path),
-            Some(&Some(Sha256::digest(&original).into()))
-        );
-        assert_eq!(preconditions.get(&previous_path), Some(&None));
-
-        let report = fanta_format::write_project_tree_cached_with_sources_checked(
-            directory.path(),
-            &document,
-            &previous_assets,
-            &mut fanta_format::ProjectWriteCache::default(),
-            &BTreeMap::new(),
-            &preconditions,
-        )?;
-        assert!(report.removed.contains(&relocated_path));
-        assert_eq!(
-            std::fs::read(directory.path().join(&previous_path))?,
-            original
-        );
-
-        let current_assets = BTreeMap::from([(id, replacement.clone())]);
-        let replacement_path = PathBuf::from(format!("assets/other/{id}.bin"));
-        let mut preconditions = BTreeMap::new();
-        add_asset_write_preconditions(
-            directory.path(),
-            &mut preconditions,
-            &previous_assets,
-            &current_assets,
-        )?;
-        assert_eq!(
-            preconditions.get(&previous_path),
-            Some(&Some(Sha256::digest(&original).into()))
-        );
-        assert_eq!(preconditions.get(&replacement_path), Some(&None));
-        let report = fanta_format::write_project_tree_cached_with_sources_checked(
-            directory.path(),
-            &document,
-            &current_assets,
-            &mut fanta_format::ProjectWriteCache::default(),
-            &BTreeMap::new(),
-            &preconditions,
-        )?;
-        assert!(report.removed.contains(&previous_path));
-        assert_eq!(
-            std::fs::read(directory.path().join(replacement_path))?,
-            replacement
-        );
-        Ok(())
     }
 
     #[test]
@@ -7398,11 +6392,8 @@ mod tests {
         );
     }
 
-    /// The write that materializes a bare `.fig`'s project on open projects
-    /// every design already; its memo is what makes the first autosave
-    /// incremental, so it must come back warm alongside the adopted root.
     #[test]
-    fn materializing_on_open_warms_the_write_cache_and_never_overwrites_a_project() {
+    fn materializing_on_open_never_overwrites_a_project() {
         let dir = tempfile::tempdir().expect("tempdir");
         let fig_path = dir.path().join("Design.fig");
         let document = FigDocument::from_doc(doc_with_one_page(), BTreeMap::new());
@@ -7411,11 +6402,6 @@ mod tests {
             .expect("materializes next to the .fig");
         assert_eq!(materialized.root, dir.path().join("Design"));
         assert!(fanta_format::is_project_dir(&materialized.root));
-        assert_eq!(
-            materialized.write_cache.cached_designs(),
-            1,
-            "the one page's projection is memoized for the first autosave"
-        );
 
         // A project that appeared at the target since the open began is left
         // alone.
@@ -8113,13 +7099,6 @@ mod tests {
                     .name,
                 "Changed externally"
             );
-            let session = item.workspace_session.as_ref().expect("project session");
-            assert_eq!(session.open.len(), 1, "only changed FNX was reparsed");
-            assert!(
-                session
-                    .open
-                    .contains_key(&fanta_format::ArtifactId::Page(second_page))
-            );
         });
 
         item.update(cx, |item, cx| {
@@ -8160,8 +7139,6 @@ mod tests {
                     .name,
                 "Second external edit"
             );
-            let session = item.workspace_session.as_ref().expect("project session");
-            assert_eq!(session.open.len(), 1, "merge parsed only the changed page");
         });
     }
 
@@ -8348,7 +7325,9 @@ mod tests {
         let paths = BTreeSet::from([
             source.clone(),
             source.with_file_name("page.json"),
-            source.with_file_name("page.ids.json"),
+            source.with_file_name("nodes.json"),
+            source.with_file_name("map.json"),
+            directory.path().join("design.css"),
             directory.path().join("fanta.json"),
             metadata,
             directory.path().join("doc/variables.json"),
@@ -8415,6 +7394,68 @@ mod tests {
         );
     }
 
+    /// Spec 0009 A5: an edit made outside Fanta that breaks a reference shows
+    /// up as a finding in the editor, without a save.
+    #[gpui::test]
+    async fn an_external_edit_that_breaks_a_reference_is_reported_without_a_save(
+        cx: &mut TestAppContext,
+    ) {
+        let project = empty_project(cx).await;
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("project");
+        let mut doc = doc_with_one_page();
+        let page = doc.active_page().expect("page");
+        let mut card = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Vector(
+            fanta_doc::VectorNode::rect_solid(0.0, 0.0, 20.0, 30.0, fanta_doc::Color::BLACK),
+        ));
+        card.parent = Some(page);
+        let card_id = card.id;
+        doc.apply(Operation::create_node(card)).expect("card");
+        write_project(directory.path(), &doc, &BTreeMap::new()).expect("initial project");
+        let session = fanta_format::WorkspaceSession::open(directory.path()).expect("session");
+        let item = ready_item(
+            &project,
+            directory.path().join("fanta.json"),
+            Some(directory.path().to_path_buf()),
+            doc.clone_for_persist(),
+            cx,
+        );
+        item.update(cx, |item, _| {
+            item.workspace_session = Some(session);
+            item.merge_base = Some(doc.clone_for_persist());
+            item.last_saved_assets = Some(Arc::new(BTreeMap::new()));
+        });
+        let stylesheet = fanta_format::locate_page_source(directory.path(), page)
+            .expect("page source")
+            .with_file_name("page.css");
+        let mut css = std::fs::read_to_string(&stylesheet).expect("stylesheet");
+        css.push_str(&format!("#{card_id} {{ fill: var(--no-such-token, #ff0000); }}\n"));
+        std::fs::write(&stylesheet, &css).expect("external edit");
+        item.read_with(cx, |item, _| assert!(item.external_findings().is_empty()));
+
+        item.update(cx, |item, cx| {
+            item.queue_watcher_paths_for_test([stylesheet.clone()], cx);
+        });
+        for _ in 0..3 {
+            cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+            cx.run_until_parked();
+        }
+        item.read_with(cx, |item, _| {
+            let codes: Vec<_> = item
+                .external_findings()
+                .iter()
+                .map(|finding| finding.code)
+                .collect();
+            assert_eq!(codes, ["ref.missing_token"]);
+            assert!(external_findings_notice(item.external_findings()).is_some());
+        });
+        assert_eq!(
+            std::fs::read_to_string(&stylesheet).expect("stylesheet"),
+            css,
+            "the finding must not need a save"
+        );
+    }
+
     #[gpui::test]
     async fn project_reload_queue_keeps_startup_edits_after_hash_seeding(cx: &mut TestAppContext) {
         let (directory, item, _, page) = reload_queue_fixture(cx).await;
@@ -8471,8 +7512,12 @@ mod tests {
     async fn project_reload_queue_refreshes_unproven_legacy_startup_nodes(cx: &mut TestAppContext) {
         let (directory, item, initial, page) = reload_queue_fixture(cx).await;
         let source = fanta_format::locate_page_source(directory.path(), page).expect("page source");
+        // Strip the web projection down to the ancient per-node layout the
+        // unproven-startup refresh exists for.
         std::fs::remove_file(&source).expect("legacy per-node source");
-        std::fs::remove_file(source.with_file_name("page.ids.json")).expect("legacy identities");
+        for name in ["nodes.json", "map.json"] {
+            std::fs::remove_file(source.with_file_name(name)).expect("web records");
+        }
         let nodes = source.parent().expect("page directory").join("nodes");
         std::fs::create_dir(&nodes).expect("legacy node directory");
         let node_path = nodes.join(format!("{page}.json"));
@@ -8733,6 +7778,46 @@ mod tests {
         assert_eq!(page.opacity, 0.5.into());
     }
 
+    /// The pane's Overwrite answer to a conflict is a plain explicit save.
+    #[gpui::test]
+    async fn overwrite_resolves_a_conflict_with_an_external_edit(cx: &mut TestAppContext) {
+        let (directory, item, mut external, page) = reload_queue_fixture(cx).await;
+        let original_name = external.scene.get(page).expect("page").name.clone();
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetOpacity {
+                    id: page,
+                    old: 1.0.into(),
+                    new: 0.5.into(),
+                },
+                cx,
+            )
+        })
+        .expect("unsaved canvas edit");
+        let agent_page = external.scene.get_mut(page).expect("page");
+        agent_page.opacity = 0.25.into();
+        agent_page.name = "Renamed by an agent".into();
+        write_project(directory.path(), &external, &BTreeMap::new()).expect("external edit");
+        item.update(cx, |item, cx| item.schedule_merge(cx));
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 2);
+        cx.run_until_parked();
+        assert!(item.read_with(cx, |item, _| item.has_conflict()));
+
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("Overwrite writes the canvas");
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert!(!item.has_conflict());
+            assert!(!item.is_dirty());
+        });
+        let (reopened, _) =
+            fanta_format::read_project_tree(directory.path()).expect("reopen overwrite");
+        let page = reopened.scene.get(page).expect("page");
+        assert_eq!(page.opacity, 0.5.into());
+        assert_eq!(page.name, original_name);
+    }
+
     #[test]
     fn project_dir_avoids_a_non_project_collision_but_reuses_a_project() {
         let dir = tempfile::tempdir().unwrap();
@@ -8829,8 +7914,11 @@ mod tests {
     #[gpui::test]
     async fn source_recovery_write_lease_defers_watchers_until_adoption(cx: &mut TestAppContext) {
         let fixture = save_generation_fixture(cx).await;
-        let source =
-            fanta_format::locate_page_source(&fixture.root, fixture.page).expect("page source");
+        // The page header is the editable source pane file on a web project
+        // (SVG buffers have no source-save path yet).
+        let source = fanta_format::locate_page_source(&fixture.root, fixture.page)
+            .expect("page source")
+            .with_file_name("page.json");
         let before = std::fs::read_to_string(&source).expect("source");
         let edited = format!("{before}\n");
         fixture
@@ -9381,8 +8469,8 @@ mod tests {
                 .filter(|(id, _)| **id != fanta_format::ArtifactId::Page(fixture.page))
                 .filter_map(|(id, meta)| {
                     let name = match id {
-                        fanta_format::ArtifactId::Page(_) => "page.fnx",
-                        fanta_format::ArtifactId::Component(_) => "master.fnx",
+                        fanta_format::ArtifactId::Page(_) => "page.svg",
+                        fanta_format::ArtifactId::Component(_) => "master.svg",
                         _ => return None,
                     };
                     let path = fixture.root.join(&meta.design_dir).join(name);
@@ -9460,8 +8548,8 @@ mod tests {
                     .keys()
                     .cloned()
                     .collect::<BTreeSet<_>>(),
-                BTreeSet::from([fanta_format::ArtifactId::Page(fixture.page)]),
-                "queued clone comparison must not reopen unrelated sources",
+                BTreeSet::new(),
+                "a web save parses no FNX sources",
             );
         });
         for (path, bytes) in unopened_sources {
@@ -10010,6 +9098,164 @@ mod tests {
 
     /// A document with a single (empty) page, so a save writes a `pages/<id>/`
     /// subtree instead of pruning the empty `pages/` directory.
+    /// Spec 0009 A10: a page whose SVG holds merge-conflict markers opens as
+    /// unavailable, and its files are unchanged after a save, also once the
+    /// editor has replaced its session.
+    #[gpui::test]
+    async fn a_page_with_conflict_markers_opens_unavailable_and_survives_saves(
+        cx: &mut TestAppContext,
+    ) {
+        let project = empty_project(cx).await;
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("project");
+        let mut doc = doc_with_one_page();
+        let kept = doc.active_page().expect("page");
+        let mut second = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+        second.name = "Broken".to_owned();
+        let broken = second.id;
+        doc.apply(Operation::create_node(second)).expect("second page");
+        doc.add_page(broken);
+        write_project(directory.path(), &doc, &BTreeMap::new()).expect("initial project");
+        let folder = fanta_format::locate_page_source(directory.path(), broken)
+            .expect("page source")
+            .parent()
+            .expect("page folder")
+            .to_path_buf();
+        std::fs::write(
+            folder.join("page.svg"),
+            "<<<<<<< HEAD\n<svg/>\n=======\n>>>>>>> theirs\n",
+        )
+        .expect("conflicted page");
+        let files = |folder: &Path| -> BTreeMap<PathBuf, Vec<u8>> {
+            std::fs::read_dir(folder)
+                .expect("page folder")
+                .map(|entry| entry.expect("entry").path())
+                .map(|path| (path.clone(), std::fs::read(&path).expect("page file")))
+                .collect()
+        };
+        let hostile = files(&folder);
+
+        let (loaded, _, session) =
+            fanta_format::WorkspaceSession::open_project_document(directory.path())
+                .expect("a project with a conflicted page opens");
+        assert_eq!(loaded.pages(), [kept]);
+        let notice = unavailable_designs_notice(&session.open_warnings).expect("notice");
+        assert!(notice.contains("pages/broken"), "{notice}");
+
+        let item = ready_item(
+            &project,
+            directory.path().join("fanta.json"),
+            Some(directory.path().to_path_buf()),
+            loaded.clone_for_persist(),
+            cx,
+        );
+        item.update(cx, |item, _| {
+            item.workspace_session = Some(session);
+            item.merge_base = Some(loaded.clone_for_persist());
+            item.last_saved_assets = Some(Arc::new(BTreeMap::new()));
+        });
+        for replace_session in [false, true] {
+            if replace_session {
+                item.update(cx, |item, _| item.workspace_session = None);
+            }
+            item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+                .await
+                .expect("save");
+            assert_eq!(files(&folder), hostile, "replaced session: {replace_session}");
+        }
+        let design_css =
+            std::fs::read_to_string(directory.path().join("design.css")).expect("design.css");
+        assert!(!design_css.contains("broken"), "the save did not run: {design_css}");
+    }
+
+    /// Spec 0009 A3: for each hostile-edit case, open it, save it, and restore
+    /// the snapshot taken before the save. The files are byte-identical to
+    /// the hostile state.
+    #[gpui::test]
+    async fn every_corpus_case_is_restored_byte_identical_after_a_save(cx: &mut TestAppContext) {
+        fn copy(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).expect("folder");
+            for entry in std::fs::read_dir(from).expect("corpus folder") {
+                let path = entry.expect("entry").path();
+                let target = to.join(path.file_name().expect("name"));
+                if path.is_dir() {
+                    copy(&path, &target);
+                } else {
+                    std::fs::copy(&path, &target).expect("copy");
+                }
+            }
+        }
+        fn project_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+            let mut found = BTreeMap::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(folder) = pending.pop() {
+                for entry in std::fs::read_dir(&folder).expect("folder") {
+                    let path = entry.expect("entry").path();
+                    if path.is_dir() {
+                        // Fanta's snapshots and the repository the editor
+                        // creates are not project files.
+                        if !path.ends_with(".fanta") && !path.ends_with(".git") {
+                            pending.push(path);
+                        }
+                    } else {
+                        found.insert(path.clone(), std::fs::read(&path).expect("file"));
+                    }
+                }
+            }
+            found
+        }
+        let project = empty_project(cx).await;
+        cx.executor().allow_parking();
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fanta-format/tests/corpus");
+        let mut restored = Vec::new();
+        for entry in std::fs::read_dir(&corpus).expect("corpus") {
+            let case = entry.expect("case").path();
+            if !case.is_dir() {
+                continue;
+            }
+            let name = case.file_name().expect("name").to_string_lossy().into_owned();
+            let directory = tempfile::tempdir().expect("project");
+            copy(&case, directory.path());
+            let hostile = project_files(directory.path());
+            // A case that does not open has no save to undo.
+            let Ok((loaded, assets, session)) =
+                fanta_format::WorkspaceSession::open_project_document(directory.path())
+            else {
+                continue;
+            };
+            let item = ready_item(
+                &project,
+                directory.path().join("fanta.json"),
+                Some(directory.path().to_path_buf()),
+                loaded.clone_for_persist(),
+                cx,
+            );
+            item.update(cx, |item, _| {
+                item.workspace_session = Some(session);
+                item.merge_base = Some(loaded.clone_for_persist());
+                item.last_saved_assets = Some(Arc::new(assets));
+            });
+            item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+                .await
+                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            assert_ne!(project_files(directory.path()), hostile, "{name}: the save wrote nothing");
+
+            let history = project_history(directory.path());
+            let before = history
+                .list()
+                .expect("snapshots")
+                .into_iter()
+                .find(|snapshot| {
+                    snapshot.reason == fanta_format::history::SnapshotReason::BeforeSave
+                })
+                .unwrap_or_else(|| panic!("{name}: no snapshot before the save"));
+            history.restore(&before.id).expect("restore");
+            assert_eq!(project_files(directory.path()), hostile, "{name}");
+            restored.push(name);
+        }
+        assert!(restored.len() >= 10, "{restored:?}");
+    }
+
     fn doc_with_one_page() -> Doc {
         use fanta_doc::{CanvasNode, GroupNode, NodeData};
         let mut doc = Doc::new();
@@ -10157,7 +9403,7 @@ mod tests {
             cx,
         );
         let changes: UpdatedEntriesSet = vec![(
-            util::rel_path::rel_path("pages/page-1/page.fnx").into(),
+            util::rel_path::rel_path("pages/page-1/page.svg").into(),
             ProjectEntryId::from_proto(1),
             PathChange::Updated,
         )]
@@ -10185,8 +9431,8 @@ mod tests {
             let relative = item
                 .own_write_hashes
                 .keys()
-                .find(|path| path.extension().is_some_and(|ext| ext == "fnx"))
-                .expect("saved FNX source");
+                .find(|path| path.extension().is_some_and(|ext| ext == "svg"))
+                .expect("saved SVG source");
             let path = item
                 .project_root
                 .as_ref()
@@ -10285,7 +9531,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn the_initial_load_adopts_the_materialized_root_and_its_write_cache(
+    async fn the_initial_load_adopts_the_materialized_root(
         cx: &mut TestAppContext,
     ) {
         let project = empty_project(cx).await;
@@ -10309,13 +9555,6 @@ mod tests {
         item.read_with(cx, |item, _| {
             assert!(item.has_ready_document());
             assert_eq!(item.project_root(), Some(root.as_path()));
-            assert_eq!(
-                item.write_cache
-                    .as_ref()
-                    .map(|cache| cache.cached_designs()),
-                Some(1),
-                "the materializing write's memo seeds the first autosave"
-            );
             assert!(
                 item.merge_base.is_some(),
                 "disk and canvas agree right after the materializing write"
@@ -10329,8 +9568,6 @@ mod tests {
             "the materialized project is registered for scoped re-opens"
         );
 
-        // Source ownership replaces the canonical projection memo after the
-        // first autosave, so subsequent edits can retain authored FNX text.
         item.update(cx, |item, _| item.dirty = true);
         item.update(cx, |item, cx| item.save(SaveKind::Auto, cx))
             .await
@@ -10338,13 +9575,6 @@ mod tests {
         item.read_with(cx, |item, _| {
             assert!(!item.is_dirty());
             assert!(item.workspace_session.is_some());
-            assert_eq!(
-                item.write_cache
-                    .as_ref()
-                    .map(|cache| cache.cached_designs()),
-                Some(0),
-                "authored sources supersede the canonical memo"
-            );
         });
     }
 
@@ -10391,8 +9621,9 @@ mod tests {
             sync_epoch: 0,
             reload_task: None,
             _load_task: None,
-            write_cache: None,
             workspace_session: None,
+            external_findings: Vec::new(),
+            external_check: None,
             project_subscriptions: Vec::new(),
         });
         item.update(cx, |item, cx| item.subscribe_to_project(project, cx));
@@ -10444,14 +9675,14 @@ mod tests {
             item.read_with(cx, |item, _| {
                 assert_eq!(
                     item.indexed_design_source(ScopedDesign::Page(page)),
-                    Some(directory.path().join("pages/page-1/page.fnx"))
+                    Some(directory.path().join("pages/page-1/page.svg"))
                 );
                 assert_eq!(
                     item.indexed_design_source(ScopedDesign::Component(component)),
                     Some(
                         directory
                             .path()
-                            .join("components/button-kit/large/master.fnx")
+                            .join("components/button-kit/large/master.svg")
                     )
                 );
                 assert_eq!(
@@ -10468,14 +9699,14 @@ mod tests {
             item.read_with(cx, |item, _| {
                 assert_eq!(
                     item.indexed_design_source(ScopedDesign::Page(page)),
-                    Some(directory.path().join("pages/photo-studio/page.fnx"))
+                    Some(directory.path().join("pages/photo-studio/page.svg"))
                 );
                 assert_eq!(
                     item.indexed_design_source(ScopedDesign::Component(component)),
                     Some(
                         directory
                             .path()
-                            .join("components/photo-buttons/large/master.fnx")
+                            .join("components/photo-buttons/large/master.svg")
                     )
                 );
             });
@@ -11495,7 +10726,9 @@ mod tests {
             .as_group_mut()
             .expect("group")
             .auto_layout = None;
-        fanta_format::write_project_tree(directory.path(), &doc, &BTreeMap::new())
+        // A legacy fixture: the external edit under test is an FNX hand edit,
+        // which only legacy projects still carry (the save below converts).
+        fanta_format::write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new())
             .expect("write baseline");
         let (baseline, _) =
             fanta_format::read_project_tree(directory.path()).expect("read baseline");

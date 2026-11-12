@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Attach-or-launch MCP bridge for Fanta.
+
+`fanta --mcp-stdio` bridges stdio JSON-RPC onto the running app's live MCP
+socket, but exits when the app is not running. MCP clients (Claude Code,
+Codex) expect their configured server command to just work, so this wrapper
+adds the missing half: if no live server is discovered, it launches the app,
+waits for the discovery file, then hands stdio to the real bridge.
+
+Configuration, all optional:
+    FANTA_BIN            the fanta binary (default: `fanta` on PATH)
+    FANTA_PROJECT        a project directory to open when launching
+    FANTA_USER_DATA_DIR  isolated profile, passed through to app and bridge
+    FANTA_LAUNCH_TIMEOUT seconds to wait for the live server (default 60)
+
+The wrapper never prints to stdout: stdout belongs to the MCP protocol.
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def data_dir() -> Path:
+    custom = os.environ.get("FANTA_USER_DATA_DIR", "").strip()
+    if custom:
+        return Path(custom)
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Fanta"
+    if sys.platform.startswith("linux"):
+        base = os.environ.get("XDG_DATA_HOME", "").strip()
+        root = Path(base) if base else Path.home() / ".local" / "share"
+        return root / "fanta"
+    if sys.platform == "win32":
+        return Path(os.environ["LOCALAPPDATA"]) / "Fanta"
+    raise RuntimeError(f"unsupported platform: {sys.platform}")
+
+
+def live_server_up(discovery: Path) -> bool:
+    try:
+        record = json.loads(discovery.read_text())
+        pid = int(record["pid"])
+    except (OSError, ValueError, KeyError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def main() -> int:
+    fanta = os.environ.get("FANTA_BIN", "").strip() or shutil.which("fanta")
+    if not fanta or not Path(fanta).exists():
+        print("fanta-agent-bridge: set FANTA_BIN or put `fanta` on PATH", file=sys.stderr)
+        return 2
+
+    discovery = data_dir() / "fanta_live_mcp.json"
+    if not live_server_up(discovery):
+        launch = [fanta]
+        project = os.environ.get("FANTA_PROJECT", "").strip()
+        if project:
+            launch.append(project)
+        # The app must outlive this bridge process: detach it fully.
+        subprocess.Popen(
+            launch,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + float(os.environ.get("FANTA_LAUNCH_TIMEOUT", "60"))
+        while not live_server_up(discovery):
+            if time.monotonic() > deadline:
+                print(
+                    "fanta-agent-bridge: launched the app but no live MCP server "
+                    f"appeared at {discovery} (settings: fanta_live_mcp.enabled)",
+                    file=sys.stderr,
+                )
+                return 2
+            time.sleep(0.25)
+
+    os.execv(fanta, [fanta, "--mcp-stdio"])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

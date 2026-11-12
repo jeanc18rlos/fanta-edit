@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
-use fanta_doc::{Bounds, Doc, NodeId, Viewport, resolve_bound_value, resolve_effective_mode};
+use fanta_doc::{Bounds, Doc, NodeId, Viewport, resolve_effective_mode};
 use fanta_render::{AssetResolver, RasterRenderer, visual_world_bounds};
 use image::codecs::jpeg::JpegEncoder;
 
@@ -56,45 +56,7 @@ impl ExportSizing {
     }
 }
 
-pub fn resolve_export_bindings(document: &Doc) -> Cow<'_, Doc> {
-    let bound_nodes = document
-        .scene
-        .roots()
-        .iter()
-        .flat_map(|root| document.scene.descendants_of(*root))
-        .filter_map(|id| {
-            let node = document.scene.get(id)?;
-            (!node.bindings.is_empty()).then_some((id, node.bindings.clone()))
-        })
-        .collect::<Vec<_>>();
-    if bound_nodes.is_empty() {
-        return Cow::Borrowed(document);
-    }
-
-    let mut resolved = document.clone();
-    for (id, bindings) in bound_nodes {
-        let values = bindings
-            .into_iter()
-            .filter_map(|(property, variable)| {
-                resolve_bound_value(
-                    &document.variables,
-                    &document.scene,
-                    id,
-                    &document.active_modes,
-                    variable,
-                )
-                .map(|value| (property, value))
-            })
-            .collect::<Vec<_>>();
-        let Some(node) = resolved.scene.get_mut(id) else {
-            continue;
-        };
-        for (property, value) in values {
-            property.apply_resolved(node, value);
-        }
-    }
-    Cow::Owned(resolved)
-}
+pub use fanta_doc::resolve_export_bindings;
 
 /// The document with `root` lifted to the top level at its world position,
 /// so a render of it alone draws it exactly as it appears on its page,
@@ -146,6 +108,12 @@ pub fn detach_export_root<'a>(
 }
 
 /// What a page or node draws, in world units.
+/// The flattened outline of a boolean node, as document path data — what the
+/// web projection stores instead of a raster stand-in (spec 0007 R11).
+pub fn boolean_outline(document: &Doc, node: NodeId) -> Option<fanta_doc::PathData> {
+    fanta_render::raster::boolean_outline(&document.scene, node)
+}
+
 pub fn page_visual_bounds(document: &Doc, root: Option<NodeId>) -> Option<Bounds> {
     match root {
         Some(root) => visual_world_bounds(&document.scene, root, 0.0),
@@ -554,5 +522,47 @@ mod tests {
             (4000, 1000)
         );
         assert!(raster_dimensions(wide, ExportSizing::MaxDimension(0.0), "Banner").is_err());
+    }
+}
+
+/// The shared [`fanta_format::WebRenderSource`] over this crate's exporter:
+/// the editor, the engine and `fanta-site` project web storage through this
+/// one implementation, so their saves stay byte-identical (spec 0007 R10).
+pub struct ProjectRenderSource<'a> {
+    document: &'a Doc,
+    assets: Option<Arc<dyn AssetResolver>>,
+}
+
+impl<'a> ProjectRenderSource<'a> {
+    pub fn new(document: &'a Doc, assets: Option<Arc<dyn AssetResolver>>) -> Self {
+        Self { document, assets }
+    }
+}
+
+impl fanta_format::WebRenderSource for ProjectRenderSource<'_> {
+    fn design_bounds(&self, root: NodeId) -> Option<Bounds> {
+        page_visual_bounds(self.document, Some(root))
+    }
+
+    fn raster(&self, node: NodeId) -> Option<fanta_format::WebRaster> {
+        // A failed render reaches report.json as "not drawn"; the log line
+        // carries the cause, which the report cannot.
+        let image = export_node(
+            self.document,
+            self.assets.clone(),
+            node,
+            ExportEncoding::Png,
+            ExportSizing::Scale(2.0),
+        )
+        .map_err(|error| log::warn!("rendering the web fallback for {node}: {error:#}"))
+        .ok()?;
+        Some(fanta_format::WebRaster {
+            bytes: image.bytes,
+            bounds: image.bounds,
+        })
+    }
+
+    fn outline(&self, node: NodeId) -> Option<fanta_doc::PathData> {
+        boolean_outline(self.document, node)
     }
 }

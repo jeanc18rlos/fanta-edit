@@ -1,0 +1,21 @@
+<?xml-stylesheet type="text/css" href="../../tokens.css"?>
+<?xml-stylesheet type="text/css" href="page.css"?>
+<svg xmlns="http://www.w3.org/2000/svg" data-fanta="page" width="368" height="80" viewBox="0 0 368 80">
+  <defs>
+    <clipPath id="n_01M78J2NEDAZ54A2EPARCW66HJ-v1-clip"><rect width="48" height="24"/></clipPath>
+  </defs>
+  <g id="n_01M78J2NEDVYY53XJHS9JP98SG" class="home" data-name="Home">
+    <text id="n_01M78J2NED10SADM0VPFR8S5ZQ" class="label" data-name="Label" transform="translate(140 0)" y="16">
+      <tspan x="0">Hello</tspan>
+    </text>
+    <rect id="n_01M78J2NED1HH0RKTBBY8WWVVX" class="card" data-name="Card" x="0" y="0" width="120" height="80"/>
+    <g id="n_01M78J2NEDAZ54A2EPARCW66HJ" class="chip-instance" data-name="Chip instance" transform="translate(320 0)">
+      <clipPath id="n_01M78J2NEDAZ54A2EPARCW66HJ-clip"><rect width="48" height="24"/></clipPath>
+      <g clip-path="url(#n_01M78J2NEDAZ54A2EPARCW66HJ-clip)">
+        <g data-virtual="true" clip-path="url(#n_01M78J2NEDAZ54A2EPARCW66HJ-v1-clip)">
+          <rect data-virtual="true" x="0" y="0" width="48" height="24" style="fill: #000000"/>
+        </g>
+      </g>
+    </g>
+  </g>
+</svg>

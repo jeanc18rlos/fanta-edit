@@ -1,0 +1,58 @@
+{
+  "nodes": {
+    "n_01M78J2NED10SADM0VPFR8S5ZQ": {
+      "bounds": [
+        140.0,
+        0.0,
+        100.0,
+        20.0
+      ],
+      "name": "Label"
+    },
+    "n_01M78J2NED1HH0RKTBBY8WWVVX": {
+      "bounds": [
+        0.0,
+        0.0,
+        120.0,
+        80.0
+      ],
+      "name": "Card"
+    },
+    "n_01M78J2NED428RD8GSGMKGB4TY": {
+      "bounds": [
+        260.0,
+        0.0,
+        40.0,
+        40.0
+      ],
+      "name": "Photo"
+    },
+    "n_01M78J2NEDAZ54A2EPARCW66HJ": {
+      "bounds": [
+        320.0,
+        0.0,
+        48.0,
+        24.0
+      ],
+      "name": "Chip instance"
+    },
+    "n_01M78J2NEDVYY53XJHS9JP98SG": {
+      "bounds": [
+        0.0,
+        0.0,
+        368.0,
+        80.0
+      ],
+      "name": "Home"
+    }
+  },
+  "page": {
+    "bounds": [
+      0.0,
+      0.0,
+      368.0,
+      80.0
+    ],
+    "name": "Home"
+  }
+}

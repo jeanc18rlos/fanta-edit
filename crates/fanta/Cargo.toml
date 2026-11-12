@@ -154,6 +154,9 @@ gpui = { workspace = true, features = [
     "wayland",
     "x11",
 ] }
+# gpui_linux picks its windowing backend from these features, not gpui's: without them it
+# panics at startup on every desktop.
+gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
 ashpd.workspace = true
 image.workspace = true
 

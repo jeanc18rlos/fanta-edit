@@ -42,7 +42,7 @@ fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent
 /// result with `design_screenshot` after substantive edits. To place an image
 /// from a URL (e.g. a finished AI generation), use `place_generation` instead.
 /// Gradients and per-run rich text are not ops: edit the page's
-/// `.fnx` source with the file tools when the project is on disk.
+/// source files with the file tools when the project is on disk.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct DesignEditToolInput {
     /// The ops to apply, in order.

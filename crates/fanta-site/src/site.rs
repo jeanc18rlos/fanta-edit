@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use unicode_normalization::UnicodeNormalization;
 
+pub mod web;
+
 pub const SITE_FORMAT: &str = "fanta-site";
 pub const SITE_VERSION: u32 = 1;
 
@@ -431,7 +433,7 @@ fn site_pages(document: &Doc) -> Result<Vec<SitePage>, SiteError> {
 
 /// A lowercase ASCII URL segment: accents fold to their base letters and any
 /// other run of characters becomes one hyphen.
-fn slug(name: &str) -> String {
+pub(crate) fn slug(name: &str) -> String {
     let mut slug = String::new();
     for character in name.nfkd() {
         if character.is_ascii_alphanumeric() {

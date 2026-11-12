@@ -5,6 +5,11 @@
 //!
 //! The facade is frozen by `docs/cloud-engine-contracts.md`.
 
+// The wasm engine build compiles out the project facade and the renderer;
+// their imports and helpers go dead there while the default build keeps
+// full analysis.
+#![cfg_attr(not(feature = "native"), allow(dead_code, unused_imports))]
+
 pub mod apply;
 pub mod assets;
 pub mod clipboard;
@@ -13,12 +18,17 @@ pub mod component_properties;
 pub mod componentize;
 pub mod document;
 pub mod edit_operations;
+#[cfg(feature = "render")]
 pub mod export;
 pub mod layout;
 pub mod pages;
+#[cfg(feature = "render")]
 pub mod render;
+#[cfg(feature = "native")]
 pub mod save;
 pub mod scene;
+#[cfg(feature = "native")]
+pub mod sources;
 pub mod structure;
 pub mod style;
 pub mod variant_sets;
@@ -33,7 +43,9 @@ use fanta_design_ops::{
     CommentDraft, DEFAULT_CHILD_LIMIT, DesignOp, DesignSystemQuery, ScreenshotTarget,
 };
 use fanta_doc::{Doc, NodeData, NodeId, Operation};
-use fanta_format::{ArtifactId, ProjectWriteCache, ScopedDesign, WorkspaceSession};
+use fanta_format::ScopedDesign;
+#[cfg(feature = "native")]
+use fanta_format::{ArtifactId, WorkspaceSession};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -116,6 +128,7 @@ pub struct ChangedFile {
 const INSPECT_FRAME_LIMIT: usize = 200;
 
 /// An open project and the edits made to it since it was opened.
+#[cfg(feature = "native")]
 pub struct HeadlessProject {
     root: PathBuf,
     document: HeadlessDocument,
@@ -127,13 +140,13 @@ pub struct HeadlessProject {
     /// next save writes it, as the editor's first save after opening does.
     pending_layout_output_nodes: BTreeSet<NodeId>,
     session: WorkspaceSession,
-    write_cache: ProjectWriteCache,
     pages: Vec<Option<NodeId>>,
     created_pages: Vec<NodeId>,
     loaded_hashes: BTreeMap<String, [u8; 32]>,
-    warnings: Vec<String>,
+    warnings: Vec<fanta_format::SourceDiagnostic>,
 }
 
+#[cfg(feature = "native")]
 impl HeadlessProject {
     /// Read the project at `root` the way the editor opens it, solve the
     /// geometry its sources leave out, and record the hash of every file so
@@ -150,9 +163,12 @@ impl HeadlessProject {
         fanta_doc::strip_redundant_instance_overrides(&mut doc.scene, &doc.components);
         let visible_page_roots = pages::visible_page_roots(&doc);
         let default_page_root = pages::default_page_root(&doc, &visible_page_roots);
-        let mut warnings = Vec::new();
+        let mut warnings = session.open_warnings.clone();
         let pending_layout_output_nodes = layout::solve_pending(&mut doc).unwrap_or_else(|error| {
-            warnings.push(format!("computing omitted source geometry: {error:#}"));
+            warnings.push(fanta_format::SourceDiagnostic::warning(
+                fanta_format::LOAD_OMITTED_GEOMETRY,
+                format!("computing omitted source geometry: {error:#}"),
+            ));
             BTreeSet::new()
         });
         let page_roots = pages::editor_page_roots(&doc);
@@ -181,7 +197,6 @@ impl HeadlessProject {
             saved_scene,
             pending_layout_output_nodes,
             session,
-            write_cache: ProjectWriteCache::default(),
             pages: page_roots,
             created_pages: Vec::new(),
             loaded_hashes,
@@ -208,7 +223,7 @@ impl HeadlessProject {
 
     /// Problems that did not stop the project from opening, worded for a
     /// person reading a review.
-    pub fn warnings(&self) -> &[String] {
+    pub fn warnings(&self) -> &[fanta_format::SourceDiagnostic] {
         &self.warnings
     }
 
@@ -520,29 +535,21 @@ impl HeadlessProject {
         })
     }
 
-    /// Write the edited document back to the project directory the way the
-    /// editor saves: sources the edits did not touch keep their bytes.
+    /// Write the edited document back to the project directory as web
+    /// storage, the same projection every save path writes (spec 0007 R10).
     pub fn save(&mut self) -> Result<()> {
         self.settle_layout()?;
-        let mut changed_artifacts = save::changed_artifact_ids(
+        let render = crate::export::ProjectRenderSource::new(
             &self.document.doc,
-            Some(&self.baseline),
-            Some(self.saved_scene),
-        );
-        save::extend_artifact_owners(
-            &self.document.doc,
-            &mut changed_artifacts,
-            self.pending_layout_output_nodes.iter().copied(),
+            self.document.asset_resolver.clone(),
         );
         save::save_project(
             &self.root,
             &mut self.session,
             &self.document.doc,
-            &self.baseline,
             &self.document.raw_assets,
-            self.document.assets_changed,
-            &changed_artifacts,
-            &mut self.write_cache,
+            Some(&render),
+            &self.warnings,
         )?;
         self.baseline = self.document.doc.clone_for_persist();
         self.saved_scene = (
@@ -579,7 +586,9 @@ impl HeadlessProject {
             .context("the project has no pages")
     }
 
-    fn active_page_index(&self) -> Result<usize> {
+    /// The active page's index in the editor page order, as agents address
+    /// pages.
+    pub fn active_page_index(&self) -> Result<usize> {
         let active = self
             .document
             .doc
@@ -591,22 +600,29 @@ impl HeadlessProject {
             .context("the active page is not in the page list")
     }
 
-    fn indexed_design_source(&self, design: ScopedDesign) -> Option<PathBuf> {
+    /// The on-disk source file of a page or component, from the session's
+    /// artifact index (no directory scan).
+    pub fn indexed_design_source(&self, design: ScopedDesign) -> Option<PathBuf> {
         let artifact = ArtifactId::from_scoped(design);
-        if !self.session.has_indexed_source(&artifact) {
-            return None;
-        }
         let metadata = self.session.artifacts.get(&artifact)?;
-        let file_name = match design {
-            ScopedDesign::Page(_) => "page.fnx",
-            ScopedDesign::Component(_) => "master.fnx",
+        let directory = self.root.join(&metadata.design_dir);
+        let (web, legacy) = match design {
+            ScopedDesign::Page(_) => ("page.svg", "page.fnx"),
+            ScopedDesign::Component(_) => ("master.svg", "master.fnx"),
         };
-        Some(self.root.join(&metadata.design_dir).join(file_name))
+        let web = directory.join(web);
+        if web.is_file() {
+            return Some(web);
+        }
+        self.session
+            .has_indexed_source(&artifact)
+            .then(|| directory.join(legacy))
     }
 }
 
 /// Compare the files under `work_dir` with the hashes they had when the
 /// project was opened.
+#[cfg(feature = "native")]
 pub fn changeset(
     loaded_hashes: &BTreeMap<String, [u8; 32]>,
     work_dir: &Path,
@@ -640,6 +656,7 @@ pub fn changeset(
 
 /// The SHA-256 of every file under `root`, keyed by its `/`-separated path.
 /// Hidden entries (`.git`, editor caches) are not project content.
+#[cfg(feature = "native")]
 fn hash_project_files(root: &Path) -> Result<BTreeMap<String, [u8; 32]>> {
     let mut hashes = BTreeMap::new();
     let mut pending = vec![(root.to_path_buf(), String::new())];
@@ -669,6 +686,7 @@ fn hash_project_files(root: &Path) -> Result<BTreeMap<String, [u8; 32]>> {
     Ok(hashes)
 }
 
+#[cfg(feature = "native")]
 fn hex_digest(hash: &[u8; 32]) -> String {
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -723,6 +741,84 @@ mod tests {
         }
     }
 
+    /// A5: a legacy FNX project opens as before, converts to web storage on
+    /// its first save, renders byte-identically before and after, and keeps
+    /// no `.fnx`/`.fss` file behind (spec 0007 R9).
+    #[test]
+    fn a_legacy_project_converts_to_web_on_save_and_renders_identically() {
+        fn files_under(root: &Path) -> Vec<PathBuf> {
+            let mut files = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(directory) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&directory) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else {
+                        files.push(path);
+                    }
+                }
+            }
+            files.sort();
+            files
+        }
+        fn render_home(project: &mut HeadlessProject) -> Vec<u8> {
+            project
+                .render(&RenderTarget {
+                    id: "home".into(),
+                    page: PageRef::Index { index: 0 },
+                    node: None,
+                    max_dimension: 300,
+                    motion_clip: None,
+                    playhead_ms: None,
+                })
+                .expect("render")
+                .png
+        }
+
+        let fixture = write_project();
+        // Rewrite the fixture as a legacy FNX tree.
+        let (doc, assets) = fanta_format::read_project_tree(fixture.directory.path())
+            .expect("read the web fixture");
+        let legacy = tempfile::tempdir().expect("legacy directory");
+        fanta_format::write_legacy_project_tree(legacy.path(), &doc, &assets)
+            .expect("write the legacy project");
+        assert!(
+            files_under(legacy.path())
+                .iter()
+                .any(|path| path.extension().is_some_and(|extension| extension == "fnx")),
+            "the legacy fixture must hold FNX sources"
+        );
+
+        let mut project = HeadlessProject::open(legacy.path()).expect("open the legacy project");
+        let before = render_home(&mut project);
+        project.save().expect("the converting save");
+        let converted = files_under(legacy.path());
+        assert!(
+            !converted.iter().any(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "fnx" || extension == "fss")
+            }),
+            "conversion must prune every FNX/FSS source: {converted:?}"
+        );
+        // A second save over the converted tree is a no-op (R5).
+        let report = {
+            let mut reopened = HeadlessProject::open(legacy.path()).expect("reopen converted");
+            let after = render_home(&mut reopened);
+            assert_eq!(before, after, "conversion must not change the render");
+            reopened.save().expect("resave");
+            changeset(reopened.loaded_hashes(), reopened.root()).expect("changeset")
+        };
+        let stable: Vec<_> = report
+            .iter()
+            .filter(|file| file.path != "doc/metadata.json")
+            .collect();
+        assert!(stable.is_empty(), "a resave rewrites nothing: {report:?}");
+    }
+
     fn finding(page: usize, node: Option<NodeId>, text: &str) -> CommentDraft {
         CommentDraft {
             page: Some(page),
@@ -753,7 +849,7 @@ mod tests {
         assert!(
             pages[0]["source"]
                 .as_str()
-                .is_some_and(|source| source.starts_with("pages/") && source.ends_with("/page.fnx")),
+                .is_some_and(|source| source.starts_with("pages/") && source.ends_with("/page.svg")),
             "{}",
             pages[0]["source"]
         );
@@ -809,12 +905,15 @@ mod tests {
                 .all(|file| file.status == FileStatus::Modified)
         );
         assert_eq!(sources.len(), 2, "{changed:?}");
-        assert!(sources.iter().all(|file| {
-            file.status == FileStatus::Modified
-                && file.path.starts_with("pages/")
-                && file.path.ends_with("/page.fnx")
-                && file.sha256.as_ref().is_some_and(|hash| hash.len() == 64)
-        }));
+        assert!(
+            sources.iter().all(|file| {
+                file.status == FileStatus::Modified
+                    && file.path.starts_with("pages/")
+                    && file.path.ends_with("/nodes.json")
+                    && file.sha256.as_ref().is_some_and(|hash| hash.len() == 64)
+            }),
+            "comments live in the node records: {changed:?}"
+        );
 
         let reopened = HeadlessProject::open(fixture.directory.path()).expect("reopen");
         let home = comments::read_comments(reopened.doc(), fixture.home);
@@ -906,10 +1005,16 @@ mod tests {
 
         project.save().expect("save");
         let changed = changeset(project.loaded_hashes(), project.root()).expect("changeset");
+        // An empty page draws nothing, so it has records and a header but no
+        // SVG projection yet (the writer reports "draws nothing to emit").
         assert!(
-            changed
-                .iter()
-                .any(|file| file.status == FileStatus::Added && file.path.ends_with("/page.fnx")),
+            changed.iter().any(|file| file.status == FileStatus::Added
+                && file.path.ends_with("pages/review/page.json")),
+            "{changed:?}"
+        );
+        assert!(
+            changed.iter().any(|file| file.status == FileStatus::Added
+                && file.path.ends_with("pages/review/nodes.json")),
             "{changed:?}"
         );
         let reopened = HeadlessProject::open(fixture.directory.path()).expect("reopen");
@@ -987,18 +1092,34 @@ mod tests {
             .expect("the page has a source")
             .to_owned();
         let target_directory = target_source
-            .strip_suffix("page.fnx")
+            .strip_suffix("page.svg")
             .expect("a page source");
-        assert_eq!(
-            sources.len(),
-            2,
-            "the page source and its id sidecar: {changed:?}"
+        let other_directory = if target_directory.contains("home") {
+            "pages/about/"
+        } else {
+            "pages/home/"
+        };
+        // The web write touches the edited page's files plus the shared
+        // project projections (design.css, pages.js, report.json) — never
+        // the untouched page's directory.
+        assert!(
+            sources
+                .iter()
+                .any(|file| file.path == format!("{target_directory}page.svg")
+                    && file.status == FileStatus::Modified),
+            "{changed:?}"
         );
         assert!(
             sources
                 .iter()
-                .all(|file| file.status == FileStatus::Modified
-                    && file.path.starts_with(target_directory)),
+                .all(|file| file.path.starts_with(target_directory)
+                    || !file.path.starts_with("pages/")),
+            "the untouched page keeps its bytes: {changed:?}"
+        );
+        assert!(
+            sources
+                .iter()
+                .all(|file| !file.path.starts_with(other_directory)),
             "{changed:?}"
         );
     }
@@ -1207,6 +1328,9 @@ mod tests {
         std::fs::write(root.join("new.txt"), "fresh").expect("add");
         std::fs::create_dir_all(root.join(".git")).expect("git");
         std::fs::write(root.join(".git").join("HEAD"), "ref").expect("hidden");
+        // Spec 0009 R6: the snapshot store is not project content.
+        std::fs::create_dir_all(root.join(".fanta/history.git")).expect("history");
+        std::fs::write(root.join(".fanta/history.git/HEAD"), "ref").expect("history");
 
         let changed = changeset(&loaded, root).expect("changeset");
         assert_eq!(

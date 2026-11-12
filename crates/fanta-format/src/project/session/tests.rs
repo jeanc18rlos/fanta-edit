@@ -32,7 +32,7 @@ fn page_fixture() -> (tempfile::TempDir, NodeId) {
     child.parent = Some(page);
     child.transform = Transform2D::translation(10.0, 20.0);
     doc.scene.insert(child).unwrap();
-    crate::write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+    crate::write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
     (dir, page)
 }
 
@@ -65,7 +65,7 @@ fn incremental_save_fixture() -> (tempfile::TempDir, Doc, NodeId, NodeId, NodeId
             fanta_doc::ComponentDef::new(component, root, format!("Master {index}")),
         );
     }
-    crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+    crate::write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())
         .expect("initial project");
     let (pages, components) = crate::projected_design_dirs(&document);
     for source in [
@@ -767,7 +767,7 @@ fn session_indexes_the_same_duplicate_component_winner_as_the_reader() {
         component_id,
         ComponentDef::new(component_id, master_id, "Button"),
     );
-    crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+    crate::write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())
         .expect("write project");
     let original = WorkspaceSession::open(directory.path()).expect("open project");
     let old_dir = directory
@@ -1031,7 +1031,7 @@ fn model3d_payloads_survive_an_unrelated_canvas_save_and_reopen() {
         preserved_models.push(model.clone());
         document.scene.insert(model).expect("existing model");
     }
-    crate::write_project_tree(directory.path(), &document, &assets).expect("existing project");
+    crate::write_legacy_project_tree(directory.path(), &document, &assets).expect("existing project");
     let mut workspace = WorkspaceSession::open(directory.path()).expect("index project");
     let artifacts = [
         ArtifactId::Page(edited_page),
@@ -1062,7 +1062,7 @@ fn model3d_payloads_survive_an_unrelated_canvas_save_and_reopen() {
     let preconditions = workspace
         .source_write_preconditions(&document)
         .expect("save preconditions");
-    crate::write_project_tree_cached_with_sources_checked(
+    crate::write_legacy_project_tree_checked(
         directory.path(),
         &document,
         &assets,
@@ -1930,7 +1930,7 @@ fn graphics_bake_component_recreation() {
         .defs
         .insert(cid, ComponentDef::new(cid, master_root, "Button"));
     // write_project_tree classifies component master into components/
-    crate::write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+    crate::write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
     let mut ws = WorkspaceSession::open(dir.path()).unwrap();
     assert!(ws.components.defs.defs.contains_key(&cid));
@@ -2338,7 +2338,7 @@ fn watcher_discovers_created_and_renamed_pages_by_header_id() {
     added_root.name = "Settings".into();
     let added_page = document.scene.insert(added_root).unwrap();
     document.add_page(added_page);
-    crate::write_project_tree(directory.path(), &document, &assets).unwrap();
+    crate::write_legacy_project_tree(directory.path(), &document, &assets).unwrap();
     let created_dir = crate::projected_design_dirs(&document).0[&added_page].clone();
     let created_events = workspace.notify_fs_event(FsEvent::Created {
         path: directory.path().join(&created_dir).join("page.fnx"),
@@ -2357,7 +2357,7 @@ fn watcher_discovers_created_and_renamed_pages_by_header_id() {
         .design_dir
         .clone();
     document.scene.get_mut(existing_page).unwrap().name = "Landing".into();
-    crate::write_project_tree(directory.path(), &document, &assets).unwrap();
+    crate::write_legacy_project_tree(directory.path(), &document, &assets).unwrap();
     let renamed_dir = crate::projected_design_dirs(&document).0[&existing_page].clone();
     assert_ne!(old_dir, renamed_dir);
     let rename_events = workspace.notify_fs_event(FsEvent::Removed {
@@ -2382,7 +2382,7 @@ fn fresh_disk_snapshot_applies_changed_page_and_shared_metadata() {
     let mut running_document = document.clone_for_persist();
     document.scene.get_mut(page).unwrap().name = "Agent Home".into();
     document.metadata.title = "Agent Project".into();
-    crate::write_project_tree(directory.path(), &document, &assets).unwrap();
+    crate::write_legacy_project_tree(directory.path(), &document, &assets).unwrap();
 
     let mut fresh = WorkspaceSession::open(directory.path()).unwrap();
     let report = fresh.reconcile_from_disk_snapshot(&baseline).unwrap();
@@ -2425,7 +2425,7 @@ fn invalid_shared_json_preserves_incremental_state_until_source_is_repaired() {
     );
     document.active_modes.insert(collection, mode);
     document.metadata.title = "Last valid project".into();
-    crate::write_project_tree(directory.path(), &document, &assets).expect("shared state");
+    crate::write_legacy_project_tree(directory.path(), &document, &assets).expect("shared state");
     let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
     let baseline = workspace.disk_snapshot();
     let original_document = serde_json::to_value(&document).expect("document snapshot");
@@ -2521,7 +2521,7 @@ fn fresh_disk_snapshot_requests_full_reload_for_flow_change() {
     let (mut document, assets) = crate::read_project_tree(directory.path()).unwrap();
     let mut running_document = document.clone_for_persist();
     document.flow_start = Some(page);
-    crate::write_project_tree(directory.path(), &document, &assets).unwrap();
+    crate::write_legacy_project_tree(directory.path(), &document, &assets).unwrap();
 
     let mut fresh = WorkspaceSession::open(directory.path()).unwrap();
     let report = fresh.reconcile_from_disk_snapshot(&baseline).unwrap();
@@ -2598,7 +2598,7 @@ fn cached_source_preconditions_reject_external_edit_at_writer() {
     assert!(preconditions[&source_path].is_some());
     let mut cache = crate::ProjectWriteCache::default();
     assert!(
-        crate::write_project_tree_cached_with_sources_checked(
+        crate::write_legacy_project_tree_checked(
             directory.path(),
             &document,
             &assets,
@@ -2645,7 +2645,7 @@ fn canvas_save_keeps_unopened_authored_source_without_projecting_it() {
     let second_page = document.scene.insert(second_root).expect("second root");
     document.add_page(second_page);
     let assets = BTreeMap::new();
-    crate::write_project_tree(directory.path(), &document, &assets).expect("initial write");
+    crate::write_legacy_project_tree(directory.path(), &document, &assets).expect("initial write");
 
     let indexed = WorkspaceSession::open(directory.path()).expect("index project");
     let second_source = indexed.artifacts[&ArtifactId::Page(second_page)]
@@ -2687,7 +2687,7 @@ fn canvas_save_keeps_unopened_authored_source_without_projecting_it() {
     assert!(preconditions.contains_key(&second_source));
 
     let mut cache = crate::ProjectWriteCache::default();
-    let report = crate::write_project_tree_cached_with_sources_checked(
+    let report = crate::write_legacy_project_tree_checked(
         directory.path(),
         &document,
         &assets,
@@ -2759,7 +2759,7 @@ fn checked_canvas_save_migrates_indexed_legacy_nodes() {
     std::fs::write(directory.path().join(&node_path), b"{}\n").expect("external edit");
     let mut cache = crate::ProjectWriteCache::default();
     assert!(
-        crate::write_project_tree_cached_with_sources_checked(
+        crate::write_legacy_project_tree_checked(
             directory.path(),
             &document,
             &assets,
@@ -2771,7 +2771,7 @@ fn checked_canvas_save_migrates_indexed_legacy_nodes() {
     );
     std::fs::write(directory.path().join(&node_path), original).expect("restore indexed node");
 
-    let report = crate::write_project_tree_cached_with_sources_checked(
+    let report = crate::write_legacy_project_tree_checked(
         directory.path(),
         &document,
         &assets,
@@ -2793,7 +2793,7 @@ fn checked_canvas_save_migrates_indexed_legacy_nodes() {
 }
 
 #[test]
-fn session_skips_headerless_design_dirs_but_rejects_malformed_headers() {
+fn session_skips_headerless_design_dirs_and_leaves_out_malformed_headers() {
     let (directory, page) = page_fixture();
     let notes = directory.path().join("pages/hand-notes");
     std::fs::create_dir_all(&notes).unwrap();
@@ -2805,7 +2805,15 @@ fn session_skips_headerless_design_dirs_but_rejects_malformed_headers() {
         .design_dir
         .join("page.json");
     std::fs::write(directory.path().join(header), b"{bad json").unwrap();
-    assert!(WorkspaceSession::open(directory.path()).is_err());
+    // Spec 0009 R11: the page is left out and reported, not a failed open.
+    let workspace = WorkspaceSession::open(directory.path()).unwrap();
+    assert_eq!(workspace.list_pages(), Vec::new());
+    assert!(
+        workspace
+            .open_warnings
+            .iter()
+            .any(|finding| finding.code == crate::DESIGN_UNAVAILABLE)
+    );
 }
 
 #[test]
@@ -2841,7 +2849,7 @@ fn component_definition_root_cannot_rebind_an_unchanged_master() {
         component_id,
         fanta_doc::ComponentDef::new(component_id, root, "Button"),
     );
-    crate::write_project_tree(directory.path(), &document, &BTreeMap::new()).unwrap();
+    crate::write_legacy_project_tree(directory.path(), &document, &BTreeMap::new()).unwrap();
     let relative = crate::projected_design_dirs(&document).1[&component_id].join("def.json");
     let path = directory.path().join(relative);
     let mut definition: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -2875,7 +2883,7 @@ fn canvas_save_adopts_a_component_master_placed_on_a_page() {
         component_id,
         ComponentDef::new(component_id, master_id, "Button"),
     );
-    crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+    crate::write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())
         .expect("write project");
 
     let mut workspace = WorkspaceSession::open(directory.path()).expect("open project");
@@ -2982,7 +2990,7 @@ fn adopting_an_edit_patches_only_the_edited_node() {
         child.parent = Some(page);
         children.push(document.scene.insert(child).expect("child"));
     }
-    crate::write_project_tree(directory.path(), &document, &BTreeMap::new()).expect("write");
+    crate::write_legacy_project_tree(directory.path(), &document, &BTreeMap::new()).expect("write");
 
     let mut workspace = WorkspaceSession::open(directory.path()).expect("open project");
     let id = ArtifactId::Page(page);
@@ -3048,7 +3056,7 @@ fn a_non_finite_transform_never_makes_a_project_unreadable() {
     broken.parent = Some(page);
     broken.transform = Transform2D::from_components([f64::NAN; 6]);
     let broken = document.scene.insert(broken).expect("degenerate node");
-    crate::write_project_tree(directory.path(), &document, &BTreeMap::new()).expect("write");
+    crate::write_legacy_project_tree(directory.path(), &document, &BTreeMap::new()).expect("write");
 
     let (loaded, _) = crate::read_project_tree(directory.path()).expect("the project reads back");
     let transform = loaded.scene.get(broken).expect("node survives").transform;
@@ -3174,7 +3182,7 @@ fn shared_reference_fixture() -> SharedReferenceFixture {
         .scene
         .insert(nested_node)
         .expect("bound nested instance");
-    crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+    crate::write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())
         .expect("write fixture");
     SharedReferenceFixture {
         directory,
@@ -3602,7 +3610,7 @@ fn full_document_source_overrides_refuse_reference_alias_drift_before_writing() 
         let save = (|| -> Result<(), SessionError> {
             let sources = workspace.validated_source_overrides_for_document(&fixture.document)?;
             let preconditions = workspace.source_write_preconditions(&fixture.document)?;
-            crate::write_project_tree_cached_with_sources_checked(
+            crate::write_legacy_project_tree_checked(
                 fixture.directory.path(),
                 &fixture.document,
                 &BTreeMap::new(),
@@ -3695,7 +3703,7 @@ fn retained_reference_alias_reuse_cannot_change_ids_through_an_artifact_save() {
         .get_mut(instance)
         .expect("placement")
         .name = "After alias reuse".into();
-    crate::write_project_tree(
+    crate::write_legacy_project_tree(
         fixture.directory.path(),
         &fixture.document,
         &BTreeMap::new(),
@@ -3983,7 +3991,7 @@ fn pending_layout_cold_read_marks_only_authored_geometry_omissions() {
             group.local_size = Some([120.0, 40.0]);
         }
     }
-    crate::write_project_tree(directory.path(), &document, &assets)
+    crate::write_legacy_project_tree(directory.path(), &document, &assets)
         .expect("write complete geometry");
     let (reopened, _) = crate::read_project_tree(directory.path()).expect("complete project");
     assert!(
@@ -4058,7 +4066,7 @@ fn pending_layout_incremental_source_replacement_transfers_and_clears_seeds() {
             group.local_size = Some([120.0, 40.0]);
         }
     }
-    crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+    crate::write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())
         .expect("save complete geometry");
     let mut workspace = WorkspaceSession::open(directory.path()).expect("complete workspace");
     let (result, document) = workspace
@@ -4084,7 +4092,7 @@ fn pending_layout_saved_zero_geometry_does_not_request_relayout() {
     let mut text = CanvasNode::new(NodeData::Text(text));
     text.parent = Some(frame);
     document.scene.insert(text).expect("zero text");
-    crate::write_project_tree(directory.path(), &document, &assets).expect("write zero geometry");
+    crate::write_legacy_project_tree(directory.path(), &document, &assets).expect("write zero geometry");
     let (reopened, _) = crate::read_project_tree(directory.path()).expect("read zero geometry");
     assert!(reopened.pending_layout.is_empty());
     assert_eq!(
@@ -4135,7 +4143,7 @@ fn pending_layout_unsized_page_root_preserves_complete_child_geometry() {
         counter_sizing: fanta_doc::AxisSizing::Hug,
         ..Default::default()
     });
-    crate::write_project_tree(directory.path(), &document, &assets)
+    crate::write_legacy_project_tree(directory.path(), &document, &assets)
         .expect("write auto-layout page");
     let (complete, _) = crate::read_project_tree(directory.path()).expect("read auto-layout page");
     assert!(complete.pending_layout.is_empty());
@@ -4188,7 +4196,7 @@ fn accept_written_sources_rejects_post_write_changes_without_advancing_any_index
                 let edited = *pages.first().expect("edited page");
                 let unopened = *pages.last().expect("unopened page");
                 let assets = BTreeMap::new();
-                crate::write_project_tree(directory.path(), &document, &assets)
+                crate::write_legacy_project_tree(directory.path(), &document, &assets)
                     .expect("initial project");
                 let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
                 let edited_id = ArtifactId::Page(edited);
@@ -4211,7 +4219,7 @@ fn accept_written_sources_rejects_post_write_changes_without_advancing_any_index
                 let preconditions = workspace
                     .source_write_preconditions(&document)
                     .expect("write preconditions");
-                let report = crate::write_project_tree_cached_with_sources_checked(
+                let report = crate::write_legacy_project_tree_checked(
                     directory.path(),
                     &document,
                     &assets,
@@ -4381,7 +4389,7 @@ fn accept_written_sources_after_conflict_matches_a_fresh_disk_index() {
         let preconditions = workspace
             .source_write_preconditions(&document)
             .expect("resolved preconditions");
-        let report = crate::write_project_tree_cached_with_sources_checked(
+        let report = crate::write_legacy_project_tree_checked(
             directory.path(),
             &document,
             &BTreeMap::new(),
@@ -4422,7 +4430,7 @@ fn accept_written_sources_hashing_benchmark() {
         let page = document.scene.insert(root).expect("page");
         document.add_page(page);
     }
-    crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+    crate::write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())
         .expect("write benchmark");
     let indexed = WorkspaceSession::open(directory.path()).expect("initial index");
     let comment = format!("// {}\n", "retained authored source ".repeat(683));
@@ -4439,7 +4447,7 @@ fn accept_written_sources_hashing_benchmark() {
     let preconditions = workspace
         .source_write_preconditions(&document)
         .expect("preconditions");
-    let report = crate::write_project_tree_cached_with_sources_checked(
+    let report = crate::write_legacy_project_tree_checked(
         directory.path(),
         &document,
         &BTreeMap::new(),
@@ -4572,7 +4580,7 @@ fn artifact_ownership_fixture(nested_master: bool) -> ArtifactOwnershipFixture {
         fanta_doc::AssetId::new(),
         b"unchanged asset control".to_vec(),
     )]);
-    crate::write_project_tree(directory.path(), &document, &assets).expect("initial project");
+    crate::write_legacy_project_tree(directory.path(), &document, &assets).expect("initial project");
     let master_page_source =
         crate::locate_page_source(directory.path(), masters).expect("master page source");
     let source = std::fs::read_to_string(&master_page_source).expect("master page FNX");
@@ -4674,7 +4682,7 @@ fn artifact_ownership_structural_whole_project_save_preserves_unrelated_master_s
     let preconditions = workspace
         .source_write_preconditions(&fixture.document)
         .expect("disk guards");
-    crate::write_project_tree_cached_with_sources_checked(
+    crate::write_legacy_project_tree_checked(
         fixture.directory.path(),
         &fixture.document,
         &fixture.assets,
@@ -4940,7 +4948,7 @@ fn artifact_ownership_untouched_unknown_attributes_and_comments_survive_property
     let preconditions = workspace
         .source_write_preconditions(&fixture.document)
         .expect("preconditions");
-    crate::write_project_tree_cached_with_sources_checked(
+    crate::write_legacy_project_tree_checked(
         fixture.directory.path(),
         &fixture.document,
         &fixture.assets,
@@ -5309,7 +5317,7 @@ fn structural_source_fixture(
     destination.parent = Some(page);
     destination.name = "Destination".into();
     let destination = document.scene.insert(destination).expect("destination");
-    crate::write_project_tree(directory.path(), &document, &assets).expect("canonical fixture");
+    crate::write_legacy_project_tree(directory.path(), &document, &assets).expect("canonical fixture");
     let path = crate::locate_page_source(directory.path(), page).expect("source path");
     let mut source = std::fs::read_to_string(&path).expect("source");
     if future_fields {
@@ -5645,7 +5653,7 @@ fn structural_source_fields_host_adoption_preserves_future_fields_but_removes_kn
     let preconditions = workspace
         .source_write_preconditions(&document)
         .expect("preconditions");
-    crate::write_project_tree_cached_with_sources_checked(
+    crate::write_legacy_project_tree_checked(
         directory.path(),
         &document,
         &assets,
@@ -6020,7 +6028,7 @@ fn structural_source_fields_instance_and_bitmap_defaults_allow_delete_but_future
             node.parent = Some(page);
             let target = node.id;
             document.scene.insert(node.clone()).expect("target");
-            crate::write_project_tree(directory.path(), &document, &assets).expect("project");
+            crate::write_legacy_project_tree(directory.path(), &document, &assets).expect("project");
             let path = crate::locate_page_source(directory.path(), page).expect("source path");
             let source = std::fs::read_to_string(&path).expect("source");
             let identity = format!("id=\"{}\"", target.0);
@@ -6159,7 +6167,7 @@ fn structural_source_type_conversion_case(kind: &str, shared_adoption: bool) {
     original.parent = Some(page);
     let target = original.id;
     document.scene.insert(original.clone()).expect("target");
-    crate::write_project_tree(directory.path(), &document, &assets).expect("project");
+    crate::write_legacy_project_tree(directory.path(), &document, &assets).expect("project");
     let path = crate::locate_page_source(directory.path(), page).expect("source");
     let source = std::fs::read_to_string(&path).expect("source");
     let identity = format!("id=\"{}\"", target.0);

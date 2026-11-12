@@ -1,0 +1,7 @@
+[
+  {
+    "code": "manifest.file_missing",
+    "file": "pages/home/nodes.json",
+    "severity": "error"
+  }
+]

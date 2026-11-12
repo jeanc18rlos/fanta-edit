@@ -6,7 +6,7 @@ use fanta_doc::{
     VarValue, VariantAxis, resolved_component_root,
 };
 use fanta_format::{
-    ArtifactDirty, ArtifactId, ClosePolicy, SaveResult, WorkspaceSession, write_project_tree,
+    ArtifactDirty, ArtifactId, ClosePolicy, SaveResult, WorkspaceSession, write_legacy_project_tree,
 };
 use std::collections::BTreeMap;
 use tempfile::tempdir;
@@ -30,7 +30,7 @@ fn page_doc() -> (Doc, fanta_doc::NodeId) {
 fn open_workspace_indexes_pages_without_loading_scene() {
     let dir = tempdir().unwrap();
     let (doc, page) = page_doc();
-    write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
     let session = WorkspaceSession::open(dir.path()).unwrap();
     assert!(session.list_pages().contains(&ArtifactId::Page(page)));
@@ -41,7 +41,7 @@ fn open_workspace_indexes_pages_without_loading_scene() {
 fn open_page_tab_loads_scoped_scene() {
     let dir = tempdir().unwrap();
     let (doc, page) = page_doc();
-    write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
     let mut session = WorkspaceSession::open(dir.path()).unwrap();
     let id = ArtifactId::Page(page);
@@ -166,7 +166,7 @@ fn render_snapshot_loads_selected_component_set_member_and_nested_master() {
     page_instance.parent = Some(page);
     let page_instance_id = doc.scene.insert(page_instance).unwrap();
 
-    write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
     let mut session = WorkspaceSession::open(dir.path()).unwrap();
     let page_id = ArtifactId::Page(page);
@@ -220,7 +220,7 @@ fn render_snapshot_loads_selected_component_set_member_and_nested_master() {
 fn canvas_op_marks_dirty_without_writing_disk() {
     let dir = tempdir().unwrap();
     let (doc, page) = page_doc();
-    write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
     let mut session = WorkspaceSession::open(dir.path()).unwrap();
     let id = ArtifactId::Page(page);
@@ -262,7 +262,7 @@ fn canvas_op_marks_dirty_without_writing_disk() {
 fn save_writes_only_that_page_and_clears_dirty() {
     let dir = tempdir().unwrap();
     let (doc, page) = page_doc();
-    write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
     let mut session = WorkspaceSession::open(dir.path()).unwrap();
     let id = ArtifactId::Page(page);
@@ -302,7 +302,7 @@ fn save_writes_only_that_page_and_clears_dirty() {
 fn save_noop_when_hash_matches() {
     let dir = tempdir().unwrap();
     let (doc, page) = page_doc();
-    write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
     let mut session = WorkspaceSession::open(dir.path()).unwrap();
     let id = ArtifactId::Page(page);
@@ -318,7 +318,7 @@ fn save_noop_when_hash_matches() {
 fn hash_equal_fs_event_is_noop() {
     let dir = tempdir().unwrap();
     let (doc, page) = page_doc();
-    write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
     let mut session = WorkspaceSession::open(dir.path()).unwrap();
     let id = ArtifactId::Page(page);
@@ -341,7 +341,7 @@ fn hash_equal_fs_event_is_noop() {
 fn second_open_returns_same_session() {
     let dir = tempdir().unwrap();
     let (doc, page) = page_doc();
-    write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
     let mut session = WorkspaceSession::open(dir.path()).unwrap();
     let id = ArtifactId::Page(page);
@@ -367,7 +367,7 @@ fn second_open_returns_same_session() {
 fn close_discard_drops_dirty() {
     let dir = tempdir().unwrap();
     let (doc, page) = page_doc();
-    write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
     let mut session = WorkspaceSession::open(dir.path()).unwrap();
     let id = ArtifactId::Page(page);
@@ -392,7 +392,7 @@ fn close_discard_drops_dirty() {
 fn text_edit_path_marks_dirty_text() {
     let dir = tempdir().unwrap();
     let (doc, page) = page_doc();
-    write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
     let mut session = WorkspaceSession::open(dir.path()).unwrap();
     let id = ArtifactId::Page(page);
@@ -417,7 +417,7 @@ fn concurrent_two_pages_independent_sessions() {
     p2.name = "P2".into();
     let page2 = doc.scene.insert(p2).unwrap();
     doc.add_page(page2);
-    write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
     let mut session = WorkspaceSession::open(dir.path()).unwrap();
     let a = ArtifactId::Page(page1);
@@ -450,7 +450,7 @@ fn concurrent_two_pages_independent_sessions() {
 fn golden_session_save_then_monodoc_read() {
     let dir = tempdir().unwrap();
     let (doc, page) = page_doc();
-    write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
     let mut session = WorkspaceSession::open(dir.path()).unwrap();
     let id = ArtifactId::Page(page);
@@ -484,7 +484,7 @@ fn golden_session_save_then_monodoc_read() {
 fn graphics_create_open_save_round_trip() {
     let dir = tempdir().unwrap();
     let (doc, _) = page_doc();
-    write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
     let mut session = WorkspaceSession::open(dir.path()).unwrap();
     let gid = session.create_graphics_artifact("icons", "Icons").unwrap();
@@ -523,7 +523,7 @@ fn workspace_apply_var_op_marks_dirty_shared() {
     use fanta_doc::{Mode, ModeId, VariableCollection, VariableCollectionId};
     let dir = tempdir().unwrap();
     let (doc, _) = page_doc();
-    write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
     let mut session = WorkspaceSession::open(dir.path()).unwrap();
     let mid = ModeId::new();
     session
