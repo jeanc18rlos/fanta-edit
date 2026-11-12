@@ -1635,6 +1635,13 @@ impl project::ProjectItem for FigItem {
                             if adopting_import && let Some(warning) = import_warning {
                                 crate::view::show_canvas_notice_deferred(warning, cx);
                             }
+                            if let Some(notice) = this
+                                .workspace_session
+                                .as_ref()
+                                .and_then(|session| unavailable_designs_notice(&session.open_warnings))
+                            {
+                                crate::view::show_unavailable_designs_notice_deferred(notice, cx);
+                            }
                         }) {
                             log::debug!("dropping loaded update for closed .fig item: {error:#}");
                             return;
@@ -4436,6 +4443,22 @@ pub(crate) fn load_project_document(root: &Path) -> Result<FigDocument> {
     let mut document = FigDocument::from_doc(doc, assets);
     document.prewarm_default_page_assets();
     Ok(document)
+}
+
+/// What to tell the user about designs the load left out (spec 0009 R11).
+fn unavailable_designs_notice(findings: &[fanta_format::SourceDiagnostic]) -> Option<String> {
+    let designs: Vec<&str> = findings
+        .iter()
+        .filter(|finding| finding.code == fanta_format::DESIGN_UNAVAILABLE)
+        .filter_map(|finding| finding.file.as_deref())
+        .collect();
+    if designs.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Not loaded, because a file in it does not parse: {}. Saving leaves these folders as they are. Run fanta-check on the project to see what to repair.",
+        designs.join(", ")
+    ))
 }
 
 fn load_project_document_with_session(
@@ -8881,6 +8904,76 @@ mod tests {
 
     /// A document with a single (empty) page, so a save writes a `pages/<id>/`
     /// subtree instead of pruning the empty `pages/` directory.
+    /// Spec 0009 A10: a page whose SVG holds merge-conflict markers opens as
+    /// unavailable, and its files are unchanged after a save, also once the
+    /// editor has replaced its session.
+    #[gpui::test]
+    async fn a_page_with_conflict_markers_opens_unavailable_and_survives_saves(
+        cx: &mut TestAppContext,
+    ) {
+        let project = empty_project(cx).await;
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("project");
+        let mut doc = doc_with_one_page();
+        let kept = doc.active_page().expect("page");
+        let mut second = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+        second.name = "Broken".to_owned();
+        let broken = second.id;
+        doc.apply(Operation::create_node(second)).expect("second page");
+        doc.add_page(broken);
+        write_project(directory.path(), &doc, &BTreeMap::new()).expect("initial project");
+        let folder = fanta_format::locate_page_source(directory.path(), broken)
+            .expect("page source")
+            .parent()
+            .expect("page folder")
+            .to_path_buf();
+        std::fs::write(
+            folder.join("page.svg"),
+            "<<<<<<< HEAD\n<svg/>\n=======\n>>>>>>> theirs\n",
+        )
+        .expect("conflicted page");
+        let files = |folder: &Path| -> BTreeMap<PathBuf, Vec<u8>> {
+            std::fs::read_dir(folder)
+                .expect("page folder")
+                .map(|entry| entry.expect("entry").path())
+                .map(|path| (path.clone(), std::fs::read(&path).expect("page file")))
+                .collect()
+        };
+        let hostile = files(&folder);
+
+        let (loaded, _, session) =
+            fanta_format::WorkspaceSession::open_project_document(directory.path())
+                .expect("a project with a conflicted page opens");
+        assert_eq!(loaded.pages(), [kept]);
+        let notice = unavailable_designs_notice(&session.open_warnings).expect("notice");
+        assert!(notice.contains("pages/broken"), "{notice}");
+
+        let item = ready_item(
+            &project,
+            directory.path().join("fanta.json"),
+            Some(directory.path().to_path_buf()),
+            loaded.clone_for_persist(),
+            cx,
+        );
+        item.update(cx, |item, _| {
+            item.workspace_session = Some(session);
+            item.merge_base = Some(loaded.clone_for_persist());
+            item.last_saved_assets = Some(Arc::new(BTreeMap::new()));
+        });
+        for replace_session in [false, true] {
+            if replace_session {
+                item.update(cx, |item, _| item.workspace_session = None);
+            }
+            item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+                .await
+                .expect("save");
+            assert_eq!(files(&folder), hostile, "replaced session: {replace_session}");
+        }
+        let design_css =
+            std::fs::read_to_string(directory.path().join("design.css")).expect("design.css");
+        assert!(!design_css.contains("broken"), "the save did not run: {design_css}");
+    }
+
     fn doc_with_one_page() -> Doc {
         use fanta_doc::{CanvasNode, GroupNode, NodeData};
         let mut doc = Doc::new();

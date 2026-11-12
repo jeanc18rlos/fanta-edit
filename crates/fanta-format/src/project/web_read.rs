@@ -39,6 +39,7 @@ pub(crate) fn apply_web_overlay(
     variables: &Value,
     pending_layout: &mut BTreeSet<NodeId>,
     warnings: &mut Vec<SourceDiagnostic>,
+    unavailable: &BTreeSet<PathBuf>,
 ) -> Result<()> {
     let tokens = TokenTable::new(variables, warnings);
     let mut rules = match source.read_to_string(&dir.join(DESIGN_CSS)) {
@@ -51,6 +52,9 @@ pub(crate) fn apply_web_overlay(
     // indexes it.
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     for path in design_svgs(source, dir)? {
+        if path.parent().is_some_and(|design| unavailable.contains(design)) {
+            continue;
+        }
         let svg = source.read_to_string(&path)?;
         let context = path
             .strip_prefix(dir)

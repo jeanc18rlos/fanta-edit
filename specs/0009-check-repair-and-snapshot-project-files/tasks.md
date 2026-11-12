@@ -12,7 +12,7 @@ request when it merges.
   existing hand-edit tests assert codes where they asserted strings.
 - [x] **T2.** ([#208](https://github.com/jeanc18rlos/fanta-edit/pull/208)) `check_project`, the `fanta-check` binary and the
   hostile-edit corpus (R1, R3, R9's boundary, R10). Verify: A1, A2, A8.
-- [ ] **T3.** Collecting load: a project with errors opens and saves; an
+- [x] **T3.** ([#209](https://github.com/jeanc18rlos/fanta-edit/pull/209)) Collecting load: a project with errors opens and saves; an
   unparsed design is shown as unavailable and its files are left untouched
   by the save (R11). Verify: A10.
 - [ ] **T4.** Snapshot store `project/history.rs`: record, list, restore,

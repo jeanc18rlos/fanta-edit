@@ -24,12 +24,26 @@ assets, and, by projecting the document the way the writer would, files and
 elements that are gone from disk. After a file error the loader's own
 reports are left out, because they echo the cause.
 
-**Collecting load.** Today a file that does not parse returns `Err` and
-aborts the whole load. For the editor to open such a project (R11) the
-reader gains a collecting mode in T3: a design whose SVG, CSS or records
-fail to parse is left out of the document and the load continues. The check
-does not need it, so it moved out of T2 (see "Changes during
-implementation").
+**Collecting load.** Before T3 a design record that did not parse failed
+the whole open, and a design SVG or stylesheet that did not parse was read
+past without a word: the page loaded from its records and the next save
+wrote over the broken file. Now the per-file pass of the check runs when a
+project opens. A page or component folder holding a file that does not
+parse (its header, its records, its SVG or its stylesheet) is left out of
+the document and out of the session's index, and is reported as
+`design.unavailable` with the parse finding beside it.
+
+A save must then not treat the folder as stale. Three things keep it:
+the writer skips folders named by `design.unavailable` findings it is
+handed; every session, also one opened later without a document, carries
+those findings; and before removing any file the writer checks for itself
+whether the file's folder parses. The last one is what holds when a caller
+passes no findings. A new design whose name maps to an unavailable folder
+fails the save instead of writing into it.
+
+A file outside a design folder (`fanta.json`, `doc/*.json`, a set's
+`set.json`) that does not parse still fails the open: there is no design to
+leave out.
 
 **Command.** A `[[bin]]` target `fanta-check` in `fanta-format`
 (`src/check_main.rs`): one path argument and `--json`, parsed from
@@ -119,6 +133,17 @@ pub fn prune(dir: &Path, now: SystemTime) -> Result<()>;  // 30 days, then one p
   `previous_seeds` (`fanta-format/AGENTS.md`).
 
 ## Changes during implementation
+
+- **T3.** The design said the reader gains a collecting mode. Built
+  instead as a pass before the read that names the folders to skip, reusing
+  the check's per-file pass, so the editor and `fanta-check` cannot disagree
+  on what "does not parse" means. Cost: design files are read twice on open.
+- **T3.** Protection moved into the writer and the session. Passing the
+  load's findings to the save was not enough: the editor opens a new
+  session after an outside change, and that session did not have them.
+- **T3.** The editor shows the unavailable designs in a notice when the
+  project opens. A notice after a reload, and the list of findings, come
+  with T6.
 
 - **T2.** The collecting load moved to T3. The check reports broken files
   from its own per-file pass, which gives positions the loader's error does

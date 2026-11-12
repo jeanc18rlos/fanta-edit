@@ -70,7 +70,7 @@ pub use migrate::migrate;
 #[cfg(feature = "native")]
 pub use project::session;
 pub use project::{
-    DIAGNOSTIC_CODES, LOAD_OMITTED_GEOMETRY, SourceDiagnostic, SourceSeverity,
+    DESIGN_UNAVAILABLE, DIAGNOSTIC_CODES, LOAD_OMITTED_GEOMETRY, SourceDiagnostic, SourceSeverity,
     ArtifactAddress, ArtifactMerge, DocMerge, FormatCapabilities, JsonPathSegment, NodeMapEdition,
     PresenceValue,
     ProjectManifest, ProjectWriteCache, PropertyConflict, ScopedDesign, WebDesignReport,

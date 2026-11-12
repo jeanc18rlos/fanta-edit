@@ -89,7 +89,8 @@ pub use read::{
 };
 #[cfg(feature = "native")]
 pub use check::check_project;
-pub use diagnostic::{DIAGNOSTIC_CODES, LOAD_OMITTED_GEOMETRY, SourceDiagnostic, SourceSeverity};
+pub use diagnostic::{
+    DESIGN_UNAVAILABLE, DIAGNOSTIC_CODES, LOAD_OMITTED_GEOMETRY, SourceDiagnostic, SourceSeverity};
 #[cfg(feature = "native")]
 pub use session::{
     ApplyReport, ArtifactDirty, ArtifactId, ArtifactMeta, ArtifactOpImpact, ArtifactRenderRevision,
