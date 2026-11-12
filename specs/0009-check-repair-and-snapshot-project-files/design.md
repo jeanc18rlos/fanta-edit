@@ -147,6 +147,26 @@ impl History {
 
 ## Changes during implementation
 
+- **T5.** The snapshots are taken by the two save functions (the editor's
+  and `fanta-headless`'s), not inside the writer: the writer also serves
+  exports and Save As staging folders, which must not gain a `.fanta`
+  directory.
+- **T5.** "Changed outside Fanta" is decided by git, not by the session's
+  hashes: a snapshot is taken before a save when the files differ from the
+  newest snapshot. Every save ends with one, so a difference is an outside
+  change. A save that changes nothing records nothing.
+- **T5.** Without git the save goes ahead and its report carries
+  `snapshot.unavailable`. Asking before a save that would rewrite an
+  outside change is not built; it belongs with the findings list in T6. The
+  App Store build runs no git and takes no snapshots.
+- **T5.** Restore is a native prompt listing five snapshots at a time, not
+  a picker. It saves first, so unsaved edits are in a snapshot too.
+- **T5.** A3 needed two more cases to open, so the collecting load of T3
+  grew: a design whose `nodes.json` is gone is left out like one that does
+  not parse, and an asset listed in the index with no file is a finding
+  where it used to fail the open. `fanta-check` no longer reports a missing
+  `nodes.json` for a legacy design, which keeps its nodes elsewhere.
+
 - **T4.** The store is a `History` value holding the directory and the git
   binary, not free functions: the editor ships its own git and has to say
   which one to run. A snapshot's id is its time in milliseconds since the

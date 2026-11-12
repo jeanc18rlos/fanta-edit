@@ -36,6 +36,8 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 - `project/history.rs` runs git against `.fanta/history.git` only. Build every command through `History::git`, which sets `GIT_DIR` and `GIT_WORK_TREE` and shuts out the user's configuration; a bare `Command::new("git")` in the project directory acts on the user's repository. (#210)
 - New code that walks a whole project directory must skip `.fanta`, or it reads git objects as project files. Code that reads the named directories (`doc`, `pages`, `components`, `assets`) never reaches it. (#210)
 
+- Take the after-save snapshot only when everything the save writes is on disk, the editor's thumbnail included. `before_save` treats any difference from the newest snapshot as an outside change, so a file written after `after_save` makes every later save record one. (#211)
+
 ## Runtime bundles
 
 - `src/runtime.rs` is the source compiler (`SourceBundle::compile`); the bundle format and `RuntimeProgram` live in `crates/fanta-bundle`, which must stay parser-free. `fanta-runtime`, the WebAssembly player, depends on `fanta-bundle` and never on this crate or `fanta-fnx`: the `fanta-runtime` workflow fails if either appears in its normal dependency tree. Sources are compiled by the `fanta-compile` binary in `crates/fanta-site`, and runtime tests compile fixtures through a dev-dependency.

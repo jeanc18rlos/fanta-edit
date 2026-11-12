@@ -15,6 +15,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{FormatError, Result};
 
+use super::diagnostic::{SNAPSHOT_UNAVAILABLE, SourceDiagnostic};
+
 /// The directory at the project root that holds Fanta's private state. Every
 /// walker of a project directory skips it.
 pub const HISTORY_DIR: &str = ".fanta";
@@ -83,12 +85,46 @@ impl History {
         self.record_at(reason, SystemTime::now())
     }
 
-    fn record_at(&self, reason: SnapshotReason, time: SystemTime) -> Result<Snapshot> {
+    /// Call before a save writes. Records the files only when they differ
+    /// from the newest snapshot: every save ends with one, so a difference
+    /// is a change made outside Fanta, which the save may be about to
+    /// rewrite (R6). A snapshot that cannot be taken never stops the save;
+    /// it comes back as a finding for the save's report.
+    pub fn before_save(&self) -> Option<SourceDiagnostic> {
+        self.record_if_changed(SnapshotReason::BeforeSave).err().map(unavailable)
+    }
+
+    /// Call after a save has written everything, then drop what retention
+    /// no longer keeps.
+    pub fn after_save(&self) -> Option<SourceDiagnostic> {
+        self.record_if_changed(SnapshotReason::AfterSave)
+            .and_then(|_| self.prune(SystemTime::now()))
+            .err()
+            .map(unavailable)
+    }
+
+    fn record_if_changed(&self, reason: SnapshotReason) -> Result<Option<Snapshot>> {
+        if let Some(newest) = self.list()?.first() {
+            let tree = self.stage()?;
+            let name = format!("{SNAPSHOT_REFS}{}^{{tree}}", newest.id);
+            if self.run(self.git().args(["rev-parse", &name]))?.trim() == tree {
+                return Ok(None);
+            }
+        }
+        self.record(reason).map(Some)
+    }
+
+    /// Bring the private index up to the files on disk; returns its tree.
+    fn stage(&self) -> Result<String> {
         self.ensure_repository()?;
         // `-f`: the project's own `.gitignore` must not thin the snapshot, or
         // a restore would not give back what the save changed.
         self.run(self.git().args(["add", "-A", "-f", "--", ".", ":(exclude).fanta"]))?;
-        let tree = self.run(self.git().arg("write-tree"))?;
+        Ok(self.run(self.git().arg("write-tree"))?.trim().to_owned())
+    }
+
+    fn record_at(&self, reason: SnapshotReason, time: SystemTime) -> Result<Snapshot> {
+        let tree = self.stage()?;
         let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
         let date = format!("@{} +0000", since_epoch.as_secs());
         let commit = self.run(
@@ -96,7 +132,7 @@ impl History {
                 .env("GIT_AUTHOR_DATE", &date)
                 .env("GIT_COMMITTER_DATE", &date)
                 .args(["commit-tree", "--no-gpg-sign", "-m", reason.as_str()])
-                .arg(tree.trim()),
+                .arg(&tree),
         )?;
         let taken = since_epoch.as_millis();
         // An empty old value makes `update-ref` fail when the ref exists, so
@@ -304,10 +340,56 @@ impl History {
     }
 }
 
+fn unavailable(error: FormatError) -> SourceDiagnostic {
+    SourceDiagnostic::warning(
+        SNAPSHOT_UNAVAILABLE,
+        format!("no snapshot was taken around this save, so it cannot be undone from the snapshots: {error}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// Spec 0009 R6: a snapshot before a save only when the files changed
+    /// outside Fanta, one after every save that changed something, and a
+    /// missing git never stops a save.
+    #[test]
+    fn saves_are_bracketed_by_snapshots_only_when_something_changed() {
+        let scratch = tempfile::tempdir().unwrap();
+        let project = scratch.path();
+        write(project, "fanta.json", "{}");
+        let history = History::new(project);
+        let reasons = || -> Vec<SnapshotReason> {
+            history.list().unwrap().iter().rev().map(|snapshot| snapshot.reason).collect()
+        };
+        use SnapshotReason::{AfterSave, BeforeSave};
+
+        // The first save of a project records what was there.
+        assert_eq!(history.before_save(), None);
+        write(project, "pages/home/page.svg", "<svg/>");
+        assert_eq!(history.after_save(), None);
+        assert_eq!(reasons(), [BeforeSave, AfterSave]);
+
+        // Nothing changed outside, and the save wrote nothing.
+        assert_eq!(history.before_save(), None);
+        assert_eq!(history.after_save(), None);
+        assert_eq!(reasons(), [BeforeSave, AfterSave]);
+
+        // An outside edit, then a save that rewrites it.
+        write(project, "pages/home/page.svg", "<svg data-hand-edit=\"\"/>");
+        assert_eq!(history.before_save(), None);
+        write(project, "pages/home/page.svg", "<svg/>");
+        assert_eq!(history.after_save(), None);
+        assert_eq!(reasons(), [BeforeSave, AfterSave, BeforeSave, AfterSave]);
+
+        let finding = History::new(project)
+            .with_git("no-such-git-binary")
+            .before_save()
+            .expect("a finding, not a failure");
+        assert_eq!(finding.code, SNAPSHOT_UNAVAILABLE);
+    }
 
     fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
         let mut found = BTreeMap::new();
