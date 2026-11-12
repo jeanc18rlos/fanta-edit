@@ -110,8 +110,8 @@ id = "hosts"
 group = "engine"
 title = "Engine hosts"
 role = "Driving adapters"
-summary = "Deliverables built on the engine without the editor: the cloud worker, the portable runtime, the website exporter and the browser wasm engine."
-crates = ["fanta-engine", "fanta-runtime", "fanta-site", "fanta-wasm-engine"]
+summary = "Deliverables built on the engine without the editor: the cloud worker, the portable runtime, the website exporter, the browser wasm engine and the headless MCP server."
+crates = ["fanta-engine", "fanta-mcp", "fanta-runtime", "fanta-site", "fanta-wasm-engine"]
 may_use = ["application"]
 
 [[layer]]

@@ -55,7 +55,7 @@ flowchart TD
 | Rendering | Engine | Driven adapters | `fanta-render`, `fanta-text` | Text layout and the renderer, both on Skia. |
 | Playback | Engine | Domain services over the renderer | `fanta-present` | Prototype and motion playback over an immutable document. |
 | Application | Engine | Use cases | `fanta-api`, `fanta-headless` | Open, edit, settle, render and save a project without the app, and the programmatic design API over it. |
-| Engine hosts | Engine | Driving adapters | `fanta-engine`, `fanta-runtime`, `fanta-site`, `fanta-wasm-engine` | Deliverables built on the engine without the editor: the cloud worker, the portable runtime, the website exporter and the browser wasm engine. |
+| Engine hosts | Engine | Driving adapters | `fanta-engine`, `fanta-mcp`, `fanta-runtime`, `fanta-site`, `fanta-wasm-engine` | Deliverables built on the engine without the editor: the cloud worker, the portable runtime, the website exporter, the browser wasm engine and the headless MCP server. |
 | Desktop editor | Editor | Driving adapter: the desktop host | `design_surface`, `fanta_languages`, `fanta_ui`, `fig_viewer` | The GPUI canvas, inspector, panels, live MCP server and the DesignSurface seam. |
 | App | App | Composition root | `fanta` | The `fanta` binary. |
 | Inherited shell | Inherited shell | Platform inherited from Zed | 129 crates | Every workspace crate that no other layer lists. |
@@ -98,6 +98,7 @@ flowchart TD
     end
     subgraph layer_hosts["Engine hosts"]
       crate_fanta_engine["fanta-engine"]
+      crate_fanta_mcp["fanta-mcp"]
       crate_fanta_runtime["fanta-runtime"]
       crate_fanta_site["fanta-site"]
       crate_fanta_wasm_engine["fanta-wasm-engine"]
@@ -135,6 +136,7 @@ flowchart TD
   crate_fanta_headless --> crate_fanta_design_ops
   crate_fanta_headless --> crate_fanta_format
   crate_fanta_headless --> crate_fanta_render
+  crate_fanta_mcp --> crate_fanta_headless
   crate_fanta_present --> crate_fanta_render
   crate_fanta_render --> crate_fanta_canvas
   crate_fanta_render --> crate_fanta_text
@@ -172,20 +174,21 @@ flowchart TD
 
 | Crate | Layer | Description | Depends on | Used by |
 | --- | --- | --- | --- | --- |
-| [`fanta-doc`](../../crates/fanta-doc) | Model | Polymorphic scene graph, CanvasNode enum, undo/redo, selection. Renderer-agnostic. | — | `fanta-api`, `fanta-bundle`, `fanta-canvas`, `fanta-engine`, `fanta-fig-interop`, `fanta-format`, `fanta-headless`, `fanta-present`, `fanta-render`, `fanta-runtime`, `fanta-site`, `fanta-text`, `fanta-tools`, `fanta-wasm-engine`, `fig_viewer` |
-| [`fanta-design-ops`](../../crates/fanta-design-ops) | Design-op vocabulary | The design ops, queries and comment drafts agents edit Fanta designs with, shared by the editor and the headless engine. | — | `design_surface`, `fanta-api`, `fanta-engine`, `fanta-headless`, `fanta-wasm-engine` |
+| [`fanta-doc`](../../crates/fanta-doc) | Model | Polymorphic scene graph, CanvasNode enum, undo/redo, selection. Renderer-agnostic. | — | `fanta-api`, `fanta-bundle`, `fanta-canvas`, `fanta-engine`, `fanta-fig-interop`, `fanta-format`, `fanta-headless`, `fanta-mcp`, `fanta-present`, `fanta-render`, `fanta-runtime`, `fanta-site`, `fanta-text`, `fanta-tools`, `fanta-wasm-engine`, `fig_viewer` |
+| [`fanta-design-ops`](../../crates/fanta-design-ops) | Design-op vocabulary | The design ops, queries and comment drafts agents edit Fanta designs with, shared by the editor and the headless engine. | — | `design_surface`, `fanta-api`, `fanta-engine`, `fanta-headless`, `fanta-mcp`, `fanta-wasm-engine` |
 | [`fanta-canvas`](../../crates/fanta-canvas) | Interaction | Viewport (pan/zoom), hit testing, snapping, alignment, distribution. | `fanta-doc` | `fanta-api`, `fanta-headless`, `fanta-present`, `fanta-render`, `fanta-tools`, `fig_viewer` |
 | [`fanta-tools`](../../crates/fanta-tools) | Interaction | Tool state machines — select, marquee, pen, rect, ellipse, line, text, hand. | `fanta-canvas`, `fanta-doc` | `fanta-api`, `fig_viewer` |
 | [`fanta-bundle`](../../crates/fanta-bundle) | Source and import | Runtime bundles: the parser-free program format fanta-runtime loads, written by fanta-compile and fanta-site. | `fanta-doc` | `fanta-format`, `fanta-runtime` |
 | [`fanta-fig-interop`](../../crates/fanta-fig-interop) | Source and import | .fig (Figma) import: Kiwi binary codec, .fig container framing, and node mapping into fanta-doc. | `fanta-doc` | `fig_viewer` |
-| [`fanta-fnx`](../../crates/fanta-fnx) | Source and import | The .fnx design-as-source language: lossless React/JSX-style text <-> the doc's per-node JSON projection, with an id sidecar. | — | `fanta-format`, `fig_viewer` |
-| [`fanta-format`](../../crates/fanta-format) | Source and import | .fant zip container (JSON doc + content-addressed assets), git-native .fnx project tree, schema migrations. | `fanta-bundle`, `fanta-doc`, `fanta-fnx` | `fanta-api`, `fanta-headless`, `fanta-site`, `fanta-wasm-engine`, `fig_viewer`; inherited shell: `workspace` |
+| [`fanta-fnx`](../../crates/fanta-fnx) | Source and import | The .fnx design-as-source language: lossless React/JSX-style text <-> the doc's per-node JSON projection, with an id sidecar. | — | `fanta-format`, `fanta-headless`, `fig_viewer` |
+| [`fanta-format`](../../crates/fanta-format) | Source and import | .fant zip container (JSON doc + content-addressed assets), git-native .fnx project tree, schema migrations. | `fanta-bundle`, `fanta-doc`, `fanta-fnx` | `fanta-api`, `fanta-headless`, `fanta-mcp`, `fanta-site`, `fanta-wasm-engine`, `fig_viewer`; inherited shell: `workspace` |
 | [`fanta-render`](../../crates/fanta-render) | Rendering | Skia raster backend: scene walk, effects, instance/image caches; renders to an owned CPU surface or an externally owned Skia canvas. | `fanta-canvas`, `fanta-doc`, `fanta-text` | `fanta-headless`, `fanta-present`, `fanta-runtime`, `fanta-site`, `fig_viewer` |
 | [`fanta-text`](../../crates/fanta-text) | Rendering | Rich text model + Skia paragraph layout + font resolution (bundled faces, metric-compatible substitution, optional Google Fonts fetch). | `fanta-doc` | `fanta-render`, `fanta-runtime`, `fanta-site`, `fig_viewer` |
 | [`fanta-present`](../../crates/fanta-present) | Playback | Prototype-playback runtime: plays imported Figma prototypes (trigger dispatch, actions, transitions) over an immutable Doc via the Skia renderer. | `fanta-canvas`, `fanta-doc`, `fanta-render` | `fanta-runtime`, `fig_viewer` |
 | [`fanta-api`](../../crates/fanta-api) | Application | Fanta's programmatic design API: create or open a design, edit its nodes, follow its changes and export it without the app. | `fanta-canvas`, `fanta-design-ops`, `fanta-doc`, `fanta-format`, `fanta-headless`, `fanta-tools` | `fanta-engine` |
-| [`fanta-headless`](../../crates/fanta-headless) | Application | Fanta's design engine without the app: open, edit, render and save a project directory. | `fanta-canvas`, `fanta-design-ops`, `fanta-doc`, `fanta-format`, `fanta-render` | `fanta-api`, `fanta-engine`, `fanta-site`, `fanta-wasm-engine`, `fig_viewer` |
+| [`fanta-headless`](../../crates/fanta-headless) | Application | Fanta's design engine without the app: open, edit, render and save a project directory. | `fanta-canvas`, `fanta-design-ops`, `fanta-doc`, `fanta-fnx`, `fanta-format`, `fanta-render` | `fanta-api`, `fanta-engine`, `fanta-mcp`, `fanta-site`, `fanta-wasm-engine`, `fig_viewer` |
 | [`fanta-engine`](../../crates/fanta-engine) | Engine hosts | The cloud engine worker: runs design steps (inspect, edit, comment, render, changeset) on a Fanta project without the app. | `fanta-api`, `fanta-design-ops`, `fanta-doc`, `fanta-headless` | — |
+| [`fanta-mcp`](../../crates/fanta-mcp) | Engine hosts | Fanta's headless MCP server: the app's agent tools over a project directory, no app required (spec 0008 R7). | `fanta-design-ops`, `fanta-doc`, `fanta-format`, `fanta-headless` | — |
 | [`fanta-runtime`](../../crates/fanta-runtime) | Engine hosts | Fanta's portable playback runtime: compiles project sources into runtime programs and plays them natively, over a C JSON bridge or as WebAssembly. | `fanta-bundle`, `fanta-doc`, `fanta-present`, `fanta-render`, `fanta-text` | `fanta-site` |
 | [`fanta-site`](../../crates/fanta-site) | Engine hosts | Project export for the web: fanta-compile writes the runtime bundle fanta-runtime loads, and fanta-site wraps it in a static website with one read-only page per design page. | `fanta-doc`, `fanta-format`, `fanta-headless`, `fanta-render`, `fanta-runtime`, `fanta-text` | — |
 | [`fanta-wasm-engine`](../../crates/fanta-wasm-engine) | Engine hosts | The design engine compiled to browser WebAssembly: load a project's files, apply design ops, emit the saved files (spec 0008 T1). | `fanta-design-ops`, `fanta-doc`, `fanta-format`, `fanta-headless` | — |

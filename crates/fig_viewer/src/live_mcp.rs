@@ -19,7 +19,11 @@ use context_server::types::{
     ServerCapabilities, ToolAnnotations, ToolsCapabilities, VERSION_2024_11_05, VERSION_2025_03_26,
     VERSION_2025_06_18, requests,
 };
-use design_surface::{DesignOp, MAX_JSON_RESPONSE_BYTES, NodeQuery, ScreenshotTarget};
+use design_surface::{
+    BatchDesignArgs, BatchGetArgs, GetEditorStateArgs, GetGuidelinesArgs, GetScreenshotArgs,
+    ImportImageArgs, ListCommentsArgs, MAX_JSON_RESPONSE_BYTES, NodeQuery, ReadFnxSourceArgs,
+    ReplyCommentArgs, ScreenshotTarget, ValidateFnxSourceArgs, narrowing_hint, slice_source,
+};
 use futures::{AsyncReadExt as _, FutureExt as _};
 use gpui::{App, AppContext as _, AsyncApp, ClipboardItem, Task};
 use http_client::HttpClient as _;
@@ -448,23 +452,6 @@ fn non_destructive_write() -> ToolAnnotations {
     }
 }
 
-/// Import a generated image into the active project's Assets panel and persist
-/// its bytes under assets/images/. Supply exactly one of path (local file,
-/// relative to the project or absolute), url (HTTP/HTTPS), or source (base64 or
-/// a base64 data URI). Returns the asset id and saved path for source file edits.
-/// Use this after image generation, including images made by another MCP
-/// server. Importing an asset does not place a new layer on the canvas.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct ImportImageArgs {
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    source: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-}
 
 #[derive(Clone)]
 struct ImportImageTool;
@@ -567,15 +554,6 @@ impl McpServerTool for ImportImageTool {
     }
 }
 
-/// Read canvas comment threads for design reviews. By default returns unresolved
-/// threads on the active page, including the pin position and existing replies.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
-struct ListCommentsArgs {
-    #[serde(default)]
-    page: Option<usize>,
-    #[serde(default)]
-    include_resolved: bool,
-}
 
 #[derive(Clone)]
 struct ListCommentsTool;
@@ -596,19 +574,6 @@ impl McpServerTool for ListCommentsTool {
     }
 }
 
-/// Reply to a canvas comment as an agent. Use the exact comment id returned by
-/// list_comments, and set resolve only after addressing and verifying the note.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct ReplyCommentArgs {
-    #[serde(default)]
-    page: Option<usize>,
-    id: String,
-    body: String,
-    #[serde(default)]
-    author: Option<String>,
-    #[serde(default)]
-    resolve: bool,
-}
 
 #[derive(Clone)]
 struct ReplyCommentTool;
@@ -700,24 +665,6 @@ impl McpServerTool for ReportActivityTool {
 
 // ---- get_editor_state --------------------------------------------------------
 
-/// Overview of the open Fanta design document: project name and root, pages
-/// (index, name, root id, node counts, source path), the active page
-/// and its content bounds, a bounded component preview, current selection and its bounds,
-/// viewport, whether the canvas is editable right now, and short `hints`.
-/// Pass `empty_space: [width, height]` to also get a free `{x, y}` on the
-/// page for a new top-level frame of that size.
-/// When `more_components` is true, use `get_design_system` with `offset` and
-/// `limit` to discover the remaining components.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
-struct GetEditorStateArgs {
-    /// `[width, height]` of a box to find room for; the result then carries
-    /// `empty_space: {page, x, y, width, height}`.
-    #[serde(default)]
-    empty_space: Option<[f64; 2]>,
-    /// Page index `empty_space` searches (defaults to the active page).
-    #[serde(default)]
-    page: Option<usize>,
-}
 
 #[derive(Clone)]
 struct GetEditorStateTool;
@@ -750,13 +697,6 @@ impl McpServerTool for GetEditorStateTool {
 
 // ---- get_guidelines ----------------------------------------------------------
 
-/// Fanta's design guidelines for agents: coordinate system, frames vs groups,
-/// auto layout, spacing and type scales, naming, components, the working
-/// method (read state, batch ops with a label, screenshot to verify), and when
-/// to edit source files instead of the canvas. Read once per session before
-/// designing.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
-struct GetGuidelinesArgs {}
 
 #[derive(Clone)]
 struct GetGuidelinesTool;
@@ -828,65 +768,6 @@ impl McpServerTool for PrepareDesignAssetTool {
 
 // ---- batch_get ---------------------------------------------------------------
 
-/// Read nodes from the open design document: pass `ids` for full node detail,
-/// or omit them to list a page's node tree in compact form (`page` defaults to
-/// the active page; `depth` limits recursion; `include_geometry` adds world
-/// bounding boxes). A listing returns at most `limit` (default 200) of the
-/// page's direct children starting at `offset`, and reports `child_count`,
-/// `children_offset`, `children_limit` and `more_children`: page through a
-/// wide page by calling again with `offset` advanced. A result over 262144
-/// bytes is refused rather than truncated.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
-struct BatchGetArgs {
-    /// Fetch these node ids in full detail.
-    #[serde(default)]
-    ids: Option<Vec<String>>,
-    /// Page index to list when `ids` is omitted.
-    #[serde(default)]
-    page: Option<usize>,
-    /// How many levels of children to include below each listed node.
-    /// Defaults to 2 when listing a page, because an imported `.fig` page can
-    /// hold tens of thousands of nodes. A node cut off by the limit reports
-    /// `child_count` instead of `children`: re-request it by id to go deeper.
-    #[serde(default)]
-    depth: Option<u32>,
-    /// Include world-space bounding boxes.
-    #[serde(default)]
-    include_geometry: bool,
-    /// How many of the page's direct children to skip before listing any
-    /// (default 0). Applies to the listed page's own children only; nested
-    /// levels are governed by `depth`. Ignored when `ids` is given.
-    #[serde(default)]
-    offset: Option<usize>,
-    /// How many of the page's direct children to list, starting at `offset`
-    /// (default 200). Applies to the listed page's own children only; nested
-    /// levels are governed by `depth`. When the result says `more_children`,
-    /// call again with `offset` advanced by this limit. Ignored when `ids` is
-    /// given.
-    #[serde(default)]
-    limit: Option<usize>,
-    /// `summary`, `style` or `raw`. With `ids` the default is `style`: the
-    /// node's editable style in the ops' own vocabulary (send a value back in
-    /// an op unchanged); `raw` is the internal record. A page listing defaults
-    /// to `summary`; `style` merges each listed node's style into it.
-    #[serde(default)]
-    detail: Option<design_surface::NodeDetail>,
-}
-
-/// How a caller narrows a result that overran [`MAX_JSON_RESPONSE_BYTES`].
-/// A listing must be told about `offset`/`limit` first: the caller may already
-/// be at `depth: 1` with no geometry, and cannot pass `ids` it has not been
-/// able to list.
-fn narrowing_hint(listing: bool) -> &'static str {
-    if listing {
-        "Narrow it: page the children with `limit` and `offset` (e.g. `limit: 50`, then \
-         `offset: 50` for the next window), and if that is still too large lower `depth` \
-         (try 1) or set `include_geometry` to false."
-    } else {
-        "Narrow it: ask for fewer `ids` per call, or set `include_geometry` to false."
-    }
-}
-
 #[derive(Clone)]
 struct BatchGetTool;
 
@@ -921,36 +802,6 @@ impl McpServerTool for BatchGetTool {
 
 // ---- batch_design ------------------------------------------------------------
 
-/// Apply a batch of design ops to the open canvas as ONE undoable
-/// transaction. Ops: create_node (frame/rectangle/ellipse/text), create_image
-/// (base64 source), create_instance (of a component, by id or unique name),
-/// set_props (name/position/size/opacity/fill/corner_radius/text/hidden/
-/// locked), set_stroke, set_shadow, set_text_style, set_auto_layout,
-/// set_index (z-order), rotate, align, distribute, group, frame_selection,
-/// ungroup, duplicate, create_component, reparent, delete, select,
-/// set_viewport, set_layout_child, create_variable_collection, add_variable_mode,
-/// create_variable, set_variable_value, set_variable_mode, bind_variable,
-/// unbind_variable, combine_variants, create_component_property,
-/// bind_component_property, set_instance_property. Read get_design_system first.
-/// Coordinates are world px, y down, x/y = top-left; ids are
-/// exact node ids. If any op fails the whole batch rolls back and the result
-/// names the failing op; created ids come back in `created`. Gradients,
-/// per-run rich text are not ops yet: for those, edit the page's nodes.json
-/// records with your own file tools, and the canvas reloads (the change
-/// is a git diff). Pass activity with the same stable mage name and agent_id
-/// used in report_agent_activity so the user can follow each streamed step.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct BatchDesignArgs {
-    /// The ops to apply, in order.
-    ops: Vec<DesignOp>,
-    /// Undo-history label for the batch (e.g. "Add login card").
-    #[serde(default)]
-    label: Option<String>,
-    /// Agent identity for the streamed steps. Reuse agent_id and agent_name
-    /// from report_agent_activity; action and location update per operation.
-    #[serde(default)]
-    activity: Option<design_surface::AgentActivity>,
-}
 
 #[derive(Clone)]
 struct BatchDesignTool;
@@ -987,27 +838,6 @@ impl McpServerTool for BatchDesignTool {
 
 // ---- get_screenshot ----------------------------------------------------------
 
-/// Render a PNG screenshot of the open design canvas: the active page by
-/// default, another page via `page`, or a single node's region via `node`.
-/// Returned as MCP image content.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
-struct GetScreenshotArgs {
-    /// Page index to render (defaults to the active page).
-    #[serde(default)]
-    page: Option<usize>,
-    /// Render only this node's region of its page.
-    #[serde(default)]
-    node: Option<String>,
-    /// Cap on the longer output dimension in pixels (default 1024).
-    #[serde(default)]
-    max_dimension: Option<u32>,
-    /// Exact animation clip id from get_editor_state.motion_clips.
-    #[serde(default)]
-    motion_clip: Option<String>,
-    /// Time in milliseconds to sample (defaults to zero when a clip is given).
-    #[serde(default)]
-    playhead_ms: Option<u32>,
-}
 
 #[derive(Clone)]
 struct GetScreenshotTool;
@@ -1045,197 +875,6 @@ impl McpServerTool for GetScreenshotTool {
 
 // ---- read_fnx_source ---------------------------------------------------------
 
-/// List the open Fanta project's design source files (omit `path`), or return
-/// one file's text (e.g. `pages/<slug>/page.svg`). Edit sources with your own file
-/// tools; while the project is open in Fanta the canvas hot-reloads about
-/// 300ms after a save, and otherwise the edit is picked up the next time it is
-/// opened.
-///
-/// A page imported from a `.fig` runs to tens of megabytes, so a file is
-/// returned in slices: at most 65536 bytes by default, starting at line
-/// `offset`. The result always carries `total_bytes`, `total_lines` and
-/// `truncated`, and a truncated result carries a `notice` naming the exact
-/// arguments for the next slice. Never assume a slice is the whole file.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
-struct ReadFnxSourceArgs {
-    /// Project-relative source path; omit to list the source files.
-    #[serde(default)]
-    path: Option<String>,
-    /// 1-based line to start at (default 1).
-    #[serde(default)]
-    offset: Option<usize>,
-    /// Maximum number of lines to return.
-    #[serde(default)]
-    limit: Option<usize>,
-    /// Maximum bytes of file text to return (default 65536, ceiling 1048576).
-    #[serde(default)]
-    max_bytes: Option<usize>,
-}
-
-/// Default cap on the file text one `read_fnx_source` call returns. One page
-/// of a 9.6 MB `.fig` is over 43 million characters, which no MCP client will
-/// carry and no model can read; 64 KiB is roughly 16k tokens, small enough to
-/// sit in a tool result next to everything else an agent is holding, and large
-/// enough for 31 lines of that page — a whole frame's worth of `.fnx`.
-const DEFAULT_SOURCE_BYTES: usize = 64 * 1024;
-
-/// Ceiling on `max_bytes`, so a caller cannot ask for a response that breaks
-/// its own transport.
-const MAX_SOURCE_BYTES: usize = 1024 * 1024;
-
-/// One slice of a source file, with everything the model needs to know that it
-/// is holding a slice and how to ask for the rest.
-#[derive(Debug, PartialEq, Eq)]
-struct SourceSlice {
-    text: String,
-    /// 1-based line number of the first returned line; 0 when nothing was
-    /// returned.
-    first_line: usize,
-    /// 1-based, inclusive line number of the last returned line; 0 when
-    /// nothing was returned.
-    last_line: usize,
-    /// Pass as `offset` to continue; `None` when the file ends here.
-    next_offset: Option<usize>,
-    /// The 1-based line the caller asked to start at, echoed so an empty
-    /// slice can say what was asked for.
-    requested_offset: usize,
-    total_bytes: usize,
-    total_lines: usize,
-    /// The line the byte budget was hit inside of, when the budget ran out
-    /// part way through a single line.
-    partial_line: Option<usize>,
-}
-
-/// Take `limit` lines from line `offset` of `text`, within a byte budget.
-fn slice_source(
-    text: &str,
-    offset: Option<usize>,
-    limit: Option<usize>,
-    max_bytes: Option<usize>,
-) -> SourceSlice {
-    let total_bytes = text.len();
-    // `split_inclusive` keeps the line terminators, so concatenating the
-    // returned lines reproduces the file byte for byte.
-    let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    let total_lines = lines.len();
-    let budget = max_bytes
-        .unwrap_or(DEFAULT_SOURCE_BYTES)
-        .clamp(1, MAX_SOURCE_BYTES);
-    let start = offset.unwrap_or(1).max(1) - 1;
-    let limit = limit.unwrap_or(usize::MAX);
-
-    let mut slice = String::new();
-    let mut taken = 0usize;
-    let mut partial_line = None;
-    for (index, line) in lines.iter().enumerate().skip(start).take(limit) {
-        if slice.len() + line.len() <= budget {
-            slice.push_str(line);
-            taken += 1;
-            continue;
-        }
-        if slice.is_empty() {
-            // A single line wider than the budget would otherwise return
-            // nothing at all and stall the caller's paging.
-            let end = floor_char_boundary(line, budget);
-            slice.push_str(&line[..end]);
-            taken = 1;
-            partial_line = Some(index + 1);
-        }
-        break;
-    }
-
-    let (first_line, last_line) = if taken == 0 {
-        (0, 0)
-    } else {
-        (start + 1, start + taken)
-    };
-    let next_offset = (taken > 0 && last_line < total_lines).then_some(last_line + 1);
-    SourceSlice {
-        text: slice,
-        first_line,
-        last_line,
-        next_offset,
-        requested_offset: start + 1,
-        total_bytes,
-        total_lines,
-        partial_line,
-    }
-}
-
-/// The largest `index` at or below the given one that splits `text` between
-/// characters (`str::floor_char_boundary` is still unstable).
-fn floor_char_boundary(text: &str, index: usize) -> usize {
-    if index >= text.len() {
-        return text.len();
-    }
-    let mut boundary = index;
-    while boundary > 0 && !text.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    boundary
-}
-
-impl SourceSlice {
-    fn truncated(&self) -> bool {
-        self.next_offset.is_some()
-            || self.partial_line.is_some()
-            || (self.first_line == 0 && self.total_lines > 0)
-    }
-
-    /// The warning a truncated slice carries. Deleting or rewriting a design
-    /// on the belief that an unread tail is empty is the failure this exists
-    /// to prevent, so the notice says outright that the file is not all here.
-    fn notice(&self, path: &str) -> Option<String> {
-        if !self.truncated() {
-            return None;
-        }
-        if self.first_line == 0 {
-            return Some(format!(
-                "NOTHING WAS RETURNED: {path} has {} lines ({} bytes), and the slice requested \
-                 from line {} is empty. Re-request with {{\"path\": \"{path}\", \"offset\": 1}} to \
-                 start from the top.",
-                self.total_lines, self.total_bytes, self.requested_offset
-            ));
-        }
-        let mut notice = format!(
-            "TRUNCATED — THIS IS NOT THE WHOLE FILE. Returned lines {}-{} of {} ({} of {} bytes) \
-             of {path}. To continue, call read_fnx_source again with {{\"path\": \"{path}\", \
-             \"offset\": {}}}; pass \"limit\" (lines) or \"max_bytes\" (up to {MAX_SOURCE_BYTES}) \
-             for a different slice size. Do not edit, replace or delete anything on the \
-             assumption that the lines you have not read are absent.",
-            self.first_line,
-            self.last_line,
-            self.total_lines,
-            self.text.len(),
-            self.total_bytes,
-            self.next_offset.unwrap_or(self.last_line + 1),
-        );
-        if let Some(line) = self.partial_line {
-            notice.push_str(&format!(
-                " Line {line} is longer than the byte budget and was cut mid-line, so the rest of \
-                 line {line} is in NO later slice: re-request that line with a larger \
-                 \"max_bytes\" to read it whole."
-            ));
-        }
-        Some(notice)
-    }
-
-    fn into_response(self, path: &str) -> serde_json::Value {
-        let notice = self.notice(path);
-        serde_json::json!({
-            "path": path,
-            "text": self.text,
-            "first_line": self.first_line,
-            "last_line": self.last_line,
-            "next_offset": self.next_offset,
-            "total_lines": self.total_lines,
-            "total_bytes": self.total_bytes,
-            "truncated": self.truncated(),
-            "notice": notice,
-        })
-    }
-}
-
 #[derive(Clone)]
 struct ReadFnxSourceTool;
 
@@ -1269,15 +908,6 @@ impl McpServerTool for ReadFnxSourceTool {
     }
 }
 
-/// Validate a complete legacy FNX or managed design-system JSON candidate without changing the project. If source
-/// is omitted, validate the saved file. Errors include parser diagnostics;
-/// repair them before writing a candidate with external file tools.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct ValidateFnxSourceArgs {
-    path: String,
-    #[serde(default)]
-    source: Option<String>,
-}
 
 #[derive(Clone)]
 struct ValidateFnxSourceTool;
@@ -1367,112 +997,6 @@ mod tests {
                 .expect("batch ops remain required")
                 .iter()
                 .any(|field| field == "activity")
-        );
-    }
-
-    #[test]
-    fn slice_returns_a_whole_small_file_untruncated() {
-        let slice = slice_source("a\nb\nc\n", None, None, None);
-        assert_eq!(slice.text, "a\nb\nc\n");
-        assert_eq!((slice.first_line, slice.last_line), (1, 3));
-        assert_eq!(slice.next_offset, None);
-        assert!(!slice.truncated());
-        assert_eq!(slice.notice("pages/page-1/page.fnx"), None);
-    }
-
-    #[test]
-    fn slice_stops_at_the_byte_budget_and_says_how_to_continue() {
-        let source = "0123456789\n".repeat(100);
-        let slice = slice_source(&source, None, None, Some(35));
-        assert_eq!(slice.text, "0123456789\n0123456789\n0123456789\n");
-        assert_eq!((slice.first_line, slice.last_line), (1, 3));
-        assert_eq!(slice.next_offset, Some(4));
-        assert_eq!(slice.total_bytes, 1100);
-        assert_eq!(slice.total_lines, 100);
-        assert!(slice.truncated());
-
-        let notice = slice
-            .notice("pages/page-1/page.fnx")
-            .expect("a truncated slice must carry a notice");
-        assert!(notice.contains("TRUNCATED"));
-        // The true size and the exact next call are the two facts a model
-        // needs to avoid acting on a partial file.
-        assert!(notice.contains("1100 bytes"));
-        assert!(notice.contains("\"offset\": 4"));
-        assert!(notice.contains("pages/page-1/page.fnx"));
-    }
-
-    #[test]
-    fn slice_honors_an_offset_and_a_line_limit() {
-        let source = "a\nb\nc\nd\ne\n";
-        let slice = slice_source(source, Some(2), Some(2), None);
-        assert_eq!(slice.text, "b\nc\n");
-        assert_eq!((slice.first_line, slice.last_line), (2, 3));
-        assert_eq!(slice.next_offset, Some(4));
-        assert!(slice.truncated());
-    }
-
-    #[test]
-    fn slice_cuts_inside_an_oversized_line_and_warns_about_the_remainder() {
-        let source = format!("{}\nsecond\n", "x".repeat(200));
-        let slice = slice_source(&source, None, None, Some(50));
-        assert_eq!(slice.text, "x".repeat(50));
-        assert_eq!(slice.partial_line, Some(1));
-        assert_eq!(slice.next_offset, Some(2));
-        let notice = slice
-            .notice("page.fnx")
-            .expect("a cut line must be reported");
-        assert!(notice.contains("cut mid-line"));
-        assert!(notice.contains("max_bytes"));
-    }
-
-    #[test]
-    fn slice_never_splits_a_multibyte_character() {
-        let source = "ééééé";
-        let slice = slice_source(source, None, None, Some(5));
-        assert_eq!(slice.text, "éé");
-        assert_eq!(slice.partial_line, Some(1));
-    }
-
-    #[test]
-    fn slice_past_the_end_returns_nothing_and_says_so() {
-        let slice = slice_source("a\nb\n", Some(9), None, None);
-        assert!(slice.text.is_empty());
-        assert_eq!(slice.next_offset, None);
-        assert!(slice.truncated());
-        let notice = slice
-            .notice("page.fnx")
-            .expect("an empty slice must be reported");
-        assert!(notice.contains("NOTHING WAS RETURNED"));
-        assert!(notice.contains("line 9"));
-    }
-
-    #[test]
-    fn an_empty_file_is_not_reported_as_truncated() {
-        let slice = slice_source("", None, None, None);
-        assert!(!slice.truncated());
-        assert_eq!(slice.notice("page.fnx"), None);
-    }
-
-    #[test]
-    fn max_bytes_is_capped_so_a_caller_cannot_ask_for_the_whole_43mb_page() {
-        let source = "x".repeat(4 * MAX_SOURCE_BYTES);
-        let slice = slice_source(&source, None, None, Some(usize::MAX));
-        assert_eq!(slice.text.len(), MAX_SOURCE_BYTES);
-        assert!(slice.truncated());
-    }
-
-    #[test]
-    fn the_response_carries_the_notice_and_the_true_total() {
-        let source = "0123456789\n".repeat(100);
-        let response = slice_source(&source, None, None, Some(35)).into_response("page.fnx");
-        assert_eq!(response["truncated"], serde_json::json!(true));
-        assert_eq!(response["total_bytes"], serde_json::json!(1100));
-        assert_eq!(response["next_offset"], serde_json::json!(4));
-        assert!(
-            response["notice"]
-                .as_str()
-                .is_some_and(|notice| notice.contains("TRUNCATED"))
         );
     }
 

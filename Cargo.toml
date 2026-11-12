@@ -51,6 +51,7 @@ members = [
     "crates/fanta-fnx",
     "crates/fanta-format",
     "crates/fanta-headless",
+    "crates/fanta-mcp",
     "crates/fanta-present",
     "crates/fanta-render",
     "crates/fanta-runtime",

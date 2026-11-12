@@ -25,6 +25,7 @@ base64.workspace = true
 fanta-canvas.workspace = true
 fanta-design-ops.workspace = true
 fanta-doc.workspace = true
+fanta-fnx.workspace = true
 # Path form: a workspace dependency cannot drop default features, and the
 # wasm engine build needs fanta-format without its native half.
 fanta-format = { path = "../fanta-format", default-features = false }

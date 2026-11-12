@@ -27,6 +27,8 @@ pub mod render;
 #[cfg(feature = "native")]
 pub mod save;
 pub mod scene;
+#[cfg(feature = "native")]
+pub mod sources;
 pub mod structure;
 pub mod style;
 pub mod variant_sets;
@@ -581,7 +583,9 @@ impl HeadlessProject {
             .context("the project has no pages")
     }
 
-    fn active_page_index(&self) -> Result<usize> {
+    /// The active page's index in the editor page order, as agents address
+    /// pages.
+    pub fn active_page_index(&self) -> Result<usize> {
         let active = self
             .document
             .doc
@@ -593,7 +597,9 @@ impl HeadlessProject {
             .context("the active page is not in the page list")
     }
 
-    fn indexed_design_source(&self, design: ScopedDesign) -> Option<PathBuf> {
+    /// The on-disk source file of a page or component, from the session's
+    /// artifact index (no directory scan).
+    pub fn indexed_design_source(&self, design: ScopedDesign) -> Option<PathBuf> {
         let artifact = ArtifactId::from_scoped(design);
         let metadata = self.session.artifacts.get(&artifact)?;
         let directory = self.root.join(&metadata.design_dir);
