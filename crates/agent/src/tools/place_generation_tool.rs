@@ -19,7 +19,7 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput};
 /// Import a generated image into the active Fanta project's asset library
 /// without creating a canvas layer. Supply exactly one of url, path, or source
 /// (base64 or a base64 data URI). The saved asset_id and path can be referenced
-/// from FNX file edits. Relative paths resolve from the active Fanta project.
+/// from source file edits. Relative paths resolve from the active Fanta project.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ImportProjectImageToolInput {
     #[serde(default)]

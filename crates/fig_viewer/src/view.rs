@@ -28,10 +28,13 @@ use std::{
 use anyhow::{Context as _, Result};
 use fanta_canvas::HitPrecision;
 use fanta_doc::{
-    AnimationClip, AnimationClipId, AssetId, BoundProp, CanvasNode, Doc, Easing, Fill, IndexKey,
+    AnimationClip, AnimationClipId, AssetId, BoundProp, CanvasNode, Doc, Easing, IndexKey,
     Interpolation, Keyframe, KeyframeId, MotionEvaluation, MotionProperty, NodeData, NodeId,
     Operation, ProjectAssetKind, ResolvedVarValue, Scope, Transaction, Viewport,
 };
+// Only the macOS video fills and tests read paint kinds here.
+#[cfg(any(test, target_os = "macos"))]
+use fanta_doc::Fill;
 use fanta_tools::{Button as ToolButton, LogicalKey, ToolEvent};
 use file_icons::FileIcons;
 use glam::DVec2;
@@ -492,6 +495,10 @@ pub struct FigView {
     space_pan: bool,
     pub(crate) container_bounds: Option<Bounds<Pixels>>,
     pub(crate) rendered_canvas: Option<RenderedCanvas>,
+    /// The CPU canvas or prototype frame painted last. GPUI keeps a painted image in the
+    /// window's sprite atlas until it is dropped explicitly, and these paths render a new image
+    /// for every pan, zoom, edit and animation frame.
+    painted_canvas_image: Option<Arc<RenderImage>>,
     /// Memoized selection-chrome geometry (frame labels, per-node selection
     /// bounds, text baselines), reused across paint frames while the scene
     /// revision, page root, selection, and text-edit target are unchanged —
@@ -754,6 +761,7 @@ impl FigView {
         let view = cx.entity_id();
         cx.on_release(move |_, cx| crate::agent_surface::clear_active_view(view, cx))
             .detach();
+        cx.on_release(Self::release_painted_canvas_image).detach();
         let item_subscription = Self::subscribe_to_item(&item, cx);
         let (layers_sidebar_visible, layers_sidebar_width) = {
             let settings = FantaDesignPanelSettings::get_global(cx);
@@ -911,6 +919,7 @@ impl FigView {
             space_pan: false,
             container_bounds: None,
             rendered_canvas: None,
+            painted_canvas_image: None,
             chrome_cache: std::cell::RefCell::new(None),
             painted_raw_text_node: None,
             #[cfg(target_os = "macos")]
@@ -2795,8 +2804,35 @@ impl FigView {
         self.viewport = Some(viewport);
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn clear_rendered_canvas(&mut self) {
         self.rendered_canvas = None;
+    }
+
+    /// Records the image the canvas element painted this frame and drops the one it painted
+    /// before from the sprite atlas.
+    pub(crate) fn replace_painted_canvas_image(
+        &mut self,
+        painted: &Arc<RenderImage>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if self
+            .painted_canvas_image
+            .as_ref()
+            .is_some_and(|previous| Arc::ptr_eq(previous, painted))
+        {
+            return;
+        }
+        if let Some(previous) = self.painted_canvas_image.replace(painted.clone()) {
+            cx.drop_image(previous, Some(window));
+        }
+    }
+
+    fn release_painted_canvas_image(&mut self, cx: &mut App) {
+        if let Some(image) = self.painted_canvas_image.take() {
+            cx.drop_image(image, None);
+        }
     }
 
     pub(crate) fn invalidate_canvas_cache(&mut self) {
@@ -6301,7 +6337,6 @@ impl FigView {
     /// project already existed.
     fn save_document(
         &mut self,
-        overwrite_conflict: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<std::path::PathBuf>>> {
         if let Some(error) = self.pending_bound_text_error(cx) {
@@ -6323,13 +6358,8 @@ impl FigView {
         }
         // Persist committed state, not a transient preview mid-session.
         self.finish_document_edits(cx);
-        self.item.update(cx, |item, cx| {
-            if overwrite_conflict {
-                item.save_overwriting_conflict(cx)
-            } else {
-                item.save(SaveKind::Explicit, cx)
-            }
-        })
+        self.item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
     }
 
     pub fn toggle_layers_sidebar(
@@ -10054,9 +10084,7 @@ impl Item for FigView {
             {
                 return source_save;
             }
-            // The pane asks Overwrite / Discard before saving an item in
-            // conflict, so a non-autosave call here carries that answer.
-            let task = view.save_document(!options.autosave, cx);
+            let task = view.save_document(cx);
             let project = view.project.clone();
             cx.spawn(async move |_, cx| {
                 let Some(root) = task.await? else {
@@ -10157,6 +10185,7 @@ impl Item for FigView {
             let view = cx.entity_id();
             cx.on_release(move |_, cx| crate::agent_surface::clear_active_view(view, cx))
                 .detach();
+            cx.on_release(Self::release_painted_canvas_image).detach();
             let item_subscription = Self::subscribe_to_item(&item, cx);
             let editor_session =
                 cx.new(|_| EditorSession::with_state(editor_mode, editor_workspace));
@@ -10256,6 +10285,7 @@ impl Item for FigView {
                 space_pan: false,
                 container_bounds: None,
                 rendered_canvas: None,
+                painted_canvas_image: None,
                 chrome_cache: std::cell::RefCell::new(None),
                 painted_raw_text_node: None,
                 #[cfg(target_os = "macos")]
@@ -13872,7 +13902,7 @@ mod tests {
             fault.restore()?;
             first
                 .view
-                .update(cx, |view, cx| view.save_document(false, cx))
+                .update(cx, |view, cx| view.save_document(cx))
                 .await?;
             cx.run_until_parked();
             assert_save_failure_notice(&first, false, cx);
@@ -14248,7 +14278,7 @@ mod tests {
             add_rect(&item, cx);
             settle_autosave_and_resync(cx);
             let error = view
-                .update(cx, |view, cx| view.save_document(false, cx))
+                .update(cx, |view, cx| view.save_document(cx))
                 .await
                 .expect_err("explicit retry still reaches the read-only directory");
             assert!(error.chain().any(|error| {
@@ -14264,7 +14294,7 @@ mod tests {
             assert_eq!(autosave_project_files(&root)?, files);
             assert!(view.read_with(cx, |view, _| view.reported_save_failure.is_some()));
             fault.restore()?;
-            view.update(cx, |view, cx| view.save_document(false, cx)).await?;
+            view.update(cx, |view, cx| view.save_document(cx)).await?;
             cx.run_until_parked();
             assert_eq!(
                 item.read_with(cx, |item, _| item.save_attempts_for_test()),
@@ -15248,7 +15278,7 @@ mod tests {
         });
         assert_ne!(moved, baseline, "the mounted drag must commit geometry");
         assert_camera(&visual);
-        view.update(&mut visual, |view, cx| view.save_document(false, cx))
+        view.update(&mut visual, |view, cx| view.save_document(cx))
             .await
             .expect("save committed drag");
         visual.run_until_parked();
@@ -15266,7 +15296,7 @@ mod tests {
                 );
             });
             assert_camera(&visual);
-            view.update(&mut visual, |view, cx| view.save_document(false, cx))
+            view.update(&mut visual, |view, cx| view.save_document(cx))
                 .await
                 .expect("save history result");
             visual.run_until_parked();
@@ -16178,6 +16208,46 @@ mod tests {
         visual.simulate_resize(size(px(1536.0), px(1084.0)));
         draw_pane_layout(&mut visual);
         (item, view, host, visual)
+    }
+
+    /// GPUI keeps a painted image in the sprite atlas until `drop_image`, which `FigView` calls
+    /// with the frame it painted before. The atlas is private to GPUI, so this checks the
+    /// bookkeeping that decides which frame gets dropped.
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn cpu_canvas_tracks_the_frame_it_painted(cx: &mut TestAppContext) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, _, images) = bitmap_canvas_doc();
+        let (_item, view, _host, mut visual) = pane_layout_fixture(&project, doc, images, cx);
+        let painted = |visual: &mut gpui::VisualTestContext| {
+            view.read_with(visual, |view, _| {
+                view.painted_canvas_image
+                    .clone()
+                    .expect("the canvas painted a CPU frame")
+            })
+        };
+
+        let first = painted(&mut visual);
+        draw_pane_layout(&mut visual);
+        assert!(
+            Arc::ptr_eq(&first, &painted(&mut visual)),
+            "an unchanged viewport repaints the cached frame"
+        );
+
+        view.update(&mut visual, |view, cx| {
+            let mut viewport = view.viewport().expect("viewport");
+            viewport.center[0] += 40.0;
+            view.set_viewport(viewport, cx);
+        });
+        draw_pane_layout(&mut visual);
+        let second = painted(&mut visual);
+        assert!(!Arc::ptr_eq(&first, &second), "a pan renders a new frame");
+        assert_eq!(
+            Arc::strong_count(&first),
+            1,
+            "the view keeps no frame it stopped painting"
+        );
     }
 
     #[cfg(feature = "fanta-gpui-ui")]

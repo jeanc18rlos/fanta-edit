@@ -325,7 +325,10 @@ pub fn geometry_operations(document: &Doc, roots: &BTreeSet<NodeId>) -> Vec<Oper
             &mut solved,
             root,
             roots,
+            #[cfg(feature = "render")]
             &mut fanta_render::measure_text_node,
+            #[cfg(not(feature = "render"))]
+            &mut approximate_measure_text_node,
         );
         for id in ids {
             let (Some(original), Some(solved)) = (document.scene.get(id), solved.get(id)) else {
@@ -420,4 +423,23 @@ pub fn settle(document: &mut Doc, state: &mut LayoutState) -> Result<BTreeSet<No
     }
     state.catch_up(document);
     Ok(moved)
+}
+
+/// shortcut: character-count text measure (the agent guide's 0.55 x size per
+/// character, 1.4 x size per line) for builds without the Skia shaper;
+/// upgrade when a wasm text stack lands.
+#[cfg(not(feature = "render"))]
+fn approximate_measure_text_node(text: &fanta_doc::TextNode) -> (f64, f64) {
+    if text.content.is_empty() {
+        return (0.0, 0.0);
+    }
+    let size = text.style.size_px.max(1.0);
+    let lines = text.content.lines().count().max(1);
+    let widest = text
+        .content
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    (widest as f64 * size * 0.55, lines as f64 * size * 1.4)
 }

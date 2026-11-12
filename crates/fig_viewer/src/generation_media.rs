@@ -992,6 +992,9 @@ pub(crate) async fn prepare_video(bytes: Arc<[u8]>) -> Result<PreparedVideo> {
     })
 }
 
+// Video trim preparation is macOS-only (AVFoundation); off macOS these
+// types back tests alone.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Clone)]
 pub(crate) struct PreparedVideoTrim {
     pub range_us: [i64; 2],
@@ -999,6 +1002,7 @@ pub(crate) struct PreparedVideoTrim {
     pub poster: VideoPoster,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn validate_video_trim(range: [i64; 2], duration_us: i64) -> Result<()> {
     ensure!(
         range[0] >= 0 && range[0] < range[1] && range[1] <= duration_us,
@@ -1042,6 +1046,7 @@ pub(crate) async fn prepare_video_trim(
     })
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn trim_video(
     document: &mut FigDocument,
     node: NodeId,

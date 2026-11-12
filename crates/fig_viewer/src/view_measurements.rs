@@ -906,7 +906,7 @@ mod tests {
                     assert_eq!(view.tools.kind(), ToolKind::Measure);
                     assert_eq!(view.editor_mode(cx), EditorMode::Design);
                     assert_eq!(view.editor_workspace(cx), EditorWorkspace::Canvas);
-                    let save = view.save_document(false, cx);
+                    let save = view.save_document(cx);
                     view.cancel(&Cancel, window, cx);
                     assert!(!view.measurement_controller.has_pending_authoring());
                     measurement_pointer_up(view, [450., 330.], window, cx);

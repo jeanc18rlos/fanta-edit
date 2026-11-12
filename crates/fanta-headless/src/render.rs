@@ -34,41 +34,8 @@ pub fn render_inputs(document: &Doc) -> RenderInputs<'_> {
     }
 }
 
-pub fn page_bounds(doc: &Doc, page_root: Option<NodeId>) -> Bounds {
-    try_page_bounds(doc, page_root).unwrap_or_else(|| Bounds::from_xywh(0.0, 0.0, 1024.0, 768.0))
-}
+pub use crate::pages::{page_bounds, try_page_bounds};
 
-pub fn try_page_bounds(doc: &Doc, page_root: Option<NodeId>) -> Option<Bounds> {
-    let mut bounds: Option<Bounds> = None;
-    let mut include = |node_id| {
-        if let Some(node_bounds) = doc.scene.world_bounds(node_id)
-            && node_bounds.is_finite()
-            && node_bounds.width() > 0.0
-            && node_bounds.height() > 0.0
-        {
-            bounds = Some(match bounds {
-                Some(bounds) => bounds.union(&node_bounds),
-                None => node_bounds,
-            });
-        }
-    };
-
-    if let Some(page_root) = page_root {
-        for node_id in doc.scene.descendants_of(page_root) {
-            if node_id != page_root {
-                include(node_id);
-            }
-        }
-    } else {
-        for root in doc.scene.roots() {
-            for node_id in doc.scene.descendants_of(*root) {
-                include(node_id);
-            }
-        }
-    }
-
-    bounds
-}
 
 /// Render `node`, or the whole of `page_root` when there is none, as a PNG
 /// no longer than `target.max_dimension` (default 768, at most 1568) on its

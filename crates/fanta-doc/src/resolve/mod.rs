@@ -35,4 +35,4 @@ pub use instance::{
     resolved_component_root_with_context, resolved_component_with_context,
     strip_redundant_instance_overrides,
 };
-pub use variables::{resolve_bound_value, resolve_effective_mode};
+pub use variables::{resolve_bound_value, resolve_effective_mode, resolve_export_bindings};
