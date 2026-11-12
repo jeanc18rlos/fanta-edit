@@ -46,6 +46,17 @@ inlined (spec 0008 T5); edits made through the chat tools appear in it
 live, and pages past the vector frame's size cap fall back to a
 `script/serve-project` pointer.
 
+## The web canvas in a browser
+
+The plugin surfaces draw host elements only (no web content), so the full
+browser canvas opens in a browser tab instead: ask Claude to "open the web
+canvas" and it serves the project with the bundled
+[`serve-project`](serve-project) (`--port 0`), handing you a
+`http://127.0.0.1:<port>/` link. Viewing needs nothing else; drag-editing
+in the browser needs either a built wasm engine (`--engine`) or the app
+running on the same project, which the page then routes edits through
+(spec 0008 T3/T6).
+
 ## How it works
 
 The app advertises its live MCP server (a Unix socket speaking
