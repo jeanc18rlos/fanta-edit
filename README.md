@@ -91,6 +91,10 @@ path. Built-in agent tools and hosted media generation have separate configurati
 and billing requirements. See the [agent quickstart](docs/fanta/agent-quickstart.md)
 for exact tool names and a bounded first task.
 
+Without the app, the same 14 tools run headlessly: `fanta-mcp <project-dir>`
+(built with `cargo build -p fanta-mcp`) serves them over stdio straight from the
+project directory, saving each edit to disk.
+
 ## Build from source
 
 ```sh

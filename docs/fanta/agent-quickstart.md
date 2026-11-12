@@ -32,6 +32,11 @@ a local Unix socket. The setting `fanta_live_mcp.enabled` is on by default; set
 it to `false` to disable the local server. With the app closed or server disabled,
 the bridge fails visibly instead of claiming a connection.
 
+Without the app, run the same tools headlessly: `fanta-mcp <project-dir>` is a
+stdio MCP server over the project directory alone (`serverInfo.name` is
+`fanta-headless`). It serves the same 14 tools and saves each edit to disk;
+`prepare_design_asset` and image downloads by URL still need the app.
+
 ## Tool scopes
 
 The inspected source registers these **14 local MCP tools**. Their target is the
