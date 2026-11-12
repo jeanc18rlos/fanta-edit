@@ -11,7 +11,7 @@ One task per pull request, in order. Each task says what it changes, which
 requirements it serves and how it is verified. Tick it and link the pull
 request when it merges.
 
-- [ ] **T1.** `fanta_site::web::export_web` and `fanta-site --plain`: one
+- [x] **T1.** ([#183](https://github.com/jeanc18rlos/fanta-edit/pull/183)) `fanta_site::web::export_web` and `fanta-site --plain`: one
   CSS-first SVG per page from the hand-written emitter (ids/classes on
   elements, all styling in `design.css`, bound properties as `var()`,
   per-node Skia PNG fallback for uncovered features), `tokens.css` from
@@ -21,8 +21,7 @@ request when it merges.
   export test asserting the file set and no `.wasm`, byte-identical double
   export, `var()` surviving a project round-trip, tokens.css mode
   assertions, `script/architecture verify` for the new dependency.
-  In review: [PR #183](https://github.com/jeanc18rlos/fanta-edit/pull/183)
-  — amended from the Skia-SVG plan to the emitter; see the note atop
+  Amended from the Skia-SVG plan to the emitter; see the note atop
   [design.md](design.md).
 - [ ] **T2.** Prototype hotspots: overlay anchors from `flow_start.json`
   and click triggers, plus the `file://` notice (R2, R6). Verify: anchor
