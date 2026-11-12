@@ -66,4 +66,5 @@ these rules or when the index below is stale.
 | [0027](0027-project-designs-onto-plain-web-files.md) | Store projects as plain web files | accepted | 2026-11-10 |
 | [0028](0028-choose-the-tools-that-run-the-business.md) | Choose the tools that run the business | proposed | 2026-11-04 |
 | [0029](0029-deliver-business-events-through-the-backend-outbox.md) | Deliver business events through the backend outbox | proposed | 2026-11-07 |
+| [0030](0030-gate-merges-on-one-fast-required-check-and.md) | Gate merges on one fast required check and run each suite on the cheapest platform that can witness it | proposed | 2026-11-12 |
 <!-- decisions:end -->
