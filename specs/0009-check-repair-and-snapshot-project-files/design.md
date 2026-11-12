@@ -147,6 +147,19 @@ impl History {
 
 ## Changes during implementation
 
+- **T6.** The editor shows the check's result as a notice that stays until
+  dismissed (counts and the first finding), not as a banner with a list:
+  the full list is one `fanta-check` or `check_project` call away, and a
+  list view is a feature of its own. The findings are kept on the document
+  for that view to read.
+- **T6.** The check runs after every reload from disk, which is what an
+  outside change triggers. An outside change that conflicts with unsaved
+  edits does not reload, so it is not checked until the conflict is
+  resolved.
+- **T6.** `check_project` is an MCP tool in the live and the headless
+  server. The built-in agent has no tool of that name; it reads the same
+  guidance and can run `fanta-check`.
+
 - **T5.** The snapshots are taken by the two save functions (the editor's
   and `fanta-headless`'s), not inside the writer: the writer also serves
   exports and Save As staging folders, which must not gain a `.fanta`

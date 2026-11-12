@@ -90,7 +90,7 @@ pub use read::{
     page_scope_of_source, read_project_tree, read_project_tree_with_warnings,
 };
 #[cfg(feature = "native")]
-pub use check::check_project;
+pub use check::{check_project, findings_json};
 pub use diagnostic::{
     DESIGN_UNAVAILABLE, DIAGNOSTIC_CODES, LOAD_OMITTED_GEOMETRY, SourceDiagnostic, SourceSeverity};
 #[cfg(feature = "native")]

@@ -31,7 +31,7 @@ fn main() -> ExitCode {
         }
     };
     if json {
-        match serde_json::to_string_pretty(&findings) {
+        match fanta_format::findings_json(&findings) {
             Ok(text) => println!("{text}"),
             Err(error) => {
                 eprintln!("{error}");
