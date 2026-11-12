@@ -355,8 +355,8 @@ fn connection_instructions(executable: &Path, data_directory: &Path) -> String {
          {}\n\
          Claude Code: run this command from the project directory, then restart the agent:\n\n\
          {}\n\n\
-         Verify with /mcp and call get_editor_state. Edit the returned .fnx files with file tools, \
-         validate complete candidates with validate_fnx_source, inspect the canvas with batch_get \
+         Verify with /mcp and call get_editor_state. Edit the returned source files with file tools \
+         (validate legacy .fnx candidates with validate_fnx_source), inspect the canvas with batch_get \
          and get_screenshot, and register generated images with import_image.\n",
         command.codex_config(),
         command.claude_code_command(),
@@ -451,7 +451,7 @@ fn non_destructive_write() -> ToolAnnotations {
 /// Import a generated image into the active project's Assets panel and persist
 /// its bytes under assets/images/. Supply exactly one of path (local file,
 /// relative to the project or absolute), url (HTTP/HTTPS), or source (base64 or
-/// a base64 data URI). Returns the asset id and saved path for FNX file edits.
+/// a base64 data URI). Returns the asset id and saved path for source file edits.
 /// Use this after image generation, including images made by another MCP
 /// server. Importing an asset does not place a new layer on the canvas.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -701,7 +701,7 @@ impl McpServerTool for ReportActivityTool {
 // ---- get_editor_state --------------------------------------------------------
 
 /// Overview of the open Fanta design document: project name and root, pages
-/// (index, name, root id, node counts, `.fnx` source path), the active page
+/// (index, name, root id, node counts, source path), the active page
 /// and its content bounds, a bounded component preview, current selection and its bounds,
 /// viewport, whether the canvas is editable right now, and short `hints`.
 /// Pass `empty_space: [width, height]` to also get a free `{x, y}` on the
@@ -753,7 +753,7 @@ impl McpServerTool for GetEditorStateTool {
 /// Fanta's design guidelines for agents: coordinate system, frames vs groups,
 /// auto layout, spacing and type scales, naming, components, the working
 /// method (read state, batch ops with a label, screenshot to verify), and when
-/// to edit `.fnx` source instead of the canvas. Read once per session before
+/// to edit source files instead of the canvas. Read once per session before
 /// designing.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
 struct GetGuidelinesArgs {}
@@ -935,8 +935,8 @@ impl McpServerTool for BatchGetTool {
 /// Coordinates are world px, y down, x/y = top-left; ids are
 /// exact node ids. If any op fails the whole batch rolls back and the result
 /// names the failing op; created ids come back in `created`. Gradients,
-/// per-run rich text are not ops yet: for those, read the page
-/// .fnx with read_fnx_source, edit the file, and the canvas reloads (the change
+/// per-run rich text are not ops yet: for those, edit the page's nodes.json
+/// records with your own file tools, and the canvas reloads (the change
 /// is a git diff). Pass activity with the same stable mage name and agent_id
 /// used in report_agent_activity so the user can follow each streamed step.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1045,8 +1045,8 @@ impl McpServerTool for GetScreenshotTool {
 
 // ---- read_fnx_source ---------------------------------------------------------
 
-/// List the open Fanta project's FNX source files (omit `path`), or return one
-/// file's text (e.g. `pages/<id>/page.fnx`). Edit sources with your own file
+/// List the open Fanta project's design source files (omit `path`), or return
+/// one file's text (e.g. `pages/<slug>/page.svg`). Edit sources with your own file
 /// tools; while the project is open in Fanta the canvas hot-reloads about
 /// 300ms after a save, and otherwise the edit is picked up the next time it is
 /// opened.
@@ -1269,7 +1269,7 @@ impl McpServerTool for ReadFnxSourceTool {
     }
 }
 
-/// Validate a complete FNX or managed design-system JSON candidate without changing the project. If source
+/// Validate a complete legacy FNX or managed design-system JSON candidate without changing the project. If source
 /// is omitted, validate the saved file. Errors include parser diagnostics;
 /// repair them before writing a candidate with external file tools.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

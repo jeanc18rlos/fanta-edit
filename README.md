@@ -2,8 +2,9 @@
 
 **Your design is source.** Fanta is a native macOS design editor. Import a
 `.fig`, create a design, or open a Fanta project folder. Canvas changes save as
-readable FNX alongside the project's assets, so you can inspect changes with
-Git and edit the same design through the Code workspace or an agent.
+readable web files — SVG, CSS and JSON — alongside the project's assets, so you
+can inspect changes with Git, open `index.html` in a browser, and edit the same
+design through the Code workspace or an agent.
 
 The **Fanta 1.0.0 Public Alpha** distribution targets Apple Silicon Macs.
 The final Build45 package is Developer ID signed, Apple-notarized and stapled;
@@ -43,8 +44,9 @@ original dates and build identities.
    [`.fig`](docs/samples/Fanta-Launch-Card.fig). Keep the original file: edits save
    into a separate Fanta project folder.
 2. Change one layer on the canvas. Use Undo and Redo to inspect the result.
-3. Open **Code** to see the corresponding FNX. The Code workspace edits supported
-   FNX and JSON in saved projects. Save a valid draft to update the canvas.
+3. Open **Code** to see the corresponding source. The Code workspace shows each
+   design's SVG and edits managed JSON (and legacy FNX) in saved projects. Save
+   a valid draft to update the canvas.
 4. Use **Review Changes** to inspect the Git diff, then save, close and reopen the
    project. Keep its manifest, source, identity sidecars and assets together.
 5. Export a selection as PNG and open the resulting image.
