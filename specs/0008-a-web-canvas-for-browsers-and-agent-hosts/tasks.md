@@ -35,9 +35,12 @@ request when it merges.
   page's own `page.svg` with its stylesheets inlined in the surface's
   sandboxed vector frame, updating as the watcher re-fires; hosting the
   T2 component waits for the plugin API to grow a web surface.
-- [ ] **T6.** Live-app attach: when the project is open in the desktop
+- [x] **T6.** ([#201](https://github.com/jeanc18rlos/fanta-edit/pull/201)) Live-app attach: when the project is open in the desktop
   app, canvas hosts route edits through the live MCP server instead of
-  writing files (R6). Verify: A5.
+  writing files (R6). Verify: A5. `serve-project` probes the app's
+  advertisement, matches the focused project, and forwards
+  `POST /__fanta/ops` to `batch_design`; the editor falls back to its
+  own engine and PUT writes when no live app matches.
 - [x] **T7.** ([#195](https://github.com/jeanc18rlos/fanta-edit/pull/195)) Headless MCP server (R7): serve the live app's tool
   vocabulary over MCP stdio against a project directory using
   `fanta-headless` (load, apply, save, `render_png` screenshots); the
