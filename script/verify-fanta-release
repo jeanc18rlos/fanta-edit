@@ -6,8 +6,14 @@ usage() {
     cat <<'EOF'
 Usage: script/verify-fanta-release [--list] [--stage NAME] [--output-dir PATH]
 
-Runs the engine, import, source-order, editor, workspace, ui, build, and lint stages.
+Runs the engine, render, import, source-order, editor, workspace, ui, shell,
+release-blockers, build, and lint stages.
 Use --stage more than once to select stages; --list prints commands without running.
+The render stage holds the golden image test, whose baseline was rendered on macOS.
+The shell stage tests the inherited crates the app relies on; release-blockers runs
+the agent request-limit, output-limit, compaction and Settings regressions and
+their default-feature lint. Off macOS, a step whose tests exist only on macOS is
+skipped with a note.
 The optional visual stage requires a macOS desktop and compares UI component images.
 The optional import-preservation stage requires FANTA_FIG_FIXTURE and fails on
 reported node-structure loss; it does not establish visual or override fidelity.
@@ -35,7 +41,7 @@ while [[ $# -gt 0 ]]; do
             fi
             if [[ "$1" == --stage ]]; then
                 case "$2" in
-                    engine|import|import-preservation|source-order|editor|workspace|ui|build|lint|visual)
+                    engine|render|import|import-preservation|source-order|editor|workspace|ui|shell|release-blockers|build|lint|visual)
                         if [[ " ${selected_stages[*]-} " == *" $2 "* ]]; then
                             printf 'Stage selected more than once: %s\n' "$2" >&2
                             exit 2
@@ -64,7 +70,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${#selected_stages[@]} -eq 0 ]]; then
-    selected_stages=(engine import source-order editor workspace ui build lint)
+    selected_stages=(engine render import source-order editor workspace ui shell release-blockers build lint)
 fi
 
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -138,13 +144,35 @@ run_stage() {
     fi
 }
 
+# A name filter that matches only #[cfg(target_os = "macos")] tests runs zero
+# tests elsewhere and exits 0, which would read as a pass.
+run_macos_stage() {
+    if [[ "$list_only" == false && "$(uname -s)" != Darwin ]]; then
+        printf 'SKIP %s: its tests are compiled only on macOS.\n' "$1"
+        return
+    fi
+    run_stage "$@"
+}
+
+check_project_checker_dependencies() {
+    local dependencies
+    dependencies="$("$cargo_binary" tree --locked -p fanta-format -e normal --prefix none)" || return 1
+    if grep -E '^(gpui|skia-safe|skia-bindings|fig_viewer) ' <<< "$dependencies"; then
+        echo 'fanta-check must build without GPUI, Skia or the editor (spec 0009 R9)' >&2
+        return 1
+    fi
+}
+
 for stage in "${selected_stages[@]}"; do
     case "$stage" in
         engine)
             run_stage "$stage" "$cargo_binary" test --locked \
                 -p fanta-bundle -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-canvas \
-                -p fanta-tools -p fanta-render -p fanta-present -p fanta-text \
+                -p fanta-tools -p fanta-present -p fanta-text \
                 -p fanta-design-ops -p fanta-headless -p fanta-api -p fanta-engine
+            ;;
+        render)
+            run_stage "$stage" "$cargo_binary" test --locked -p fanta-render
             ;;
         import)
             # Spectrum integration binaries return success without a fixture;
@@ -167,6 +195,45 @@ for stage in "${selected_stages[@]}"; do
             ;;
         ui)
             run_stage "$stage" "$cargo_binary" test --locked -p fanta_ui --lib --features test-support
+            ;;
+        shell)
+            run_macos_stage shell-bundled-git "$cargo_binary" test --locked -p git --lib bundled_git_
+            run_stage shell-languages "$cargo_binary" test --locked -p fanta_languages --lib
+            run_stage shell-ai-provider-authentication "$cargo_binary" test --locked \
+                -p language_model -p language_models --lib
+            run_stage shell-browser-sign-in "$cargo_binary" test --locked -p client --lib test_browser_sign_in
+            run_stage shell-media-server-account "$cargo_binary" test --locked \
+                -p project --lib --test integration test_fanta_mcp
+            run_stage shell-save-as-prompts "$cargo_binary" test --locked -p open_path_prompt --lib save_as_
+            # ADR 0017 relies on these: update signatures, the signer's test
+            # vector and version ordering.
+            run_stage shell-update-verification "$cargo_binary" test --locked -p auto_update --lib
+            run_stage shell-agent-panel-toggle "$cargo_binary" test --locked -p agent_ui --lib \
+                test_toggle_closes_visible_agent_panel_when_center_pane_has_focus
+            run_stage shell-design-specs "$cargo_binary" test --locked -p agent --lib test_fanta_specs
+            run_stage shell-design-progress "$cargo_binary" test --locked -p agent --lib test_design_progress
+            run_stage shell-design-source "$cargo_binary" test --locked \
+                -p fanta-bundle -p fanta-fnx -p fanta-format --lib
+            run_stage shell-hostile-edit-corpus "$cargo_binary" test --locked -p fanta-format --test check_corpus
+            run_stage shell-checker-dependencies check_project_checker_dependencies
+            run_stage shell-sidebar "$cargo_binary" test --locked -p sidebar --lib
+            ;;
+        release-blockers)
+            run_stage release-blockers-agent "$cargo_binary" test --locked -p agent --lib test_turn_request_budget_
+            run_stage release-blockers-acp-thread "$cargo_binary" test --locked \
+                -p acp_thread --lib test_turn_request_budget_
+            run_macos_stage release-blockers-settings-window "$cargo_binary" test --locked \
+                -p fanta --bin fanta settings_window_
+            run_stage release-blockers-output-limit "$cargo_binary" test --locked -p agent --lib test_output_limit_
+            run_stage release-blockers-compaction "$cargo_binary" test --locked -p agent --lib test_compaction_
+            run_stage release-blockers-manual-compaction-cancel "$cargo_binary" test --locked \
+                -p agent --lib test_manual_compact_cancelled_leaves_no_marker
+            run_stage release-blockers-acp-stale-cancel "$cargo_binary" test --locked \
+                -p acp_thread --lib test_stale_cancelled_response_does_not_cancel_current_compaction
+            run_stage release-blockers-acp-max-tokens "$cargo_binary" test --locked \
+                -p acp_thread --lib test_max_tokens_cancels_pending_session_elicitation
+            run_stage release-blockers-default-clippy env FANTA_CLIPPY_DEFAULT_FEATURES=1 \
+                ./script/clippy --locked -p agent -p acp_thread -p language_model -p fanta
             ;;
         build)
             run_stage "$stage" "$cargo_binary" check --locked -p fanta -p cli

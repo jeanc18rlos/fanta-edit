@@ -11,7 +11,8 @@ Run the narrowest check that exercises the change, then the release stage that c
 
 | Changed | Run |
 | --- | --- |
-| `fanta-doc`, `fanta-canvas`, `fanta-tools`, `fanta-render`, `fanta-text`, `fanta-present` | `cargo test --locked -p <crate>`, then stage `engine` |
+| `fanta-doc`, `fanta-canvas`, `fanta-tools`, `fanta-text`, `fanta-present` | `cargo test --locked -p <crate>`, then stage `engine` |
+| `fanta-render` | `cargo test --locked -p fanta-render`, then stage `render`. Its golden image was rendered on macOS, so `tier1_golden_scene_matches` fails on Linux; do not regenerate it |
 | `fanta-fnx`, `fanta-format` | `cargo test --locked -p fanta-fnx -p fanta-format --lib`, then stages `engine` and `source-order` |
 | `fanta-fig-interop` | stage `import`; with a private fixture, `FANTA_FIG_FIXTURE=<file.fig>` and stage `import-preservation` |
 | `fig_viewer` | `cargo test --locked -p fig_viewer --lib <filter>`, then stage `editor`; add `workspace` for pane, save and close flows |
@@ -28,7 +29,9 @@ Run the narrowest check that exercises the change, then the release stage that c
 
 `./script/verify-fanta-release --list` prints each stage's exact command. `--stage <name>` (repeatable) runs stages and writes logs plus `results.tsv` under `target/release-verification`. The script does not validate an installer, drive the full app, contact production services or run ignored benchmarks, and it refuses to run while golden-regeneration variables are set.
 
-A green stage is not the whole CI gate. `.github/workflows/check.yml` also runs single-test gates (bundled git, languages, AI provider auth, browser sign-in, Save As prompts, agent panel toggle, sidebar) and requires 51 named editor and workspace tests. Renaming one of those tests means updating that list.
+Stage `shell` runs the single-test gates on the inherited crates (bundled git, languages, AI provider auth, browser sign-in, Save As prompts, update verification, agent panel toggle, sidebar) and stage `release-blockers` the agent request-limit, output-limit, compaction and Settings regressions with their default-feature lint. Off macOS both skip, with a printed note, the steps whose tests are macOS-only (bundled git, the Settings window).
+
+A green stage is not the whole CI gate. `.github/workflows/check.yml` also requires 51 named editor and workspace tests. Renaming one of those tests means updating that list.
 
 ## Probe and render examples
 
