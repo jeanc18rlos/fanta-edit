@@ -143,7 +143,7 @@ pub struct HeadlessProject {
     pages: Vec<Option<NodeId>>,
     created_pages: Vec<NodeId>,
     loaded_hashes: BTreeMap<String, [u8; 32]>,
-    warnings: Vec<String>,
+    warnings: Vec<fanta_format::SourceDiagnostic>,
 }
 
 #[cfg(feature = "native")]
@@ -165,7 +165,10 @@ impl HeadlessProject {
         let default_page_root = pages::default_page_root(&doc, &visible_page_roots);
         let mut warnings = session.open_warnings.clone();
         let pending_layout_output_nodes = layout::solve_pending(&mut doc).unwrap_or_else(|error| {
-            warnings.push(format!("computing omitted source geometry: {error:#}"));
+            warnings.push(fanta_format::SourceDiagnostic::warning(
+                fanta_format::LOAD_OMITTED_GEOMETRY,
+                format!("computing omitted source geometry: {error:#}"),
+            ));
             BTreeSet::new()
         });
         let page_roots = pages::editor_page_roots(&doc);
@@ -220,7 +223,7 @@ impl HeadlessProject {
 
     /// Problems that did not stop the project from opening, worded for a
     /// person reading a review.
-    pub fn warnings(&self) -> &[String] {
+    pub fn warnings(&self) -> &[fanta_format::SourceDiagnostic] {
         &self.warnings
     }
 

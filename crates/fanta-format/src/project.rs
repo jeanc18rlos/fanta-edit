@@ -44,6 +44,7 @@
 //! upstream (`fanta-app`), per spec 09 §A.1/§A.3.
 
 mod component_dirs;
+mod diagnostic;
 mod layout;
 mod media;
 mod merge;
@@ -84,14 +85,15 @@ pub use read::{
     component_id_of_dir, locate_master_source, locate_page_source, page_id_of_dir,
     page_scope_of_source, read_project_tree, read_project_tree_with_warnings,
 };
+pub use diagnostic::{DIAGNOSTIC_CODES, LOAD_OMITTED_GEOMETRY, SourceDiagnostic, SourceSeverity};
 #[cfg(feature = "native")]
 pub use session::{
     ApplyReport, ArtifactDirty, ArtifactId, ArtifactMeta, ArtifactOpImpact, ArtifactRenderRevision,
     ArtifactRenderSnapshot, ArtifactSession, ClosePolicy, ConflictResolution, ContentHash,
     DependencyGraph, DocMutGuard, FsEvent, IncrementalDocApply, MergeReview, MotionIndex,
     MotionSource, ProposalApplied, ReviewConflict, ReviewResolution, SaveBlocked, SaveResult,
-    ScopedDoc, SessionError, SessionEvent, SourceDiagnostic, SourceProposalOutcome,
-    SourceRebuildReason, SourceSeverity, SourceSync, WorkspaceDirty, WorkspaceDiskSnapshot,
+    ScopedDoc, SessionError, SessionEvent, SourceProposalOutcome,
+    SourceRebuildReason, SourceSync, WorkspaceDirty, WorkspaceDiskSnapshot,
     WorkspaceIr, WorkspaceSession, WorkspaceSharedState, artifact_op_impact, hash_file_set,
     read_motion_dual, synthesize_workspace_fnx, write_artifact_files,
 };
@@ -1130,7 +1132,7 @@ mod tests {
 
         // A pristine projection loads with nothing to report.
         let (_, _, warnings) = read_project_tree_with_warnings(dir.path()).unwrap();
-        assert_eq!(warnings, Vec::<String>::new());
+        assert_eq!(warnings, Vec::<crate::SourceDiagnostic>::new());
 
         // Hand edits: unbind the card's fill to a literal, bind the panel's
         // literal to the token, widen the gap, plus one unknown declaration.
@@ -1165,7 +1167,17 @@ mod tests {
 
         let (loaded, _, warnings) = read_project_tree_with_warnings(dir.path()).unwrap();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("zzz-unknown"), "{warnings:?}");
+        // Spec 0009 R2: the finding is a record a tool can act on, not a sentence.
+        let finding = &warnings[0];
+        assert!(finding.message.contains("zzz-unknown"), "{warnings:?}");
+        assert_eq!(finding.code, "edit.not_kept");
+        assert_eq!(finding.node_id.as_deref(), Some(card.to_string().as_str()));
+        assert_eq!(finding.file.as_deref(), Some("pages/home/page.svg"));
+        let svg = fs::read_to_string(&svg_path).unwrap();
+        let id_offset = svg.find(&format!("id=\"{card}\"")).unwrap();
+        let expected_line = u32::try_from(svg[..id_offset].matches('\n').count() + 1).unwrap();
+        assert_eq!(finding.line, Some(expected_line));
+        assert!(finding.column.is_some());
         let loaded_card = loaded.scene.get(card).unwrap();
         assert!(loaded_card.bindings.is_empty(), "literal fill unbinds");
         let NodeData::Vector(vector) = &loaded_card.data else {
@@ -1438,7 +1450,7 @@ mod tests {
         );
 
         let (loaded, _, warnings) = read_project_tree_with_warnings(dir.path()).unwrap();
-        assert_eq!(warnings, Vec::<String>::new(), "a pristine projection loads clean");
+        assert_eq!(warnings, Vec::<crate::SourceDiagnostic>::new(), "a pristine projection loads clean");
         assert_eq!(persisted(&loaded), persisted(&doc));
         let second = tempdir().unwrap();
         write_web_project_tree(second.path(), &loaded, &assets, None, &[]).unwrap();
@@ -1459,7 +1471,7 @@ mod tests {
         )
         .unwrap();
         let (edited, _, warnings) = read_project_tree_with_warnings(second.path()).unwrap();
-        assert_eq!(warnings, Vec::<String>::new(), "{warnings:?}");
+        assert_eq!(warnings, Vec::<crate::SourceDiagnostic>::new(), "{warnings:?}");
         let NodeData::Vector(vector) = &edited.scene.get(gradient_id).unwrap().data else {
             panic!("the gradient rect stays a vector");
         };
@@ -2731,7 +2743,7 @@ mod tests {
         files.insert(svg_path, svg.replace(">Hello<", ">Edited<").into_bytes());
 
         let (loaded, _, warnings) = read_project_files(&files).unwrap();
-        assert_eq!(warnings, Vec::<String>::new());
+        assert_eq!(warnings, Vec::<crate::SourceDiagnostic>::new());
         let NodeData::Vector(vector) = &loaded.scene.get(panel).unwrap().data else {
             panic!("panel stays a vector");
         };

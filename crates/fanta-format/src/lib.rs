@@ -70,6 +70,7 @@ pub use migrate::migrate;
 #[cfg(feature = "native")]
 pub use project::session;
 pub use project::{
+    DIAGNOSTIC_CODES, LOAD_OMITTED_GEOMETRY, SourceDiagnostic, SourceSeverity,
     ArtifactAddress, ArtifactMerge, DocMerge, FormatCapabilities, JsonPathSegment, NodeMapEdition,
     PresenceValue,
     ProjectManifest, ProjectWriteCache, PropertyConflict, ScopedDesign, WebDesignReport,
@@ -85,8 +86,8 @@ pub use project::{
     ConflictResolution, ContentHash, DependencyGraph, DocMutGuard, FsEvent, IncrementalDocApply,
     MediaFormat, MediaRegistry, MediaRegistryError, MergeReview, MotionIndex, MotionSource,
     ProjectSourceEdit, ProjectUpgrade, ProposalApplied, ReviewConflict, ReviewResolution,
-    SaveBlocked, SaveResult, ScopedDoc, SessionError, SessionEvent, SourceDiagnostic,
-    SourceProposalOutcome, SourceRebuildReason, SourceSeverity, SourceSync, WorkspaceDirty,
+    SaveBlocked, SaveResult, ScopedDoc, SessionError, SessionEvent,
+    SourceProposalOutcome, SourceRebuildReason, SourceSync, WorkspaceDirty,
     WorkspaceDiskSnapshot, WorkspaceIr, WorkspaceSession, WorkspaceSharedState,
     apply_project_json_edit, apply_project_source_edit,
     apply_project_source_edit_with_diagnostics, artifact_op_impact, component_id_of_dir,

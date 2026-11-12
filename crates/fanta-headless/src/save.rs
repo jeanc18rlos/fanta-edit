@@ -18,7 +18,7 @@ pub fn save_project(
     doc: &Doc,
     raw_assets: &BTreeMap<AssetId, Vec<u8>>,
     render: Option<&dyn WebRenderSource>,
-    warnings: &[String],
+    warnings: &[fanta_format::SourceDiagnostic],
 ) -> Result<WriteReport> {
     let (report, _) = fanta_format::write_web_project_tree(root, doc, raw_assets, render, warnings)
         .with_context(|| format!("writing Fanta project at {}", root.display()))?;

@@ -1,6 +1,7 @@
 //! Shared session types: ids, dirty state, conflict, save results.
 
 use super::hash::ContentHash;
+pub use crate::project::diagnostic::{SourceDiagnostic, SourceSeverity};
 use crate::project::merge::NodeMapEdition;
 use crate::project::read::ScopedDesign;
 use fanta_doc::{ComponentId, NodeId};
@@ -160,32 +161,6 @@ pub enum ClosePolicy {
 pub enum SaveResult {
     NoOp,
     Wrote { paths: Vec<PathBuf> },
-}
-
-/// Severity of a non-fatal source-authoring diagnostic. There is deliberately
-/// no `Error` arm: anything fatal fails the parse/materialize path itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceSeverity {
-    Warning,
-    Info,
-}
-
-/// One non-fatal diagnostic from ingesting hand-written `.fnx` source (e.g. a
-/// typo'd attribute that serde would otherwise swallow silently). These never
-/// block a commit — unknown FUTURE fields must keep riding through — the
-/// caller decides whether a policy (such as the harness `--deny`) promotes
-/// them.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-pub struct SourceDiagnostic {
-    pub severity: SourceSeverity,
-    /// Stable machine code, e.g. `source.unknown_attribute`.
-    pub code: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node_name: Option<String>,
-    pub message: String,
 }
 
 /// How the retained FNX source changed after a successful canvas transaction.

@@ -337,7 +337,7 @@ pub fn stage_new_project_tree(
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
     render: Option<&dyn crate::project::web::WebRenderSource>,
-    warnings: &[String],
+    warnings: &[super::diagnostic::SourceDiagnostic],
 ) -> Result<WriteReport> {
     if !fs::symlink_metadata(dir)?.file_type().is_dir()
         || fs::read_dir(dir)?.next().transpose()?.is_some()
