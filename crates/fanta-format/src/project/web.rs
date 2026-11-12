@@ -42,8 +42,9 @@ use super::write::{
     project_design_headers, project_doc_singletons, project_loose_nodes, sync_project_files,
 };
 
-const PAGE_SVG: &str = "page.svg";
-const MASTER_SVG: &str = "master.svg";
+pub(crate) const PAGE_SVG: &str = "page.svg";
+pub(crate) const MASTER_SVG: &str = "master.svg";
+pub(crate) const DESIGN_CSS: &str = "design.css";
 pub(crate) const NODES_JSON: &str = "nodes.json";
 const MAP_JSON: &str = "map.json";
 const INDEX_TEMPLATE: &str = include_str!("../../assets/web/index.html");
@@ -281,7 +282,7 @@ pub fn web_project_files(
         PathBuf::from("tokens.css"),
         Arc::new(tokens_css(doc, &mut skipped_variables).into_bytes()),
     );
-    files.insert(PathBuf::from("design.css"), Arc::new(design_css.into_bytes()));
+    files.insert(PathBuf::from(DESIGN_CSS), Arc::new(design_css.into_bytes()));
 
     let title = match doc.metadata.title.trim() {
         "" => "Fanta project",
@@ -829,6 +830,22 @@ impl Emitter<'_> {
         if !filters.is_empty() {
             rule.push("filter", filters.join(" "));
         }
+        // R8: auto-layout intent lives in CSS; the solved child geometry in
+        // the SVG is derived from it and regenerated when the intent changes.
+        if let NodeData::Group(group) = &node.data
+            && let Some(layout) = &group.auto_layout
+        {
+            if let Some(mode) = serde_json::to_value(layout.mode)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+            {
+                rule.push("--fanta-layout", mode);
+            }
+            rule.push("--fanta-gap", number(layout.spacing));
+            if layout.padding != [0.0; 4] {
+                rule.push("--fanta-padding", layout.padding.map(number).join(" "));
+            }
+        }
         self.rule(&node.id.to_string(), rule);
     }
 
@@ -1198,7 +1215,7 @@ fn unsupported_kind(data: &NodeData) -> &'static str {
     }
 }
 
-fn css_blend_mode(mode: BlendMode) -> Option<&'static str> {
+pub(crate) fn css_blend_mode(mode: BlendMode) -> Option<&'static str> {
     Some(match mode {
         BlendMode::Multiply => "multiply",
         BlendMode::Screen => "screen",
@@ -1219,7 +1236,7 @@ fn css_blend_mode(mode: BlendMode) -> Option<&'static str> {
     })
 }
 
-fn css_color(color: Color) -> String {
+pub(crate) fn css_color(color: Color) -> String {
     if color.a == 255 {
         color.to_hex()
     } else {
@@ -1249,7 +1266,7 @@ fn xml_escape(text: &str) -> String {
 }
 
 /// Shortest-round-trip float formatting; deterministic across platforms.
-fn number(value: f64) -> String {
+pub(crate) fn number(value: f64) -> String {
     format!("{value}")
 }
 

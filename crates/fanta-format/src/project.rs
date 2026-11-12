@@ -53,6 +53,7 @@ pub mod session;
 mod snapshot;
 mod source_edit;
 mod web;
+mod web_read;
 mod write;
 
 pub use fanta_fnx::canonicalize_legacy_source;
@@ -66,7 +67,7 @@ pub use merge::{
 };
 pub use read::{
     ScopedDesign, component_id_of_dir, locate_master_source, locate_page_source, page_id_of_dir,
-    page_scope_of_source, read_project_tree,
+    page_scope_of_source, read_project_tree, read_project_tree_with_warnings,
 };
 pub use session::{
     ApplyReport, ArtifactDirty, ArtifactId, ArtifactMeta, ArtifactOpImpact, ArtifactRenderRevision,
@@ -989,6 +990,214 @@ mod tests {
             tree_snapshot(dir.path()),
             "A3 byte identity across write → load → write"
         );
+    }
+
+    /// A4 and A6 (spec 0007 T3, R7/R8): hand edits inside the emitted dialect
+    /// — a fill in `design.css`, a width in the page SVG, text content, a
+    /// `var()` swapped for a literal and back, auto-layout intent — survive
+    /// load, win over the `nodes.json` records, and the next save keeps them.
+    /// What the loader cannot keep is reported, never silently dropped.
+    #[test]
+    fn web_hand_edits_win_over_the_records() {
+        use fanta_doc::{AutoLayout, Color, PathData, TextNode, Transform2D, VectorNode};
+
+        let mut doc = Doc::new();
+        doc.metadata.title = "Hand Edits".into();
+        let mut insert = |node: CanvasNode| -> NodeId {
+            let id = node.id;
+            doc.scene.insert(node).unwrap();
+            id
+        };
+        let page = insert(group(None, "Home"));
+        let mut stack = group(Some(page), "Stack");
+        if let NodeData::Group(frame) = &mut stack.data {
+            frame.local_size = Some([100.0, 100.0]);
+            frame.auto_layout = Some(
+                serde_json::from_value::<AutoLayout>(serde_json::json!({
+                    "mode": "vertical",
+                    "spacing": 10.0,
+                }))
+                .expect("auto layout"),
+            );
+        }
+        let stack_id = stack.id;
+        insert(stack);
+        let collection_id = VariableCollectionId::new();
+        let variable_id = VariableId::new();
+        let mut place = |data: NodeData, name: &str, parent: NodeId, x: f64| -> NodeId {
+            let mut node = CanvasNode::new(data);
+            node.name = name.into();
+            node.parent = Some(parent);
+            node.transform = Transform2D::translation(x, 0.0);
+            let id = node.id;
+            doc.scene.insert(node).unwrap();
+            id
+        };
+        let card = place(
+            NodeData::Vector(VectorNode::rect_solid(0.0, 0.0, 120.0, 80.0, Color::WHITE)),
+            "Card",
+            page,
+            0.0,
+        );
+        let panel = place(
+            NodeData::Vector(VectorNode::rect_solid(
+                0.0,
+                0.0,
+                64.0,
+                32.0,
+                Color::from_hex("#123456").unwrap(),
+            )),
+            "Panel",
+            page,
+            140.0,
+        );
+        let label = place(
+            NodeData::Text(TextNode::new("Hello", 100.0, 20.0)),
+            "Label",
+            page,
+            220.0,
+        );
+        let child_a = place(
+            NodeData::Vector(VectorNode::rect_solid(0.0, 0.0, 10.0, 10.0, Color::BLACK)),
+            "A",
+            stack_id,
+            0.0,
+        );
+        doc.scene
+            .get_mut(card)
+            .unwrap()
+            .bindings
+            .insert(fanta_doc::BoundProp::FillColor { index: 0 }, variable_id);
+        doc.add_page(page);
+        let mode = ModeId::new();
+        doc.variables.collections.insert(
+            collection_id,
+            VariableCollection {
+                id: collection_id,
+                name: "Theme".into(),
+                modes: vec![Mode {
+                    id: mode,
+                    name: "Light".into(),
+                }],
+                default_mode: mode,
+                variable_order: Vec::new(),
+            },
+        );
+        doc.variables.variables.insert(
+            variable_id,
+            Variable {
+                id: variable_id,
+                collection: collection_id,
+                name: "Surface".into(),
+                ty: VariableType::Color,
+                values_by_mode: BTreeMap::from([(
+                    mode,
+                    VarValue::Color {
+                        value: Color::WHITE,
+                    },
+                )]),
+                scopes: Vec::new(),
+                options: Vec::new(),
+            },
+        );
+
+        let dir = tempdir().unwrap();
+        let bounds = fanta_doc::Bounds {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 320.0,
+            max_y: 160.0,
+        };
+        let mut inputs = WebWriteInputs::default();
+        inputs.bounds.insert(page, bounds);
+        let assets = BTreeMap::new();
+        let written = write_web_project_tree(dir.path(), &doc, &assets, &inputs).unwrap();
+        assert!(matches!(written, WebWriteOutcome::Written { .. }));
+
+        // A pristine projection loads with nothing to report.
+        let (_, _, warnings) = read_project_tree_with_warnings(dir.path()).unwrap();
+        assert_eq!(warnings, Vec::<String>::new());
+
+        // Hand edits: unbind the card's fill to a literal, bind the panel's
+        // literal to the token, widen the gap, plus one unknown declaration.
+        let css_path = dir.path().join("design.css");
+        let css = fs::read_to_string(&css_path).unwrap();
+        assert!(css.contains("fill: var(--theme-surface, #FFFFFF);"), "{css}");
+        let css = css
+            .replace(
+                "fill: var(--theme-surface, #FFFFFF);",
+                "fill: #FF0000;",
+            )
+            .replace(
+                "fill: #123456;",
+                "fill: var(--theme-surface, #123456);",
+            )
+            .replace("--fanta-gap: 10;", "--fanta-gap: 24;");
+        let css = format!("{css}\n#{card} {{ zzz-unknown: 1; }}\n");
+        fs::write(&css_path, css).unwrap();
+        let svg_path = dir.path().join("pages/home/page.svg");
+        let svg = fs::read_to_string(&svg_path).unwrap();
+        assert!(svg.contains("width=\"120\""), "{svg}");
+        let svg = svg
+            .replace("width=\"120\"", "width=\"200\"")
+            .replace(">Hello<", ">Edited<");
+        fs::write(&svg_path, svg).unwrap();
+
+        let (loaded, _, warnings) = read_project_tree_with_warnings(dir.path()).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("zzz-unknown"), "{warnings:?}");
+        let loaded_card = loaded.scene.get(card).unwrap();
+        assert!(loaded_card.bindings.is_empty(), "literal fill unbinds");
+        let NodeData::Vector(vector) = &loaded_card.data else {
+            panic!("card stays a vector");
+        };
+        assert_eq!(
+            vector.fills.first(),
+            Some(&fanta_doc::Fill::Solid {
+                color: Color::from_hex("#FF0000").unwrap(),
+                blend: fanta_doc::BlendMode::Normal,
+            })
+        );
+        assert_eq!(
+            vector.path.to_svg_d(),
+            PathData::rect(0.0, 0.0, 200.0, 80.0).to_svg_d(),
+            "the SVG width wins over the record"
+        );
+        let loaded_panel = loaded.scene.get(panel).unwrap();
+        assert_eq!(
+            loaded_panel
+                .bindings
+                .get(&fanta_doc::BoundProp::FillColor { index: 0 }),
+            Some(&variable_id),
+            "a var() swap binds the fill"
+        );
+        let NodeData::Text(text) = &loaded.scene.get(label).unwrap().data else {
+            panic!("label stays text");
+        };
+        assert_eq!(text.content, "Edited");
+        let NodeData::Group(frame) = &loaded.scene.get(stack_id).unwrap().data else {
+            panic!("stack stays a frame");
+        };
+        assert_eq!(frame.auto_layout.as_ref().unwrap().spacing, 24.0);
+        assert!(
+            loaded.pending_layout.contains(&stack_id)
+                && loaded.pending_layout.contains(&child_a),
+            "changed intent re-solves the derived geometry (R8): {:?}",
+            loaded.pending_layout
+        );
+
+        // The next save canonicalizes and keeps every edit (A4).
+        let rewritten = write_web_project_tree(dir.path(), &loaded, &assets, &inputs).unwrap();
+        assert!(matches!(rewritten, WebWriteOutcome::Written { .. }));
+        let css = fs::read_to_string(&css_path).unwrap();
+        assert!(css.contains("fill: #FF0000;"), "{css}");
+        // The canonical fallback literal is the token's resolved value.
+        assert!(css.contains("fill: var(--theme-surface, #FFFFFF);"), "{css}");
+        assert!(css.contains("--fanta-gap: 24;"), "{css}");
+        assert!(!css.contains("zzz-unknown"), "unknown declarations canonicalize away");
+        let svg = fs::read_to_string(&svg_path).unwrap();
+        assert!(svg.contains("width=\"200\""), "{svg}");
+        assert!(svg.contains(">Edited<"), "{svg}");
     }
 
     /// A5 groundwork: writing web storage over an FNX tree converts it in

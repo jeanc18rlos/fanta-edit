@@ -150,7 +150,7 @@ impl HeadlessProject {
         fanta_doc::strip_redundant_instance_overrides(&mut doc.scene, &doc.components);
         let visible_page_roots = pages::visible_page_roots(&doc);
         let default_page_root = pages::default_page_root(&doc, &visible_page_roots);
-        let mut warnings = Vec::new();
+        let mut warnings = session.open_warnings.clone();
         let pending_layout_output_nodes = layout::solve_pending(&mut doc).unwrap_or_else(|error| {
             warnings.push(format!("computing omitted source geometry: {error:#}"));
             BTreeSet::new()

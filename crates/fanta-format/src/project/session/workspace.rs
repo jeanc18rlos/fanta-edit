@@ -232,6 +232,10 @@ pub struct WorkspaceSession {
     pub workspace_ir: super::workspace_fnx::WorkspaceIr,
     /// Motion dual-read index (singleton or artifact stubs).
     pub motion: super::motion::MotionIndex,
+    /// Loader diagnostics from the open that produced this session: hand
+    /// edits in a web-storage projection that could not be kept (R7). The
+    /// next save carries them into `report.json`.
+    pub open_warnings: Vec<String>,
 }
 
 impl WorkspaceSession {
@@ -260,7 +264,8 @@ impl WorkspaceSession {
             let reader_seconds = diagnostic_started.map(|started| started.elapsed().as_secs_f64());
             #[cfg(test)]
             let index_started = diagnostic_started.map(|_| std::time::Instant::now());
-            let session = Self::open_locked(root.clone(), Some(&evidence))?;
+            let mut session = Self::open_locked(root.clone(), Some(&evidence))?;
+            session.open_warnings = evidence.warnings;
             #[cfg(test)]
             let index_seconds = index_started.map(|started| started.elapsed().as_secs_f64());
             #[cfg(test)]
@@ -617,6 +622,7 @@ impl WorkspaceSession {
             file_hash_index,
             workspace_ir,
             motion,
+            open_warnings: Vec::new(),
         };
         if let Some(evidence) = loaded {
             session.validate_loaded_project_evidence(evidence)?;

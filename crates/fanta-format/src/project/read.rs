@@ -34,6 +34,26 @@ pub fn read_project_tree(dir: &Path) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)
     read_project_tree_with_source_override(dir, None)
 }
 
+/// [`read_project_tree`], also returning the loader's diagnostics: hand edits
+/// in a web-storage projection that could not be kept (R7). The next save
+/// carries them into `report.json`.
+pub fn read_project_tree_with_warnings(
+    dir: &Path,
+) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>, Vec<String>)> {
+    super::layout::with_project_read_lock(dir, || {
+        let mut warnings = Vec::new();
+        let (doc, assets) = read_project_tree_with_source_override_locked(
+            dir,
+            None,
+            None,
+            None,
+            None,
+            Some(&mut warnings),
+        )?;
+        Ok((doc, assets, warnings))
+    })
+}
+
 pub(crate) struct LoadedSourceIdentity {
     pub(crate) source_hash: Option<[u8; 32]>,
     pub(crate) sidecar_hash: Option<[u8; 32]>,
@@ -49,6 +69,8 @@ pub(crate) struct LoadedProjectEvidence {
     pub(crate) sources: LoadedSourceIdentities,
     pub(crate) files: LoadedFileHashes,
     pub(crate) pages: Vec<NodeId>,
+    /// Loader diagnostics: web-storage hand edits that could not be kept (R7).
+    pub(crate) warnings: Vec<String>,
 }
 
 pub(crate) fn read_project_tree_with_source_identities(
@@ -62,6 +84,7 @@ pub(crate) fn read_project_tree_with_source_identities(
             None,
             Some(&mut evidence.sources),
             Some(&mut evidence.files),
+            Some(&mut evidence.warnings),
         )?;
         evidence.pages = doc.pages().to_vec();
         Ok((doc, assets, evidence))
@@ -79,7 +102,7 @@ pub(super) fn read_project_tree_with_source_override(
     source_override: Option<&FnxSourceOverride<'_>>,
 ) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
     super::layout::with_project_read_lock(dir, || {
-        read_project_tree_with_source_override_locked(dir, source_override, None, None, None)
+        read_project_tree_with_source_override_locked(dir, source_override, None, None, None, None)
     })
 }
 
@@ -93,7 +116,7 @@ pub(super) fn read_project_tree_with_json_override(
     source_override: &JsonSourceOverride<'_>,
 ) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
     super::layout::with_project_read_lock(dir, || {
-        read_project_tree_with_source_override_locked(dir, None, Some(source_override), None, None)
+        read_project_tree_with_source_override_locked(dir, None, Some(source_override), None, None, None)
     })
 }
 
@@ -177,6 +200,7 @@ fn read_project_tree_with_source_override_locked(
     json_override: Option<&JsonSourceOverride<'_>>,
     mut source_identities: Option<&mut LoadedSourceIdentities>,
     mut loaded_files: Option<&mut LoadedFileHashes>,
+    warnings: Option<&mut Vec<String>>,
 ) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
     let manifest =
         match json_override.filter(|source| source.path == dir.join(super::layout::FANTA_JSON)) {
@@ -360,6 +384,24 @@ fn read_project_tree_with_source_override_locked(
             ("sets".to_owned(), component_scan.sets),
         ])),
     );
+    // Web storage: hand edits in the SVG and CSS win over the records (R7).
+    // Diagnostics about edits that could not be kept flow to the caller; the
+    // next save writes them into report.json. A caller with no sink gets the
+    // overlay applied all the same (the sink arrives with T5's session work).
+    if manifest.storage.as_deref() == Some(super::layout::STORAGE_WEB) {
+        let mut overlay_warnings = Vec::new();
+        super::web_read::apply_web_overlay(
+            dir,
+            &mut nodes,
+            &variables,
+            &mut pending_layout,
+            &mut overlay_warnings,
+        )?;
+        if let Some(warnings) = warnings {
+            warnings.extend(overlay_warnings);
+        }
+    }
+
     root.insert(
         "scene".to_owned(),
         Value::Object(Map::from_iter([("nodes".to_owned(), Value::Object(nodes))])),
