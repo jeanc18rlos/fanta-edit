@@ -153,7 +153,8 @@ validator that runs without the editor.
   **Resolved by the founder, 2026-11-12:** open with diagnostics and allow
   saving; refuse only files that do not parse (R11). The founder added that
   the repair agent should see git to reconcile changes (R8).
-- **Q4.** Where the binary lives: a new crate, or a subcommand of an
+- **Q4.** ~~Where the binary lives.~~ **Answered in `design.md`:** a binary
+  target in `fanta-format`, no new crate. Original question: a new crate, or a subcommand of an
   existing engine binary (`fanta-site`, `fanta-mcp`). A new crate needs a
   layer in `layers.toml`. To settle in `design.md`.
 - **Q5.** ~~Earlier git lifecycle work.~~ **Founder, 2026-11-12:** look in

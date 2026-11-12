@@ -2,23 +2,164 @@
 
 ## Approach
 
-How it works. Name the crates, modules, files and types involved and the
-layer each one sits in ([crate map](../../docs/architecture/crate-map.md)).
+Everything that reads or writes project files already lives in
+`fanta-format` (persistence layer), so the checker and the snapshot store go
+there too. No new crate and no change to `layers.toml`.
+
+**Diagnostics.** `SourceDiagnostic` and `SourceSeverity`
+(`project/session/types.rs`) already carry a stable code, a node id and a
+message for the legacy FNX path. They gain optional `file`, `line` and
+`column`, and replace the free-text `Vec<String>` that
+`project/web_read.rs`, `read_project_tree_with_warnings` and
+`WorkspaceSession::open_warnings` pass around today. `report.json` writes
+the same records.
+
+**Collecting load.** Today a file that does not parse returns `Err` and
+aborts the whole load. The reader gains a collecting mode: a design whose
+SVG, CSS or sidecar fails to parse is recorded as an `error` diagnostic and
+left out of the document, and the load continues. `check_project` is that
+mode plus the cross-file checks of R3 (duplicate ids, dangling references,
+records without elements, manifest against files). The strict mode stays
+for callers that need all-or-nothing.
+
+**Command.** A `[[bin]]` target `fanta-check` in `fanta-format`
+(`src/check_main.rs`): one path argument and `--json`, parsed from
+`std::env::args`. It replaces `examples/check_project.rs`, which already
+loads a project without writing and prints the first error; the binary keeps
+that behaviour and adds the diagnostics. Its dependency tree is `fanta-format`'s own, which the
+persistence layer already forbids from reaching Skia. This answers Q4.
+
+**Snapshots.** A native-only module `project/history.rs` in `fanta-format`
+drives the `git` binary against a private bare repository at
+`<project>/.fanta/history.git`, with `GIT_DIR` and `GIT_WORK_TREE` set so
+the user's repository is never read or written. It follows the method of
+Zed's `checkpoint` in `crates/git/src/repository.rs` (stage everything into
+an index, `write-tree`, `commit-tree`) but cannot call it: the engine layers
+may not depend on shell crates, and headless saves need snapshots too. This
+answers Q5.
+
+- Each snapshot is a parentless commit under its own ref,
+  `refs/snapshots/<utc timestamp>`. Git still shares unchanged files between
+  snapshots, any two can be diffed, and pruning is deleting refs and running
+  `git gc`; a chained history could not drop its middle.
+- Restore records a snapshot of the current state, then makes the working
+  files equal to the chosen snapshot's tree, removing files it lacks.
+- `.fanta/` is added to the project's `.gitignore` (created or appended),
+  and every walker of the project directory skips it: the loader, the
+  session hash index, the editor's watcher, `.fant` export and `fanta-site`.
+
+**Wiring.** The save path in `fanta-format` (`project/write.rs`) calls the
+store, so the editor, `fanta-headless`, `fanta-mcp` and the cloud worker
+all get R6 from one place. A snapshot is taken before a save when the
+session's expected disk hashes differ from disk (the condition the
+reconcile already computes), and after every successful save.
+
+**Editor.** `fig_viewer`'s `document.rs` already debounces watcher events
+(`schedule_watcher_check`) and reconciles external changes. After a
+reconcile it runs `check_project` on the background executor and stores the
+result on the document entity; a banner shows the count and opens the list.
+A design left out by the collecting load renders as unavailable (R11).
+Restore is an action listing snapshots by time.
+
+**Agents.** One tool, `check_project`, defined with the other shared tool
+schemas and served by `live_mcp.rs` and `fanta-mcp`. The repair skill is
+text: it ships in the plugin's skills and in the guide seeded into
+projects, and tells the agent to run the check, read the snapshot diff with
+plain `git --git-dir=.fanta/history.git`, edit, and re-check. In the app
+the agent's existing edit review shows the diff for acceptance.
 
 ## Interfaces and data
 
-Public types, wire formats, file formats and migrations, with signatures or
-schemas.
+```rust
+// fanta-format, project/session/types.rs (extended)
+pub struct SourceDiagnostic {
+    pub severity: SourceSeverity,      // Error | Warning | Info
+    pub code: &'static str,            // e.g. "ref.missing_token"
+    pub file: Option<String>,          // project-relative, forward slashes
+    pub line: Option<u32>,
+    pub column: Option<u32>,
+    pub node_id: Option<String>,       // prefixed Display form
+    pub node_name: Option<String>,
+    pub message: String,
+}
+
+// fanta-format, project/check.rs
+pub fn check_project(dir: &Path) -> Result<Vec<SourceDiagnostic>>;
+
+// fanta-format, project/history.rs (not built for wasm)
+pub struct Snapshot { pub id: String, pub taken_at: String, pub reason: SnapshotReason }
+pub enum SnapshotReason { BeforeSave, AfterSave, BeforeRestore }
+pub fn record(dir: &Path, reason: SnapshotReason) -> Result<Snapshot>;
+pub fn list(dir: &Path) -> Result<Vec<Snapshot>>;
+pub fn restore(dir: &Path, id: &str) -> Result<Snapshot>; // returns the BeforeRestore snapshot
+pub fn prune(dir: &Path, now: SystemTime) -> Result<()>;  // 30 days, then one per day
+```
+
+- `fanta-check <dir> [--json]`: exit 0 with no `error` diagnostics, 1 with
+  some, 2 when the directory is not a project. JSON is the array of
+  diagnostics, sorted by file, line, code.
+- Code families: `parse.*`, `id.*`, `ref.*`, `record.*`, `edit.*`,
+  `unknown.*`, `manifest.*`, `snapshot.*`. The list lives in
+  `docs/` beside the project schema; a test compares it with the codes in
+  the source (A9).
+- `report.json` changes from strings to these records. It is a generated
+  file with no reader in the repository other than tests.
+- Corpus: `crates/fanta-format/tests/corpus/<case>/` holds a project and
+  `expected.json` (codes with file and line).
+- Seeded guide: changing `AGENTS_MD` needs the replaced text's SHA-256 in
+  `previous_seeds` (`fanta-format/AGENTS.md`).
 
 ## Alternatives
 
-What else could work and why this approach wins. A choice with lasting
-consequences becomes an ADR; list it here as proposed.
+- **A new `fanta-check` crate in the hosts layer.** Cleaner name, but a
+  crate, a layer entry, a licence file and a map change for forty lines of
+  argument handling. Worth doing only if ADR 0026 ends up licensing the
+  checker differently from `fanta-format`.
+- **Snapshots as a hidden ref in the user's repository.** Rejected by the
+  founder's answer to Q1.
+- **Snapshots as plain directory copies.** No git needed, but no sharing of
+  unchanged files and nothing for the repair agent to diff with standard
+  tools, which the founder asked for.
+- **A git library (`gix`) instead of the binary.** Removes the dependency on
+  an installed git at the cost of a large new dependency in the engine. The
+  inherited editor already requires the binary. Revisit if the cloud worker
+  image lacks git.
+- **Calling Zed's `checkpoint` from the editor only.** Leaves headless and
+  MCP saves without snapshots, and it writes objects into the user's
+  repository.
 
 ## Risks
 
-What can go wrong, how we would notice and how we would back out.
+- **Positions.** Line and column need the SVG and CSS parsers in
+  `web_read.rs` to keep offsets. Not yet verified; T1 starts by checking,
+  and falls back to file-level diagnostics for a parser that cannot.
+- **Collecting load reaches far.** Callers assume a loaded document is
+  complete. A design left out must not be treated as deleted by the next
+  save: the writer has to leave an unparsed design's files untouched (A10).
+  This is the change most likely to lose data if done wrong, so it lands
+  alone (T3) behind its own test.
+- **No git binary.** `record` fails; the save still proceeds, and the
+  failure is a `snapshot.unavailable` diagnostic shown in the editor. A save
+  that would rewrite an externally changed file then asks first.
+- **Save latency.** Two git invocations per save on a large project
+  (9,034 designs were imported in spec 0007's live test). Measure in T4 with
+  the `fanta-perf` method; if it shows, snapshot after save on a background
+  task and keep only the before-save snapshot synchronous.
+- **Stray `.fanta/` readers.** Any directory walker that does not skip it
+  will index git objects. T4 greps for walkers and adds a test per one.
+- **Licence.** `fanta-format` is GPL today. Publishing the checker under a
+  permissive licence waits for ADR 0026; T8 is blocked on it.
 
 ## Verification
 
-How each acceptance criterion is checked: tests, release stages, manual steps.
+| Criterion | How |
+| --- | --- |
+| A1, A2, A9 | `cargo test -p fanta-format` over the corpus and the code list |
+| A3, A10 | `fig_viewer` tests: open each corpus case, save, restore, compare bytes |
+| A4 | `fanta-format` test in a temporary git repository and outside one |
+| A5 | `fig_viewer` test through `queue_watcher_paths_for_test` |
+| A6 | `fanta-mcp` test and the live MCP smoke test, compared with the binary's output |
+| A7 | Manual run of the skill on the repairable corpus cases, recorded in the pull request |
+| A8 | A workflow step running `cargo tree -p fanta-format -e normal` and failing on `gpui` or `skia` |
+
+Release stages touched: engine, source-order, editor, workspace.
