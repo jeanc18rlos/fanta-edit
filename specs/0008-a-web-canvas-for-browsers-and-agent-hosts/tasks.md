@@ -11,7 +11,7 @@ request when it merges.
   `batch_design` op list, return the rewritten files (R1, R2). Verify:
   A1's CI target check and A2's byte-identity test against the native
   writer.
-- [ ] **T2.** `fanta-canvas-web`: the JS canvas component — load a
+- [x] **T2.** ([#196](https://github.com/jeanc18rlos/fanta-edit/pull/196)) `fanta-canvas-web`: the JS canvas component — load a
   web-format project, display `page.svg` with its scoped CSS, pan, zoom
   and click-select, apply ops through the T1 engine and swap the updated
   SVG in place (R3, R4, R5). Verify: A3.
