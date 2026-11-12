@@ -1,0 +1,40 @@
+{
+  "nodes": {
+    "n_01M78J2NED7QX15H9HKM844EQ8": {
+      "bounds": [
+        0.0,
+        0.0,
+        48.0,
+        24.0
+      ],
+      "name": "Components"
+    },
+    "n_01M78J2NED8V9QBVT6HY9D6N2F": {
+      "bounds": [
+        0.0,
+        0.0,
+        48.0,
+        24.0
+      ],
+      "name": "Chip background"
+    },
+    "n_01M78J2NEDEJWQYWMVS67TPF95": {
+      "bounds": [
+        0.0,
+        0.0,
+        48.0,
+        24.0
+      ],
+      "name": "Chip"
+    }
+  },
+  "page": {
+    "bounds": [
+      0.0,
+      0.0,
+      48.0,
+      24.0
+    ],
+    "name": "Components"
+  }
+}

@@ -5,7 +5,7 @@ The running app advertises its live MCP server (a Unix socket speaking
 newline-delimited JSON-RPC, the same framing as MCP stdio) in
 `<data-dir>/fanta_live_mcp.json`. This bridge attaches to it and pumps
 bytes both ways; when no live server is up it serves the project headlessly
-with `fanta-mcp` (the same 14 tools, no app), and only launches the app when
+with `fanta-mcp` (the same 15 tools, no app), and only launches the app when
 no headless server is available either. Attaching needs no Fanta binary at
 all — only the fallbacks do.
 

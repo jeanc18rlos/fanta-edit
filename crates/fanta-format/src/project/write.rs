@@ -337,7 +337,7 @@ pub fn stage_new_project_tree(
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
     render: Option<&dyn crate::project::web::WebRenderSource>,
-    warnings: &[String],
+    warnings: &[super::diagnostic::SourceDiagnostic],
 ) -> Result<WriteReport> {
     if !fs::symlink_metadata(dir)?.file_type().is_dir()
         || fs::read_dir(dir)?.next().transpose()?.is_some()
@@ -415,7 +415,7 @@ fn write_legacy_project_tree_impl(
         Arc::new(asset_index_bytes(assets)?),
     );
     let asset_files = project_asset_files(assets, media_registry)?;
-    sync_project_files(dir, &files, &asset_files, expected_disk)
+    sync_project_files(dir, &files, &asset_files, expected_disk, &[])
 }
 
 /// Bring the tree at `dir` to exactly `files` + `asset_files`: plan the byte
@@ -429,6 +429,8 @@ pub(crate) fn sync_project_files(
     files: &ProjectedFiles,
     asset_files: &BTreeMap<PathBuf, &[u8]>,
     expected_disk: Option<&BTreeMap<PathBuf, Option<[u8; 32]>>>,
+    // Design directories whose files are never removed (spec 0009 R11).
+    unavailable: &[PathBuf],
 ) -> Result<WriteReport> {
     // The writer is synchronous; a per-thread delta includes shared recovery and
     // editor-support helpers without counting concurrent saves on other threads.
@@ -464,7 +466,19 @@ pub(crate) fn sync_project_files(
     for (relative, bytes) in asset_files.iter() {
         plan_write(dir, relative, bytes, &mut writes)?;
     }
-    let removals = stale_managed_files(dir, &keep)?;
+    let mut removals = stale_managed_files(dir, &keep)?;
+    if !removals.is_empty() {
+        // A design that does not parse now is kept whoever the caller is: a
+        // session opened after the load does not always carry its findings.
+        let (broken, _) = super::check::unparsable_designs(dir)?;
+        removals.retain(|removal| {
+            let absolute = dir.join(&removal.relative);
+            !unavailable
+                .iter()
+                .any(|design| removal.relative.starts_with(design))
+                && !broken.iter().any(|design| absolute.starts_with(design))
+        });
+    }
     if let Some(expected_disk) = expected_disk {
         if let Some(untracked) = removals
             .iter()

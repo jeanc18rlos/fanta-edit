@@ -18,8 +18,14 @@ use fanta_headless::{HeadlessProject, MAX_RENDER_DIMENSION, PageRef, RenderTarge
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+pub mod server;
+pub mod source;
+
 /// The longest a run may take; Cloud Run ends the request at 300 s.
 pub const MAX_DEADLINE_MS: u64 = 280_000;
+/// The most steps one run takes. Each render and export step is capped, and
+/// this caps how many a run can stack before the deadline is next checked.
+pub const MAX_STEPS: usize = 32;
 pub const MAX_RENDER_TARGETS: usize = 8;
 /// The most data rows one `export_batch` step renders.
 pub const MAX_BATCH_ROWS: usize = 8;
@@ -356,8 +362,39 @@ pub fn validate(request: &RunRequest) -> Result<(), EngineError> {
             "deadline_ms must be between 1 and {MAX_DEADLINE_MS}"
         ));
     }
-    if request.steps.is_empty() {
-        return bad_request("a run needs at least one step".into());
+    if request.steps.is_empty() || request.steps.len() > MAX_STEPS {
+        return bad_request(format!("a run takes 1 to {MAX_STEPS} steps"));
+    }
+    if let Source::Github {
+        repo,
+        sha,
+        path,
+        overlay,
+        ..
+    } = &request.source
+    {
+        // Both parts go into GitHub API paths, so `..` must not pass.
+        let name = |part: &str| {
+            !matches!(part, "" | "." | "..")
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        };
+        if !repo
+            .split_once('/')
+            .is_some_and(|(owner, name_part)| name(owner) && name(name_part))
+        {
+            return bad_request(format!("repo {repo:?} must be owner/name"));
+        }
+        if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            return bad_request("sha must be a full 40-character commit SHA".into());
+        }
+        source::relative_path(path)?;
+        for file in overlay.iter().flat_map(|overlay| &overlay.files) {
+            if source::relative_path(&file.path)?.as_os_str().is_empty() {
+                return bad_request("an overlay file needs a path".into());
+            }
+        }
     }
     for (index, step) in request.steps.iter().enumerate() {
         if let Step::Render { targets } = step
@@ -421,6 +458,12 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
         };
         EngineError::new(code, format!("{error:#}"))
     })?;
+    if started.elapsed() >= deadline {
+        return Err(EngineError::new(
+            ErrorCode::DeadlineExceeded,
+            "the deadline passed before the project loaded",
+        ));
+    }
     let mut session = DesignSession::from_project(project);
     // Template images come from data: URIs or this checkout's own files,
     // never from the network.
@@ -471,7 +514,8 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
             sha: None,
             project_id: project.map(|project| project.doc().id.to_string()),
             warnings: project
-                .map(|project| project.warnings().to_vec())
+                // The cloud contract is frozen (ADR 0021): one sentence per finding.
+                .map(|project| project.warnings().iter().map(ToString::to_string).collect())
                 .unwrap_or_default(),
             fonts: project.map(font_report).unwrap_or_default(),
         },
@@ -727,15 +771,46 @@ mod tests {
         assert_eq!(code(wide), Err(ErrorCode::BadRequest));
 
         let mut ambiguous = base.clone();
-        ambiguous["source"] = json!({"kind": "github", "repo": "a/b", "sha": "c", "token": "t",
+        ambiguous["source"] = json!({"kind": "github", "repo": "a/b", "sha": "0123456789abcdef0123456789abcdef01234567", "token": "t",
             "overlay": {"files": [{"path": "fanta.json", "content_b64": "e30=", "deleted": true}]}});
         assert_eq!(code(ambiguous), Err(ErrorCode::BadRequest));
 
-        let mut large = base;
-        large["source"] = json!({"kind": "github", "repo": "a/b", "sha": "c", "token": "t",
+        let mut large = base.clone();
+        large["source"] = json!({"kind": "github", "repo": "a/b", "sha": "0123456789abcdef0123456789abcdef01234567", "token": "t",
             "overlay": {"files": [{"path": "big.bin",
                 "content_b64": "A".repeat(MAX_OVERLAY_BYTES / 3 * 4 + 8)}]}});
         assert_eq!(code(large), Err(ErrorCode::PayloadTooLarge));
+
+        let mut long = base.clone();
+        long["steps"] = json!(vec![json!({"step": "inspect"}); MAX_STEPS + 1]);
+        assert_eq!(code(long), Err(ErrorCode::BadRequest));
+
+        let github = |repo: &str, sha: &str, path: &str, overlay_path: &str| {
+            let mut value = base.clone();
+            value["source"] = json!({"kind": "github", "repo": repo, "sha": sha, "path": path,
+                "token": "t", "overlay": {"files": [{"path": overlay_path, "content_b64": "e30="}]}});
+            code(value)
+        };
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(github("acme/site", sha, "design", "pages/a.fnx"), Ok(()));
+        for (repo, sha, path, overlay_path) in [
+            ("acme", sha, "", "a.fnx"),
+            ("acme/site/extra", sha, "", "a.fnx"),
+            ("../site", sha, "", "a.fnx"),
+            ("acme/site", "0123456", "", "a.fnx"),
+            ("acme/site", &"g".repeat(40), "", "a.fnx"),
+            ("acme/site", sha, "../other", "a.fnx"),
+            ("acme/site", sha, "/abs", "a.fnx"),
+            ("acme/site", sha, "", "../../app/x"),
+            ("acme/site", sha, "", "/etc/x"),
+            ("acme/site", sha, "", ""),
+        ] {
+            assert_eq!(
+                github(repo, sha, path, overlay_path),
+                Err(ErrorCode::BadRequest),
+                "{repo} {sha} {path} {overlay_path}"
+            );
+        }
     }
 
     #[test]

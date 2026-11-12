@@ -12,7 +12,8 @@ Agent-facing behavior is described in several places that nothing checks against
 2. The live MCP tool in `crates/fig_viewer/src/live_mcp.rs`, the headless server in `crates/fanta-mcp/src/main.rs` (the shared argument structs in `crates/fanta-design-ops` usually carry both), and the built-in tool in `crates/agent/src/tools/`, as applicable.
 3. The seeded project guide `AGENTS_MD` in `crates/fanta-format/src/project/layout.rs`. Add the SHA-256 of the replaced text to `previous_seeds`, or existing projects keep the old guide.
 4. The tool table and tool count in `docs/fanta/agent-quickstart.md`, and `README.md` ("Connect an agent") if the count changes.
-5. The agent prompt templates in `crates/agent/src/templates/` when the canvas workflow they describe changes.
+5. `examples/claude-plugin/skills/fanta-repair/SKILL.md`, when a diagnostic code is added or its repair changes. The same file is compiled into the app as a built-in skill (`crates/agent_skills`), so keep it free of plugin-only instructions. (#213)
+6. The agent prompt templates in `crates/agent/src/templates/` when the canvas workflow they describe changes.
 
 Then run `cargo test --locked -p agent --lib test_fanta_specs` and `test_design_progress` (both CI gates), and `script/smoke-mcp` against a running app (see the `fanta-verify` skill).
 

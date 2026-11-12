@@ -85,6 +85,7 @@ macro_rules! live_tools {
             ReadFnxSourceTool,
             ValidateFnxSourceTool,
             GetGuidelinesTool,
+            CheckProjectTool,
             ImportImageTool,
             ListCommentsTool,
             ReplyCommentTool,
@@ -740,6 +741,37 @@ impl McpServerTool for GetGuidelinesTool {
     }
 }
 
+// ---- check_project -----------------------------------------------------------
+
+#[derive(Clone)]
+struct CheckProjectTool;
+
+impl McpServerTool for CheckProjectTool {
+    type Input = OrDefault<design_surface::CheckProjectArgs>;
+    type Output = ();
+
+    const NAME: &'static str = "check_project";
+
+    fn annotations(&self) -> ToolAnnotations {
+        read_only()
+    }
+
+    async fn run(&self, _input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
+        let root = with_surface(cx, |surface, cx| surface.project_root(cx))?
+            .context("the open design is not saved as a project yet; save it first")?;
+        // Spec 0009 R5: the same JSON `fanta-check --json` prints.
+        let text = cx
+            .background_spawn(async move {
+                fanta_format::findings_json(&fanta_format::check_project(&root)?)
+            })
+            .await?;
+        Ok(ToolResponse {
+            content: vec![context_server::types::ToolResponseContent::Text { text }],
+            structured_content: (),
+        })
+    }
+}
+
 /// Inspect reusable component properties/variant sets, variable collections, modes,
 /// paginated components, variant sets and typed token values, and optional
 /// selected-node bindings. Use offset and limit (default 100, maximum 200),
@@ -972,7 +1004,7 @@ mod tests {
             };
         }
         let tools = live_tools!(descriptions!());
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 15);
         for (name, description) in tools {
             let description = description.unwrap_or_default();
             assert!(

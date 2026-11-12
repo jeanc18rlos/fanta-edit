@@ -20,6 +20,10 @@ use serde_json::{Map, Value};
 use crate::error::Result;
 
 use super::layout::{COMPONENTS_DIR, PAGES_DIR, id_from_key, json_key, slugify};
+use super::diagnostic::{
+    EDIT_NOT_KEPT, EDIT_SELECTOR_OUTSIDE_DIALECT, ID_NOT_A_NODE, PARSE_SVG, RECORD_MISSING,
+    RECORD_UNREADABLE, REF_AMBIGUOUS_TOKEN, REF_MISSING_TOKEN, SourceDiagnostic,
+};
 use super::tree_source::TreeSource;
 use super::web::{DESIGN_CSS, MASTER_SVG, PAGE_SVG, css_blend_mode, css_color, number};
 
@@ -34,23 +38,36 @@ pub(crate) fn apply_web_overlay(
     nodes: &mut Map<String, Value>,
     variables: &Value,
     pending_layout: &mut BTreeSet<NodeId>,
-    warnings: &mut Vec<String>,
+    warnings: &mut Vec<SourceDiagnostic>,
+    unavailable: &BTreeSet<PathBuf>,
 ) -> Result<()> {
     let tokens = TokenTable::new(variables, warnings);
     let mut rules = match source.read_to_string(&dir.join(DESIGN_CSS)) {
-        Ok(css) => parse_rules(&css, warnings),
+        Ok(css) => parse_rules(&css, DESIGN_CSS, warnings),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
         Err(error) => return Err(error.into()),
     };
     let mut elements = BTreeMap::new();
+    // (project-relative name, path) of each design SVG; `SvgElement::file`
+    // indexes it.
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
     for path in design_svgs(source, dir)? {
+        if path.parent().is_some_and(|design| unavailable.contains(design)) {
+            continue;
+        }
         let svg = source.read_to_string(&path)?;
         let context = path
             .strip_prefix(dir)
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        parse_design_svg(&svg, &context, &mut elements, warnings);
+        let file = u32::try_from(files.len()).unwrap_or(u32::MAX);
+        parse_design_svg(&svg, &context, file, &mut elements, warnings);
+        let scoped_context = Path::new(&context)
+            .with_extension("css")
+            .to_string_lossy()
+            .into_owned();
+        files.push((context, path.clone()));
         // The design's own stylesheet wins over a duplicate declaration in
         // the root design.css (scoped is more specific — spec 0007 R3 as
         // amended), but a root-only declaration still applies: append the
@@ -58,7 +75,7 @@ pub(crate) fn apply_web_overlay(
         let scoped = path.with_extension("css");
         match source.read_to_string(&scoped) {
             Ok(css) => {
-                for (id, declarations) in parse_rules(&css, warnings) {
+                for (id, declarations) in parse_rules(&css, &scoped_context, warnings) {
                     rules.entry(id).or_default().extend(declarations);
                 }
             }
@@ -76,25 +93,36 @@ pub(crate) fn apply_web_overlay(
             continue;
         }
         let Ok(id) = display.parse::<NodeId>() else {
-            warnings.push(format!(
-                "#{raw}: the id does not name a node; its rule is regenerated on save"
-            ));
+            let finding = SourceDiagnostic::warning(
+                ID_NOT_A_NODE,
+                format!("#{raw}: the id does not name a node; its rule is regenerated on save"),
+            );
+            warnings.push(locate(finding, raw, elements.get(raw), &files, source));
             continue;
         };
         let key = json_key(&id)?;
         let Some(record) = nodes.get(&key) else {
-            warnings.push(format!(
-                "{display}: appears in the projection but not in nodes.json; ignored"
-            ));
+            let finding = SourceDiagnostic::warning(
+                RECORD_MISSING,
+                format!("{display}: appears in the projection but not in nodes.json; ignored"),
+            )
+            .for_node(display);
+            warnings.push(locate(finding, raw, elements.get(raw), &files, source));
             continue;
         };
         let mut node: CanvasNode = match serde_json::from_value(record.clone()) {
             Ok(node) => node,
             Err(error) => {
-                warnings.push(format!("{display}: unreadable record: {error}"));
+                let finding = SourceDiagnostic::warning(
+                    RECORD_UNREADABLE,
+                    format!("{display}: unreadable record: {error}"),
+                )
+                .for_node(display);
+                warnings.push(locate(finding, raw, elements.get(raw), &files, source));
                 continue;
             }
         };
+        let reported = warnings.len();
         let mut edit = Edit {
             node: &mut node,
             display,
@@ -112,6 +140,15 @@ pub(crate) fn apply_web_overlay(
             }
         }
         let (changed, layout_changed) = (edit.changed, edit.layout_changed);
+        if warnings.len() > reported {
+            let located: Vec<_> = warnings
+                .drain(reported..)
+                .map(|finding| {
+                    locate(finding.for_node(display), raw, elements.get(raw), &files, source)
+                })
+                .collect();
+            warnings.extend(located);
+        }
         if layout_changed {
             relayout.push(id);
         }
@@ -178,9 +215,36 @@ fn split_slot(raw: &str) -> (&str, Slot) {
     (raw, Slot::Node)
 }
 
+/// Say where a finding about the element with raw id `raw` sits: its SVG
+/// file and the position of its `id` attribute. The file is read again here
+/// because findings are rare and tracking a position for every element would
+/// tax every load.
+fn locate(
+    finding: SourceDiagnostic,
+    raw: &str,
+    element: Option<&SvgElement>,
+    files: &[(String, PathBuf)],
+    source: &TreeSource<'_>,
+) -> SourceDiagnostic {
+    let Some((context, path)) = element.and_then(|element| files.get(element.file as usize))
+    else {
+        return finding;
+    };
+    let finding = finding.in_file(context.clone());
+    let Ok(text) = source.read_to_string(path) else {
+        return finding;
+    };
+    match text.find(&format!("id=\"{raw}\"")) {
+        Some(offset) => finding.at_offset(&text, offset),
+        None => finding,
+    }
+}
+
 /// One parsed SVG element, keyed by its raw `id`.
 #[derive(Default)]
 struct SvgElement {
+    /// Index into the overlay's list of design SVG files.
+    file: u32,
     tag: String,
     name: Option<String>,
     transform: Option<String>,
@@ -227,8 +291,9 @@ fn design_svgs(source: &TreeSource<'_>, dir: &Path) -> Result<Vec<PathBuf>> {
 fn parse_design_svg(
     src: &str,
     context: &str,
+    file: u32,
     elements: &mut BTreeMap<String, SvgElement>,
-    warnings: &mut Vec<String>,
+    warnings: &mut Vec<SourceDiagnostic>,
 ) {
     use quick_xml::events::Event;
     let mut reader = quick_xml::Reader::from_str(src);
@@ -247,10 +312,12 @@ fn parse_design_svg(
                     continue;
                 }
                 let mut element = SvgElement {
+                    file,
                     tag: tag.clone(),
                     ..SvgElement::default()
                 };
                 let mut id = None;
+                let mut styled = false;
                 for attribute in start.attributes().flatten() {
                     let value = match attribute.unescape_value() {
                         Ok(value) => value.into_owned(),
@@ -266,10 +333,28 @@ fn parse_design_svg(
                         b"height" => element.height = value.trim().parse().ok(),
                         b"d" => element.d = Some(value),
                         b"href" => element.href = Some(value),
+                        b"style" => styled = true,
                         _ => {}
                     }
                 }
                 let Some(id) = id else { continue };
+                // The writer never puts `style` on a node's own element, so
+                // one there is a hand edit (vector applications fold paint
+                // into it on save), and only the stylesheet is read.
+                if styled && id.parse::<NodeId>().is_ok() {
+                    let finding = SourceDiagnostic::warning(
+                        EDIT_NOT_KEPT,
+                        format!(
+                            "{id}: the style attribute is not read; styling belongs in the design's stylesheet, and the save removes the attribute"
+                        ),
+                    )
+                    .for_node(&id)
+                    .in_file(context);
+                    warnings.push(match src.find(&format!("id=\"{id}\"")) {
+                        Some(offset) => finding.at_offset(src, offset),
+                        None => finding,
+                    });
+                }
                 if tag == "text" {
                     text = Some((id.clone(), Vec::new()));
                 }
@@ -297,9 +382,17 @@ fn parse_design_svg(
             },
             Ok(Event::Eof) => break,
             Err(error) => {
-                warnings.push(format!(
-                    "{context}: SVG parse error ({error}); edits beyond this point are ignored"
-                ));
+                let offset = usize::try_from(reader.error_position()).unwrap_or(src.len());
+                warnings.push(
+                    SourceDiagnostic::warning(
+                        PARSE_SVG,
+                        format!(
+                            "{context}: SVG parse error ({error}); edits beyond this point are ignored"
+                        ),
+                    )
+                    .in_file(context)
+                    .at_offset(src, offset),
+                );
                 break;
             }
             Ok(_) => {}
@@ -312,7 +405,8 @@ fn parse_design_svg(
 /// classes) are skipped; a grouped selector is reported, not guessed at.
 fn parse_rules(
     css: &str,
-    warnings: &mut Vec<String>,
+    context: &str,
+    warnings: &mut Vec<SourceDiagnostic>,
 ) -> BTreeMap<String, Vec<(String, String)>> {
     let mut source = String::with_capacity(css.len());
     let mut rest = css;
@@ -340,9 +434,17 @@ fn parse_rules(
             continue;
         };
         if id.contains([',', ' ', '.', ':', '#']) {
-            warnings.push(format!(
-                "selector {selector:?} is outside the emitted dialect; its rule is regenerated on save"
-            ));
+            let finding = SourceDiagnostic::warning(
+                EDIT_SELECTOR_OUTSIDE_DIALECT,
+                format!(
+                    "selector {selector:?} is outside the emitted dialect; its rule is regenerated on save"
+                ),
+            )
+            .in_file(context);
+            warnings.push(match css.find(selector) {
+                Some(offset) => finding.at_offset(css, offset),
+                None => finding,
+            });
             continue;
         }
         let declarations = rules.entry(id.to_string()).or_default();
@@ -363,7 +465,7 @@ struct TokenTable {
 }
 
 impl TokenTable {
-    fn new(variables: &Value, warnings: &mut Vec<String>) -> Self {
+    fn new(variables: &Value, warnings: &mut Vec<SourceDiagnostic>) -> Self {
         let mut by_token = BTreeMap::new();
         let collections = variables.get("collections").and_then(Value::as_object);
         let variables = variables.get("variables").and_then(Value::as_object);
@@ -389,8 +491,11 @@ impl TokenTable {
                 );
                 if let Some(first) = by_token.get(&token) {
                     if first != key {
-                        warnings.push(format!(
-                            "variables {collection_name}/{variable_name} and another share the token {token}; var() edits resolve to the first"
+                        warnings.push(SourceDiagnostic::warning(
+                            REF_AMBIGUOUS_TOKEN,
+                            format!(
+                                "variables {collection_name}/{variable_name} and another share the token {token}; var() edits resolve to the first"
+                            ),
                         ));
                     }
                     continue;
@@ -473,13 +578,19 @@ struct Edit<'a> {
     changed: bool,
     layout_changed: bool,
     tokens: &'a TokenTable,
-    warnings: &'a mut Vec<String>,
+    warnings: &'a mut Vec<SourceDiagnostic>,
 }
 
 impl Edit<'_> {
     fn keep(&mut self, what: &str) {
-        self.warnings
-            .push(format!("{}: {what}", self.display));
+        self.keep_as(EDIT_NOT_KEPT, what);
+    }
+
+    fn keep_as(&mut self, code: &'static str, what: &str) {
+        self.warnings.push(SourceDiagnostic::warning(
+            code,
+            format!("{}: {what}", self.display),
+        ));
     }
 
     fn apply_svg(&mut self, slot: &Slot, element: &SvgElement) {
@@ -796,9 +907,12 @@ impl Edit<'_> {
             Paint::Var { token, literal } => {
                 match self.tokens.variable(&token) {
                     Some(variable) => self.set_binding(binding_prop, Some(variable)),
-                    None => self.keep(&format!(
-                        "var({token}) names no variable; the literal fallback is kept unbound"
-                    )),
+                    None => self.keep_as(
+                        REF_MISSING_TOKEN,
+                        &format!(
+                            "var({token}) names no variable; the literal fallback is kept unbound"
+                        ),
+                    ),
                 }
                 literal
             }
@@ -933,9 +1047,12 @@ impl Edit<'_> {
                     Some(variable) => {
                         self.set_binding(BoundProp::StrokeColor { index: 0 }, Some(variable))
                     }
-                    None => self.keep(&format!(
-                        "var({token}) names no variable; the literal fallback is kept unbound"
-                    )),
+                    None => self.keep_as(
+                        REF_MISSING_TOKEN,
+                        &format!(
+                            "var({token}) names no variable; the literal fallback is kept unbound"
+                        ),
+                    ),
                 }
                 literal
             }
@@ -995,9 +1112,10 @@ impl Edit<'_> {
         match parse_var_token(value) {
             Some(token) => match self.tokens.variable(&token) {
                 Some(variable) => self.set_binding(prop, Some(variable)),
-                None => self.keep(&format!(
-                    "var({token}) names no variable; the literal fallback is kept unbound"
-                )),
+                None => self.keep_as(
+                    REF_MISSING_TOKEN,
+                    &format!("var({token}) names no variable; the literal fallback is kept unbound"),
+                ),
             },
             None => self.set_binding(prop, None),
         }
@@ -1148,4 +1266,42 @@ fn blend_mode_from_css(value: &str) -> Option<BlendMode> {
 
 fn normalized(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_broken_svg_is_reported_with_its_file_and_position() {
+        let mut elements = BTreeMap::new();
+        let mut warnings = Vec::new();
+        parse_design_svg(
+            "<svg>\n  <g id=\"a\"></g>\n  <rect id=\"b\"></svg>",
+            "pages/home/page.svg",
+            0,
+            &mut elements,
+            &mut warnings,
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].code, PARSE_SVG);
+        assert_eq!(warnings[0].file.as_deref(), Some("pages/home/page.svg"));
+        assert_eq!(warnings[0].line, Some(3), "{warnings:?}");
+        assert!(elements.contains_key("a"), "elements before the error are kept");
+    }
+
+    #[test]
+    fn a_grouped_selector_is_reported_with_its_file_and_position() {
+        let mut warnings = Vec::new();
+        let rules = parse_rules(
+            "#a { fill: red; }\n#b, #c { fill: blue; }\n",
+            "design.css",
+            &mut warnings,
+        );
+        assert!(rules.contains_key("a"));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].code, EDIT_SELECTOR_OUTSIDE_DIALECT);
+        assert_eq!(warnings[0].file.as_deref(), Some("design.css"));
+        assert_eq!((warnings[0].line, warnings[0].column), (Some(2), Some(1)));
+    }
 }

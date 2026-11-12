@@ -1173,6 +1173,7 @@ mode use canvas operations; source file mutation is unavailable.
 - A design's SVG is its tree (element order, `id`, `data-name`, geometry, text) and the stylesheet beside it (`page.css` / `master.css`) its styling; the root `design.css` imports each and holds project-wide rules (a design's declaration wins per property). `nodes.json` beside the SVG holds the complete node records. Parsed SVG/CSS fields win over the records on load; anything a load cannot keep is reported per node in `report.json`, and the next save canonicalizes formatting.
 - Edit values inside the emitted dialect: geometry attributes, `data-name`, text content, CSS declaration values, `var(--token, literal)` swaps, and `--fanta-layout`/`--fanta-gap`/`--fanta-padding` intent. Leave derived output alone (`-grad`/`-mask` defs, `url(#…)` paints, stacked-fill clones, `data-virtual` instance content, boolean outlines); edit those through `nodes.json` or canvas ops.
 - Save complete, well-formed documents. Build large designs through small, complete frame/component edits so tool output limits cannot truncate the page.
+- After editing project files directly, call `check_project`: it lists what is broken in the files on disk (a file that does not parse, a duplicate id, a missing token, component or asset, an edit the next save would drop), with file and line. Fix what it reports before saying the edit is done.
 - A legacy project may still hold `.fnx` sources (it converts on its first save): repair parser diagnostics and retry instead of force-saving partial drafts, and external file agents can call `validate_fnx_source` with the complete candidate before writing one.
 
 ## Coordinates and geometry
@@ -1380,6 +1381,15 @@ pub struct GetEditorStateArgs {
 /// designing.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GetGuidelinesArgs {}
+
+/// Check the project's files on disk and return everything wrong with them
+/// as a JSON array of findings (severity, code, file, line, column, node_id,
+/// message): files that do not parse, duplicate ids, references to missing
+/// components, tokens or assets, and hand edits the next save would not
+/// keep. Empty means clean. It reads the saved files, not unsaved canvas
+/// edits, and writes nothing. Run it after editing project files directly.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CheckProjectArgs {}
 
 /// Read nodes from the open design document: pass `ids` for full node detail,
 /// or omit them to list a page's node tree in compact form (`page` defaults to

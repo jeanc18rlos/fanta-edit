@@ -29,7 +29,7 @@ use wasm_bindgen::prelude::*;
 pub struct EngineCore {
     staged: BTreeMap<PathBuf, Vec<u8>>,
     document: HeadlessDocument,
-    warnings: Vec<String>,
+    warnings: Vec<fanta_format::SourceDiagnostic>,
     emitted: BTreeMap<PathBuf, Arc<Vec<u8>>>,
 }
 
@@ -69,7 +69,10 @@ impl EngineCore {
             fanta_format::read_project_files(&self.staged).context("reading the project files")?;
         fanta_doc::strip_redundant_instance_overrides(&mut doc.scene, &doc.components);
         if let Err(error) = layout::solve_pending(&mut doc) {
-            warnings.push(format!("computing omitted source geometry: {error:#}"));
+            warnings.push(fanta_format::SourceDiagnostic::warning(
+                fanta_format::LOAD_OMITTED_GEOMETRY,
+                format!("computing omitted source geometry: {error:#}"),
+            ));
         }
         self.document = HeadlessDocument::new(doc, assets);
         self.warnings = warnings;
@@ -145,7 +148,8 @@ impl EngineCore {
             "pages": pages,
             "active_page": doc.active_page().map(|root| root.to_string()),
             "undo_depth": doc.history.undo_depth(),
-            "warnings": self.warnings,
+            // One sentence per finding: the web canvas shows these as text.
+            "warnings": self.warnings.iter().map(ToString::to_string).collect::<Vec<_>>(),
         })
     }
 }

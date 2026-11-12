@@ -864,6 +864,19 @@ impl PlaybackSession {
         })
     }
 
+    /// Put back a camera the host read earlier, such as across a reload of the
+    /// same design. Navigation, restart and [`Self::fit_view`] fit it again.
+    pub fn set_camera(&mut self, camera: Camera2D) -> Result<PresentResponse, PresentError> {
+        if !camera.is_valid() {
+            return Err(PresentError::InvalidCamera);
+        }
+        self.camera = camera;
+        Ok(PresentResponse {
+            needs_redraw: true,
+            ..PresentResponse::default()
+        })
+    }
+
     /// Fit the camera to the current frame again.
     pub fn fit_view(&mut self) -> PresentResponse {
         self.camera = frame_camera(

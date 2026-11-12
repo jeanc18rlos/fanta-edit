@@ -212,6 +212,16 @@ jobs:
       - name: Test design source validation and saves
         run: cargo test --locked -p fanta-bundle -p fanta-fnx -p fanta-format --lib
 
+      - name: Check the hostile-edit corpus
+        run: cargo test --locked -p fanta-format --test check_corpus
+
+      - name: Keep the editor and the renderer out of the project checker
+        run: |
+          if cargo tree --locked -p fanta-format -e normal --prefix none | grep -E '^(gpui|skia-safe|skia-bindings|fig_viewer) '; then
+            echo 'fanta-check must build without GPUI, Skia or the editor (spec 0009 R9)' >&2
+            exit 1
+          fi
+
       - name: Test sidebar behavior and project ownership
         run: cargo test --locked -p sidebar --lib
 
