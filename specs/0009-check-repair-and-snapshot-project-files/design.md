@@ -24,7 +24,9 @@ for callers that need all-or-nothing.
 
 **Command.** A `[[bin]]` target `fanta-check` in `fanta-format`
 (`src/check_main.rs`): one path argument and `--json`, parsed from
-`std::env::args`. Its dependency tree is `fanta-format`'s own, which the
+`std::env::args`. It replaces `examples/check_project.rs`, which already
+loads a project without writing and prints the first error; the binary keeps
+that behaviour and adds the diagnostics. Its dependency tree is `fanta-format`'s own, which the
 persistence layer already forbids from reaching Skia. This answers Q4.
 
 **Snapshots.** A native-only module `project/history.rs` in `fanta-format`
