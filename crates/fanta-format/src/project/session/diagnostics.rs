@@ -16,8 +16,7 @@ use serde_json::Value;
 /// authored attributes and never count as unknown.
 const STRUCTURAL_KEYS: [&str; 4] = ["type", "id", "parent", "index"];
 
-/// The diagnostic code every unknown-attribute warning carries.
-pub(crate) const UNKNOWN_ATTRIBUTE: &str = "source.unknown_attribute";
+pub(crate) use crate::project::diagnostic::UNKNOWN_ATTRIBUTE;
 
 /// Diff every decoded node value's keys against the vocabulary table for its
 /// `type` tag. A future tag [`fanta_doc::known_fields`] has no table for is
@@ -55,6 +54,9 @@ pub(crate) fn unknown_attribute_diagnostics(nodes: &[Value]) -> Vec<SourceDiagno
             diagnostics.push(SourceDiagnostic {
                 severity: SourceSeverity::Warning,
                 code: UNKNOWN_ATTRIBUTE,
+                file: None,
+                line: None,
+                column: None,
                 node_id: node_id.clone(),
                 node_name: node_name.clone(),
                 message: format!(
