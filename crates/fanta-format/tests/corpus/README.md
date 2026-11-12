@@ -23,6 +23,11 @@ cargo run -p fanta-format --bin fanta-check -- crates/fanta-format/tests/corpus/
 | `deleted-component` | A component's folder deleted while an instance remains |
 | `missing-asset` | An image file deleted while the index lists it |
 
+Repairable from the files alone: `renamed-id`, `pasted-element`,
+`merge-conflict`, `missing-token` and `resaved-by-vector-app`. The four
+deletion cases need the deleted file from a snapshot or a commit, and the
+corpus folders carry no history.
+
 `reformatted` and `resaved-by-vector-app` are written by the generator, not
 by running a formatter or a vector application.
 
