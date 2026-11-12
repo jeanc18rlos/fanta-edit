@@ -34,12 +34,12 @@ the bridge fails visibly instead of claiming a connection.
 
 Without the app, run the same tools headlessly: `fanta-mcp <project-dir>` is a
 stdio MCP server over the project directory alone (`serverInfo.name` is
-`fanta-headless`). It serves the same 14 tools and saves each edit to disk;
+`fanta-headless`). It serves the same 15 tools and saves each edit to disk;
 `prepare_design_asset` and image downloads by URL still need the app.
 
 ## Tool scopes
 
-The inspected source registers these **14 local MCP tools**. Their target is the
+The inspected source registers these **15 local MCP tools**. Their target is the
 focused open design. A tool listing is an interface inventory, not proof every
 end-to-end use has passed on a particular installer.
 
@@ -51,6 +51,7 @@ end-to-end use has passed on a particular installer.
 | `get_design_system` | Read components, typed variables, modes and bindings |
 | `read_fnx_source` | List design source files or read a bounded, line-based slice |
 | `validate_fnx_source` | Validate a complete legacy FNX or managed JSON candidate without writing |
+| `check_project` | List everything wrong with the project's files on disk, as `fanta-check --json` does; writes nothing |
 | `get_screenshot` | Render the current page or an addressed node |
 | `batch_design` | Apply typed design operations as one undoable content transaction |
 | `import_image` | Register an image in the open project's asset workflow |

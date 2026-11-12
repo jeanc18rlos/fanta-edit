@@ -378,6 +378,12 @@ for agents (coordinates, frames vs groups, auto layout, spacing and type
 scales, naming, components, the working method, and when to edit the source
 files instead). Read it once per session before designing.
 
+**`check_project`** — takes no arguments. Returns everything wrong with the
+project's files on disk as a JSON array of findings (`severity`, `code`,
+`file`, `line`, `column`, `node_id`, `message`), the same output as
+`fanta-check <project> --json`. Empty means clean. Run it after you edit
+project files directly, and before you tell the user a file edit is done.
+
 **`batch_get`** — `{ ids?, page?, depth?, include_geometry?, detail? }`. With
 `ids`, returns those nodes' editable style (`detail: "style"`, the default) in
 the ops' own vocabulary — `bounds`, `fills`, `strokes`, `effects`,
@@ -841,6 +847,7 @@ fn seed_agents_md(dir: &Path) -> Result<()> {
         "cb02692ceaa70322e52d03b14a2b7ffa029ebce479f3216645b45eb65a1d52b3",
         "e8d497228bc1bd876e263bef5320438ca39e57520ec240398c8ee5760d152026",
         "43f0a9f47c7fdc11a6cb38db65958a57cb38a4f4f7a04387a8132abe42dd867d",
+        "e5892602bc4798dcb3858af3ad520b8674aa3b1c1d49bdf64479638b34d757ff",
     ];
     let should_write = match fs::read(&path) {
         Ok(contents) => {

@@ -21,7 +21,7 @@ request when it merges.
   on a large project.
 - [x] **T5.** ([#211](https://github.com/jeanc18rlos/fanta-edit/pull/211)) Snapshots on the save path for the editor and the headless
   engine, and the restore action in the editor (R6, R7). Verify: A3.
-- [ ] **T6.** Automatic check: the editor runs it after an external change
+- [x] **T6.** ([#212](https://github.com/jeanc18rlos/fanta-edit/pull/212)) Automatic check: the editor runs it after an external change
   and shows the result; the `check_project` tool in the live and headless
   MCP servers (R5). Verify: A5, A6, and the `design_surface` sync checklist.
 - [ ] **T7.** Repair skill in the plugin and the seeded project guide; the
