@@ -34,6 +34,10 @@ args = ["/path/to/fanta-edit/examples/agent-plugin/fanta-agent-bridge"]
 env = { FANTA_BIN = "/path/to/fanta" }
 ```
 
+Either way, the agent can also serve any saved project as an editable web
+canvas with `python3 -u script/serve-project <project> --port 0` and hand you the
+printed `http://127.0.0.1:<port>/` link — no app or binary needed to view.
+
 ## Configuration
 
 | Variable | Meaning |

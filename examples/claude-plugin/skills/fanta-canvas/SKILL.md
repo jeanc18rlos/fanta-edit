@@ -21,3 +21,20 @@ so every change shows up as a git diff in the project folder.
    own `AGENTS.md` documents its file layout.
 6. The user can watch your edits live by running `/fanta-canvas`, a pane
    that re-renders the page on every save.
+
+## The web canvas in a browser
+
+Every saved project is also a web app: its emitted `index.html` upgrades
+into a pan/zoom/drag-edit canvas when served. To give the user that view,
+run the `serve-project` script in the plugin folder (two directories above
+this file) in the background and tell them the URL it prints:
+
+```sh
+python3 -u <plugin-root>/serve-project <project_root> --port 0
+```
+
+The first stdout line is `serving <project> at http://127.0.0.1:<port>/`
+(`-u` matters: buffered, the line only appears on exit).
+No app is needed to view. Browser-side editing needs a built wasm engine
+(`--engine <pkg-dir>`); when the app is running on the same project, the
+browser routes edits through it automatically and needs no engine.
