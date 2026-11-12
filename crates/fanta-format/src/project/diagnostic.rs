@@ -18,6 +18,26 @@ pub(crate) const RECORD_MISSING: &str = "record.missing";
 pub(crate) const RECORD_UNREADABLE: &str = "record.unreadable";
 /// Two variables that produce the same CSS token.
 pub(crate) const REF_AMBIGUOUS_TOKEN: &str = "ref.ambiguous_token";
+/// The same `id` on two elements of one design SVG.
+pub(crate) const ID_DUPLICATE: &str = "id.duplicate";
+/// The project does not load, for a reason no other finding explains.
+pub(crate) const LOAD_FAILED: &str = "load.failed";
+/// A file every design needs, or the writer would emit, is not on disk.
+pub(crate) const MANIFEST_FILE_MISSING: &str = "manifest.file_missing";
+/// A node the writer draws has no element in its design's SVG.
+pub(crate) const RECORD_NO_ELEMENT: &str = "record.no_element";
+/// A node paints an image asset the project does not hold.
+pub(crate) const REF_MISSING_ASSET: &str = "ref.missing_asset";
+/// An instance of a component the project does not define.
+pub(crate) const REF_MISSING_COMPONENT: &str = "ref.missing_component";
+/// A `var()` naming a token no variable produces.
+pub(crate) const REF_MISSING_TOKEN: &str = "ref.missing_token";
+/// Unresolved merge-conflict markers in a project file.
+pub(crate) const PARSE_CONFLICT_MARKER: &str = "parse.conflict_marker";
+/// A stylesheet with unbalanced braces.
+pub(crate) const PARSE_CSS: &str = "parse.css";
+/// A project JSON file that is not valid JSON.
+pub(crate) const PARSE_JSON: &str = "parse.json";
 /// Auto-layout geometry omitted from the source could not be solved on load.
 pub const LOAD_OMITTED_GEOMETRY: &str = "load.omitted_geometry";
 
@@ -26,21 +46,33 @@ pub const LOAD_OMITTED_GEOMETRY: &str = "load.omitted_geometry";
 pub const DIAGNOSTIC_CODES: &[&str] = &[
     EDIT_NOT_KEPT,
     EDIT_SELECTOR_OUTSIDE_DIALECT,
+    ID_DUPLICATE,
     ID_NOT_A_NODE,
+    LOAD_FAILED,
     LOAD_OMITTED_GEOMETRY,
+    MANIFEST_FILE_MISSING,
+    PARSE_CONFLICT_MARKER,
+    PARSE_CSS,
+    PARSE_JSON,
     PARSE_SVG,
     RECORD_MISSING,
+    RECORD_NO_ELEMENT,
     RECORD_UNREADABLE,
     REF_AMBIGUOUS_TOKEN,
+    REF_MISSING_ASSET,
+    REF_MISSING_COMPONENT,
+    REF_MISSING_TOKEN,
     UNKNOWN_ATTRIBUTE,
 ];
 
 
-/// Severity of a non-fatal source-authoring diagnostic. There is deliberately
-/// no `Error` arm: anything fatal fails the parse/materialize path itself.
+/// How bad a finding is. The loader itself only ever warns, because anything
+/// fatal fails its parse; `Error` comes from the whole-project check, which
+/// reports what would stop a load or lose data instead of stopping at it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceSeverity {
+    Error,
     Warning,
     Info,
 }
@@ -84,6 +116,19 @@ impl SourceDiagnostic {
             node_name: None,
             message: message.into(),
         }
+    }
+
+    pub fn error(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            severity: SourceSeverity::Error,
+            ..Self::warning(code, message)
+        }
+    }
+
+    pub fn at(mut self, line: usize, column: usize) -> Self {
+        self.line = u32::try_from(line).ok();
+        self.column = u32::try_from(column).ok();
+        self
     }
 
     pub fn for_node(mut self, node_id: impl Into<String>) -> Self {

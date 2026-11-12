@@ -83,19 +83,33 @@ rewrites it.
 
 A finding from reading a project is a record: `severity`, `code`, `message`,
 and where known `file` (project-relative), `line`, `column` and `node_id`.
-`report.json` lists them under `warnings`. A code is permanent: new codes are
+`report.json` lists them under `warnings`, and `fanta-check <project> [--json]`
+reports them for a whole project without writing anything: exit status 0
+with no errors, 1 with errors, 2 when the folder is not a project. The cases
+under `crates/fanta-format/tests/corpus` show what each kind of outside edit
+produces. A code is permanent: new codes are
 added, and an existing code never changes meaning.
 
 | Code | Meaning |
 | --- | --- |
-| `edit.not_kept` | A hand edit to a node's SVG or CSS was read but could not be applied; the next save regenerates it |
+| `edit.not_kept` | A hand edit to a node's SVG or CSS could not be applied, or sits where the loader does not read (an inline `style`); the next save regenerates it |
 | `edit.selector_outside_dialect` | A CSS rule's selector is not a single node id; the rule is regenerated on save |
+| `id.duplicate` | The same `id` is on two elements of one design SVG |
 | `id.not_a_node` | An `id` in the SVG or CSS is not a node id |
+| `load.failed` | The project does not load, for a reason no other finding explains |
 | `load.omitted_geometry` | Auto-layout geometry left out of the source could not be solved on load |
-| `parse.svg` | A design SVG stopped parsing; edits after that point are ignored |
+| `manifest.file_missing` | A design's `nodes.json` is gone (error), or an SVG or stylesheet the writer would emit is gone (warning) |
+| `parse.conflict_marker` | Unresolved merge-conflict markers in a project file |
+| `parse.css` | A stylesheet has unbalanced braces |
+| `parse.json` | A project JSON file is not valid JSON |
+| `parse.svg` | A design SVG is not well-formed; edits after that point are ignored and a save regenerates the file |
 | `record.missing` | An element or rule names a node that has no record in `nodes.json` |
+| `record.no_element` | A node the writer draws has no element in its design's SVG; removing an element does not delete the node |
 | `record.unreadable` | A `nodes.json` record does not decode as a node |
 | `ref.ambiguous_token` | Two variables produce the same CSS token; `var()` edits resolve to the first |
+| `ref.missing_asset` | The asset index lists a file that is gone, or a node paints an image the project does not hold |
+| `ref.missing_component` | An instance of a component the project does not define |
+| `ref.missing_token` | A `var()` names a token no variable produces; the fallback is kept unbound |
 | `source.unknown_attribute` | An attribute on a legacy FNX node is not in the vocabulary; it is preserved and ignored by the renderer |
 
 ## Asset identity

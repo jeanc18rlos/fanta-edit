@@ -22,7 +22,7 @@ use crate::error::Result;
 use super::layout::{COMPONENTS_DIR, PAGES_DIR, id_from_key, json_key, slugify};
 use super::diagnostic::{
     EDIT_NOT_KEPT, EDIT_SELECTOR_OUTSIDE_DIALECT, ID_NOT_A_NODE, PARSE_SVG, RECORD_MISSING,
-    RECORD_UNREADABLE, REF_AMBIGUOUS_TOKEN, SourceDiagnostic,
+    RECORD_UNREADABLE, REF_AMBIGUOUS_TOKEN, REF_MISSING_TOKEN, SourceDiagnostic,
 };
 use super::tree_source::TreeSource;
 use super::web::{DESIGN_CSS, MASTER_SVG, PAGE_SVG, css_blend_mode, css_color, number};
@@ -313,6 +313,7 @@ fn parse_design_svg(
                     ..SvgElement::default()
                 };
                 let mut id = None;
+                let mut styled = false;
                 for attribute in start.attributes().flatten() {
                     let value = match attribute.unescape_value() {
                         Ok(value) => value.into_owned(),
@@ -328,10 +329,28 @@ fn parse_design_svg(
                         b"height" => element.height = value.trim().parse().ok(),
                         b"d" => element.d = Some(value),
                         b"href" => element.href = Some(value),
+                        b"style" => styled = true,
                         _ => {}
                     }
                 }
                 let Some(id) = id else { continue };
+                // The writer never puts `style` on a node's own element, so
+                // one there is a hand edit (vector applications fold paint
+                // into it on save), and only the stylesheet is read.
+                if styled && id.parse::<NodeId>().is_ok() {
+                    let finding = SourceDiagnostic::warning(
+                        EDIT_NOT_KEPT,
+                        format!(
+                            "{id}: the style attribute is not read; styling belongs in the design's stylesheet, and the save removes the attribute"
+                        ),
+                    )
+                    .for_node(&id)
+                    .in_file(context);
+                    warnings.push(match src.find(&format!("id=\"{id}\"")) {
+                        Some(offset) => finding.at_offset(src, offset),
+                        None => finding,
+                    });
+                }
                 if tag == "text" {
                     text = Some((id.clone(), Vec::new()));
                 }
@@ -560,8 +579,12 @@ struct Edit<'a> {
 
 impl Edit<'_> {
     fn keep(&mut self, what: &str) {
+        self.keep_as(EDIT_NOT_KEPT, what);
+    }
+
+    fn keep_as(&mut self, code: &'static str, what: &str) {
         self.warnings.push(SourceDiagnostic::warning(
-            EDIT_NOT_KEPT,
+            code,
             format!("{}: {what}", self.display),
         ));
     }
@@ -880,9 +903,12 @@ impl Edit<'_> {
             Paint::Var { token, literal } => {
                 match self.tokens.variable(&token) {
                     Some(variable) => self.set_binding(binding_prop, Some(variable)),
-                    None => self.keep(&format!(
-                        "var({token}) names no variable; the literal fallback is kept unbound"
-                    )),
+                    None => self.keep_as(
+                        REF_MISSING_TOKEN,
+                        &format!(
+                            "var({token}) names no variable; the literal fallback is kept unbound"
+                        ),
+                    ),
                 }
                 literal
             }
@@ -1017,9 +1043,12 @@ impl Edit<'_> {
                     Some(variable) => {
                         self.set_binding(BoundProp::StrokeColor { index: 0 }, Some(variable))
                     }
-                    None => self.keep(&format!(
-                        "var({token}) names no variable; the literal fallback is kept unbound"
-                    )),
+                    None => self.keep_as(
+                        REF_MISSING_TOKEN,
+                        &format!(
+                            "var({token}) names no variable; the literal fallback is kept unbound"
+                        ),
+                    ),
                 }
                 literal
             }
@@ -1079,9 +1108,10 @@ impl Edit<'_> {
         match parse_var_token(value) {
             Some(token) => match self.tokens.variable(&token) {
                 Some(variable) => self.set_binding(prop, Some(variable)),
-                None => self.keep(&format!(
-                    "var({token}) names no variable; the literal fallback is kept unbound"
-                )),
+                None => self.keep_as(
+                    REF_MISSING_TOKEN,
+                    &format!("var({token}) names no variable; the literal fallback is kept unbound"),
+                ),
             },
             None => self.set_binding(prop, None),
         }
