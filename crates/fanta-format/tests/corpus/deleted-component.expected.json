@@ -1,0 +1,20 @@
+[
+  {
+    "code": "record.missing",
+    "file": "pages/components/page.svg",
+    "line": 5,
+    "severity": "warning"
+  },
+  {
+    "code": "record.missing",
+    "file": "pages/components/page.svg",
+    "line": 7,
+    "severity": "warning"
+  },
+  {
+    "code": "ref.missing_component",
+    "file": "pages/home/page.svg",
+    "line": 12,
+    "severity": "error"
+  }
+]

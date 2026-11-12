@@ -477,3 +477,39 @@ fn moving_a_master_into_its_set_frame_survives_the_editors_save() {
         );
     }
 }
+
+/// Spec 0009 R11: one variant whose file does not parse is left out; the
+/// rest of its set loads, a save leaves the variant's folder alone, and
+/// repairing the file brings it back.
+#[test]
+fn a_variant_that_does_not_parse_is_left_out_of_its_set_and_survives_a_save() {
+    let f = fixture();
+    let dir = tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fanta_format::write_web_project_tree(&root, &f.doc, &BTreeMap::new(), None, &[]).unwrap();
+    let variant = listing(&root)
+        .into_iter()
+        .find(|path| path.matches('/').count() == 3 && path.ends_with("/def.json"))
+        .expect("a variant inside its set folder");
+    let original = std::fs::read_to_string(root.join(&variant)).unwrap();
+    std::fs::write(root.join(&variant), "<<<<<<< HEAD\n").unwrap();
+    let folder = root.join(&variant).parent().unwrap().to_path_buf();
+    let hostile = |folder: &Path| -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+        std::fs::read_dir(folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .map(|path| (path.clone(), std::fs::read(&path).unwrap()))
+            .collect()
+    };
+    let before = hostile(&folder);
+
+    let (doc, assets, session) = WorkspaceSession::open_project_document(&root).unwrap();
+    assert_eq!(doc.components.defs.len(), f.doc.components.defs.len() - 1);
+    fanta_format::write_web_project_tree(&root, &doc, &assets, None, &session.open_warnings)
+        .unwrap();
+    assert_eq!(hostile(&folder), before);
+
+    std::fs::write(root.join(&variant), original).unwrap();
+    let (repaired, _, _) = WorkspaceSession::open_project_document(&root).unwrap();
+    assert_eq!(repaired.components.defs.len(), f.doc.components.defs.len());
+}

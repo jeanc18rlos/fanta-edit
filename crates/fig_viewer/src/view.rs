@@ -24025,6 +24025,18 @@ fn show_toast_deferred(id: &'static str, message: String, autohide: bool, cx: &m
     });
 }
 
+/// Say which designs a load left out. It stays until dismissed: the user has
+/// files to repair, and nothing else on screen shows the design is missing.
+pub(crate) fn show_unavailable_designs_notice_deferred(message: String, cx: &mut App) {
+    show_toast_deferred("fanta-unavailable-designs", message, false, cx);
+}
+
+/// Say what the project check found after an outside change. It stays until
+/// dismissed, and a newer result replaces it.
+pub(crate) fn show_external_findings_notice_deferred(message: String, cx: &mut App) {
+    show_toast_deferred("fanta-external-findings", message, false, cx);
+}
+
 /// Show a canvas notice from a place that holds no `Window` — an item event
 /// subscription. The notice lands at the next effect flush, which is also
 /// when the reload it announces has finished applying.
