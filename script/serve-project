@@ -8,10 +8,16 @@ GET serves the project's own files, exactly as any static server would, so
 `index.html` works unchanged. On top of that:
 
 - `/__fanta/capabilities` answers `{"write": true, "engine": <bool>,
-  "stamp": <latest change>}`; the emitted `editor.js` enables edit mode only
-  when this endpoint exists, so a plain static host stays view-only.
+  "live": <bool>, "stamp": <latest change>}`; the emitted `editor.js`
+  enables edit mode only when this endpoint exists, so a plain static host
+  stays view-only.
 - `PUT /<project-relative-path>` writes a file atomically inside the project
   (and only inside it). The editor saves every file the engine re-emits.
+- `POST /__fanta/ops` forwards a `{"ops": [...], "label": ...}` batch to the
+  running Fanta app's live MCP server when the app has this project open
+  (spec 0008 R6/T6), so edits appear in the app instead of racing its
+  reconciliation; it answers 409 when no live app matches, and the editor
+  falls back to its own engine and PUT writes.
 - `/__fanta/files` lists the project's files, so the engine can load them.
 - `--engine` serves a `wasm-pack --target web` build of `fanta-wasm-engine`
   at `/__fanta/engine/`, keeping WebAssembly out of the project tree. Build:
@@ -24,14 +30,99 @@ Local development only: binds 127.0.0.1 and holds no authentication.
 import argparse
 import json
 import os
+import socket
 import sys
 import tempfile
+import time
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 SKIPPED_DIRECTORIES = {".git", "exports", "previews", "node_modules"}
 MAX_PUT_BYTES = 64 * 1024 * 1024
+LIVE_CACHE_SECONDS = 5.0
+INITIALIZE_PARAMS = {
+    "protocolVersion": "2025-06-18",
+    "capabilities": {},
+    "clientInfo": {"name": "serve-project", "version": "1.0"},
+}
+
+
+def discovery_file() -> Path:
+    """Where the running app advertises its live MCP socket."""
+    custom = os.environ.get("FANTA_USER_DATA_DIR", "").strip()
+    if custom:
+        return Path(custom) / "fanta_live_mcp.json"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Fanta" / "fanta_live_mcp.json"
+    base = os.environ.get("XDG_DATA_HOME", "").strip()
+    root = Path(base) if base else Path.home() / ".local" / "share"
+    return root / "fanta" / "fanta_live_mcp.json"
+
+
+def live_socket_path():
+    try:
+        record = json.loads(discovery_file().read_text())
+        pid = int(record["pid"])
+        path = record["socket"]
+    except (OSError, ValueError, KeyError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return path
+
+
+def live_calls(path, calls):
+    """Send newline-delimited JSON-RPC calls over the app's Unix socket.
+
+    `calls` holds `(method, params, is_notification)`; returns the non-
+    notification results in order and raises on any error answer.
+    """
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(20)
+        connection.connect(path)
+        reader = connection.makefile("r", encoding="utf-8", newline="\n")
+        results = []
+        request_id = 0
+        for method, params, is_notification in calls:
+            message = {"jsonrpc": "2.0", "method": method, "params": params}
+            if not is_notification:
+                request_id += 1
+                message["id"] = request_id
+            connection.sendall((json.dumps(message) + "\n").encode())
+            if is_notification:
+                continue
+            while True:
+                line = reader.readline()
+                if not line:
+                    raise RuntimeError("the live server closed the connection")
+                answer = json.loads(line)
+                if answer.get("id") != request_id:
+                    continue  # a server notification; not ours
+                if "error" in answer:
+                    raise RuntimeError(answer["error"].get("message", "live server error"))
+                results.append(answer["result"])
+                break
+        return results
+
+
+def tool_json(result):
+    """The JSON a tool result's first text content carries."""
+    return json.loads(result["content"][0]["text"])
+
+
+def call_live_tool(path, name, arguments):
+    results = live_calls(
+        path,
+        [
+            ("initialize", INITIALIZE_PARAMS, False),
+            ("notifications/initialized", {}, True),
+            ("tools/call", {"name": name, "arguments": arguments}, False),
+        ],
+    )
+    return tool_json(results[1])
 
 
 def project_files(root: Path):
@@ -66,6 +157,28 @@ class Handler(SimpleHTTPRequestHandler):
     # Set by serve(): project root and optional engine package directory.
     project: Path
     engine: Path | None
+    # (expiry, socket path or None): whether the running app has THIS
+    # project open, probed at most every LIVE_CACHE_SECONDS.
+    live_cache: tuple[float, str | None] = (0.0, None)
+
+    @classmethod
+    def live_app(cls):
+        now = time.monotonic()
+        expires, cached = cls.live_cache
+        if now < expires:
+            return cached
+        matched = None
+        path = live_socket_path()
+        if path:
+            try:
+                state = call_live_tool(path, "get_editor_state", {})
+                root = state.get("project_root", "")
+                if root and Path(root).resolve() == cls.project.resolve():
+                    matched = path
+            except (OSError, RuntimeError, ValueError, KeyError, IndexError):
+                matched = None
+        cls.live_cache = (now + LIVE_CACHE_SECONDS, matched)
+        return matched
 
     def send_json(self, value):
         body = json.dumps(value).encode()
@@ -81,7 +194,12 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/__fanta/capabilities":
             _, stamp = project_files(self.project)
             self.send_json(
-                {"write": True, "engine": self.engine is not None, "stamp": stamp}
+                {
+                    "write": True,
+                    "engine": self.engine is not None,
+                    "live": self.live_app() is not None,
+                    "stamp": stamp,
+                }
             )
             return
         if path == "/__fanta/files":
@@ -108,6 +226,36 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.write(body)
             return
         super().do_GET()
+
+    def do_POST(self):
+        if self.path.split("?", 1)[0] != "/__fanta/ops":
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        length = int(self.headers.get("Content-Length", -1))
+        if length < 0 or length > MAX_PUT_BYTES:
+            self.send_error(HTTPStatus.BAD_REQUEST, "missing or oversized body")
+            return
+        try:
+            batch = json.loads(self.rfile.read(length))
+            operations = batch["ops"]
+        except (ValueError, KeyError, TypeError):
+            self.send_error(HTTPStatus.BAD_REQUEST, "expected a JSON body with ops")
+            return
+        live = self.live_app()
+        if live is None:
+            self.send_error(HTTPStatus.CONFLICT, "no running app has this project open")
+            return
+        arguments = {"ops": operations}
+        if isinstance(batch.get("label"), str):
+            arguments["label"] = batch["label"]
+        try:
+            result = call_live_tool(live, "batch_design", arguments)
+        except (OSError, RuntimeError, ValueError, KeyError, IndexError) as error:
+            # The next capabilities probe re-checks the app.
+            type(self).live_cache = (0.0, None)
+            self.send_error(HTTPStatus.BAD_GATEWAY, f"the live app refused the edit: {error}")
+            return
+        self.send_json(result)
 
     def do_PUT(self):
         target = contained(self.project, self.path.split("?", 1)[0])

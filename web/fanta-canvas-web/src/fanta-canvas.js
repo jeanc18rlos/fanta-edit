@@ -405,7 +405,19 @@ export async function createFantaCanvas(options) {
 
   /// Apply a `batch_design` ops array as one undo step, write every re-emitted
   /// file back through the host, and swap the current page's SVG in place.
+  /// A host may route the batch elsewhere first with `applyRemote` (the
+  /// running app's live MCP server, spec 0008 R6): when that answers, the
+  /// edit is the app's and this canvas updates when the host's files change.
   async function applyOps(ops, label = "Canvas edit") {
+    if (typeof options.applyRemote === "function") {
+      let remote = null;
+      try {
+        remote = await options.applyRemote(ops, label);
+      } catch {
+        remote = null;
+      }
+      if (remote) return remote;
+    }
     await loadEngine();
     const result = JSON.parse(
       engine.apply(JSON.stringify(ops), label, true),

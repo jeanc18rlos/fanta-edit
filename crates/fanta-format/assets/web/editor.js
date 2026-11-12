@@ -18,6 +18,10 @@
     return;
   }
   if (!capabilities || capabilities.write !== true) return;
+  // Whether the running Fanta app has this project open: then edits route
+  // through its live MCP server (`POST __fanta/ops`) instead of local
+  // writes, and this canvas refreshes when the app's autosave lands.
+  let live = capabilities.live === true;
 
   const { createFantaCanvas } = await import("./canvas.js");
 
@@ -66,7 +70,11 @@
     "align-items:center;background:rgba(28,28,28,0.82);color:#fff;" +
     "border-radius:8px;padding:5px 10px;font-size:12px;";
   const mode = document.createElement("span");
-  mode.textContent = engine ? "Editing" : "Viewing (no engine)";
+  function baseMode() {
+    if (live) return "Editing (live app)";
+    return engine ? "Editing" : "Viewing (no engine)";
+  }
+  mode.textContent = baseMode();
   const fitButton = document.createElement("button");
   fitButton.textContent = "Fit";
   fitButton.style.cssText =
@@ -82,10 +90,20 @@
     container,
     files,
     engine,
-    editable: engine !== null,
+    editable: engine !== null || live,
+    async applyRemote(ops, label) {
+      if (!live) return null;
+      const response = await fetch("__fanta/ops", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ops, label }),
+      });
+      if (!response.ok) return null;
+      return await response.json();
+    },
     onSelect(ids) {
-      if (!engine) return;
-      note(ids.length ? `${ids.length} selected` : "Editing");
+      if (!engine && !live) return;
+      note(ids.length ? `${ids.length} selected` : baseMode());
     },
     onError(error) {
       note(`Save failed: ${error.message || error}`);
@@ -130,11 +148,15 @@
     try {
       const response = await fetch("__fanta/capabilities");
       if (!response.ok) return;
-      const current = (await response.json()).stamp;
-      if (stamp !== undefined && current !== stamp) {
+      const current = await response.json();
+      if (live !== (current.live === true)) {
+        live = current.live === true;
+        note(baseMode());
+      }
+      if (stamp !== undefined && current.stamp !== stamp) {
         await canvas.refresh();
       }
-      stamp = current;
+      stamp = current.stamp;
     } catch {
       // The host went away; keep the canvas as it stands.
     }
