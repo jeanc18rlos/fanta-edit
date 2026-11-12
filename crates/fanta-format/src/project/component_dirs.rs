@@ -23,6 +23,7 @@ use fanta_doc::{ComponentDef, ComponentId, ComponentSet, Doc};
 use serde_json::{Map, Value};
 
 use super::layout::{COMPONENTS_DIR, DEF_JSON, SET_JSON, SETS_JSON};
+use super::tree_source::TreeSource;
 use super::write::design_slugs;
 use crate::error::{FormatError, Result};
 
@@ -116,38 +117,33 @@ pub(crate) struct ScannedComponents {
     pub(crate) set_files: Vec<PathBuf>,
 }
 
-fn sorted_dirs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut dirs = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
-            dirs.push(path);
-        }
-    }
-    dirs.sort();
-    Ok(dirs)
-}
-
 /// Walk `components/` under `project_root`: each folder with a `def.json` is
 /// a component; each with a `set.json` is a variant set whose sub-folders
 /// with a `def.json` are its variants.
 pub(crate) fn scan_component_dirs(project_root: &Path) -> Result<ScannedComponents> {
+    scan_component_dirs_in(&TreeSource::Dir, project_root)
+}
+
+pub(crate) fn scan_component_dirs_in(
+    source: &TreeSource<'_>,
+    project_root: &Path,
+) -> Result<ScannedComponents> {
     let components = project_root.join(COMPONENTS_DIR);
     let mut scan = ScannedComponents::default();
-    if !components.is_dir() {
+    if !source.is_dir(&components) {
         return Ok(scan);
     }
     let legacy = components.join(SETS_JSON);
-    if legacy.is_file() {
+    if source.is_file(&legacy) {
         scan.set_files.push(legacy);
     }
-    for dir in sorted_dirs(&components)? {
-        if dir.join(DEF_JSON).is_file() {
+    for dir in source.sorted_dirs(&components)? {
+        if source.is_file(&dir.join(DEF_JSON)) {
             scan.component_dirs.push(dir);
-        } else if dir.join(SET_JSON).is_file() {
+        } else if source.is_file(&dir.join(SET_JSON)) {
             scan.set_files.push(dir.join(SET_JSON));
-            for variant in sorted_dirs(&dir)? {
-                if variant.join(DEF_JSON).is_file() {
+            for variant in source.sorted_dirs(&dir)? {
+                if source.is_file(&variant.join(DEF_JSON)) {
                     scan.component_dirs.push(variant);
                 }
             }

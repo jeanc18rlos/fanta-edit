@@ -1,0 +1,142 @@
+<!doctype html>
+<!-- Dev-only demo of the fanta-canvas-web component (spec 0008 T2).
+
+     From the repository root:
+       1. Build the engine (optional; view-only without it):
+            RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build \
+              crates/fanta-wasm-engine --target web --no-typescript --release \
+              --out-dir "$PWD/web/fanta-canvas-web/demo/pkg"
+       2. Serve the repository root (python3 -m http.server 8642) and open
+            http://localhost:8642/web/fanta-canvas-web/demo/?project=/path/under/server/
+          where the project query names a served web-format project directory.
+
+     Writes stay in memory: the demo overlays engine saves over HTTP reads,
+     which shows edits swapping in place without a reload. Persistence to
+     disk is the T3 browser host's job. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>fanta-canvas-web demo</title>
+    <style>
+      html, body { margin: 0; height: 100%; font: 13px system-ui, sans-serif; }
+      body { display: flex; flex-direction: column; }
+      header { padding: 8px 12px; border-bottom: 1px solid #d8d8e0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      #canvas-host { flex: 1; min-height: 0; background: #f3f4f8; }
+      #status { color: #555; }
+      select, button { font: inherit; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <strong>fanta-canvas-web</strong>
+      <select id="page-picker"></select>
+      <button id="fit">Fit</button>
+      <button id="tint" title="Set the selected nodes' fill through the wasm engine">Tint selection</button>
+      <span id="status">loading…</span>
+    </header>
+    <div id="canvas-host"></div>
+    <script type="module">
+      import { createFantaCanvas } from "../src/fanta-canvas.js";
+
+      const status = document.getElementById("status");
+      const search = new URLSearchParams(location.search);
+      const base = (search.get("project") || "").replace(/\/?$/, "/");
+      if (!base || base === "/") {
+        status.textContent = "pass ?project=<served project directory>";
+        throw new Error("no project");
+      }
+
+      // In-memory overlay: engine saves land here, reads prefer it.
+      const written = new Map();
+      const files = {
+        async read(path) {
+          if (written.has(path)) return written.get(path);
+          const response = await fetch(base + path);
+          if (!response.ok) throw new Error(`${path}: ${response.status}`);
+          return new Uint8Array(await response.arrayBuffer());
+        },
+        async write(path, bytes) {
+          written.set(path, bytes);
+        },
+        // Plain HTTP cannot enumerate a directory, so candidate paths come
+        // from report.json's page and component slugs; absent ones are
+        // skipped on read. Good enough for the demo; real hosts list files.
+        async list() {
+          const report = JSON.parse(
+            new TextDecoder().decode(await files.read("report.json")),
+          );
+          const candidates = [
+            "fanta.json", "design.css", "tokens.css", "pages.js",
+            "doc/metadata.json", "doc/variables.json", "doc/active_modes.json",
+            "doc/asset_library.json", "doc/motion.json", "doc/flows.json",
+            "doc/flow_start.json", "doc/presentation.json", "components/sets.json",
+          ];
+          for (const page of report.pages || []) {
+            for (const name of ["page.svg", "page.css", "page.json", "nodes.json", "map.json"]) {
+              candidates.push(`pages/${page.slug}/${name}`);
+            }
+          }
+          for (const component of report.components || []) {
+            for (const name of ["master.svg", "master.css", "def.json", "nodes.json"]) {
+              candidates.push(`components/${component.slug}/${name}`);
+            }
+          }
+          const present = [];
+          for (const path of candidates) {
+            try {
+              await files.read(path);
+              present.push(path);
+            } catch {
+              // Optional file; the engine's reader treats it as absent.
+            }
+          }
+          return present;
+        },
+      };
+
+      let engine = null;
+      try {
+        const wasm = await import("./pkg/fanta_wasm_engine.js");
+        await wasm.default();
+        engine = new wasm.FantaEngine();
+        status.textContent = "engine loaded";
+      } catch (error) {
+        status.textContent = "view-only (no engine build in demo/pkg)";
+        console.warn("demo: wasm engine unavailable", error);
+      }
+
+      const canvas = await createFantaCanvas({
+        container: document.getElementById("canvas-host"),
+        files,
+        engine,
+        onSelect(ids) {
+          status.textContent = ids.length
+            ? `selected ${ids.join(", ")}`
+            : engine ? "engine loaded" : "view-only";
+        },
+      });
+
+      const picker = document.getElementById("page-picker");
+      for (const page of canvas.pages) {
+        const option = document.createElement("option");
+        option.value = page.slug;
+        option.textContent = page.name;
+        picker.appendChild(option);
+      }
+      picker.addEventListener("change", () => canvas.showPage(picker.value));
+      document.getElementById("fit").addEventListener("click", canvas.zoomToFit);
+      document.getElementById("tint").addEventListener("click", async () => {
+        const selection = canvas.selection();
+        if (!selection.length) {
+          status.textContent = "select a node first";
+          return;
+        }
+        const result = await canvas.applyOps(
+          selection.map((id) => ({ op: "set_props", id, fill: "#FF5522" })),
+          "Demo tint",
+        );
+        status.textContent = `applied: ${JSON.stringify(result.applied)}`;
+      });
+    </script>
+  </body>
+</html>

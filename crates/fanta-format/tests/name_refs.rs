@@ -8,7 +8,7 @@ use fanta_doc::{
     NodeId, Operation, Variable, VariableCollection, VariableCollectionId, VariableId,
     VariableType, VectorNode,
 };
-use fanta_format::{ArtifactId, WorkspaceSession, write_project_tree};
+use fanta_format::{ArtifactId, WorkspaceSession, write_legacy_project_tree};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use tempfile::tempdir;
@@ -71,7 +71,7 @@ fn fixture() -> Fixture {
     );
 
     let dir = tempdir().unwrap();
-    write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
     Fixture {
         dir,
         page,

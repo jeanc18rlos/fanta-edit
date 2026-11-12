@@ -21,6 +21,10 @@ fanta-bundle.workspace = true
 
 # The `.fnx` design-as-source codec — the per-page/per-component node encoding.
 fanta-fnx.workspace = true
+glam.workspace = true
+
+# Web storage (spec 0007): reading hand edits back out of the emitted SVG.
+quick-xml.workspace = true
 
 # Error and logging primitives shared across the workspace.
 thiserror.workspace = true

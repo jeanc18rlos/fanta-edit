@@ -199,7 +199,8 @@ pub struct JournalViewport {
 
 /// Wall-clock millis since the Unix epoch — display-only timestamps for steps.
 pub fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    // web_time re-exports std on native; on browser wasm std's SystemTime panics.
+    use web_time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

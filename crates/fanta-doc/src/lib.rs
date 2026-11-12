@@ -120,6 +120,7 @@ pub use resolve::{
     ExpandedNode, InstanceExpansionContext, ResolvedComponentDefRef, backfill_vector_viewports,
     def_local_path, expand_instance, expand_instance_with_context,
     expand_instance_with_context_cancellable, instance_bindings_with_context, resolve_bound_value,
+    resolve_export_bindings,
     resolve_effective_mode, resolved_component, resolved_component_rev,
     resolved_component_rev_with_context, resolved_component_root,
     resolved_component_root_with_context, resolved_component_with_context,

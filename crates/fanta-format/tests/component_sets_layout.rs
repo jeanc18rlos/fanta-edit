@@ -5,7 +5,7 @@ use fanta_doc::{
     NodeData, NodeId, Transform2D, VariantAxis,
 };
 use fanta_format::{
-    ArtifactDirty, ArtifactId, SaveResult, WorkspaceSession, read_project_tree, write_project_tree,
+    ArtifactDirty, ArtifactId, SaveResult, WorkspaceSession, read_project_tree, write_legacy_project_tree,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -131,7 +131,7 @@ fn listing(root: &Path) -> Vec<String> {
 fn a_component_set_is_one_folder_holding_its_variants() {
     let dir = tempdir().unwrap();
     let f = fixture();
-    write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
 
     assert_eq!(
         listing(dir.path()),
@@ -214,7 +214,7 @@ fn downgrade_to_v4(dir: &Path, f: &Fixture) {
 fn a_v4_project_reads_and_its_next_save_moves_the_variants_into_the_set_folder() {
     let dir = tempdir().unwrap();
     let f = fixture();
-    write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
     downgrade_to_v4(dir.path(), &f);
     let manifest_path = dir.path().join("fanta.json");
 
@@ -222,7 +222,7 @@ fn a_v4_project_reads_and_its_next_save_moves_the_variants_into_the_set_folder()
     assert_eq!(read.components.sets.len(), 1, "v4 sets.json still reads");
     assert_eq!(read.components.defs, f.doc.components.defs);
 
-    write_project_tree(dir.path(), &read, &assets).unwrap();
+    write_legacy_project_tree(dir.path(), &read, &assets).unwrap();
     assert_eq!(
         listing(dir.path()),
         [
@@ -248,7 +248,7 @@ fn a_v4_project_reads_and_its_next_save_moves_the_variants_into_the_set_folder()
 fn the_session_opens_a_variant_in_its_set_folder_and_sees_no_change() {
     let dir = tempdir().unwrap();
     let f = fixture();
-    write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
 
     let mut session = WorkspaceSession::open(dir.path()).unwrap();
     assert_eq!(session.components.defs.sets.len(), 1);
@@ -275,7 +275,7 @@ fn a_component_inside_a_page_opens_clean_and_saves_nothing() {
     // must still compare as in sync.
     let dir = tempdir().unwrap();
     let f = fixture();
-    write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
     let mut session = WorkspaceSession::open(dir.path()).unwrap();
     let id = ArtifactId::Component(f.avatar);
     session.open_artifact(id.clone()).unwrap();
@@ -288,7 +288,7 @@ fn a_component_inside_a_page_opens_clean_and_saves_nothing() {
 fn a_variants_source_path_resolves_to_its_component() {
     let dir = tempdir().unwrap();
     let f = fixture();
-    write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
     let source = dir
         .path()
         .join("components/button/primary-hover/master.fnx");
@@ -313,7 +313,7 @@ fn the_editors_save_of_an_edited_v4_variant_moves_it_into_its_set_folder() {
     // `../../../fnx`, and accepting the save must expect exactly that.
     let dir = tempdir().unwrap();
     let mut f = fixture();
-    write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
     downgrade_to_v4(dir.path(), &f);
     let mut session = WorkspaceSession::open(dir.path()).unwrap();
     let id = ArtifactId::Component(f.variants[1].0);
@@ -336,7 +336,7 @@ fn the_editors_save_of_an_edited_v4_variant_moves_it_into_its_set_folder() {
     );
     let expected = session.source_write_preconditions(&persisted).unwrap();
     let mut cache = fanta_format::ProjectWriteCache::default();
-    let report = fanta_format::write_project_tree_cached_with_sources_checked(
+    let report = fanta_format::write_legacy_project_tree_checked(
         dir.path(),
         &persisted,
         &BTreeMap::new(),
@@ -367,7 +367,7 @@ fn the_editors_save_of_an_edited_v4_variant_moves_it_into_its_set_folder() {
 fn upgrading_a_v4_project_moves_it_to_v5_once() {
     let dir = tempdir().unwrap();
     let f = fixture();
-    write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
     downgrade_to_v4(dir.path(), &f);
     let upgrade = fanta_format::upgrade_project(dir.path()).unwrap();
     assert_eq!((upgrade.from, upgrade.to), (4, 5));
@@ -399,7 +399,7 @@ fn editor_save(dir: &Path, session: &mut WorkspaceSession, doc: &Doc, open: &[Ar
         .unwrap();
     let expected = session.source_write_preconditions(&persisted).unwrap();
     let mut cache = fanta_format::ProjectWriteCache::default();
-    let report = fanta_format::write_project_tree_cached_with_sources_checked(
+    let report = fanta_format::write_legacy_project_tree_checked(
         dir,
         &persisted,
         &BTreeMap::new(),
@@ -440,7 +440,7 @@ fn moving_a_master_into_its_set_frame_survives_the_editors_save() {
             })
             .unwrap();
     }
-    write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+    write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
     let (on_disk, _) = read_project_tree(dir.path()).unwrap();
     assert_eq!(on_disk.scene.get(f.variants[0].1).unwrap().parent, None);
 

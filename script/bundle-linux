@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 
 set -euxo pipefail
-source script/lib/blob-store.sh
 
 # Function for displaying help info
 help_info() {
@@ -45,31 +44,32 @@ done
 
 export FANTA_BUNDLE=true
 
-channel=$(<crates/fanta/RELEASE_CHANNEL)
+channel="${FANTA_RELEASE_CHANNEL:-$(<crates/fanta/RELEASE_CHANNEL)}"
+case "$channel" in
+    dev|nightly|preview|stable) ;;
+    *)
+        echo "Unsupported release channel: $channel"
+        exit 1
+        ;;
+esac
+# release_channel compiles FANTA_RELEASE_CHANNEL in, so the updater polls the channel this bundle
+# is for. The fanta build script picks the window icon from RELEASE_CHANNEL.
+export FANTA_RELEASE_CHANNEL="${channel}"
+export RELEASE_CHANNEL="${channel}"
+
 target_dir="${CARGO_TARGET_DIR:-target}"
 
 version="$(script/get-crate-version fanta)"
 # Set RELEASE_VERSION so it's compiled into GPUI and it knows about the version.
 export RELEASE_VERSION="${version}"
 
-commit=$(git rev-parse HEAD | cut -c 1-7)
-
 version_info=$(rustc --version --verbose)
 host_line=$(echo "$version_info" | grep host)
 target_triple=${host_line#*: }
-musl_triple=${target_triple%-gnu}-musl
-remote_server_triple=${REMOTE_SERVER_TARGET:-"${musl_triple}"}
-rustup_installed=false
-if command -v rustup >/dev/null 2>&1; then
-    rustup_installed=true
-fi
+release_dir="${target_dir}/${target_triple}/release"
 
 # Generate the licenses first, so they can be baked into the binaries
 script/generate-licenses
-
-if "$rustup_installed"; then
-    rustup target add "$remote_server_triple"
-fi
 
 export CC=${CC:-$(which clang)}
 
@@ -83,13 +83,7 @@ if [[ "$(uname -m)" == "aarch64" ]]; then
 else
     export RUSTFLAGS="${RUSTFLAGS:-} -C link-args=-Wl,--disable-new-dtags,-rpath,\$ORIGIN/../lib"
 fi
-cargo build --release --target "${target_triple}" --package fanta --package cli
-# Build remote_server in separate invocation to prevent feature unification from other crates
-# from influencing dynamic libraries required by it.
-if [[ "$remote_server_triple" == "$musl_triple" ]]; then
-    export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static"
-fi
-cargo build --release --target "${remote_server_triple}" --package remote_server
+cargo build --locked --release --target "${target_triple}" --package fanta --package cli
 
 # Upload debug info to sentry.io
 if ! command -v sentry-cli >/dev/null 2>&1; then
@@ -103,8 +97,7 @@ else
         for attempt in 1 2 3; do
             echo "Attempting sentry upload (attempt $attempt/3)..."
             if sentry-cli debug-files upload --include-sources --wait -p fanta -o fanta-dev \
-                "${target_dir}/${target_triple}"/release/fanta \
-                "${target_dir}/${remote_server_triple}"/release/remote_server; then
+                "${release_dir}/fanta"; then
                 echo "Sentry upload successful on attempt $attempt"
                 break
             else
@@ -119,21 +112,13 @@ else
     fi
 fi
 
-# Strip debug symbols and save them for upload to DigitalOcean.
+# Move the debug info into fanta.dbg, which ships separately from the tarball, and leave a
+# debuglink to it in the binary.
 # We use llvm-objcopy because GNU objcopy on older distros (e.g. Ubuntu 20.04)
 # doesn't understand CREL sections produced by newer LLVM.
-llvm-objcopy --strip-debug "${target_dir}/${target_triple}/release/fanta"
-llvm-objcopy --strip-debug "${target_dir}/${target_triple}/release/cli"
-llvm-objcopy --strip-debug "${target_dir}/${remote_server_triple}/release/remote_server"
-
-# Ensure that remote_server does not depend on libssl nor libcrypto, as we got rid of these deps.
-if ldd "${target_dir}/${remote_server_triple}/release/remote_server" | grep -q 'libcrypto\|libssl'; then
-    if [[ "$remote_server_triple" == *-musl ]]; then
-        echo "Error: remote_server still depends on libssl or libcrypto" && exit 1
-    else
-        echo "Info: Using non-musl remote-server build."
-    fi
-fi
+llvm-objcopy --only-keep-debug "${release_dir}/fanta" "${release_dir}/fanta.dbg"
+llvm-objcopy --strip-debug --add-gnu-debuglink="${release_dir}/fanta.dbg" "${release_dir}/fanta"
+llvm-objcopy --strip-debug "${release_dir}/cli"
 
 suffix=""
 if [ "$channel" != "stable" ]; then
@@ -147,20 +132,19 @@ fanta_dir="${temp_dir}/fanta$suffix.app"
 
 # Binary
 mkdir -p "${fanta_dir}/bin" "${fanta_dir}/libexec"
-cp "${target_dir}/${target_triple}/release/fanta" "${fanta_dir}/libexec/fanta-editor"
-cp "${target_dir}/${target_triple}/release/cli" "${fanta_dir}/bin/fanta"
+cp "${release_dir}/fanta" "${fanta_dir}/libexec/fanta-editor"
+cp "${release_dir}/cli" "${fanta_dir}/bin/fanta"
 
 # Libs
 # Bundle libstdc++ so older supported systems can run binaries built with our
 # toolchain even when their system libstdc++.so.6 lacks required GLIBCXX symbols.
 find_libs() {
-    ldd ${target_dir}/${target_triple}/release/fanta |\
+    ldd "${release_dir}/fanta" |\
         cut -d' ' -f3 |\
         grep -v '\<\(libc.so\|libgcc_s.so\|libm.so\|libpthread.so\|libdl.so\|libasound.so\)'
 }
 
 mkdir -p "${fanta_dir}/lib"
-rm -rf "${fanta_dir}/lib/*"
 cp $(find_libs) "${fanta_dir}/lib"
 
 # Icons
@@ -192,6 +176,10 @@ mkdir -p "${fanta_dir}/share/applications"
 envsubst < "crates/fanta/resources/fanta.desktop.in" > "${fanta_dir}/share/applications/$APP_ID.desktop"
 chmod +x "${fanta_dir}/share/applications/$APP_ID.desktop"
 
+# The .fnx and .fig types the desktop entry opens. script/install.sh registers them.
+mkdir -p "${fanta_dir}/share/mime/packages"
+cp "crates/fanta/resources/fanta-mime.xml" "${fanta_dir}/share/mime/packages/$APP_ID.xml"
+
 # Copy generated licenses so they'll end up in archive too
 cp "assets/licenses.md" "${fanta_dir}/licenses.md"
 
@@ -199,9 +187,6 @@ cp "assets/licenses.md" "${fanta_dir}/licenses.md"
 arch=$(uname -m)
 archive="fanta-linux-${arch}.tar.gz"
 
-rm -rf "${archive}"
 remove_match="fanta(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
 ls "${target_dir}/release" | grep -E ${remove_match} | xargs -d "\n" -I {} rm -f "${target_dir}/release/{}" || true
-tar -czvf "${target_dir}/release/$archive" -C ${temp_dir} "fanta$suffix.app"
-
-gzip -f --stdout --best "${target_dir}/${remote_server_triple}/release/remote_server" > "${target_dir}/fanta-remote-server-linux-${arch}.gz"
+tar -czf "${target_dir}/release/$archive" -C "${temp_dir}" "fanta$suffix.app"

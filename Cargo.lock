@@ -4437,6 +4437,7 @@ name = "fanta-doc"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.10.0",
+ "getrandom 0.3.4",
  "glam 0.32.1",
  "kurbo 0.11.3",
  "serde",
@@ -4444,6 +4445,7 @@ dependencies = [
  "smallvec",
  "thiserror 2.0.17",
  "ulid",
+ "web-time",
 ]
 
 [[package]]
@@ -4496,6 +4498,8 @@ dependencies = [
  "fanta-bundle",
  "fanta-doc",
  "fanta-fnx",
+ "glam 0.32.1",
+ "quick-xml 0.38.3",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -5292,6 +5296,7 @@ dependencies = [
  "fanta-canvas",
  "fanta-design-ops",
  "fanta-doc",
+ "fanta-fnx",
  "fanta-format",
  "fanta-render",
  "glam 0.32.1",
@@ -5302,6 +5307,22 @@ dependencies = [
  "sha2",
  "skia-safe",
  "smallvec",
+ "tempfile",
+]
+
+[[package]]
+name = "fanta-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "fanta-design-ops",
+ "fanta-doc",
+ "fanta-format",
+ "fanta-headless",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
@@ -5365,8 +5386,11 @@ dependencies = [
  "clap",
  "fanta-doc",
  "fanta-format",
+ "fanta-headless",
+ "fanta-render",
  "fanta-runtime",
  "fanta-text",
+ "glam 0.32.1",
  "serde",
  "serde_json",
  "tempfile",
@@ -5404,6 +5428,19 @@ dependencies = [
  "serde_json",
  "smallvec",
  "tracing",
+]
+
+[[package]]
+name = "fanta-wasm-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fanta-design-ops",
+ "fanta-doc",
+ "fanta-format",
+ "fanta-headless",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]
