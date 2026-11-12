@@ -124,7 +124,7 @@ pub fn render_screenshot(
 /// time an image is drawn (or prewarmed) and remembers a failure so a corrupt
 /// asset is logged once, not once per frame.
 pub fn decode_embedded_image(asset_id: AssetId, bytes: &[u8]) -> Option<DecodedImage> {
-    match decode_rgba(bytes) {
+    match crate::assets::decode_rgba(bytes) {
         Ok(image) => {
             let (width, height) = image.dimensions();
             Some(DecodedImage::new(image.as_raw(), width, height))
@@ -134,24 +134,6 @@ pub fn decode_embedded_image(asset_id: AssetId, bytes: &[u8]) -> Option<DecodedI
             None
         }
     }
-}
-
-/// The most pixels one image may decode to: four times Figma's own 4096 x
-/// 4096 limit. A small, highly compressed file can otherwise decode to
-/// gigabytes, and the image crate's allocation limit is advisory.
-pub const MAX_IMAGE_PIXELS: u64 = 64 << 20;
-
-/// Decode `bytes` to straight-alpha RGBA8, refusing an image larger than
-/// [`MAX_IMAGE_PIXELS`] from its header, before its pixels are allocated.
-pub fn decode_rgba(bytes: &[u8]) -> Result<image::RgbaImage> {
-    let reader = || image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format();
-    let (width, height) = reader()?.into_dimensions()?;
-    anyhow::ensure!(
-        u64::from(width) * u64::from(height) <= MAX_IMAGE_PIXELS,
-        "the image is {width} x {height} pixels; the limit is {MAX_IMAGE_PIXELS} pixels"
-    );
-    // `into_rgba8` moves an RGBA8 decode instead of cloning it.
-    Ok(reader()?.decode()?.into_rgba8())
 }
 
 /// An embedded image's natural size, read from its header. The canvas picks

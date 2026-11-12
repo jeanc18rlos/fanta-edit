@@ -631,6 +631,7 @@ impl HeadlessProject {
 
 /// Whether [`HeadlessProject::open`] failed because a newer Fanta saved the
 /// project.
+#[cfg(feature = "native")]
 pub fn saved_by_newer_fanta(error: &anyhow::Error) -> bool {
     use fanta_format::{FormatError, SessionError};
     error.chain().any(|cause| {

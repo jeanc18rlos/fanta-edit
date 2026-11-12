@@ -23,6 +23,24 @@ use fanta_render::{AssetResolver, DecodeListener, DecodedImage, LevelLookup, Lev
 /// than it was given.
 pub const MAX_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 
+/// The most pixels one image may decode to: four times Figma's own 4096 x
+/// 4096 limit. A small, highly compressed file can otherwise decode to
+/// gigabytes, and the image crate's allocation limit is advisory.
+pub const MAX_IMAGE_PIXELS: u64 = 64 << 20;
+
+/// Decode `bytes` to straight-alpha RGBA8, refusing an image larger than
+/// [`MAX_IMAGE_PIXELS`] from its header, before its pixels are allocated.
+pub fn decode_rgba(bytes: &[u8]) -> Result<image::RgbaImage> {
+    let reader = || image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format();
+    let (width, height) = reader()?.into_dimensions()?;
+    anyhow::ensure!(
+        u64::from(width) * u64::from(height) <= MAX_IMAGE_PIXELS,
+        "the image is {width} x {height} pixels; the limit is {MAX_IMAGE_PIXELS} pixels"
+    );
+    // `into_rgba8` moves an RGBA8 decode instead of cloning it.
+    Ok(reader()?.decode()?.into_rgba8())
+}
+
 /// Somewhere an edit batch can ingest images and, when the batch fails, take
 /// them out again. The editor's implementation also keeps its thumbnail cache
 /// in step.
@@ -93,7 +111,7 @@ impl PreparedImage {
             bytes.len()
         );
         let id = fanta_format::asset_id_for_bytes(&bytes);
-        let rgba = crate::render::decode_rgba(&bytes).context("decoding image bytes")?;
+        let rgba = decode_rgba(&bytes).context("decoding image bytes")?;
         let (width, height) = rgba.dimensions();
         anyhow::ensure!(width > 0 && height > 0, "the image has no pixels");
         let format = image::guess_format(&bytes).ok();
