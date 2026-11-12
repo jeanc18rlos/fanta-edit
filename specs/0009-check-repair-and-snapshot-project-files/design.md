@@ -14,13 +14,22 @@ message for the legacy FNX path. They gain optional `file`, `line` and
 `WorkspaceSession::open_warnings` pass around today. `report.json` writes
 the same records.
 
+**Whole-project check.** `check_project` (`project/check.rs`) works in two
+passes. It first reads every source file on its own, so a file that does not
+parse, holds conflict markers or repeats an id is reported with its position
+instead of ending the run. It then loads the project through the editor's
+reader, adds what that reader reports, and checks what only the loaded
+document can show: instances of missing components, paints of missing
+assets, and, by projecting the document the way the writer would, files and
+elements that are gone from disk. After a file error the loader's own
+reports are left out, because they echo the cause.
+
 **Collecting load.** Today a file that does not parse returns `Err` and
-aborts the whole load. The reader gains a collecting mode: a design whose
-SVG, CSS or sidecar fails to parse is recorded as an `error` diagnostic and
-left out of the document, and the load continues. `check_project` is that
-mode plus the cross-file checks of R3 (duplicate ids, dangling references,
-records without elements, manifest against files). The strict mode stays
-for callers that need all-or-nothing.
+aborts the whole load. For the editor to open such a project (R11) the
+reader gains a collecting mode in T3: a design whose SVG, CSS or records
+fail to parse is left out of the document and the load continues. The check
+does not need it, so it moved out of T2 (see "Changes during
+implementation").
 
 **Command.** A `[[bin]]` target `fanta-check` in `fanta-format`
 (`src/check_main.rs`): one path argument and `--json`, parsed from
@@ -109,6 +118,19 @@ pub fn prune(dir: &Path, now: SystemTime) -> Result<()>;  // 30 days, then one p
 - Seeded guide: changing `AGENTS_MD` needs the replaced text's SHA-256 in
   `previous_seeds` (`fanta-format/AGENTS.md`).
 
+## Changes during implementation
+
+- **T2.** The collecting load moved to T3. The check reports broken files
+  from its own per-file pass, which gives positions the loader's error does
+  not, so changing the load path was not needed to ship the checker and is
+  now done only where the editor needs it.
+- **T2.** The loader now reports an inline `style` attribute on a node's
+  element (`edit.not_kept`). Building the corpus showed that a colour
+  changed that way, which is how vector applications save paint, was dropped
+  with no report.
+- **T1.** Positions: the SVG reader gives offsets; the CSS reader does not,
+  so CSS findings are placed by searching the file for the selector.
+
 ## Alternatives
 
 - **A new `fanta-check` crate in the hosts layer.** Cleaner name, but a
@@ -130,9 +152,8 @@ pub fn prune(dir: &Path, now: SystemTime) -> Result<()>;  // 30 days, then one p
 
 ## Risks
 
-- **Positions.** Line and column need the SVG and CSS parsers in
-  `web_read.rs` to keep offsets. Not yet verified; T1 starts by checking,
-  and falls back to file-level diagnostics for a parser that cannot.
+- **Positions.** Findings the loader raises about a node's styling point at
+  the node's element in the SVG, not at the declaration in the stylesheet.
 - **Collecting load reaches far.** Callers assume a loaded document is
   complete. A design left out must not be treated as deleted by the next
   save: the writer has to leave an unparsed design's files untouched (A10).

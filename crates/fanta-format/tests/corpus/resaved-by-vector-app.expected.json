@@ -1,0 +1,14 @@
+[
+  {
+    "code": "id.not_a_node",
+    "file": "pages/home/page.svg",
+    "line": 3,
+    "severity": "warning"
+  },
+  {
+    "code": "edit.not_kept",
+    "file": "pages/home/page.svg",
+    "line": 11,
+    "severity": "warning"
+  }
+]

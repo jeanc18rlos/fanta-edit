@@ -1,0 +1,20 @@
+{
+  "01M78J2NED7QX15H9HKM844EQ8": {
+    "blend_mode": "normal",
+    "id": "01M78J2NED7QX15H9HKM844EQ8",
+    "index": 1.0,
+    "name": "Components",
+    "opacity": 1.0,
+    "parent": null,
+    "scrollable": false,
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "type": "group"
+  }
+}

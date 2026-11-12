@@ -1,0 +1,8 @@
+[
+  {
+    "code": "ref.missing_token",
+    "file": "pages/home/page.svg",
+    "line": 11,
+    "severity": "warning"
+  }
+]
