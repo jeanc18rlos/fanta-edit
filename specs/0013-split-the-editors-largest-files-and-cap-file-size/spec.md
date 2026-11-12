@@ -2,7 +2,7 @@
 status: draft
 date: 2026-11-12
 owner: Jean Rojas
-decisions: [0023]
+decisions: [0023, 0031]
 ---
 
 # Split the editor's largest files and cap file size

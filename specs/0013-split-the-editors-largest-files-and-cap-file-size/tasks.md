@@ -29,5 +29,5 @@ Outside this spec, recorded here so it is not lost:
   each against non-Rust consumers first (the asset-deletion trap in
   `CLAUDE.md`).
 - **Editor-group layers:**
-  [ADR 0031](../../docs/decisions/README.md), proposed with this spec's
-  pull request stack. It moves no code.
+  [ADR 0031](../../docs/decisions/0031-split-the-desktop-layer-into-three-editor-layers.md),
+  proposed. It moves no code.
