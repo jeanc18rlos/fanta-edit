@@ -287,7 +287,7 @@ pub trait DesignSurface: 'static {
     /// Render a PNG of a page or node region.
     fn screenshot(&self, target: ScreenshotTarget, cx: &mut App) -> Task<Result<Vec<u8>>>;
 
-    /// List the project's FNX source files, or return one file's text.
+    /// List the project's design source files, or return one file's text.
     fn read_source(&self, path: Option<String>, cx: &mut App) -> Result<serde_json::Value>;
 
     /// Validate managed FNX and JSON candidates before an agent saves them.

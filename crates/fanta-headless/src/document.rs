@@ -13,19 +13,26 @@ use fanta_doc::{
     AssetId, CanvasNode, Doc, GroupNode, JournalEvent, JournalSink, NodeData, NodeId, Operation,
     Transaction,
 };
+#[cfg(feature = "render")]
 use fanta_render::{AssetResolver, asset::LazyAssetResolver};
 use serde_json::Value;
 
 use crate::apply::{self, BatchProgress};
-use crate::assets::{AssetStores, OverlayAssetResolver};
-use crate::{layout, render};
+use crate::assets::AssetStores;
+#[cfg(feature = "render")]
+use crate::assets::OverlayAssetResolver;
+use crate::layout;
+#[cfg(feature = "render")]
+use crate::render;
 
 pub struct HeadlessDocument {
     pub(crate) doc: Doc,
     pub(crate) raw_assets: Arc<BTreeMap<AssetId, Vec<u8>>>,
     pub(crate) assets_changed: bool,
+    #[cfg(feature = "render")]
     pub(crate) asset_resolver: Option<Arc<dyn AssetResolver>>,
     /// Images that applied ops ingested, layered over `asset_resolver`.
+    #[cfg(feature = "render")]
     pub(crate) asset_overlay: Option<Arc<OverlayAssetResolver>>,
     pub(crate) layout: layout::LayoutState,
     journal_events: mpsc::Receiver<JournalEvent>,
@@ -50,6 +57,7 @@ impl HeadlessDocument {
     fn with_assets(mut doc: Doc, raw_assets: Arc<BTreeMap<AssetId, Vec<u8>>>) -> Self {
         let (sender, journal_events) = mpsc::channel();
         doc.set_journal_sink(Some(JournalSink::new(sender)));
+        #[cfg(feature = "render")]
         let asset_resolver = (!raw_assets.is_empty()).then(|| {
             Arc::new(LazyAssetResolver::with_size_reader(
                 raw_assets.clone(),
@@ -62,7 +70,9 @@ impl HeadlessDocument {
             doc,
             raw_assets,
             assets_changed: false,
+            #[cfg(feature = "render")]
             asset_resolver,
+            #[cfg(feature = "render")]
             asset_overlay: None,
             layout,
             journal_events,
@@ -102,6 +112,7 @@ impl HeadlessDocument {
     }
 
     /// What renders resolve image assets through.
+    #[cfg(feature = "render")]
     pub fn asset_resolver(&self) -> Option<Arc<dyn AssetResolver>> {
         self.asset_resolver.clone()
     }
@@ -115,7 +126,9 @@ impl HeadlessDocument {
             &mut self.doc,
             AssetStores::new(
                 &mut self.raw_assets,
+                #[cfg(feature = "render")]
                 &mut self.asset_resolver,
+                #[cfg(feature = "render")]
                 &mut self.asset_overlay,
             ),
         )
@@ -126,7 +139,9 @@ impl HeadlessDocument {
     pub fn ingest_image(&mut self, bytes: Vec<u8>) -> Result<(AssetId, [u32; 2], bool)> {
         let ingested = AssetStores::new(
             &mut self.raw_assets,
+            #[cfg(feature = "render")]
             &mut self.asset_resolver,
+            #[cfg(feature = "render")]
             &mut self.asset_overlay,
         )
         .add_image_tracked(bytes)?;
@@ -139,7 +154,9 @@ impl HeadlessDocument {
     pub fn remove_image(&mut self, asset: AssetId) {
         AssetStores::new(
             &mut self.raw_assets,
+            #[cfg(feature = "render")]
             &mut self.asset_resolver,
+            #[cfg(feature = "render")]
             &mut self.asset_overlay,
         )
         .remove(asset);
@@ -162,7 +179,9 @@ impl HeadlessDocument {
         let modified_at = self.doc.metadata.modified_at;
         let mut stores = AssetStores::new(
             &mut self.raw_assets,
+            #[cfg(feature = "render")]
             &mut self.asset_resolver,
+            #[cfg(feature = "render")]
             &mut self.asset_overlay,
         );
         let mut progress = BatchProgress::new(default_container);

@@ -14,6 +14,12 @@ use theme::theme_settings;
 pub fn init(cx: &mut App) {
     apply(cx);
     cx.observe_global::<SettingsStore>(apply).detach();
+    // The window-appearance observer swaps the theme global directly
+    // (`theme_settings::reload_theme`), with no settings write. On Linux the
+    // system appearance resolves only after the first window opens, so
+    // without this the fanta-gpui panels keep the palette seeded before the
+    // flip: a light toolbar and unreadable panel text on a dark theme.
+    cx.observe_global::<theme::GlobalTheme>(apply).detach();
 }
 
 fn apply(cx: &mut App) {
@@ -165,6 +171,39 @@ fn contrast_ratio(first: Hsla, second: Hsla) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn reseeds_gpui_component_when_the_theme_global_swaps(cx: &mut gpui::TestAppContext) {
+        // Setup flushes in its own update: GPUI activates global observers via
+        // a deferred effect and dedupes pending global notifies, so a trigger
+        // in the same update fires before the observer is active.
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            gpui_component::init(cx);
+            init(cx);
+        });
+        cx.update(|cx| {
+            let fanta = theme::ActiveTheme::theme(cx).clone();
+            // The Linux startup sequence: the component palette was seeded
+            // before the system appearance resolved, so its tokens disagree
+            // with the active Fanta theme.
+            let stale = gpui::red();
+            assert_ne!(fanta.colors().elevated_surface_background, stale);
+            Theme::global_mut(cx).colors.popover = stale;
+
+            // `reload_theme` swaps the global directly, no settings write.
+            theme::GlobalTheme::update_theme(cx, fanta);
+        });
+        cx.update(|cx| {
+            let fanta = theme::ActiveTheme::theme(cx).clone();
+            assert_eq!(
+                cx.global::<Theme>().colors.popover,
+                fanta.colors().elevated_surface_background
+            );
+        });
+    }
 
     fn assert_success_contrast(colors: &ThemeColor, panel_background: Hsla) {
         assert!(contrast_ratio(panel_background.blend(colors.success), panel_background) >= 4.5);

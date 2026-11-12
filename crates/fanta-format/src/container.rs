@@ -20,7 +20,6 @@ use crate::error::{FormatError, Result};
 use crate::manifest::Manifest;
 use crate::migrate::migrate;
 use fanta_doc::{AssetId, Doc, SCHEMA_VERSION};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Seek, Write};
@@ -443,32 +442,8 @@ fn read_optional_binary_entry<R: Read + Seek>(
     }
 }
 
-/// The content-addressed [`AssetId`] for `bytes` — the same id [`FantaFile::put_asset`]
-/// would assign. Lets a caller mint an id (e.g. for an in-memory image about to
-/// be placed) that will match the container on save, so the asset round-trips
-/// without an id-remap.
-pub fn asset_id_for_bytes(bytes: &[u8]) -> AssetId {
-    compute_asset_id(bytes).0
-}
+pub(crate) use crate::project::compute_asset_id;
 
-/// SHA-256 the bytes and turn the digest into both an [`AssetId`] (top 128
-/// bits packed into `from_u128`) and the hex string used as the on-disk
-/// filename.
-fn compute_asset_id(bytes: &[u8]) -> (AssetId, String) {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    let mut first_16 = [0u8; 16];
-    first_16.copy_from_slice(&digest[..16]);
-    let id = AssetId::from_u128(u128::from_be_bytes(first_16));
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        hex.push(HEX[usize::from(byte >> 4)] as char);
-        hex.push(HEX[usize::from(byte & 0x0f)] as char);
-    }
-    (id, hex)
-}
 
 fn validate_hash_named_asset(path: &str, id: AssetId, bytes: &[u8]) -> Result<()> {
     let Some(stem) = Path::new(path).file_stem().and_then(|stem| stem.to_str()) else {
@@ -511,7 +486,7 @@ mod tests {
     fn duplicate_id_never_discards_different_bytes() {
         let directory = tempdir().unwrap();
         let mut file = FantaFile::create(directory.path().join("assets.fant")).unwrap();
-        let id = asset_id_for_bytes(b"intended bytes");
+        let id = crate::asset_id_for_bytes(b"intended bytes");
         file.put_asset_as(id, b"legacy bytes").unwrap();
         assert!(matches!(
             file.put_asset_as(id, b"changed bytes"),

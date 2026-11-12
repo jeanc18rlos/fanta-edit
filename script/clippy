@@ -6,8 +6,56 @@ if [[ ! " $* " == *" -p "* && ! " $* " == *" --package "* ]]; then
     set -- "$@" --workspace
 fi
 
+# Skia's Metal backend compiles only against Apple's SDK, so --all-features
+# cannot build anywhere else. Off macOS, every other feature is enabled instead.
+# script/clippy.ps1 carries the same list.
+apple_only_features="fanta-render/gpu fanta-render/metal"
+
+features_off_macos() {
+    python3 - "${CARGO:-cargo}" "$apple_only_features" "$@" <<'PYTHON'
+import json
+import subprocess
+import sys
+
+cargo, apple_only, *arguments = sys.argv[1:]
+excluded = set(apple_only.split())
+selected = {
+    arguments[index + 1]
+    for index, argument in enumerate(arguments[:-1])
+    if argument in ("-p", "--package")
+}
+# Without --locked here, metadata would repair a stale lockfile and the
+# --locked clippy run after it would pass.
+locked = ["--locked"] if "--locked" in arguments else []
+metadata = json.loads(
+    subprocess.run(
+        [cargo, "metadata", "--no-deps", "--format-version", "1", *locked],
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout
+)
+features = sorted(
+    f"{package['name']}/{feature}"
+    for package in metadata["packages"]
+    if not selected or package["name"] in selected
+    for feature in package["features"]
+)
+print(",".join(feature for feature in features if feature not in excluded))
+PYTHON
+}
+
 case "${FANTA_CLIPPY_DEFAULT_FEATURES-0}" in
-    0) set -- "$@" --all-features ;;
+    0)
+        if [[ "$(uname -s)" == Darwin ]]; then
+            set -- "$@" --all-features
+        else
+            # Assigned first: a failure inside "$(...)" in the `set` line
+            # would be ignored and lint with no features at all.
+            features="$(features_off_macos "$@")"
+            set -- "$@" --features "$features"
+        fi
+        ;;
     1) ;;
     *)
         printf 'FANTA_CLIPPY_DEFAULT_FEATURES must be 0 or 1.\n' >&2

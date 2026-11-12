@@ -60,6 +60,12 @@ jobs:
       - name: Check the app and command line tool build
         run: cargo check --locked -p fanta -p cli
 
+      - name: Check the browser wasm engine builds
+        run: |
+          rustup target add wasm32-unknown-unknown
+          RUSTFLAGS='--cfg getrandom_backend="wasm_js"' \
+            cargo check --locked -p fanta-wasm-engine --target wasm32-unknown-unknown
+
       - name: Test design engines, import, editor interactions and UI components
         run: |
           ./script/verify-fanta-release \

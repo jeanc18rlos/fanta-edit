@@ -1281,8 +1281,9 @@ pub enum DocMigrationError {
 }
 
 fn unix_seconds_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    // web_time re-exports std on native; on browser wasm std's SystemTime panics.
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }

@@ -76,7 +76,9 @@ reruns each test in its own process to list every test that fails:
 .\script\test-isolated.ps1 -Package fanta-render
 ```
 
-`script\clippy.ps1` uses the same flags as `script/clippy`. The other scripts in
+`script\clippy.ps1` uses the same flags as `script/clippy`: off macOS, both
+enable every feature except the renderer's Metal ones, which need Apple's SDK.
+The other scripts in
 `script/` are Bash; run them from Git Bash, or run the `cargo` commands they wrap
 directly.
 

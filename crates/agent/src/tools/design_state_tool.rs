@@ -16,7 +16,7 @@ fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent
 /// Read the state of the open design canvas (a `.fig` file or Fanta project).
 ///
 /// With no arguments this returns the document overview: pages (with each
-/// page's `.fnx` source path), the active page and its content bounds,
+/// page's source path), the active page and its content bounds,
 /// a bounded component preview (id, name, source), selection and its bounds, viewport, whether
 /// the canvas is editable, and short hints. Pass `page` to list that page's
 /// node tree in compact form (each node: id, kind, name, plus a frame's size
