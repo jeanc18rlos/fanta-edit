@@ -40,7 +40,7 @@
 
   function show(page) {
     current = page;
-    fetch("pages/" + page.slug + ".svg")
+    fetch("pages/" + page.slug + "/page.svg")
       .then(function (response) {
         if (!response.ok) throw new Error(response.status);
         return response.text();

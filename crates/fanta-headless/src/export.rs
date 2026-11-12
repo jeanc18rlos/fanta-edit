@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
-use fanta_doc::{Bounds, Doc, NodeId, Viewport, resolve_bound_value, resolve_effective_mode};
+use fanta_doc::{Bounds, Doc, NodeId, Viewport, resolve_effective_mode};
 use fanta_render::{AssetResolver, RasterRenderer, visual_world_bounds};
 use image::codecs::jpeg::JpegEncoder;
 
@@ -56,45 +56,7 @@ impl ExportSizing {
     }
 }
 
-pub fn resolve_export_bindings(document: &Doc) -> Cow<'_, Doc> {
-    let bound_nodes = document
-        .scene
-        .roots()
-        .iter()
-        .flat_map(|root| document.scene.descendants_of(*root))
-        .filter_map(|id| {
-            let node = document.scene.get(id)?;
-            (!node.bindings.is_empty()).then_some((id, node.bindings.clone()))
-        })
-        .collect::<Vec<_>>();
-    if bound_nodes.is_empty() {
-        return Cow::Borrowed(document);
-    }
-
-    let mut resolved = document.clone();
-    for (id, bindings) in bound_nodes {
-        let values = bindings
-            .into_iter()
-            .filter_map(|(property, variable)| {
-                resolve_bound_value(
-                    &document.variables,
-                    &document.scene,
-                    id,
-                    &document.active_modes,
-                    variable,
-                )
-                .map(|value| (property, value))
-            })
-            .collect::<Vec<_>>();
-        let Some(node) = resolved.scene.get_mut(id) else {
-            continue;
-        };
-        for (property, value) in values {
-            property.apply_resolved(node, value);
-        }
-    }
-    Cow::Owned(resolved)
-}
+pub use fanta_doc::resolve_export_bindings;
 
 /// The document with `root` lifted to the top level at its world position,
 /// so a render of it alone draws it exactly as it appears on its page,

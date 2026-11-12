@@ -722,7 +722,16 @@ pub struct ProjectManifest {
     // project's identity file on every save, putting a fourth file in a diff
     // that a one-node edit should keep to two. Git already records when the
     // tree changed. Older trees still carry the field; serde ignores it.
+    /// How designs are stored: absent for `.fnx` + `.fss` sources,
+    /// [`STORAGE_WEB`] for the plain-web-files format (spec 0007). Older
+    /// binaries drop the field on read and then fail to find `.fnx` sources,
+    /// which is the intended refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<String>,
 }
+
+/// [`ProjectManifest::storage`] value of the plain-web-files format.
+pub const STORAGE_WEB: &str = "web";
 
 impl ProjectManifest {
     /// Manifest for an existing doc. `created_at` comes from `doc.metadata` so
@@ -735,6 +744,7 @@ impl ProjectManifest {
             schema_version: doc.schema_version,
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
             created_at: doc.metadata.created_at,
+            storage: None,
         }
     }
 
@@ -749,6 +759,7 @@ impl ProjectManifest {
             schema_version: SCHEMA_VERSION,
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
             created_at: unix_seconds_now(),
+            storage: None,
         }
     }
 }

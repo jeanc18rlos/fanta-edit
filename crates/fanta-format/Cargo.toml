@@ -21,6 +21,7 @@ fanta-bundle.workspace = true
 
 # The `.fnx` design-as-source codec — the per-page/per-component node encoding.
 fanta-fnx.workspace = true
+glam.workspace = true
 
 # Error and logging primitives shared across the workspace.
 thiserror.workspace = true
