@@ -4454,15 +4454,27 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bytes 1.11.1",
  "clap",
  "fanta-api",
  "fanta-design-ops",
  "fanta-doc",
  "fanta-format",
  "fanta-headless",
+ "flate2",
+ "hex",
+ "hmac",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde",
  "serde_json",
+ "sha2",
+ "tar",
  "tempfile",
+ "tiny_http",
+ "tokio",
+ "ureq",
 ]
 
 [[package]]
@@ -5366,6 +5378,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "fanta-bundle",
+ "fanta-canvas",
  "fanta-doc",
  "fanta-format",
  "fanta-present",
@@ -5375,6 +5388,7 @@ dependencies = [
  "serde",
  "serde_json",
  "skia-safe",
+ "tempfile",
  "thiserror 2.0.17",
 ]
 
@@ -7047,6 +7061,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "pin-utils",
