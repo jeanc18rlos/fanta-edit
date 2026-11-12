@@ -19,3 +19,5 @@ so every change shows up as a git diff in the project folder.
 4. Verify visually with `get_screenshot`.
 5. The project under `project_root` is reviewable with git; the project's
    own `AGENTS.md` documents its file layout.
+6. The user can watch your edits live by running `/fanta-canvas`, a pane
+   that re-renders the page on every save.
