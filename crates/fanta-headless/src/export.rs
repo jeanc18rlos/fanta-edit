@@ -524,3 +524,45 @@ mod tests {
         assert!(raster_dimensions(wide, ExportSizing::MaxDimension(0.0), "Banner").is_err());
     }
 }
+
+/// The shared [`fanta_format::WebRenderSource`] over this crate's exporter:
+/// the editor, the engine and `fanta-site` project web storage through this
+/// one implementation, so their saves stay byte-identical (spec 0007 R10).
+pub struct ProjectRenderSource<'a> {
+    document: &'a Doc,
+    assets: Option<Arc<dyn AssetResolver>>,
+}
+
+impl<'a> ProjectRenderSource<'a> {
+    pub fn new(document: &'a Doc, assets: Option<Arc<dyn AssetResolver>>) -> Self {
+        Self { document, assets }
+    }
+}
+
+impl fanta_format::WebRenderSource for ProjectRenderSource<'_> {
+    fn design_bounds(&self, root: NodeId) -> Option<Bounds> {
+        page_visual_bounds(self.document, Some(root))
+    }
+
+    fn raster(&self, node: NodeId) -> Option<fanta_format::WebRaster> {
+        // A failed render reaches report.json as "not drawn"; the log line
+        // carries the cause, which the report cannot.
+        let image = export_node(
+            self.document,
+            self.assets.clone(),
+            node,
+            ExportEncoding::Png,
+            ExportSizing::Scale(2.0),
+        )
+        .map_err(|error| log::warn!("rendering the web fallback for {node}: {error:#}"))
+        .ok()?;
+        Some(fanta_format::WebRaster {
+            bytes: image.bytes,
+            bounds: image.bounds,
+        })
+    }
+
+    fn outline(&self, node: NodeId) -> Option<fanta_doc::PathData> {
+        boolean_outline(self.document, node)
+    }
+}

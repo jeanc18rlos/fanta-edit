@@ -166,6 +166,12 @@ impl WorkspaceSession {
         {
             return Ok(IncrementalDocApply::RequiresFullReload);
         }
+        // shortcut: a web artifact has no FNX parse session to splice from, so
+        // the full reader (which applies the hand-edit contract) takes over;
+        // add an SVG/record splice when incremental web sync profiles call for it.
+        if report.changed.iter().any(|id| !self.has_indexed_source(id)) {
+            return Ok(IncrementalDocApply::RequiresFullReload);
+        }
         if let Some(id) = report.events.iter().find_map(|event| match event {
             SessionEvent::EnteredConflict { id, .. } | SessionEvent::Invalidated { id, .. } => {
                 Some(id)
@@ -506,7 +512,7 @@ mod tests {
             ComponentDef::new(component_id, master_root, "Button"),
         );
 
-        crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+        crate::write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())
             .expect("project files");
         let mut session = WorkspaceSession::open(directory.path()).expect("project session");
         let report = ApplyReport {

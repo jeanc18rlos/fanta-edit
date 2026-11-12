@@ -2155,8 +2155,10 @@ mod tests {
         let (doc, page) = doc_with_page();
         let target_project = tempfile::tempdir()?;
         let focused_project = tempfile::tempdir()?;
+        // FNX validation needs legacy fixtures; web sources are reconciled by
+        // the load overlay, not this validator.
         for root in [target_project.path(), focused_project.path()] {
-            fanta_format::write_project_tree(root, &doc, &Default::default())?;
+            fanta_format::write_legacy_project_tree(root, &doc, &Default::default())?;
         }
         let path = fanta_format::locate_page_source(target_project.path(), page)
             .context("target source")?;
@@ -2179,7 +2181,7 @@ mod tests {
         let (mut doc, page) = doc_with_page();
         doc.scene.get_mut(page).context("page")?.name = "Original".into();
         let directory = tempfile::tempdir()?;
-        fanta_format::write_project_tree(directory.path(), &doc, &Default::default())?;
+        fanta_format::write_legacy_project_tree(directory.path(), &doc, &Default::default())?;
         let path =
             fanta_format::locate_page_source(directory.path(), page).context("page source")?;
         let original = std::fs::read_to_string(&path)?;
@@ -2486,7 +2488,7 @@ mod tests {
     /// source, so the state has to name it — relative to the project, the way
     /// a file tool wants it.
     #[test]
-    fn page_state_names_the_fnx_source_on_disk() {
+    fn page_state_names_the_design_source_on_disk() {
         let (doc, page_id) = doc_with_page();
         let temporary = tempfile::tempdir().expect("temporary project");
         fanta_format::write_project_tree(
@@ -2511,7 +2513,7 @@ mod tests {
         let source = located[0]["source"]
             .as_str()
             .expect("the page names its source");
-        assert!(source.ends_with("page.fnx"), "{source}");
+        assert!(source.ends_with("page.svg"), "{source}");
         assert!(source.starts_with("pages/"), "{source}");
 
         // A `.fig` import with no project on disk has no source to name.

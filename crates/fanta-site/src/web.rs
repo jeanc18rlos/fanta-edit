@@ -1,20 +1,16 @@
 //! `fanta-site --plain`: export a project as plain web files (spec 0007).
 //! The projection and writer live in `fanta-format`
-//! (`write_web_project_tree`); this caller supplies what the pure writer
-//! cannot compute itself — renderer-accurate design bounds and PNG fallbacks
-//! for nodes outside the SVG subset.
+//! (`write_web_project_tree`); the renderer-derived data comes from the
+//! shared `ProjectRenderSource` in `fanta-headless`, the same one every
+//! save path uses (R10).
 
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
-use fanta_format::{
-    WebRaster, WebReport, WebWriteInputs, WebWriteOutcome, write_web_project_tree,
-};
+use fanta_format::{WebReport, write_web_project_tree};
 use fanta_headless::HeadlessProject;
-use fanta_headless::export::{
-    ExportEncoding, ExportSizing, boolean_outline, export_node, page_visual_bounds,
-};
+use fanta_headless::export::ProjectRenderSource;
 
 /// Project `project` into `output` (default `<project>/web`). The output must
 /// be missing, empty, or a previous web projection; anything else is refused
@@ -29,57 +25,15 @@ pub fn export_web(project: &Path, output: Option<&Path>) -> Result<WebReport> {
     fs::create_dir_all(&output).with_context(|| format!("creating {}", output.display()))?;
 
     let doc = opened.doc();
-    let resolver = opened.document().asset_resolver();
-    let mut inputs = WebWriteInputs {
-        warnings: opened.warnings().to_vec(),
-        ..Default::default()
-    };
-    let design_roots = doc
-        .pages()
-        .to_vec()
-        .into_iter()
-        .chain(doc.components.defs.values().map(|def| def.root));
-    for root in design_roots {
-        if let Some(bounds) = page_visual_bounds(doc, Some(root)) {
-            inputs.bounds.insert(root, bounds);
-        }
-    }
-
-    loop {
-        match write_web_project_tree(&output, doc, opened.document().raw_assets(), &inputs)? {
-            WebWriteOutcome::Written { report, .. } => return Ok(report),
-            WebWriteOutcome::NeedsRenderData { rasters, outlines } => {
-                for node in rasters {
-                    if inputs.rasters.contains_key(&node) {
-                        bail!("the writer rejected the raster rendered for {node}");
-                    }
-                    let image = export_node(
-                        doc,
-                        resolver.clone(),
-                        node,
-                        ExportEncoding::Png,
-                        ExportSizing::Scale(2.0),
-                    )
-                    .with_context(|| format!("rendering the PNG fallback for {node}"))?;
-                    inputs.rasters.insert(
-                        node,
-                        WebRaster {
-                            bytes: image.bytes,
-                            bounds: image.bounds,
-                        },
-                    );
-                }
-                for node in outlines {
-                    if inputs.outlines.contains_key(&node) {
-                        bail!("the writer rejected the outline flattened for {node}");
-                    }
-                    let outline = boolean_outline(doc, node)
-                        .with_context(|| format!("flattening the boolean outline for {node}"))?;
-                    inputs.outlines.insert(node, outline);
-                }
-            }
-        }
-    }
+    let render = ProjectRenderSource::new(doc, opened.document().asset_resolver());
+    let (_, report) = write_web_project_tree(
+        &output,
+        doc,
+        opened.document().raw_assets(),
+        Some(&render),
+        opened.warnings(),
+    )?;
+    Ok(report)
 }
 
 /// The output may be new, empty, or a previous projection, recognized by its

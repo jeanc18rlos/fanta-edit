@@ -1834,7 +1834,7 @@ mod tests {
     }
 
     #[test]
-    fn measurements_and_mixed_metadata_survive_fnx_reopen_and_byte_identical_second_save() {
+    fn measurements_and_mixed_metadata_survive_reopen_and_byte_identical_second_save() {
         let unknown = json!({"version": 9, "id": "future-measurement", "attached": {"layer": "future-layer"}, "style": [0.1 + 0.2, null]});
         let malformed = json!({"version": 1, "id": "incomplete", "start": "opaque"});
         let (mut doc, first_page) = fixture(json!({
@@ -1892,17 +1892,20 @@ mod tests {
         assert_eq!(
             before
                 .keys()
-                .filter(|path| path.extension().is_some_and(|extension| extension == "fnx"))
+                .filter(|path| path.extension().is_some_and(|extension| extension == "svg"))
                 .count(),
             2
         );
         for (page, record) in [(first_page, &first), (second_page, &second)] {
-            let source =
-                fanta_format::locate_page_source(directory.path(), page).expect("page FNX source");
-            let source = std::fs::read_to_string(source).expect("read saved FNX");
-            assert!(source.contains("measurements"));
-            assert!(source.contains(&record.id));
-            assert!(source.contains("comments"));
+            // Measurements and comments are node metadata, which web storage
+            // keeps in the page's records file.
+            let records = fanta_format::locate_page_source(directory.path(), page)
+                .expect("page source")
+                .with_file_name("nodes.json");
+            let records = std::fs::read_to_string(records).expect("read saved records");
+            assert!(records.contains("measurements"));
+            assert!(records.contains(&record.id));
+            assert!(records.contains("comments"));
         }
 
         let (reopened, assets) =

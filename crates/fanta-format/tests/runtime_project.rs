@@ -444,7 +444,7 @@ fn mixed_document() -> (Doc, BTreeMap<AssetId, Vec<u8>>) {
 fn mixed_document_native_source_and_deployment_bundle_preserve_authored_state_exactly() {
     let (document, resources) = mixed_document();
     let directory = tempfile::tempdir().expect("project directory");
-    fanta_format::write_project_tree(directory.path(), &document, &resources)
+    fanta_format::write_legacy_project_tree(directory.path(), &document, &resources)
         .expect("save native project");
     let mut source = SourceBundle::default();
     collect_files(directory.path(), directory.path(), &mut source.files).expect("project bytes");
@@ -488,7 +488,7 @@ fn mixed_document_native_source_and_deployment_bundle_preserve_authored_state_ex
             .to_authored_json_value()
             .expect("original authored")
     );
-    fanta_format::write_project_tree(directory.path(), &opened, &opened_resources)
+    fanta_format::write_legacy_project_tree(directory.path(), &opened, &opened_resources)
         .expect("native save");
     let (reopened, _) = fanta_format::read_project_tree(directory.path()).expect("native reopen");
     assert_eq!(
@@ -505,7 +505,7 @@ fn mixed_document_native_source_and_deployment_bundle_preserve_authored_state_ex
 fn native_scoped_sessions_keep_the_shared_style_registry_on_open_and_save() {
     let (document, resources) = mixed_document();
     let directory = tempfile::tempdir().expect("project directory");
-    fanta_format::write_project_tree(directory.path(), &document, &resources)
+    fanta_format::write_legacy_project_tree(directory.path(), &document, &resources)
         .expect("save native project");
     let mut workspace =
         fanta_format::WorkspaceSession::open(directory.path()).expect("open native workspace");

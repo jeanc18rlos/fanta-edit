@@ -28,10 +28,13 @@ use std::{
 use anyhow::{Context as _, Result};
 use fanta_canvas::HitPrecision;
 use fanta_doc::{
-    AnimationClip, AnimationClipId, AssetId, BoundProp, CanvasNode, Doc, Easing, Fill, IndexKey,
+    AnimationClip, AnimationClipId, AssetId, BoundProp, CanvasNode, Doc, Easing, IndexKey,
     Interpolation, Keyframe, KeyframeId, MotionEvaluation, MotionProperty, NodeData, NodeId,
     Operation, ProjectAssetKind, ResolvedVarValue, Scope, Transaction, Viewport,
 };
+// Only the macOS video fills and tests read paint kinds here.
+#[cfg(any(test, target_os = "macos"))]
+use fanta_doc::Fill;
 use fanta_tools::{Button as ToolButton, LogicalKey, ToolEvent};
 use file_icons::FileIcons;
 use glam::DVec2;
@@ -2801,6 +2804,7 @@ impl FigView {
         self.viewport = Some(viewport);
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn clear_rendered_canvas(&mut self) {
         self.rendered_canvas = None;
     }
