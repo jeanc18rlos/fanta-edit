@@ -98,6 +98,7 @@ added, and an existing code never changes meaning.
 | `id.duplicate` | The same `id` is on two elements of one design SVG |
 | `id.not_a_node` | An `id` in the SVG or CSS is not a node id |
 | `design.unavailable` | A page or component is left out of the opened project because a file in its folder does not parse. The finding names the folder; a save leaves every file in it as it is, and the design comes back once the file is repaired |
+| `snapshot.unavailable` | A save was written without the snapshots that would let it be undone, because git is not installed or failed. The message says why |
 | `load.failed` | The project does not load, for a reason no other finding explains |
 | `load.omitted_geometry` | Auto-layout geometry left out of the source could not be solved on load |
 | `manifest.file_missing` | A design's `nodes.json` is gone (error), or an SVG or stylesheet the writer would emit is gone (warning) |

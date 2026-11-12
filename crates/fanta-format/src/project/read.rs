@@ -51,7 +51,7 @@ pub fn read_project_tree_with_warnings(
             None,
             None,
             Some(&mut warnings),
-            &BTreeSet::new(),
+            None,
         )?;
         Ok((doc, assets, warnings))
     })
@@ -75,7 +75,7 @@ pub fn read_project_files(
         None,
         None,
         Some(&mut warnings),
-        &BTreeSet::new(),
+        None,
     )?;
     Ok((doc, assets, warnings))
 }
@@ -123,7 +123,7 @@ pub(crate) fn read_project_tree_with_source_identities(
             Some(&mut evidence.sources),
             Some(&mut evidence.files),
             Some(&mut evidence.warnings),
-            &unavailable,
+            Some(&unavailable),
         )?;
         evidence.pages = doc.pages().to_vec();
         evidence.unavailable = unavailable;
@@ -150,7 +150,7 @@ pub(super) fn read_project_tree_with_source_override(
             None,
             None,
             None,
-            &BTreeSet::new(),
+            None,
         )
     })
 }
@@ -173,7 +173,7 @@ pub(super) fn read_project_tree_with_json_override(
             None,
             None,
             None,
-            &BTreeSet::new(),
+            None,
         )
     })
 }
@@ -263,10 +263,14 @@ fn read_project_tree_with_source_override_locked(
     json_override: Option<&JsonSourceOverride<'_>>,
     mut source_identities: Option<&mut LoadedSourceIdentities>,
     mut loaded_files: Option<&mut LoadedFileHashes>,
-    warnings: Option<&mut Vec<SourceDiagnostic>>,
-    // Design directories to leave out of the document (spec 0009 R11).
-    unavailable: &BTreeSet<PathBuf>,
+    mut warnings: Option<&mut Vec<SourceDiagnostic>>,
+    // `Some` for the collecting load (spec 0009 R11): the design directories
+    // to leave out of the document. A listed asset whose file is gone is then
+    // a finding and not a failed open.
+    collecting: Option<&BTreeSet<PathBuf>>,
 ) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
+    let none_unavailable = BTreeSet::new();
+    let unavailable = collecting.unwrap_or(&none_unavailable);
     let manifest = match json_override
         .filter(|override_| override_.path == dir.join(super::layout::FANTA_JSON))
     {
@@ -475,7 +479,7 @@ fn read_project_tree_with_source_override_locked(
             &mut overlay_warnings,
             unavailable,
         )?;
-        if let Some(warnings) = warnings {
+        if let Some(warnings) = warnings.as_deref_mut() {
             warnings.extend(overlay_warnings);
         }
     }
@@ -489,7 +493,13 @@ fn read_project_tree_with_source_override_locked(
     if manifest.schema_version < SCHEMA_VERSION {
         value = migrate(value, manifest.schema_version, SCHEMA_VERSION)?;
     }
-    let assets = read_assets(source, dir, json_override, loaded_files)?;
+    let assets = read_assets(
+        source,
+        dir,
+        json_override,
+        loaded_files,
+        collecting.and(warnings),
+    )?;
     fanta_doc::prepare_doc_json(&mut value)
         .map_err(|error| FormatError::InvalidProjectTree(format!("{}: {error}", dir.display())))?;
     // Consume the assembled values so geometry JSON is released as typed
@@ -1648,6 +1658,8 @@ fn read_assets(
     dir: &Path,
     json_override: Option<&JsonSourceOverride<'_>>,
     mut loaded_files: Option<&mut LoadedFileHashes>,
+    // Where a listed asset with no file is reported; `None` fails the read.
+    missing: Option<&mut Vec<SourceDiagnostic>>,
 ) -> Result<BTreeMap<AssetId, Vec<u8>>> {
     let mut assets = BTreeMap::new();
     let assets_dir = dir.join(ASSETS_DIR);
@@ -1675,7 +1687,13 @@ fn read_assets(
         };
         collect_assets(source, &assets_dir, &mut assets, index.as_ref(), loaded_files)?;
         if let Some(index) = index {
-            index.verify_complete(&assets)?;
+            match (index.verify_complete(&assets), missing) {
+                (Err(error), Some(missing)) => missing.push(
+                    SourceDiagnostic::error(super::diagnostic::REF_MISSING_ASSET, error.to_string())
+                        .in_file("assets/index.json"),
+                ),
+                (result, _) => result?,
+            }
         }
     }
     Ok(assets)

@@ -960,6 +960,8 @@ pub mod fanta {
             ConnectExternalAgent,
             /// Creates a new Fanta design.
             NewDesign,
+            /// Restores the project's files to an earlier snapshot.
+            RestoreSnapshot,
             /// Reveals the current project's folder in the system file manager.
             RevealProjectInFileManager
         ]

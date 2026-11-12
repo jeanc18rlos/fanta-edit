@@ -19,7 +19,7 @@ request when it merges.
   prune; `.fanta/` ignored by git and skipped by every directory walker
   (R6, R7 at the format layer). Verify: A4, one test per walker, save timing
   on a large project.
-- [ ] **T5.** Snapshots on the save path for the editor and the headless
+- [x] **T5.** ([#211](https://github.com/jeanc18rlos/fanta-edit/pull/211)) Snapshots on the save path for the editor and the headless
   engine, and the restore action in the editor (R6, R7). Verify: A3.
 - [ ] **T6.** Automatic check: the editor runs it after an external change
   and shows the result; the `check_project` tool in the live and headless

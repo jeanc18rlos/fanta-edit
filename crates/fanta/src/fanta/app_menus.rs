@@ -88,6 +88,8 @@ pub fn app_menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("Save", workspace::Save { save_intent: None }),
                 MenuItem::action("Save As…", workspace::SaveAs),
+                #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+                MenuItem::action("Restore Snapshot…", fanta_actions::fanta::RestoreSnapshot),
                 MenuItem::separator(),
                 // Declared in git_ui's `actions!(git, [Diff, ..])`, not in the
                 // git crate, and registered on every workspace by git_ui::init.

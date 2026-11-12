@@ -2432,6 +2432,12 @@ impl FigItem {
     /// Content gestures dirty the item on their first preview frame, so a
     /// mid-gesture reload can only interrupt selection-style gestures, which
     /// tolerate having their selection reset.
+    /// Read the project again after its files were replaced under the editor.
+    #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+    pub(crate) fn reload_after_restore(&mut self, cx: &mut Context<Self>) {
+        self.schedule_reload_with_full(true, cx);
+    }
+
     #[cfg(test)]
     fn schedule_reload(&mut self, cx: &mut Context<Self>) {
         self.schedule_reload_with_full(false, cx);
@@ -3306,7 +3312,17 @@ impl FigItem {
                             let session = workspace_session
                                 .as_mut()
                                 .context("The Fanta source session is unavailable")?;
-                            let warnings = session.open_warnings.clone();
+                            #[cfg_attr(
+                                all(target_os = "macos", feature = "mac_app_store"),
+                                expect(unused_mut)
+                            )]
+                            let mut warnings = session.open_warnings.clone();
+                            // Spec 0009 R6: a snapshot before the write when
+                            // the files changed outside Fanta, and one after.
+                            #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+                            let history = project_history(&target);
+                            #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+                            warnings.extend(history.before_save());
                             let report =
                                 write_project_cached_report(&target, &doc, &raw_assets, &warnings)?;
                             // The web write prunes the FNX sources it replaces
@@ -3315,6 +3331,10 @@ impl FigItem {
                             // the session adopts its own write while
                             // rebuilding its disk view.
                             session.accept_own_write(&report)?;
+                            #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+                            if let Some(finding) = history.after_save() {
+                                log::warn!("{}: {}", target.display(), finding.message);
+                            }
                             Ok(report)
                         })();
                         #[cfg(test)]
@@ -4046,6 +4066,14 @@ fn git_init_if_needed(root: &Path) {
         ),
         Err(error) => log::warn!("running git init in {} failed: {error}", root.display()),
     }
+}
+
+/// The snapshot store of the project at `root`, run with the git the editor
+/// ships. The sandboxed App Store build runs no git, so it has none.
+#[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+pub(crate) fn project_history(root: &Path) -> fanta_format::history::History {
+    fanta_format::history::History::new(root)
+        .with_git(project_git_binary(std::env::current_exe().ok().as_deref()))
 }
 
 #[cfg(any(test, not(all(target_os = "macos", feature = "mac_app_store"))))]
@@ -8972,6 +9000,94 @@ mod tests {
         let design_css =
             std::fs::read_to_string(directory.path().join("design.css")).expect("design.css");
         assert!(!design_css.contains("broken"), "the save did not run: {design_css}");
+    }
+
+    /// Spec 0009 A3: for each hostile-edit case, open it, save it, and restore
+    /// the snapshot taken before the save. The files are byte-identical to
+    /// the hostile state.
+    #[gpui::test]
+    async fn every_corpus_case_is_restored_byte_identical_after_a_save(cx: &mut TestAppContext) {
+        fn copy(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).expect("folder");
+            for entry in std::fs::read_dir(from).expect("corpus folder") {
+                let path = entry.expect("entry").path();
+                let target = to.join(path.file_name().expect("name"));
+                if path.is_dir() {
+                    copy(&path, &target);
+                } else {
+                    std::fs::copy(&path, &target).expect("copy");
+                }
+            }
+        }
+        fn project_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+            let mut found = BTreeMap::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(folder) = pending.pop() {
+                for entry in std::fs::read_dir(&folder).expect("folder") {
+                    let path = entry.expect("entry").path();
+                    if path.is_dir() {
+                        // Fanta's snapshots and the repository the editor
+                        // creates are not project files.
+                        if !path.ends_with(".fanta") && !path.ends_with(".git") {
+                            pending.push(path);
+                        }
+                    } else {
+                        found.insert(path.clone(), std::fs::read(&path).expect("file"));
+                    }
+                }
+            }
+            found
+        }
+        let project = empty_project(cx).await;
+        cx.executor().allow_parking();
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fanta-format/tests/corpus");
+        let mut restored = Vec::new();
+        for entry in std::fs::read_dir(&corpus).expect("corpus") {
+            let case = entry.expect("case").path();
+            if !case.is_dir() {
+                continue;
+            }
+            let name = case.file_name().expect("name").to_string_lossy().into_owned();
+            let directory = tempfile::tempdir().expect("project");
+            copy(&case, directory.path());
+            let hostile = project_files(directory.path());
+            // A case that does not open has no save to undo.
+            let Ok((loaded, assets, session)) =
+                fanta_format::WorkspaceSession::open_project_document(directory.path())
+            else {
+                continue;
+            };
+            let item = ready_item(
+                &project,
+                directory.path().join("fanta.json"),
+                Some(directory.path().to_path_buf()),
+                loaded.clone_for_persist(),
+                cx,
+            );
+            item.update(cx, |item, _| {
+                item.workspace_session = Some(session);
+                item.merge_base = Some(loaded.clone_for_persist());
+                item.last_saved_assets = Some(Arc::new(assets));
+            });
+            item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+                .await
+                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            assert_ne!(project_files(directory.path()), hostile, "{name}: the save wrote nothing");
+
+            let history = project_history(directory.path());
+            let before = history
+                .list()
+                .expect("snapshots")
+                .into_iter()
+                .find(|snapshot| {
+                    snapshot.reason == fanta_format::history::SnapshotReason::BeforeSave
+                })
+                .unwrap_or_else(|| panic!("{name}: no snapshot before the save"));
+            history.restore(&before.id).expect("restore");
+            assert_eq!(project_files(directory.path()), hostile, "{name}");
+            restored.push(name);
+        }
+        assert!(restored.len() >= 10, "{restored:?}");
     }
 
     fn doc_with_one_page() -> Doc {

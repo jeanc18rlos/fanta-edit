@@ -51,7 +51,7 @@ pub fn check_project(dir: &Path) -> Result<Vec<SourceDiagnostic>> {
             svgs.insert(name.clone(), text);
         }
     }
-    check_design_records(&files, &mut findings);
+    check_design_records(dir, &files, &mut findings);
 
     let broken = findings
         .iter()
@@ -103,7 +103,25 @@ pub fn check_project(dir: &Path) -> Result<Vec<SourceDiagnostic>> {
 pub(crate) fn unparsable_designs(dir: &Path) -> Result<(BTreeSet<PathBuf>, Vec<SourceDiagnostic>)> {
     let mut unavailable = BTreeSet::new();
     let mut findings = Vec::new();
-    for (name, path) in source_files(dir)? {
+    let files = source_files(dir)?;
+    // A design whose records file is gone cannot be read either.
+    let mut without_records = Vec::new();
+    check_design_records(dir, &files, &mut without_records);
+    for finding in without_records {
+        let Some(design_name) = finding
+            .file
+            .as_deref()
+            .and_then(|file| file.strip_suffix("/nodes.json"))
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        findings.push(finding);
+        if unavailable.insert(dir.join(&design_name)) {
+            findings.push(design_unavailable(&design_name));
+        }
+    }
+    for (name, path) in files {
         if !(name.starts_with(PAGES_DIR) || name.starts_with(COMPONENTS_DIR)) {
             continue;
         }
@@ -128,18 +146,20 @@ pub(crate) fn unparsable_designs(dir: &Path) -> Result<(BTreeSet<PathBuf>, Vec<S
         }
         findings.extend(found);
         if unavailable.insert(design.to_path_buf()) {
-            findings.push(
-                SourceDiagnostic::error(
-                    DESIGN_UNAVAILABLE,
-                    format!(
-                        "{design_name} is not loaded because a file in it does not parse; saving leaves its files as they are"
-                    ),
-                )
-                .in_file(design_name),
-            );
+            findings.push(design_unavailable(design_name));
         }
     }
     Ok((unavailable, findings))
+}
+
+fn design_unavailable(design_name: &str) -> SourceDiagnostic {
+    SourceDiagnostic::error(
+        DESIGN_UNAVAILABLE,
+        format!(
+            "{design_name} is not loaded because a file in it is missing or does not parse; saving leaves its files as they are"
+        ),
+    )
+    .in_file(design_name)
 }
 
 fn source_files(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
@@ -349,7 +369,11 @@ fn check_asset_index(dir: &Path, text: &str, findings: &mut Vec<SourceDiagnostic
 /// A design folder (one holding `page.json` or `def.json`) without its
 /// `nodes.json` has lost its nodes: the SVG beside it is a view, not the
 /// record, and the load fails.
-fn check_design_records(files: &[(String, PathBuf)], findings: &mut Vec<SourceDiagnostic>) {
+fn check_design_records(
+    dir: &Path,
+    files: &[(String, PathBuf)],
+    findings: &mut Vec<SourceDiagnostic>,
+) {
     for (name, _) in files {
         let Some(folder) = name
             .strip_suffix("/page.json")
@@ -358,7 +382,16 @@ fn check_design_records(files: &[(String, PathBuf)], findings: &mut Vec<SourceDi
             continue;
         };
         let records = format!("{folder}/{NODES_JSON}");
-        if !files.iter().any(|(other, _)| *other == records) {
+        // A legacy design keeps its nodes in an `.fnx` source, or in a
+        // `nodes` folder before that.
+        let legacy = fs::read_dir(dir.join(folder)).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                let path = entry.path();
+                path.extension().is_some_and(|extension| extension == "fnx")
+                    || path.file_name().is_some_and(|name| name == "nodes")
+            })
+        });
+        if !legacy && !files.iter().any(|(other, _)| *other == records) {
             findings.push(
                 SourceDiagnostic::error(
                     MANIFEST_FILE_MISSING,
