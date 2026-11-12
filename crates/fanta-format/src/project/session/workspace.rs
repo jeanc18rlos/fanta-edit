@@ -774,6 +774,8 @@ impl WorkspaceSession {
                                     | "master.ids.json"
                                     | "page.svg"
                                     | "master.svg"
+                                    | "page.css"
+                                    | "master.css"
                                     | "nodes.json"
                                     | "map.json"
                             ) || (name.as_str() == DEF_JSON
@@ -2952,14 +2954,16 @@ fn read_indexed_file_set(
     if !matches!(kind, ArtifactKind::Page | ArtifactKind::Component) {
         return Ok(files);
     }
-    let (source_name, web_source) = match kind {
+    let (source_name, web_source, web_css) = match kind {
         ArtifactKind::Page => (
             crate::project::layout::PAGE_FNX,
             crate::project::web::PAGE_SVG,
+            crate::project::web::PAGE_CSS,
         ),
         ArtifactKind::Component => (
             crate::project::layout::MASTER_FNX,
             crate::project::web::MASTER_SVG,
+            crate::project::web::MASTER_CSS,
         ),
         _ => return Ok(files),
     };
@@ -2967,6 +2971,7 @@ fn read_indexed_file_set(
     // projection files must change the indexed disk hash.
     for name in [
         web_source,
+        web_css,
         crate::project::web::NODES_JSON,
         crate::project::web::MAP_JSON,
     ] {

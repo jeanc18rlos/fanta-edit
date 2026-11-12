@@ -1170,7 +1170,7 @@ AGENTS.md and current mode/tool restrictions take precedence. In Edit Visual
 mode use canvas operations; source file mutation is unavailable.
 
 ## Safe source edits
-- A design's SVG is its tree (element order, `id`, `data-name`, geometry, text) and `design.css` its styling; `nodes.json` beside the SVG holds the complete node records. Parsed SVG/CSS fields win over the records on load; anything a load cannot keep is reported per node in `report.json`, and the next save canonicalizes formatting.
+- A design's SVG is its tree (element order, `id`, `data-name`, geometry, text) and the stylesheet beside it (`page.css` / `master.css`) its styling; the root `design.css` imports each and holds project-wide rules (a design's declaration wins per property). `nodes.json` beside the SVG holds the complete node records. Parsed SVG/CSS fields win over the records on load; anything a load cannot keep is reported per node in `report.json`, and the next save canonicalizes formatting.
 - Edit values inside the emitted dialect: geometry attributes, `data-name`, text content, CSS declaration values, `var(--token, literal)` swaps, and `--fanta-layout`/`--fanta-gap`/`--fanta-padding` intent. Leave derived output alone (`-grad`/`-mask` defs, `url(#…)` paints, stacked-fill clones, `data-virtual` instance content, boolean outlines); edit those through `nodes.json` or canvas ops.
 - Save complete, well-formed documents. Build large designs through small, complete frame/component edits so tool output limits cannot truncate the page.
 - A legacy project may still hold `.fnx` sources (it converts on its first save): repair parser diagnostics and retry instead of force-saving partial drafts, and external file agents can call `validate_fnx_source` with the complete candidate before writing one.
@@ -1280,10 +1280,11 @@ mode use canvas operations; source file mutation is unavailable.
 - Use streamed canvas ops for visible element creation and placement. Use
   source edits for small complete subtrees or typed JSON changes; verify each
   save on the live canvas before moving to the next component or section.
-- Source files: each page is `pages/<slug>/page.svg` with its `nodes.json`,
-  each component master `components/<slug>/master.svg` (paths are in the
-  state's `pages[].source` and `components[].source`); styling is in the root
-  `design.css`. Read and edit these files with normal file tools for design
+- Source files: each page is `pages/<slug>/page.svg` with its `page.css` and
+  `nodes.json`, each component master `components/<slug>/master.svg` with its
+  `master.css` and `nodes.json` (paths are in the state's `pages[].source`
+  and `components[].source`); the root `design.css` holds project-wide
+  rules. Read and edit these files with normal file tools for design
   creation, styling, layout and structural changes; the open canvas
   hot-reloads about 300 ms after save. Keep every file well-formed.
 - JSON metadata and identity sidecars are editable: inspect their schema,

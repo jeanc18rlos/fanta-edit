@@ -190,7 +190,8 @@ child-coordinate nudges. Verify wrapping and alignment at representative sizes.
 The SVG and CSS are generated, canonical source: edit values inside the emitted
 dialect (see *Editing the web sources* below) rather than reformatting whole
 files, and save only complete, well-formed documents. Structure lives in each
-design's SVG, styling in `design.css`, and the complete node records in the
+design's SVG, styling in the stylesheet beside it (`page.css` /
+`master.css`), and the complete node records in the
 neighboring `nodes.json`; anything a load cannot keep is reported per node in
 `report.json` on the next save — nothing is silently dropped. Build large
 designs through small, complete frame or component edits; do not stream a
@@ -204,7 +205,7 @@ on its first save. For a legacy `.fnx` edit, external file agents can call
 ```
 fanta.json                       # project manifest (format tag, versions, "storage": "web") — do not hand-edit
 index.html, viewer.js            # dependency-free viewer: open index.html in a browser — generated
-design.css                       # one CSS rule per node, selected by node id   <- edit values here
+design.css                       # imports each design's stylesheet; add project-wide rules here
 tokens.css                       # variable collections/modes as CSS custom properties — generated
                                  #   from doc/variables.json; not a hand-edit surface
 pages.js                         # the viewer's page manifest — generated
@@ -220,17 +221,20 @@ doc/
 pages/<page-slug>/
   page.json                      # { "id": "n_…", "name": ..., "order": N }
   page.svg                       # the page's tree: element order, ids, names, geometry, text  <- edit this
+  page.css                       # the page's styling, one rule per node id   <- edit values here
   nodes.json                     # the complete node records, keyed by bare node id — editable JSON
   map.json                       # node id -> name and world bounds for outside tools — generated
 components/<component-slug>/     # a component without variants
   def.json                       # component definition (id, root, name)  — do not hand-edit
   master.svg                     # the component master's tree              <- edit this
+  master.css                     # the master's styling, one rule per node id  <- edit values here
   nodes.json                     # the master's node records — editable JSON
 components/<set-slug>/           # a component WITH variants: one folder
   set.json                       # its axes, values and default variant    — do not hand-edit
   <variant-slug>/                # one per variant, named by its values (primary-hover)
     def.json                     # the variant's definition               — do not hand-edit
     master.svg                   # the variant master's tree                <- edit this
+    master.css                   # the variant's styling                    <- edit values here
     nodes.json                   # the variant's node records — editable JSON
 assets/index.json                # asset sizes and full SHA-256 digests
 assets/<family>/<AssetId>.<ext>  # shared binary assets, one folder per family:
@@ -265,8 +269,11 @@ Do not hand-rename a component in `def.json`.
 
 A design's SVG (`page.svg` / `master.svg`) is its readable tree. Each scene
 node is one element whose `id` is the node id in display form (`n_…`) and
-whose `data-name` is the layer name; children nest in render (z) order. All
-styling is in `design.css`, one rule per node, selected by that same id. The
+whose `data-name` is the layer name; children nest in render (z) order. The
+design's styling is in the stylesheet beside the SVG (`page.css` /
+`master.css`), one rule per node, selected by that same id. The root
+`design.css` imports every design stylesheet and is where project-wide rules
+go; where both set the same property, the design's declaration wins. The
 neighboring `nodes.json` holds every node's complete record (keyed by the
 bare 26-character id), so nothing is lost when a property has no SVG/CSS
 spelling yet.
@@ -278,8 +285,9 @@ over them. Edits inside this emitted dialect survive load and the next save:
 - **Edit text** — change a text element's content.
 - **Move / resize** — change the element's geometry attributes (`x`, `y`,
   `width`, `height`, `transform`, a path's `d`).
-- **Restyle** — change a declaration value in the node's `design.css` rule,
-  or swap a literal for `var(--token, literal)` to bind a variable. The
+- **Restyle** — change a declaration value in the node's rule in the design's
+  stylesheet, or swap a literal for `var(--token, literal)` to bind a
+  variable. The
   literal inside a `var()` is the token's resolved value under the active
   modes.
 - **Reorder** — change an element's position among its siblings.
@@ -819,6 +827,7 @@ fn seed_agents_md(dir: &Path) -> Result<()> {
         "71d49782238e8e17464761de73b4b71a807e1d9346582a1c00e38f00e7993065",
         "b95dd139e72304af8d38947f10b594bb70c455db8c75f2332ff45b33423ec756",
         "cb02692ceaa70322e52d03b14a2b7ffa029ebce479f3216645b45eb65a1d52b3",
+        "e8d497228bc1bd876e263bef5320438ca39e57520ec240398c8ee5760d152026",
     ];
     let should_write = match fs::read(&path) {
         Ok(contents) => {

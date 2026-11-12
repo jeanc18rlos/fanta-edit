@@ -35,7 +35,7 @@ pub(crate) fn apply_web_overlay(
     warnings: &mut Vec<String>,
 ) -> Result<()> {
     let tokens = TokenTable::new(variables, warnings);
-    let rules = match std::fs::read_to_string(dir.join(DESIGN_CSS)) {
+    let mut rules = match std::fs::read_to_string(dir.join(DESIGN_CSS)) {
         Ok(css) => parse_rules(&css, warnings),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
         Err(error) => return Err(error.into()),
@@ -49,6 +49,20 @@ pub(crate) fn apply_web_overlay(
             .to_string_lossy()
             .replace('\\', "/");
         parse_design_svg(&svg, &context, &mut elements, warnings);
+        // The design's own stylesheet wins over a duplicate declaration in
+        // the root design.css (scoped is more specific — spec 0007 R3 as
+        // amended), but a root-only declaration still applies: append the
+        // scoped declarations so the later value wins per property.
+        let scoped = path.with_extension("css");
+        match std::fs::read_to_string(&scoped) {
+            Ok(css) => {
+                for (id, declarations) in parse_rules(&css, warnings) {
+                    rules.entry(id).or_default().extend(declarations);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
     }
 
     let mut ids: BTreeSet<&String> = elements.keys().collect();
@@ -318,7 +332,9 @@ fn parse_rules(
         let Some((selector, body)) = block.split_once('{') else {
             continue;
         };
-        let selector = selector.trim();
+        // Statements before the selector (the aggregator's `@import` lines)
+        // end with `;`; the selector is what follows the last one.
+        let selector = selector.rsplit(';').next().unwrap_or(selector).trim();
         let Some(id) = selector.strip_prefix('#') else {
             continue;
         };
@@ -640,7 +656,7 @@ impl Edit<'_> {
             }
             "font-family" => {
                 if let NodeData::Text(text) = &mut self.node.data {
-                    let family = value.trim().trim_matches('"').to_string();
+                    let family = value.trim().trim_matches(['"', '\'']).to_string();
                     if family != text.style.font_family {
                         text.style.font_family = family;
                         self.changed = true;

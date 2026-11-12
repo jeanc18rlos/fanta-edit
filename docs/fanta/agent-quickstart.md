@@ -2,9 +2,10 @@
 
 Current source guidance, **11 November 2026**. Connection instructions should come
 from the installed app to target its executable and user-data directory. Projects
-now store designs as web files (spec 0007): SVG per design, styling in
-`design.css`, complete node records in `nodes.json`; legacy FNX projects convert
-on their first save.
+now store designs as web files (spec 0007): SVG per design, styling in the
+stylesheet beside it (`page.css` / `master.css`, aggregated by the root
+`design.css`), complete node records in `nodes.json`; legacy FNX projects
+convert on their first save.
 
 The [12 October recorded example](../alpha/DEMO_GUIDE.md#an-agent-edits-your-design)
 uses an external Opus 5.5 agent through Fanta MCP for one bounded CTA edit.
@@ -63,8 +64,9 @@ Never treat a truncated slice as a whole file.
 Use paths returned by `get_editor_state`. Read complete relevant source, preserve
 node IDs, and edit inside the emitted dialect: geometry attributes, `data-name`,
 text content and element order in the design's SVG; declaration values,
-`var(--token, literal)` swaps and `--fanta-*` layout intent in `design.css`;
-everything else through the design's `nodes.json` records. Anything a load
+`var(--token, literal)` swaps and `--fanta-*` layout intent in the design's
+own stylesheet (`page.css` / `master.css`; project-wide rules go in the root
+`design.css`); everything else through the design's `nodes.json` records. Anything a load
 cannot keep is reported per node in `report.json`. For a legacy `.fnx` edit,
 call `validate_fnx_source` before saving it with the agent's normal file tools.
 There is no local MCP `edit_fnx_source` tool. Inspect the reloaded canvas and

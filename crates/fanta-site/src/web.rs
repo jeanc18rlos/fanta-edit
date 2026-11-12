@@ -176,9 +176,11 @@ mod tests {
             "pages.js",
             "report.json",
             "pages/home/page.svg",
+            "pages/home/page.css",
             "pages/home/map.json",
             "pages/home/nodes.json",
             "pages/about/page.svg",
+            "pages/about/page.css",
             "pages/about/map.json",
             "pages/about/nodes.json",
         ] {
@@ -195,10 +197,15 @@ mod tests {
             "nodes keep their names:\n{home}"
         );
         assert!(home.contains("<rect"), "a rectangle emits a <rect>:\n{home}");
-        let css = fs::read_to_string(output.join("design.css")).expect("design css");
+        let css = fs::read_to_string(output.join("pages/home/page.css")).expect("page css");
         assert!(
             css.contains("fill: var(--theme-surface, #FFFFFF);"),
             "a bound fill styles through the token:\n{css}"
+        );
+        let aggregator = fs::read_to_string(output.join("design.css")).expect("design css");
+        assert!(
+            aggregator.contains("@import url(\"pages/home/page.css\");"),
+            "design.css imports each page stylesheet:\n{aggregator}"
         );
         let mut snapshot = BTreeMap::new();
         for entry in walk(&output) {

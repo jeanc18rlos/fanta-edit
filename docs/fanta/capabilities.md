@@ -49,8 +49,9 @@ These source additions have not been exercised in the installed app.
 
 Create a design from **New Design**, open a Fanta project folder, or import a
 `.fig` file or `.fant` snapshot. A saved project contains `fanta.json`, one SVG
-plus a `nodes.json` record file per page and component master, styling in
-`design.css`, a browser viewer, metadata and assets (spec 0007). A legacy
+plus a stylesheet and a `nodes.json` record file per page and component
+master, a root `design.css` that imports each stylesheet and holds
+project-wide rules, a browser viewer, metadata and assets (spec 0007). A legacy
 project with FNX source and identity sidecars opens unchanged and converts to
 the web layout on its first save. See
 [project-schema.md](project-schema.md) for the layout.

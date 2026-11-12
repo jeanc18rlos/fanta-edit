@@ -1110,7 +1110,7 @@ mod tests {
 
         // Hand edits: unbind the card's fill to a literal, bind the panel's
         // literal to the token, widen the gap, plus one unknown declaration.
-        let css_path = dir.path().join("design.css");
+        let css_path = dir.path().join("pages/home/page.css");
         let css = fs::read_to_string(&css_path).unwrap();
         assert!(css.contains("fill: var(--theme-surface, #FFFFFF);"), "{css}");
         let css = css
@@ -1123,8 +1123,14 @@ mod tests {
                 "fill: var(--theme-surface, #123456);",
             )
             .replace("--fanta-gap: 10;", "--fanta-gap: 24;");
-        let css = format!("{css}\n#{card} {{ zzz-unknown: 1; }}\n");
         fs::write(&css_path, css).unwrap();
+        // A project-wide rule hand-added to the root design.css (after the
+        // generated @import lines) applies on load too.
+        let root_css_path = dir.path().join("design.css");
+        let root_css = fs::read_to_string(&root_css_path).unwrap();
+        assert!(root_css.contains("@import url(\"pages/home/page.css\");"), "{root_css}");
+        let root_css = format!("{root_css}\n#{card} {{ zzz-unknown: 1; }}\n");
+        fs::write(&root_css_path, root_css).unwrap();
         let svg_path = dir.path().join("pages/home/page.svg");
         let svg = fs::read_to_string(&svg_path).unwrap();
         assert!(svg.contains("width=\"120\""), "{svg}");
@@ -1197,7 +1203,7 @@ mod tests {
     fn web_t4_features_emit_natively_without_rasters() {
         use fanta_doc::{
             BlendMode, BooleanBakedGeometry, BooleanNode, Color, Fill, Gradient, GradientStop,
-            InstanceNode, PathData, Transform2D, VectorNode,
+            InstanceNode, PathData, TextNode, Transform2D, VectorNode,
         };
 
         let mut doc = Doc::new();
@@ -1219,7 +1225,17 @@ mod tests {
         )));
         chip_shape.name = "Chip / Shape".into();
         chip_shape.parent = Some(comp_root);
+        // A level style on instance content must share the fill's one style
+        // attribute; a second style="" made the SVG malformed XML.
+        chip_shape.opacity = fanta_doc::UnitInterval::new(0.5);
         insert(chip_shape);
+        let mut chip_label = CanvasNode::new(NodeData::Text(TextNode::new("Chip", 40.0, 12.0)));
+        if let NodeData::Text(text) = &mut chip_label.data {
+            text.style.font_family = "Source Serif Pro".into();
+        }
+        chip_label.name = "Chip / Label".into();
+        chip_label.parent = Some(comp_root);
+        insert(chip_label);
         let comp_id = ComponentId::new();
 
         let mut gradient_rect = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
@@ -1345,6 +1361,13 @@ mod tests {
         );
 
         let svg = fs::read_to_string(dir.path().join("pages/home/page.svg")).unwrap();
+        assert!(
+            svg.starts_with(
+                "<?xml-stylesheet type=\"text/css\" href=\"../../tokens.css\"?>\n\
+                 <?xml-stylesheet type=\"text/css\" href=\"page.css\"?>\n<svg "
+            ),
+            "a standalone open of the SVG must load the project's styling: {svg}"
+        );
         assert!(svg.contains("<linearGradient id=\""), "{svg}");
         assert!(
             svg.contains(&format!("id=\"{gradient_id}-f1\"")),
@@ -1364,7 +1387,21 @@ mod tests {
             svg.contains("data-virtual=\"true\""),
             "instance content emits inline, without ids: {svg}"
         );
-        let css = fs::read_to_string(dir.path().join("design.css")).unwrap();
+        assert!(
+            svg.contains("font-family: 'Source Serif Pro'"),
+            "a spaced family in an inline style must stay XML-safe (single quotes): {svg}"
+        );
+        assert!(
+            svg.contains("<svg xmlns=\"http://www.w3.org/2000/svg\" data-fanta=\"page\""),
+            "the root element identifies the file as Fanta source and its kind: {svg}"
+        );
+        assert!(
+            svg.contains("style=\"opacity: 0.5; fill:"),
+            "a level style on instance content shares the fill's style attribute: {svg}"
+        );
+        let master = fs::read_to_string(dir.path().join("components/chip/master.svg")).unwrap();
+        assert!(master.contains("data-fanta=\"master\""), "{master}");
+        let css = fs::read_to_string(dir.path().join("pages/home/page.css")).unwrap();
         assert!(
             css.contains(&format!("fill: url(#{gradient_id}-grad);")),
             "{css}"
@@ -1388,7 +1425,7 @@ mod tests {
         );
 
         // A hand edit on the stacked-fill clone element wins (R7).
-        let css_path = second.path().join("design.css");
+        let css_path = second.path().join("pages/home/page.css");
         let css = fs::read_to_string(&css_path).unwrap();
         let marker = format!("#{gradient_id}-f1 {{\n  fill: rgba(255, 0, 0, 0.502);");
         assert!(css.contains(&marker), "{css}");

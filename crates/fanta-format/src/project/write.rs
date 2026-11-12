@@ -1529,10 +1529,10 @@ fn is_web_artifact(parts: &[&str]) -> bool {
         ]
         .contains(name),
         [PAGES_DIR, _, name] => {
-            ["page.svg", "nodes.json", "map.json"].contains(name) || node_raster(name)
+            ["page.svg", "page.css", "nodes.json", "map.json"].contains(name) || node_raster(name)
         }
         [COMPONENTS_DIR, _, name] | [COMPONENTS_DIR, _, _, name] => {
-            ["master.svg", "nodes.json"].contains(name) || node_raster(name)
+            ["master.svg", "master.css", "nodes.json"].contains(name) || node_raster(name)
         }
         _ => false,
     }

@@ -14,15 +14,16 @@ file reconciliation path.
 | --- | --- | --- |
 | `fanta.json` | Project ID, schema/layout versions, `"storage": "web"` | No |
 | `index.html`, `viewer.js`, `pages.js` | Dependency-free project viewer and its page manifest | No — regenerated each save |
-| `design.css` | One CSS rule per node, selected by node id; `var(--token, fallback)` where a property is bound | Yes — declaration values, `var()` swaps, `--fanta-*` layout intent |
+| `design.css` | Imports each design's stylesheet; the home for project-wide rules | Yes — add theme-wide rules; keep the generated `@import` lines |
 | `tokens.css` | Variable collections and modes as CSS custom properties | No — generated from `doc/variables.json` |
 | `report.json` | The last save's warnings and anything a load could not keep, per node | No — the loader's report channel |
 | `pages/<slug>/page.json` | Page ID, name, and order | Change name/order with care; keep the ID |
 | `pages/<slug>/page.svg` | The page's tree: element order, ids, `data-name`, geometry, path data, text | Yes |
+| `pages/<slug>/page.css` | The page's styling: one rule per node, selected by node id; `var(--token, fallback)` where a property is bound | Yes — declaration values, `var()` swaps, `--fanta-*` layout intent |
 | `pages/<slug>/nodes.json` | The complete node records, keyed by bare node id | Yes, as valid JSON; keep the id keys |
 | `pages/<slug>/map.json` | Node id → name and world bounds, for outside tools | No — derived |
 | `components/<slug>/def.json` | Component identity and definition | Keep IDs and root consistent |
-| `components/<slug>/master.svg` + `nodes.json` | A component master's tree and records | Yes, like a page |
+| `components/<slug>/master.svg` + `master.css` + `nodes.json` | A component master's tree, styling and records | Yes, like a page |
 | `components/<set>/set.json` | A variant set's axes, values and default | No — use the editor's variant ops |
 | `doc/variables.json`, `doc/active_modes.json` | Tokens (`color`, `float`, `string`, `boolean`, `typography`, `enum` with its `options`, `image` asset ids) and current modes | Yes, as valid JSON |
 | `doc/metadata.json`, `doc/motion.json`, `doc/flow_start.json` | Project metadata, animation, prototype start | Yes, as valid JSON |
@@ -39,9 +40,16 @@ its generated files; an unrelated note alongside them remains.
 ## The web projection and the hand-edit contract
 
 The SVG is the authoritative scene tree (element order, `id` in the display
-`n_…` form, `data-name`, geometry, path data, text content) and `design.css`
-is the authoritative styling; `nodes.json` carries each node's complete
-record, so properties without an SVG/CSS spelling are never lost. On load the
+`n_…` form, `data-name`, geometry, path data, text content) and the design's
+own stylesheet (`page.css` or `master.css` beside the SVG) its authoritative
+styling; `nodes.json` carries each node's complete record, so properties
+without an SVG/CSS spelling are never lost. The root `design.css` imports
+every design stylesheet and is where project-wide rules live; where a root
+rule and a design's rule set the same property for a node, the design's
+declaration wins. Each SVG references `tokens.css` and its own stylesheet
+with `<?xml-stylesheet?>`, so opening it standalone renders styled, and its
+root element carries `data-fanta="page"` or `data-fanta="master"` so a tool
+handed the bare file knows it is Fanta source and which kind. On load the
 records are read first, then parsed SVG and CSS fields win over them. The
 writer is canonical and deterministic: load-then-save normalizes hand-edited
 formatting like a formatter — values survive, whitespace does not.
@@ -67,7 +75,7 @@ rewrites it.
 | Text editors, diff tools, agents editing values in place | Yes — the contract above |
 | JSON edits to `nodes.json`, `doc/*.json` | Yes, as valid JSON with ids preserved |
 | Browsers (open `index.html`) | View only; text wrapping is approximated — the engine shapes text |
-| CSS formatters on `design.css` | Values survive; formatting is canonicalized on the next save |
+| CSS formatters on `design.css`, `page.css`, `master.css` | Values survive; formatting is canonicalized on the next save |
 | Illustrator, Inkscape and other SVG apps that re-serialize whole files | No — structure outside the emitted dialect is reported and regenerated, not guessed at |
 | Anything editing `tokens.css`, `map.json`, `pages.js`, `report.json`, the viewer files | No — regenerated every save |
 
@@ -94,8 +102,8 @@ format handler; its source reference remains a small asset ID.
 
 ## Editing and recovery
 
-Keep `fanta.json`, a design's SVG, its `nodes.json`, the `design.css` rules
-and any referenced assets in the same commit. Save valid files before
+Keep `fanta.json`, a design's SVG, its `nodes.json`, its stylesheet and any
+referenced assets in the same commit. Save valid files before
 switching branches. The running editor debounces file events, checks content
 hashes, and reconciles changed artifacts. A concurrent canvas and file edit is
 merged when the changes do not overlap; an overlap is shown as a conflict and
