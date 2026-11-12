@@ -502,3 +502,20 @@ fn a_save_without_the_load_findings_still_keeps_an_unparsable_design() {
     fanta_format::write_web_project_tree(&root, &doc, &assets, None, &[]).unwrap();
     assert_eq!(files_in(&root.join("pages/home")), hostile);
 }
+
+/// Spec 0009 R6: the snapshot store under `.fanta/` is invisible to the
+/// check, the loader and the save.
+#[test]
+fn the_snapshot_store_is_skipped_by_the_check_the_loader_and_the_save() {
+    use fanta_format::history::{History, SnapshotReason};
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().canonicalize().unwrap();
+    copy_tree(&corpus_dir().join("pristine"), &root);
+    let taken = History::new(&root).record(SnapshotReason::BeforeSave).unwrap();
+
+    assert_eq!(fanta_format::check_project(&root).unwrap(), Vec::new());
+    let (doc, assets, session) = fanta_format::WorkspaceSession::open_project_document(&root).unwrap();
+    assert_eq!(session.open_warnings, Vec::new());
+    fanta_format::write_web_project_tree(&root, &doc, &assets, None, &[]).unwrap();
+    assert_eq!(History::new(&root).list().unwrap(), [taken]);
+}

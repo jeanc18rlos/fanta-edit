@@ -15,7 +15,7 @@ request when it merges.
 - [x] **T3.** ([#209](https://github.com/jeanc18rlos/fanta-edit/pull/209)) Collecting load: a project with errors opens and saves; an
   unparsed design is shown as unavailable and its files are left untouched
   by the save (R11). Verify: A10.
-- [ ] **T4.** Snapshot store `project/history.rs`: record, list, restore,
+- [x] **T4.** ([#210](https://github.com/jeanc18rlos/fanta-edit/pull/210)) Snapshot store `project/history.rs`: record, list, restore,
   prune; `.fanta/` ignored by git and skipped by every directory walker
   (R6, R7 at the format layer). Verify: A4, one test per walker, save timing
   on a large project.

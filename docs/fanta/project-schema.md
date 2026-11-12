@@ -16,6 +16,7 @@ file reconciliation path.
 | `index.html`, `viewer.js`, `canvas.js`, `editor.js`, `pages.js` | Dependency-free project viewer, the browser editor it upgrades into under `script/serve-project`, and the page manifest | No — regenerated each save |
 | `design.css` | Imports each design's stylesheet; the home for project-wide rules | Yes — add theme-wide rules; keep the generated `@import` lines |
 | `tokens.css` | Variable collections and modes as CSS custom properties | No — generated from `doc/variables.json` |
+| `.fanta/` | Fanta's private state: `history.git` holds the snapshots taken around saves. Ignores itself for git | No — never edit; delete it to drop the snapshots |
 | `report.json` | The last save's findings and anything a load could not keep, as [diagnostic records](#diagnostic-codes) | No — the loader's report channel |
 | `pages/<slug>/page.json` | Page ID, name, and order | Change name/order with care; keep the ID |
 | `pages/<slug>/page.svg` | The page's tree: element order, ids, `data-name`, geometry, path data, text | Yes |
