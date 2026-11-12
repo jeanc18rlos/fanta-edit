@@ -15,10 +15,12 @@ request when it merges.
   web-format project, display `page.svg` with its scoped CSS, pan, zoom
   and click-select, apply ops through the T1 engine and swap the updated
   SVG in place (R3, R4, R5). Verify: A3.
-- [ ] **T3.** Browser host: an edit mode on the emitted `index.html` /
+- [x] **T3.** ([#197](https://github.com/jeanc18rlos/fanta-edit/pull/197)) Browser host: an edit mode on the emitted `index.html` /
   `viewer.js` that mounts the canvas component, with the persistence
   answer from the open questions (R3, R5). Verify: A3 against a served
-  project.
+  project. Persistence answer: a localhost dev server
+  (`script/serve-project`) with an atomic, path-contained PUT channel;
+  plain static hosts stay view-only.
 - [ ] **T4.** Claude Code pane, terminal surface: the `fanta-canvas`
   plugin opens a pane showing the current page as PNG frames, re-rendered
   when project files change (R4). Verify: A4 on a terminal session.
