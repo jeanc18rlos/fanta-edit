@@ -206,8 +206,16 @@ impl DesignSession {
             return Err(ApiError::ViewOnly);
         }
         let mut assignments = Vec::new();
+        let mut keys = BTreeSet::new();
         for (key, value) in row {
             let key = key.trim();
+            // The row's map dedupes untrimmed keys only; " photo" and "photo"
+            // would each fetch the same image again.
+            if !keys.insert(key) {
+                return Err(ApiError::InvalidArgument(format!(
+                    "the row names `{key}` more than once"
+                )));
+            }
             let names_variable =
                 fanta_doc::text_token_variable(&self.doc().variables, key).is_some();
             let placeholders = if names_variable {
@@ -459,6 +467,23 @@ mod tests {
         assert!(session.undo().expect("undo"));
         assert_eq!(shown_text(&session, greeting), "Hi {{name}}");
         assert_eq!(bitmap_asset(&session, photo), before);
+    }
+
+    #[test]
+    fn a_row_naming_a_key_twice_after_trimming_is_refused() {
+        let (mut session, greeting, photo) = template();
+        let before = bitmap_asset(&session, photo);
+        let red = data_uri(&png(4, 4, [255, 0, 0, 255]));
+        let error = session
+            .fill_template(&row(&[
+                ("photo", &red),
+                (" photo", &red),
+                ("\tphoto", &red),
+            ]))
+            .expect_err("one key, three spellings");
+        assert!(error.to_string().contains("more than once"), "{error}");
+        assert_eq!(bitmap_asset(&session, photo), before);
+        assert_eq!(shown_text(&session, greeting), "Hi {{name}}");
     }
 
     #[test]

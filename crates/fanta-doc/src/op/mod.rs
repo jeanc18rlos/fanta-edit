@@ -730,6 +730,73 @@ mod tests {
     }
 
     #[test]
+    fn undoing_an_override_removal_restores_it_without_overwriting_the_next() {
+        use crate::node::{Override, OverrideValue};
+        let override_at = |node: u128, target_prop: BoundProp, value: OverrideValue| Override {
+            target_path: [NodeId::from_u128(node)].into_iter().collect(),
+            target_prop,
+            value,
+        };
+        let title = override_at(
+            10,
+            BoundProp::TextContent,
+            OverrideValue::Text {
+                value: "Title".into(),
+            },
+        );
+        let badge = override_at(
+            11,
+            BoundProp::Visible,
+            OverrideValue::Visible { value: false },
+        );
+        let mut d = TestDoc::new();
+        let inst = CanvasNode::new(NodeData::Instance(InstanceNode {
+            component: ComponentId::from_u128(1),
+            overrides: vec![title.clone(), badge.clone()],
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [10.0, 10.0],
+        }));
+        let id = inst.id;
+        d.scene.insert(inst).unwrap();
+        let overrides = |d: &TestDoc| match &d.scene.get(id).unwrap().data {
+            NodeData::Instance(i) => i.overrides.clone(),
+            _ => panic!(),
+        };
+
+        // Resetting the title removes the first of two overrides.
+        let reset = Operation::SetInstanceOverride {
+            id,
+            index: 0,
+            old: Some(title.clone()),
+            new: None,
+        };
+        reset.apply(&mut d.ctx()).unwrap();
+        assert_eq!(overrides(&d), std::slice::from_ref(&badge));
+        reset.revert(&mut d.ctx()).unwrap();
+        assert_eq!(overrides(&d), [title.clone(), badge.clone()]);
+        reset.apply(&mut d.ctx()).unwrap();
+        assert_eq!(overrides(&d), std::slice::from_ref(&badge));
+
+        // An edit in place still replaces, and its revert restores the original.
+        let mut retitled = title.clone();
+        retitled.value = OverrideValue::Text {
+            value: "Retitled".into(),
+        };
+        reset.revert(&mut d.ctx()).unwrap();
+        let edit = Operation::SetInstanceOverride {
+            id,
+            index: 0,
+            old: Some(title.clone()),
+            new: Some(retitled.clone()),
+        };
+        edit.apply(&mut d.ctx()).unwrap();
+        assert_eq!(overrides(&d), [retitled, badge.clone()]);
+        edit.revert(&mut d.ctx()).unwrap();
+        assert_eq!(overrides(&d), [title, badge]);
+    }
+
+    #[test]
     fn add_remove_reaction_and_flow_start_round_trip() {
         let mut d = TestDoc::new();
         let node = rect_node();

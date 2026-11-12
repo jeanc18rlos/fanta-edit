@@ -23,6 +23,24 @@ use fanta_render::{AssetResolver, DecodeListener, DecodedImage, LevelLookup, Lev
 /// than it was given.
 pub const MAX_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 
+/// The most pixels one image may decode to: four times Figma's own 4096 x
+/// 4096 limit. A small, highly compressed file can otherwise decode to
+/// gigabytes, and the image crate's allocation limit is advisory.
+pub const MAX_IMAGE_PIXELS: u64 = 64 << 20;
+
+/// Decode `bytes` to straight-alpha RGBA8, refusing an image larger than
+/// [`MAX_IMAGE_PIXELS`] from its header, before its pixels are allocated.
+pub fn decode_rgba(bytes: &[u8]) -> Result<image::RgbaImage> {
+    let reader = || image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format();
+    let (width, height) = reader()?.into_dimensions()?;
+    anyhow::ensure!(
+        u64::from(width) * u64::from(height) <= MAX_IMAGE_PIXELS,
+        "the image is {width} x {height} pixels; the limit is {MAX_IMAGE_PIXELS} pixels"
+    );
+    // `into_rgba8` moves an RGBA8 decode instead of cloning it.
+    Ok(reader()?.decode()?.into_rgba8())
+}
+
 /// Somewhere an edit batch can ingest images and, when the batch fails, take
 /// them out again. The editor's implementation also keeps its thumbnail cache
 /// in step.
@@ -93,8 +111,7 @@ impl PreparedImage {
             bytes.len()
         );
         let id = fanta_format::asset_id_for_bytes(&bytes);
-        let decoded = image::load_from_memory(&bytes).context("decoding image bytes")?;
-        let rgba = decoded.to_rgba8();
+        let rgba = decode_rgba(&bytes).context("decoding image bytes")?;
         let (width, height) = rgba.dimensions();
         anyhow::ensure!(width > 0 && height > 0, "the image has no pixels");
         let format = image::guess_format(&bytes).ok();
@@ -410,5 +427,31 @@ mod tests {
             decode_image_source(&wrapped).expect("wrapped base64 decodes"),
             png(1, 1)
         );
+    }
+
+    /// A 54-byte BMP header claiming `width` x `height` 24-bit pixels, with no
+    /// pixel data: BMP headers carry no checksum.
+    fn bmp_header(width: i32, height: i32) -> Vec<u8> {
+        let mut bytes = b"BM".to_vec();
+        bytes.extend(54u32.to_le_bytes());
+        bytes.extend(0u32.to_le_bytes());
+        bytes.extend(54u32.to_le_bytes());
+        bytes.extend(40u32.to_le_bytes());
+        bytes.extend(width.to_le_bytes());
+        bytes.extend(height.to_le_bytes());
+        bytes.extend(1u16.to_le_bytes());
+        bytes.extend(24u16.to_le_bytes());
+        bytes.extend([0; 24]);
+        bytes
+    }
+
+    #[test]
+    fn images_over_the_pixel_limit_are_refused_from_their_header() {
+        let error = PreparedImage::new(bmp_header(10_000, 10_000))
+            .err()
+            .expect("a 100-megapixel image is refused");
+        assert!(format!("{error:#}").contains("the limit is"), "{error:#}");
+        let image = PreparedImage::new(png(3, 2)).expect("a small image decodes");
+        assert_eq!(image.size, [3, 2]);
     }
 }

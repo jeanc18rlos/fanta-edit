@@ -124,16 +124,13 @@ pub fn render_screenshot(
 /// time an image is drawn (or prewarmed) and remembers a failure so a corrupt
 /// asset is logged once, not once per frame.
 pub fn decode_embedded_image(asset_id: AssetId, bytes: &[u8]) -> Option<DecodedImage> {
-    match image::load_from_memory(bytes) {
+    match crate::assets::decode_rgba(bytes) {
         Ok(image) => {
-            // `into_rgba8` moves an RGBA8 decode instead of cloning it, so the
-            // copy into the shared buffer is the only one made.
-            let image = image.into_rgba8();
             let (width, height) = image.dimensions();
             Some(DecodedImage::new(image.as_raw(), width, height))
         }
         Err(error) => {
-            log::warn!("failed to decode embedded .fig image asset {asset_id}: {error}");
+            log::warn!("failed to decode embedded .fig image asset {asset_id}: {error:#}");
             None
         }
     }

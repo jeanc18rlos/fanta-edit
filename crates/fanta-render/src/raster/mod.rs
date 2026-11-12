@@ -130,8 +130,8 @@ pub use split::{
     RetainedTranslationSession, SplitError, SplitPhase, SplitSpec,
 };
 pub use text::{
-    TextRenderContext, text_caret_rect, text_first_baseline, text_hit_test, text_line_height,
-    text_node_outline, text_selection_rects,
+    TextRenderContext, missing_font_families, text_caret_rect, text_first_baseline, text_hit_test,
+    text_line_height, text_node_outline, text_selection_rects,
 };
 pub use text_path::{
     TextPathAffinity, TextPathCaretSegment, TextPathPosition, TextPathSelectionQuad,

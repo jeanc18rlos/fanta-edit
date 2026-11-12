@@ -502,12 +502,9 @@ impl Server {
             bail!("supply exactly one of path, url or source");
         }
         let bytes = if let Some(path) = arguments.path {
-            let path = PathBuf::from(path);
-            let path = if path.is_absolute() {
-                path
-            } else {
-                self.root.join(path)
-            };
+            // Only files inside the project, as the app's live server imports:
+            // other files may be private, and the project is usually in git.
+            let path = self.source_path(&path)?;
             let file = std::fs::File::open(&path)
                 .with_context(|| format!("opening image {}", path.display()))?;
             if !file.metadata()?.is_file() {

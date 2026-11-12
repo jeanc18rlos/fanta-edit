@@ -58,7 +58,7 @@ flowchart TD
 | Engine hosts | Engine | Driving adapters | `fanta-engine`, `fanta-mcp`, `fanta-runtime`, `fanta-site`, `fanta-wasm-engine` | Deliverables built on the engine without the editor: the cloud worker, the portable runtime, the website exporter, the browser wasm engine and the headless MCP server. |
 | Desktop editor | Editor | Driving adapter: the desktop host | `design_surface`, `fanta_languages`, `fanta_ui`, `fig_viewer` | The GPUI canvas, inspector, panels, live MCP server and the DesignSurface seam. |
 | App | App | Composition root | `fanta` | The `fanta` binary. |
-| Inherited shell | Inherited shell | Platform inherited from Zed | 129 crates | Every workspace crate that no other layer lists. |
+| Inherited shell | Inherited shell | Platform inherited from Zed | 126 crates | Every workspace crate that no other layer lists. |
 
 ## Crates
 
@@ -118,7 +118,7 @@ flowchart TD
     end
   end
   subgraph group_shell["Inherited shell"]
-    rest_crates[["129 inherited shell crates"]]
+    rest_crates[["126 inherited shell crates"]]
   end
   external_skia(["Skia"])
   external_fanta_ui(["fanta-ui"])

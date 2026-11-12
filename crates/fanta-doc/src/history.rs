@@ -220,15 +220,14 @@ impl History {
         let Some(transaction) = self.open.as_mut() else {
             return Ok(());
         };
-        if transaction.ops.len() > len {
-            self.edit_generation = self.edit_generation.wrapping_add(1);
+        if transaction.ops.len() <= len {
+            return Ok(());
         }
-        while transaction.ops.len() > len {
-            let Some(op) = transaction.ops.pop() else {
-                break;
-            };
-            op.revert(ctx)?;
-            ctx.bump_revs(&op);
+        self.edit_generation = self.edit_generation.wrapping_add(1);
+        let tail = transaction.ops.split_off(len);
+        if let Err(error) = revert_all(&tail, ctx) {
+            transaction.ops.extend(tail);
+            return Err(error);
         }
         Ok(())
     }
@@ -287,13 +286,13 @@ impl History {
     /// revisions are bumped for the reverted ops as `undo` does. No-op without
     /// an open transaction.
     pub fn abort_with(&mut self, ctx: &mut OpCtx) -> Result<(), SceneError> {
-        if let Some(mut tx) = self.open.take() {
+        if let Some(tx) = self.open.take() {
             if !tx.is_empty() {
                 self.edit_generation = self.edit_generation.wrapping_add(1);
             }
-            while let Some(op) = tx.ops.pop() {
-                op.revert(ctx)?;
-                ctx.bump_revs(&op);
+            if let Err(error) = revert_all(&tx.ops, ctx) {
+                self.open = Some(tx);
+                return Err(error);
             }
         }
         Ok(())
@@ -339,10 +338,7 @@ impl History {
         if tx.is_empty() {
             return Ok(());
         }
-        for op in &tx.ops {
-            op.apply(ctx)?;
-            ctx.bump_revs(op);
-        }
+        apply_all(&tx.ops, ctx)?;
         self.record_applied_transaction(tx);
         Ok(())
     }
@@ -443,9 +439,9 @@ impl History {
         let Some(mut tx) = self.undo.pop() else {
             return Ok(false);
         };
-        for op in tx.ops.iter().rev() {
-            op.revert(ctx)?;
-            ctx.bump_revs(op);
+        if let Err(error) = revert_all(&tx.ops, ctx) {
+            self.undo.push(tx);
+            return Err(error);
         }
         // Drain into redo so an immediate redo replays in original order.
         // We swap-and-restore the ops vector to avoid double-clone.
@@ -461,9 +457,9 @@ impl History {
         let Some(tx) = self.redo.pop() else {
             return Ok(false);
         };
-        for op in &tx.ops {
-            op.apply(ctx)?;
-            ctx.bump_revs(op);
+        if let Err(error) = apply_all(&tx.ops, ctx) {
+            self.redo.push(tx);
+            return Err(error);
         }
         self.edit_generation = self.edit_generation.wrapping_add(1);
         self.emit(JournalEvent::Redo(tx.clone()));
@@ -479,6 +475,39 @@ impl History {
             self.undo.drain(..excess);
         }
     }
+}
+
+/// Apply `ops` in order. When one fails, revert the ones already applied,
+/// newest first, so the document is left as it was: callers treat an error as
+/// "nothing changed".
+fn apply_all(ops: &[Operation], ctx: &mut OpCtx) -> Result<(), SceneError> {
+    for (applied, op) in ops.iter().enumerate() {
+        if let Err(error) = op.apply(ctx) {
+            for op in ops[..applied].iter().rev() {
+                op.revert(ctx)?;
+                ctx.bump_revs(op);
+            }
+            return Err(error);
+        }
+        ctx.bump_revs(op);
+    }
+    Ok(())
+}
+
+/// Revert `ops` newest first. When one fails, apply again the ones already
+/// reverted, so the document is left as it was.
+fn revert_all(ops: &[Operation], ctx: &mut OpCtx) -> Result<(), SceneError> {
+    for (reverted, op) in ops.iter().rev().enumerate() {
+        if let Err(error) = op.revert(ctx) {
+            for op in &ops[ops.len() - reverted..] {
+                op.apply(ctx)?;
+                ctx.bump_revs(op);
+            }
+            return Err(error);
+        }
+        ctx.bump_revs(op);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -567,6 +596,55 @@ mod tests {
                 &mut document.ctx(),
             )
             .expect("authored edit");
+    }
+
+    #[test]
+    fn a_transaction_whose_second_op_fails_leaves_nothing_applied() {
+        let mut document = TestDoc::new();
+        let vector = rect_node();
+        let vector_id = vector.id;
+        document.scene.insert(vector).expect("vector");
+        let first = rect_node();
+        let first_id = first.id;
+        let mut child = rect_node();
+        child.parent = Some(vector_id);
+        let mut tx = Transaction::new("Batch");
+        tx.push(Operation::create_node(first));
+        tx.push(Operation::create_node(child));
+
+        let mut history = History::new();
+        let error = history
+            .apply_transaction(tx, &mut document.ctx())
+            .expect_err("a vector holds no children");
+        assert!(document.scene.get(first_id).is_none(), "{error}");
+        assert!(!history.can_undo());
+    }
+
+    #[test]
+    fn an_undo_that_fails_partway_restores_the_step_and_keeps_it() {
+        let mut document = TestDoc::new();
+        let renamed = rect_node();
+        let renamed_id = renamed.id;
+        document.scene.insert(renamed).expect("renamed");
+        let created = rect_node();
+        let created_id = created.id;
+        let mut tx = Transaction::new("Batch");
+        tx.push(Operation::SetName {
+            id: renamed_id,
+            old: String::new(),
+            new: "Renamed".into(),
+        });
+        tx.push(Operation::create_node(created));
+        let mut history = History::new();
+        history
+            .apply_transaction(tx, &mut document.ctx())
+            .expect("apply");
+        // Undo reverts the creation first, then fails on the rename.
+        document.scene.remove(renamed_id).expect("remove");
+
+        assert!(history.undo(&mut document.ctx()).is_err());
+        assert!(document.scene.get(created_id).is_some());
+        assert!(history.can_undo());
     }
 
     #[test]

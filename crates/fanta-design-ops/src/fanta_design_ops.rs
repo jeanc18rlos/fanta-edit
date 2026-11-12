@@ -1312,9 +1312,11 @@ mode use canvas operations; source file mutation is unavailable.
 // vocabulary by construction (spec 0008 R7).
 
 /// Import a generated image into the active project's Assets panel and persist
-/// its bytes under assets/images/. Supply exactly one of path (local file,
-/// relative to the project or absolute), url (HTTP/HTTPS), or source (base64 or
-/// a base64 data URI). Returns the asset id and saved path for source file edits.
+/// its bytes under assets/images/. Supply exactly one of path (a file inside the
+/// project folder, relative to it or absolute; copy other files in first), url
+/// (HTTPS on a public host, without redirects; only the running app downloads),
+/// or source (base64 or a base64 data URI). Returns the asset id and saved path
+/// for source file edits.
 /// Use this after image generation, including images made by another MCP
 /// server. Importing an asset does not place a new layer on the canvas.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

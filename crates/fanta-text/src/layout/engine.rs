@@ -118,6 +118,12 @@ impl LayoutEngine {
         self.resolver.supports_family(family)
     }
 
+    /// The families Skia tries for `family`, best first; see
+    /// [`FontResolver::resolve_families`].
+    pub fn resolve_families(&self, family: &str) -> Vec<String> {
+        self.resolver.resolve_families(family)
+    }
+
     pub fn validate_text(
         &self,
         family: &str,

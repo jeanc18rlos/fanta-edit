@@ -95,8 +95,6 @@ members = [
     "crates/oauth_callback_server",
     "crates/open_ai",
     "crates/open_path_prompt",
-    "crates/outline",
-    "crates/outline_panel",
     "crates/panel",
     "crates/paths",
     "crates/picker",
@@ -139,7 +137,6 @@ members = [
     "crates/time_format",
     "crates/title_bar",
     "crates/ui_prompt",
-    "crates/vim",
     "crates/vim_mode_setting",
     "crates/watch",
     "crates/web_search",
@@ -328,8 +325,6 @@ notifications = { path = "crates/notifications" }
 oauth_callback_server = { path = "crates/oauth_callback_server" }
 open_ai = { path = "crates/open_ai" }
 open_path_prompt = { path = "crates/open_path_prompt" }
-outline = { path = "crates/outline" }
-outline_panel = { path = "crates/outline_panel" }
 panel = { path = "crates/panel" }
 paths = { path = "crates/paths" }
 perf = {package = "fanta-gpui-perf", version = "=0.5.0"}
@@ -385,7 +380,6 @@ ui_macros = {package = "fanta-gpui-ui-macros", version = "=0.5.0"}
 ui_prompt = { path = "crates/ui_prompt" }
 util = {package = "fanta-gpui-util", version = "=0.5.0"}
 util_macros = {package = "fanta-gpui-util-macros", version = "=0.5.0"}
-vim = { path = "crates/vim" }
 vim_mode_setting = { path = "crates/vim_mode_setting" }
 
 watch = { path = "crates/watch" }
@@ -926,7 +920,6 @@ image_viewer = { codegen-units = 1 }
 install_cli = { codegen-units = 1 }
 json_schema_store = { codegen-units = 1 }
 notifications = { codegen-units = 1 }
-outline = { codegen-units = 1 }
 paths = { codegen-units = 1 }
 prettier = { codegen-units = 1 }
 release_channel = { codegen-units = 1 }

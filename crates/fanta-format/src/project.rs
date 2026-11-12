@@ -2401,6 +2401,36 @@ mod tests {
         );
     }
 
+    /// The same holds below the design folder: an asset family folder, and a
+    /// file inside a design, renamed by case only.
+    #[test]
+    fn case_only_renames_of_asset_folders_and_files_never_delete_them() {
+        let f = fixture();
+        let (assets, expected) = fixture_assets();
+        let dir = tempdir().unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        let rename_case = |from: &str, to: &str| {
+            let via = dir.path().join("case-tmp");
+            fs::rename(dir.path().join(from), &via).unwrap();
+            fs::rename(&via, dir.path().join(to)).unwrap();
+        };
+        rename_case("assets/images", "assets/Images");
+        rename_case("pages/page-1/page.fnx", "pages/page-1/Page.fnx");
+
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
+
+        let (image, _, extension) = expected[0];
+        assert!(
+            dir.path()
+                .join(format!("assets/images/{image}.{extension}"))
+                .is_file()
+        );
+        assert!(dir.path().join("pages/page-1/page.fnx").is_file());
+        let (reread, reread_assets) = read_project_tree(dir.path()).unwrap();
+        assert!(reread.scene.get(f.page1).is_some());
+        assert_eq!(reread_assets, assets);
+    }
+
     /// A symlink planted at a projected file path (e.g. from a cloned repo)
     /// must be replaced with a real file — never written THROUGH, which would
     /// clobber whatever the link points at outside the project.

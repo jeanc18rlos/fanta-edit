@@ -196,6 +196,11 @@ jobs:
       - name: Test Save As path prompts
         run: cargo test --locked -p open_path_prompt --lib save_as_
 
+      # ADR 0017 relies on these: update signatures, the signer's test vector
+      # and version ordering.
+      - name: Test update verification
+        run: cargo test --locked -p auto_update --lib
+
       - name: Test the agent panel toggle
         run: cargo test --locked -p agent_ui --lib test_toggle_closes_visible_agent_panel_when_center_pane_has_focus
 

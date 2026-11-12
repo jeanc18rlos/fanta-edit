@@ -1763,6 +1763,19 @@ fn authored_rect_fixture() -> (&'static str, FnxSidecar) {
     (source, sidecar)
 }
 
+#[test]
+fn the_source_mirror_reads_every_source_the_parser_accepts() {
+    let (source, sidecar) = authored_rect_fixture();
+    // Option+Space on a Mac types a no-break space.
+    let source = source.replace("<Frame name", "<Frame\u{a0}name");
+    parse_doc(&source).expect("the parser accepts a no-break space");
+    FnxSourceMirror::from_source(&source, &sidecar).expect("and so does the source mirror");
+
+    let source = source.replace("\n  );", "\n    <Frame name=\"Footer\" />\n  );");
+    assert!(parse_doc(&source).is_err());
+    assert!(FnxSourceMirror::from_source(&source, &sidecar).is_err());
+}
+
 /// A canvas resize reaches the mirror as a canonical Vector whose path is the
 /// regenerated rect at the new size. The patch must land in sugar space:
 /// `width` updated in place, the author's `<Rect>` spelling (and everything

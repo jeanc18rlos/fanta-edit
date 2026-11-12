@@ -215,9 +215,13 @@ pub(super) fn update_unavailable_reason(cx: &App) -> Option<SharedString> {
     {
         return Some(explanation.into());
     }
-    release_channel::ReleaseChannel::try_global(cx)
-        .filter(|channel| !channel.poll_for_updates())
-        .map(|_| "This development build does not check for updates.".into())
+    if release_channel::ReleaseChannel::try_global(cx)
+        .is_some_and(|channel| !channel.poll_for_updates())
+    {
+        return Some("This development build does not check for updates.".into());
+    }
+    (!auto_update::can_update(cx))
+        .then(|| "This build can't update itself. Download new versions from fantaisa.net.".into())
 }
 
 fn updates_settings_group(cx: &mut App) -> SettingsGroup {

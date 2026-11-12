@@ -1455,17 +1455,21 @@ impl<'a> SourceScanner<'a> {
     }
 
     fn scan(mut self) -> Result<Vec<ElementSpans>, FnxError> {
-        self.cursor = self
-            .bytes
-            .iter()
-            .position(|byte| *byte == b'<')
+        self.cursor = crate::parse::root_start(self.source)
             .ok_or_else(|| FnxError::Parse("no element found".into()))?;
         let mut spans = Vec::new();
-        self.element(&mut spans)?;
+        self.element(&mut spans, 0)?;
+        self.skip_child_trivia()?;
+        if self.peek() == Some(b'<') {
+            return Err(self.error(crate::parse::SECOND_ROOT_ERROR));
+        }
         Ok(spans)
     }
 
-    fn element(&mut self, spans: &mut Vec<ElementSpans>) -> Result<(), FnxError> {
+    fn element(&mut self, spans: &mut Vec<ElementSpans>, depth: usize) -> Result<(), FnxError> {
+        if depth >= crate::parse::MAX_DEPTH {
+            return Err(self.error(crate::parse::too_deep()));
+        }
         self.skip_ws();
         let open_start = self.cursor;
         self.expect(b'<')?;
@@ -1524,7 +1528,7 @@ impl<'a> SourceScanner<'a> {
             if self.peek().is_none() {
                 return Err(self.error(format!("unterminated <{tag}>")));
             }
-            self.element(spans)?;
+            self.element(spans, depth + 1)?;
         }
     }
 
@@ -1618,9 +1622,7 @@ impl<'a> SourceScanner<'a> {
     }
 
     fn skip_ws(&mut self) {
-        while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
-            self.cursor += 1;
-        }
+        self.cursor = crate::parse::skip_whitespace(self.source, self.cursor);
     }
 
     fn expect(&mut self, byte: u8) -> Result<(), FnxError> {

@@ -12,8 +12,8 @@ use crate::refs::RefTable;
 use serde_json::Value;
 
 /// Parse a `.fnx` source string into its single root element. The function
-/// wrapper and any leading comment are ignored — parsing starts at the first
-/// `<` (the only `<` before the root element is none).
+/// wrapper and its comments are ignored: parsing starts at the first `<`
+/// outside a comment, and a second element after the root is an error.
 ///
 /// Equivalent to [`parse_doc_with`] with an empty [`RefTable`]: name-based
 /// references pass through untouched, exactly as the codec always behaved.
@@ -36,6 +36,44 @@ mod tests {
                 .and_then(|child| child.attrs.get("content")),
             Some(&Value::from("héllo 雪🙂"))
         );
+    }
+
+    fn nested_frames(count: usize) -> String {
+        format!("{}{}", "<Frame>".repeat(count), "</Frame>".repeat(count))
+    }
+
+    #[test]
+    fn the_deepest_allowed_page_parses_on_a_worker_thread_stack() {
+        let parsed = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| parse_doc(&nested_frames(MAX_DEPTH)).is_ok())
+            .expect("spawn")
+            .join()
+            .expect("no stack overflow");
+        assert!(parsed);
+    }
+
+    #[test]
+    fn elements_nested_past_the_limit_are_refused() {
+        let error = parse_doc(&nested_frames(MAX_DEPTH + 1)).expect_err("too deep");
+        assert!(error.to_string().contains("nest deeper"), "{error}");
+    }
+
+    #[test]
+    fn a_second_root_element_is_refused_instead_of_dropped() {
+        let source = "export default function Home() {\n  return (\n    <Frame name=\"Hero\" />\n    <Frame name=\"Footer\" />\n  );\n}\n";
+        let error = parse_doc(source).expect_err("two roots");
+        assert!(error.to_string().contains("one root element"), "{error}");
+        // The wrapper's closing text and JSX comments after the root are fine.
+        let source = "export default function Home() {\n  return (\n    <Frame name=\"Hero\" />\n    {/* end */}\n  );\n}\n";
+        assert!(parse_doc(source).is_ok());
+    }
+
+    #[test]
+    fn a_tag_inside_a_wrapper_comment_is_not_the_root() {
+        let source = "// e.g. <Frame name=\"Example\" />\n/* or <Text /> */\nexport default function Home() {\n  return (<Frame name=\"Real\" />);\n}\n";
+        let root = parse_doc(source).expect("parse");
+        assert_eq!(root.attrs.get("name"), Some(&Value::from("Real")));
     }
 
     #[test]
@@ -82,7 +120,11 @@ mod tests {
 pub fn parse_doc_with(src: &str, refs: &RefTable) -> Result<FnxElement, FnxError> {
     let mut s = Scanner::new(src);
     s.skip_to_root()?;
-    let mut root = s.element()?;
+    let mut root = s.element(0)?;
+    s.skip_child_trivia()?;
+    if s.peek() == Some(b'<') {
+        return Err(s.err(SECOND_ROOT_ERROR));
+    }
     // Desugar `<Rect>`/`<Ellipse>` shape sugar into canonical `<Vector>`
     // geometry FIRST: it consumes `width`/`height` before desugar_size could
     // misread them (a sugar tag is not in its Frame/Vector table), and it
@@ -100,6 +142,61 @@ pub fn parse_doc_with(src: &str, refs: &RefTable) -> Result<FnxElement, FnxError
     // shapes and no earlier pass ever observes a name.
     crate::refs::desugar_refs(&mut root, refs)?;
     Ok(root)
+}
+
+/// How deep elements may nest. Parsing and every later pass over the tree
+/// recurse once per level, and projects load on 512 KiB worker-thread stacks,
+/// where 256 levels overflow a debug build. Real designs nest about 20 levels.
+pub(crate) const MAX_DEPTH: usize = 128;
+
+pub(crate) const SECOND_ROOT_ERROR: &str =
+    "a source holds one root element; wrap sibling layers in it";
+
+pub(crate) fn too_deep() -> String {
+    format!("elements nest deeper than {MAX_DEPTH} levels")
+}
+
+/// The position after any whitespace at `pos`: ASCII whitespace, vertical tab
+/// and Unicode spaces such as U+00A0. The parser and the source scanner share
+/// it, so a page that parses also opens.
+pub(crate) fn skip_whitespace(source: &str, mut pos: usize) -> usize {
+    while let Some(&byte) = source.as_bytes().get(pos) {
+        if byte.is_ascii_whitespace() || byte == b'\x0b' {
+            pos += 1;
+        } else if !byte.is_ascii()
+            && let Some(character) = source.get(pos..).and_then(|rest| rest.chars().next())
+            && character.is_whitespace()
+        {
+            pos += character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
+/// The root element's `<`: the first one outside `//` and `/* */` comments
+/// in the function wrapper.
+pub(crate) fn root_start(source: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut pos = 0;
+    while let Some(&byte) = bytes.get(pos) {
+        match (byte, bytes.get(pos + 1)) {
+            (b'<', _) => return Some(pos),
+            (b'/', Some(b'/')) => {
+                pos = source[pos..]
+                    .find('\n')
+                    .map_or(source.len(), |end| pos + end);
+            }
+            (b'/', Some(b'*')) => {
+                pos = source[pos + 2..]
+                    .find("*/")
+                    .map_or(source.len(), |end| pos + 2 + end + 2);
+            }
+            _ => pos += 1,
+        }
+    }
+    None
 }
 
 struct Scanner<'a> {
@@ -234,27 +331,12 @@ impl<'a> Scanner<'a> {
     }
 
     fn skip_ws(&mut self) {
-        while let Some(byte) = self.peek() {
-            if byte.is_ascii_whitespace() || byte == b'\x0b' {
-                self.pos += 1;
-            } else if !byte.is_ascii()
-                && let Some(character) = self.source[self.pos..].chars().next()
-                && character.is_whitespace()
-            {
-                self.pos += character.len_utf8();
-            } else {
-                break;
-            }
-        }
+        self.pos = skip_whitespace(self.source, self.pos);
     }
 
-    /// Advance to the first `<` — the root element's open tag.
+    /// Advance to the root element's open tag.
     fn skip_to_root(&mut self) -> Result<(), FnxError> {
-        self.pos = self
-            .source
-            .as_bytes()
-            .iter()
-            .position(|byte| *byte == b'<')
+        self.pos = root_start(self.source)
             .ok_or_else(|| self.err_at(self.source.len(), "no element found"))?;
         Ok(())
     }
@@ -285,7 +367,11 @@ impl<'a> Scanner<'a> {
         Ok(self.source[start..self.pos].to_owned())
     }
 
-    fn element(&mut self) -> Result<FnxElement, FnxError> {
+    /// Parse one element inside `depth` enclosing ones.
+    fn element(&mut self, depth: usize) -> Result<FnxElement, FnxError> {
+        if depth >= MAX_DEPTH {
+            return Err(self.err(too_deep()));
+        }
         self.skip_ws();
         self.expect(b'<')?;
         let tag = self.ident()?;
@@ -334,7 +420,7 @@ impl<'a> Scanner<'a> {
             if self.peek().is_none() {
                 return Err(self.err(format!("unterminated <{tag}>")));
             }
-            el.children.push(self.element()?);
+            el.children.push(self.element(depth + 1)?);
         }
     }
 
