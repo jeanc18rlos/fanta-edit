@@ -36,6 +36,7 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 - `project/history.rs` runs git against `.fanta/history.git` only. Build every command through `History::git`, which sets `GIT_DIR` and `GIT_WORK_TREE` and shuts out the user's configuration; a bare `Command::new("git")` in the project directory acts on the user's repository. (#210)
 - New code that walks a whole project directory must skip `.fanta`, or it reads git objects as project files. Code that reads the named directories (`doc`, `pages`, `components`, `assets`) never reaches it. (#210)
 
+- After changing the save path or the snapshot store, run all of `cargo test --locked -p fig_viewer --lib`, not a filter: the store's binary files land in every project a test saves, and a serialization test far from the save code was the one that broke. (#215)
 - Take the after-save snapshot only when everything the save writes is on disk, the editor's thumbnail included. `before_save` treats any difference from the newest snapshot as an outside change, so a file written after `after_save` makes every later save record one. (#211)
 
 ## Runtime bundles
