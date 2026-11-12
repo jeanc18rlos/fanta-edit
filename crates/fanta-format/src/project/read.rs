@@ -22,6 +22,7 @@ use super::layout::{
     VARIABLES_JSON, id_from_key, is_project_dir, json_key, read_json_file_in,
     read_manifest_with_source_in,
 };
+use super::diagnostic::SourceDiagnostic;
 use super::tree_source::TreeSource;
 
 /// Load a project directory back into a [`Doc`] plus its asset blobs.
@@ -39,7 +40,7 @@ pub fn read_project_tree(dir: &Path) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)
 /// carries them into `report.json`.
 pub fn read_project_tree_with_warnings(
     dir: &Path,
-) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>, Vec<String>)> {
+) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>, Vec<SourceDiagnostic>)> {
     super::layout::with_project_read_lock(dir, || {
         let mut warnings = Vec::new();
         let (doc, assets) = read_project_tree_with_source_override_locked(
@@ -63,7 +64,7 @@ pub fn read_project_tree_with_warnings(
 /// the map wins exactly as it would on disk (spec 0008 R1).
 pub fn read_project_files(
     files: &BTreeMap<PathBuf, Vec<u8>>,
-) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>, Vec<String>)> {
+) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>, Vec<SourceDiagnostic>)> {
     let mut warnings = Vec::new();
     let (doc, assets) = read_project_tree_with_source_override_locked(
         &TreeSource::Mem(files),
@@ -93,7 +94,7 @@ pub(crate) struct LoadedProjectEvidence {
     pub(crate) files: LoadedFileHashes,
     pub(crate) pages: Vec<NodeId>,
     /// Loader diagnostics: web-storage hand edits that could not be kept (R7).
-    pub(crate) warnings: Vec<String>,
+    pub(crate) warnings: Vec<SourceDiagnostic>,
 }
 
 pub(crate) fn read_project_tree_with_source_identities(
@@ -245,7 +246,7 @@ fn read_project_tree_with_source_override_locked(
     json_override: Option<&JsonSourceOverride<'_>>,
     mut source_identities: Option<&mut LoadedSourceIdentities>,
     mut loaded_files: Option<&mut LoadedFileHashes>,
-    warnings: Option<&mut Vec<String>>,
+    warnings: Option<&mut Vec<SourceDiagnostic>>,
 ) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
     let manifest = match json_override
         .filter(|override_| override_.path == dir.join(super::layout::FANTA_JSON))

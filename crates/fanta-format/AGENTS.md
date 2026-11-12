@@ -20,6 +20,11 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 - Geometry signatures stored in project data use the source format's numeric normalization and stable object ordering. Otherwise a save, or a change in serde feature unification, invalidates preserved imported artwork. (#41)
 - Move owned JSON fragments as `Value::Object`/`Value::Array`. `json!` serializes its arguments by reference and copies large geometry. (#126)
 
+## Diagnostics
+
+- `SourceDiagnostic` and its codes live in `src/project/diagnostic.rs`, not under `session`: `session` is gated on `native` and the wasm engine reads projects without it. A new code needs a row in `docs/fanta/project-schema.md`; a test compares the two. (#207)
+- `fanta-engine`'s response and `fanta-wasm-engine`'s `inspect` state forward findings as strings on purpose. Sending records there changes the cloud contract and the web canvas. (#207)
+
 ## Runtime bundles
 
 - `src/runtime.rs` is the source compiler (`SourceBundle::compile`); the bundle format and `RuntimeProgram` live in `crates/fanta-bundle`, which must stay parser-free. `fanta-runtime`, the WebAssembly player, depends on `fanta-bundle` and never on this crate or `fanta-fnx`: the `fanta-runtime` workflow fails if either appears in its normal dependency tree. Sources are compiled by the `fanta-compile` binary in `crates/fanta-site`, and runtime tests compile fixtures through a dev-dependency.

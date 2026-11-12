@@ -3938,7 +3938,7 @@ fn write_project_cached_report(
     root: &Path,
     doc: &Doc,
     raw_assets: &BTreeMap<AssetId, Vec<u8>>,
-    warnings: &[String],
+    warnings: &[fanta_format::SourceDiagnostic],
 ) -> Result<fanta_format::WriteReport> {
     if root.join("fanta.json").exists() {
         anyhow::ensure!(

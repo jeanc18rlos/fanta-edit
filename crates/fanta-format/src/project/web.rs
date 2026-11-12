@@ -46,6 +46,7 @@ use super::layout::{
     ASSETS_DIR, COMPONENTS_DIR, FANTA_JSON, PAGES_DIR, ProjectManifest, STORAGE_WEB, json_bytes,
     json_key, slugify,
 };
+use super::diagnostic::SourceDiagnostic;
 use super::media::{ASSET_INDEX_FILE, asset_index_bytes, sniff_media};
 #[cfg(feature = "native")]
 use super::write::{WriteReport, sync_project_files};
@@ -104,8 +105,8 @@ pub struct WebReport {
     pub components: Vec<WebDesignReport>,
     /// Variables that have no CSS form, with the reason.
     pub skipped_variables: Vec<SkippedVariable>,
-    /// Warnings from opening the project, verbatim.
-    pub warnings: Vec<String>,
+    /// Findings from opening the project (spec 0009 R2).
+    pub warnings: Vec<SourceDiagnostic>,
 }
 
 #[derive(Debug, Serialize)]
@@ -155,7 +156,7 @@ pub fn write_web_project_tree(
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
     render: Option<&dyn WebRenderSource>,
-    warnings: &[String],
+    warnings: &[SourceDiagnostic],
 ) -> Result<(WriteReport, WebReport)> {
     let asset_hrefs = asset_hrefs(assets);
     let projection = web_project_files(doc, &asset_hrefs, render, warnings)?;
@@ -181,7 +182,7 @@ pub fn emit_web_project_tree(
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
     render: Option<&dyn WebRenderSource>,
-    warnings: &[String],
+    warnings: &[SourceDiagnostic],
 ) -> Result<(BTreeMap<PathBuf, Arc<Vec<u8>>>, WebReport)> {
     let asset_hrefs = asset_hrefs(assets);
     let projection = web_project_files(doc, &asset_hrefs, render, warnings)?;
@@ -215,7 +216,7 @@ pub fn web_project_files(
     doc: &Doc,
     asset_hrefs: &BTreeMap<AssetId, String>,
     render: Option<&dyn WebRenderSource>,
-    warnings: &[String],
+    warnings: &[SourceDiagnostic],
 ) -> Result<WebProjection> {
     let resolved = resolve_export_bindings(doc);
     let grouping = design_grouping(doc)?;
