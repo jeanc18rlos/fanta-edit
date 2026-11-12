@@ -20,7 +20,7 @@ Run the narrowest check that exercises the change, then the release stage that c
 | Built-in agent canvas tools or prompts | `cargo test --locked -p agent --lib test_fanta_specs` and `test_design_progress` (both CI gates) |
 | Live MCP server or agent surface | the agent tests above, plus `script/smoke-mcp` against a running app (below) |
 | Anything compiled into the app | stage `build` (`cargo check --locked -p fanta -p cli`) |
-| Lints | `./script/clippy -p <crate>`; stage `lint` covers the release crates |
+| Lints | `./script/clippy -p <crate>` (off macOS it enables every feature except the renderer's Metal ones); stage `lint` covers the release crates and lints the wasm engine for the browser target |
 | Platform-specific code (`cfg(target_os)`, `std::os::unix`, per-OS keymaps) | the `Windows` workflow (`.github/workflows/windows.yml`). On Windows, run `.\script\clippy.ps1` and the `cargo` commands directly; the other scripts are Bash ([guide](../../../docs/fanta/windows-development.md)) |
 | Packaging scripts | `bash -n <script>`, `python3 script/test-macos-release`, `./script/check-licenses` |
 | Crate dependencies, a new crate, `docs/architecture`, `docs/decisions`, `specs`, `script/architecture` | `script/architecture verify` (no build); `python3 script/test-architecture` when the script changed |

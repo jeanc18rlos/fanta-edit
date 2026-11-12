@@ -1,6 +1,6 @@
 # Code-first project audit and source-of-truth proposal
 
-Status: source-of-truth proposal approved on 2026-09-23. This report records the pre-implementation audit; see [project-schema.md](project-schema.md) for the resulting file conventions.
+Status: source-of-truth proposal approved on 2026-09-23. This report records the pre-implementation audit; see [project-schema.md](project-schema.md) for the resulting file conventions. Since spec 0007 (2026-11-10) designs store as plain web files (SVG + CSS + JSON) instead of the `.fnx` layout this audit proposed; the FNX references below are historical.
 
 ## Current pipeline
 

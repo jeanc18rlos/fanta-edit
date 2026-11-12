@@ -349,6 +349,7 @@ pub fn authored_local_bounds(scene: &fanta_doc::Scene, id: NodeId) -> Option<fan
             .or(group.local_size)
             .map(|[width, height]| fanta_doc::Bounds::from_xywh(0.0, 0.0, width, height))
             .or_else(|| scene.local_bounds(id)),
+        #[cfg(feature = "render")]
         fanta_doc::NodeData::TextPath(text_path) => {
             fanta_render::text_path_visual_bounds(text_path).or_else(|| scene.local_bounds(id))
         }
