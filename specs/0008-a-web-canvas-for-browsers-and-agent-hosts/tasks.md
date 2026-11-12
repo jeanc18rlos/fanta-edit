@@ -21,9 +21,13 @@ request when it merges.
   project. Persistence answer: a localhost dev server
   (`script/serve-project`) with an atomic, path-contained PUT channel;
   plain static hosts stay view-only.
-- [ ] **T4.** Claude Code pane, terminal surface: the `fanta-canvas`
-  plugin opens a pane showing the current page as PNG frames, re-rendered
-  when project files change (R4). Verify: A4 on a terminal session.
+- [x] **T4.** ([#198](https://github.com/jeanc18rlos/fanta-edit/pull/198),
+  [#199](https://github.com/jeanc18rlos/fanta-edit/pull/199)) Claude Code
+  pane, terminal surface: the `fanta-canvas` plugin opens a pane showing
+  the current page as PNG frames, re-rendered when project files change
+  (R4). Verify: A4 on a terminal session. `fanta-mcp --frames` watches
+  and renders; the pane reads the PNG by file, so no pixels cross the
+  plugin boundary.
 - [ ] **T5.** Claude Code pane, desktop surface: host the T2 component as
   the pane's `Client` module with file read/write over the plugin host
   (R4). Verify: A4 on the desktop app.
