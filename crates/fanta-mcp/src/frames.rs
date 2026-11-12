@@ -72,6 +72,10 @@ fn render_frame(options: &FrameOptions, generation: u64) -> Result<Value> {
         playhead_ms: None,
     };
     let image = project.render(&target)?;
+    if let Some(parent) = options.out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
     let staged = options.out.with_extension("png.tmp");
     std::fs::write(&staged, &image.png)
         .with_context(|| format!("writing {}", staged.display()))?;
