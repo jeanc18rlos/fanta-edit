@@ -38,19 +38,23 @@ use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+#[cfg(feature = "native")]
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use super::layout::{
     ACTIVE_MODES_JSON, ASSET_LIBRARY_JSON, ASSETS_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR,
-    EXPORTS_DIR, FANTA_JSON, FLOW_START_JSON, FLOWS_JSON, LOOSE_DIR, MASTER_FNX, MASTER_IDS,
-    METADATA_JSON, MOTION_JSON, NODES_DIR, PAGE_FNX, PAGE_IDS, PAGE_JSON, PAGES_DIR,
-    PRESENTATION_JSON, PREVIEWS_DIR, PROJECT_VERSION, ProjectManifest, SET_JSON, SETS_JSON,
-    STYLES_JSON, VARIABLES_JSON, WORKSPACE_FNX, id_from_key, json_bytes, json_key, slugify,
-    sorted_entries,
+    FANTA_JSON, FLOW_START_JSON, FLOWS_JSON, LOOSE_DIR, MASTER_FNX, MASTER_IDS, METADATA_JSON,
+    MOTION_JSON, NODES_DIR, PAGE_FNX, PAGE_IDS, PAGE_JSON, PAGES_DIR, PRESENTATION_JSON,
+    PROJECT_VERSION, ProjectManifest, SET_JSON, SETS_JSON, STYLES_JSON, VARIABLES_JSON,
+    WORKSPACE_FNX, id_from_key, json_bytes, json_key, slugify, sorted_entries,
 };
-use super::media::{ASSET_INDEX_FILE, MediaRegistry, asset_index_bytes, sniff_media};
+#[cfg(feature = "native")]
+use super::layout::{EXPORTS_DIR, PREVIEWS_DIR};
+#[cfg(feature = "native")]
+use super::media::asset_index_bytes;
+use super::media::{ASSET_INDEX_FILE, MediaRegistry, sniff_media};
 
 const TRANSACTION_DIR: &str = ".fanta-transaction";
 static PROJECT_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
@@ -183,6 +187,7 @@ impl ProjectWriteCache {
 /// the SVG subset get their raster fallbacks; this renderer-less form still
 /// writes a complete, lossless tree (`nodes.json` carries every record) and
 /// reports the nodes it could not draw.
+#[cfg(feature = "native")]
 pub fn write_project_tree(
     dir: &Path,
     doc: &Doc,
@@ -195,6 +200,7 @@ pub fn write_project_tree(
 /// projection is not cached yet, so the cache is accepted and ignored.
 // shortcut: full web projection on every save; add per-design caching when
 // large-project save profiles call for it.
+#[cfg(feature = "native")]
 pub fn write_project_tree_cached(
     dir: &Path,
     doc: &Doc,
@@ -207,6 +213,7 @@ pub fn write_project_tree_cached(
 /// The legacy FNX/FSS tree writer, kept for the R9 migration story and for
 /// fixtures that exercise the legacy readers. No product save path reaches
 /// it: every save writes web storage.
+#[cfg(feature = "native")]
 pub fn write_legacy_project_tree(
     dir: &Path,
     doc: &Doc,
@@ -226,6 +233,7 @@ pub fn write_legacy_project_tree(
 /// source overrides and disk preconditions — the complete FNX-era editor save.
 /// Kept with the legacy writer so the legacy reconciliation tests keep their
 /// coverage until the FNX readers are deprecated.
+#[cfg(feature = "native")]
 pub fn write_legacy_project_tree_checked(
     dir: &Path,
     doc: &Doc,
@@ -237,6 +245,7 @@ pub fn write_legacy_project_tree_checked(
     write_legacy_project_tree_impl(dir, doc, assets, cache, sources, Some(expected_disk))
 }
 
+#[cfg(feature = "native")]
 pub(crate) fn write_project_artifacts_checked(
     dir: &Path,
     doc: &Doc,
@@ -322,6 +331,7 @@ pub(crate) fn write_project_artifacts_checked(
 /// calls. The caller must durably flush the complete staged filesystem before
 /// exclusively publishing this directory, then durably flush its parent.
 /// Existing projects must use the transactional writer instead.
+#[cfg(feature = "native")]
 pub fn stage_new_project_tree(
     dir: &Path,
     doc: &Doc,
@@ -366,6 +376,7 @@ pub fn stage_new_project_tree(
     Ok(report)
 }
 
+#[cfg(feature = "native")]
 fn write_unpublished_file(
     path: &Path,
     write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
@@ -384,6 +395,7 @@ fn write_unpublished_file(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn write_legacy_project_tree_impl(
     dir: &Path,
     doc: &Doc,
@@ -411,6 +423,7 @@ fn write_legacy_project_tree_impl(
 /// files, and seed editor support. Shared by every on-disk format the writer
 /// projects (FNX and web), so the locking, symlink defense, case healing and
 /// stale pruning never fork.
+#[cfg(feature = "native")]
 pub(crate) fn sync_project_files(
     dir: &Path,
     files: &ProjectedFiles,
@@ -747,6 +760,7 @@ pub struct ProjectUpgrade {
 /// and drops `components/sets.json`). A project already at the current
 /// layout is left untouched. Nothing is lost: every design, asset and
 /// workspace file round-trips.
+#[cfg(feature = "native")]
 pub fn upgrade_project(dir: &Path) -> Result<ProjectUpgrade> {
     let from = super::layout::read_manifest(dir)?.version;
     if from >= PROJECT_VERSION {
@@ -1762,6 +1776,7 @@ fn validate_unchanged(dir: &Path, relative: &Path, expected: &FileState) -> Resu
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn apply_single_change(
     dir: &Path,
     writes: &[PlannedWrite<'_>],
@@ -1825,6 +1840,7 @@ fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn apply_project_transaction(
     dir: &Path,
     writes: &[PlannedWrite<'_>],
@@ -2075,10 +2091,12 @@ fn sync_file(file: &fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 pub(super) fn write_with_parents(path: &Path, bytes: &[u8]) -> Result<()> {
     write_with_parents_with(path, |file| file.write_all(bytes))
 }
 
+#[cfg(feature = "native")]
 fn write_with_parents_with(
     path: &Path,
     write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
@@ -2110,6 +2128,7 @@ fn write_with_parents_with(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn discard_project_temporary(
     temporary: tempfile::NamedTempFile,
     primary: std::io::Error,

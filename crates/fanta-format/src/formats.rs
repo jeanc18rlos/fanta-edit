@@ -17,16 +17,7 @@ pub struct ImportedDesign {
     pub assets: BTreeMap<AssetId, Vec<u8>>,
 }
 
-/// The affordances a format supports directly. `edit` and `version` refer to
-/// the original path, before any import into a native project directory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FormatCapabilities {
-    pub import: bool,
-    pub export: bool,
-    pub display: bool,
-    pub edit: bool,
-    pub version: bool,
-}
+pub use crate::project::FormatCapabilities;
 
 /// A path a format handler recognizes. Extensions omit the leading period.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

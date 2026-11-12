@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use fanta_doc::{CanvasNode, Doc, GroupNode, NodeData, NodeId, Operation};
+use fanta_doc::{Bounds, CanvasNode, Doc, GroupNode, NodeData, NodeId, Operation};
 
 /// Every root the editor lists as a page, in order: the authored pages (one
 /// scene-root canvas when there are none), then the component masters that
@@ -98,7 +98,7 @@ pub fn default_page_root(doc: &Doc, visible_page_roots: &[NodeId]) -> Option<Nod
 }
 
 pub fn page_content_area(doc: &Doc, page_root: Option<NodeId>) -> f64 {
-    crate::render::try_page_bounds(doc, page_root)
+    try_page_bounds(doc, page_root)
         .map(|bounds| bounds.width() * bounds.height())
         .unwrap_or(0.0)
 }
@@ -120,4 +120,40 @@ pub fn add_page_operations(doc: &Doc, name: String) -> (NodeId, Vec<Operation>) 
         new_active_page: Some(root),
     };
     (root, vec![Operation::create_node(node), registry])
+}
+
+pub fn page_bounds(doc: &Doc, page_root: Option<NodeId>) -> Bounds {
+    try_page_bounds(doc, page_root).unwrap_or_else(|| Bounds::from_xywh(0.0, 0.0, 1024.0, 768.0))
+}
+
+pub fn try_page_bounds(doc: &Doc, page_root: Option<NodeId>) -> Option<Bounds> {
+    let mut bounds: Option<Bounds> = None;
+    let mut include = |node_id| {
+        if let Some(node_bounds) = doc.scene.world_bounds(node_id)
+            && node_bounds.is_finite()
+            && node_bounds.width() > 0.0
+            && node_bounds.height() > 0.0
+        {
+            bounds = Some(match bounds {
+                Some(bounds) => bounds.union(&node_bounds),
+                None => node_bounds,
+            });
+        }
+    };
+
+    if let Some(page_root) = page_root {
+        for node_id in doc.scene.descendants_of(page_root) {
+            if node_id != page_root {
+                include(node_id);
+            }
+        }
+    } else {
+        for root in doc.scene.roots() {
+            for node_id in doc.scene.descendants_of(*root) {
+                include(node_id);
+            }
+        }
+    }
+
+    bounds
 }

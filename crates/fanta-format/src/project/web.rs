@@ -47,9 +47,11 @@ use super::layout::{
     json_key, slugify,
 };
 use super::media::{ASSET_INDEX_FILE, asset_index_bytes, sniff_media};
+#[cfg(feature = "native")]
+use super::write::{WriteReport, sync_project_files};
 use super::write::{
-    ProjectedFiles, WriteReport, design_grouping, project_asset_files,
-    project_design_headers, project_doc_singletons, project_loose_nodes, sync_project_files,
+    ProjectedFiles, design_grouping, project_asset_files, project_design_headers,
+    project_doc_singletons, project_loose_nodes,
 };
 
 pub(crate) const PAGE_SVG: &str = "page.svg";
@@ -143,6 +145,7 @@ pub struct WebProjection {
 /// which also removes `.fnx`/`.fss` files when converting a project in
 /// place). `render` supplies what the pure projection cannot compute; with
 /// `None`, nodes that need it draw nothing and the report says so.
+#[cfg(feature = "native")]
 pub fn write_web_project_tree(
     dir: &Path,
     doc: &Doc,
@@ -160,6 +163,33 @@ pub fn write_web_project_tree(
     let asset_files = project_asset_files(assets, None)?;
     let write = sync_project_files(dir, &files, &asset_files, None)?;
     Ok((write, projection.report))
+}
+
+/// Everything [`write_web_project_tree`] writes, as one in-memory map — the
+/// asset index and the asset bytes included — with no disk I/O. The browser
+/// engine emits through this, so a browser save and a native save are the
+/// same byte path by construction (spec 0008 R3). The one difference: the
+/// editor-support seeds (`AGENTS.md`, `.gitignore`, …) are stateful on disk
+/// — seeded only when absent or still pristine — so they belong to the disk
+/// sync, and a host writing this map back must not delete files it does not
+/// contain.
+pub fn emit_web_project_tree(
+    doc: &Doc,
+    assets: &BTreeMap<AssetId, Vec<u8>>,
+    render: Option<&dyn WebRenderSource>,
+    warnings: &[String],
+) -> Result<(BTreeMap<PathBuf, Arc<Vec<u8>>>, WebReport)> {
+    let asset_hrefs = asset_hrefs(assets);
+    let projection = web_project_files(doc, &asset_hrefs, render, warnings)?;
+    let mut files = projection.files;
+    files.insert(
+        PathBuf::from(ASSETS_DIR).join(ASSET_INDEX_FILE),
+        Arc::new(asset_index_bytes(assets)?),
+    );
+    for (path, bytes) in project_asset_files(assets, None)? {
+        files.insert(path, Arc::new(bytes.to_vec()));
+    }
+    Ok((files, projection.report))
 }
 
 /// `assets/<family>/<id>.<ext>` for every asset — the same naming

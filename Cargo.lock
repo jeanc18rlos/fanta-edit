@@ -4437,6 +4437,7 @@ name = "fanta-doc"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.10.0",
+ "getrandom 0.3.4",
  "glam 0.32.1",
  "kurbo 0.11.3",
  "serde",
@@ -4444,6 +4445,7 @@ dependencies = [
  "smallvec",
  "thiserror 2.0.17",
  "ulid",
+ "web-time",
 ]
 
 [[package]]
@@ -5409,6 +5411,19 @@ dependencies = [
  "serde_json",
  "smallvec",
  "tracing",
+]
+
+[[package]]
+name = "fanta-wasm-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fanta-design-ops",
+ "fanta-doc",
+ "fanta-format",
+ "fanta-headless",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]

@@ -8,6 +8,7 @@ use crate::error::{FormatError, Result};
 use fanta_doc::{Doc, DocId, SCHEMA_VERSION};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(feature = "native")]
 use sha2::{Digest as _, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -726,6 +727,7 @@ impl ProjectManifest {
 /// Create the skeleton of an empty project at `dir`: the standard directories,
 /// a `.gitignore`, and a fresh [`ProjectManifest`]. No git operations — repo
 /// init is the app layer's job (spec 09 §A.1).
+#[cfg(feature = "native")]
 pub fn scaffold_project_tree(dir: &Path) -> Result<()> {
     let existing_manifest = dir.join(FANTA_JSON).exists();
     if existing_manifest {
@@ -746,6 +748,7 @@ pub fn scaffold_project_tree(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 pub(super) fn scaffold_project_directories(dir: &Path) -> Result<()> {
     fs::create_dir_all(dir.join(DOC_DIR))?;
     fs::create_dir_all(dir.join(PAGES_DIR))?;
@@ -758,6 +761,7 @@ pub(super) fn scaffold_project_directories(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 pub(super) fn fresh_project_editor_support() -> [(&'static str, &'static [u8]); 6] {
     [
         (GITIGNORE_NAME, GITIGNORE.as_bytes()),
@@ -775,6 +779,7 @@ pub(super) fn fresh_project_editor_support() -> [(&'static str, &'static [u8]); 
 /// FNX declarations and default Prettier configuration. Existing support
 /// files, custom Prettier configurations, the manifest, and all design files
 /// are left untouched.
+#[cfg(feature = "native")]
 pub fn ensure_project_editor_support(dir: &Path) -> Result<()> {
     read_manifest(dir)?;
     seed_gitignore(dir)?;
@@ -789,6 +794,7 @@ pub fn ensure_project_editor_support(dir: &Path) -> Result<()> {
     seed_fanta_spec(dir)
 }
 
+#[cfg(feature = "native")]
 fn seed_fanta_spec(dir: &Path) -> Result<()> {
     let path = dir.join("fanta.md");
     if path.exists() {
@@ -797,6 +803,7 @@ fn seed_fanta_spec(dir: &Path) -> Result<()> {
     super::write::write_with_parents(&path, FANTA_SPEC.as_bytes())
 }
 
+#[cfg(feature = "native")]
 fn seed_gitignore(dir: &Path) -> Result<()> {
     let path = dir.join(GITIGNORE_NAME);
     match fs::read(&path) {
@@ -816,6 +823,7 @@ fn seed_gitignore(dir: &Path) -> Result<()> {
 /// customized `AGENTS.md` already exists. The exact previous seed is upgraded
 /// so corrected agent instructions reach existing projects; customizations
 /// survive re-saves.
+#[cfg(feature = "native")]
 fn seed_agents_md(dir: &Path) -> Result<()> {
     let path = dir.join(AGENTS_MD_NAME);
     // Upgrade only the exact previous seed; edited guides remain user-owned.
@@ -842,6 +850,7 @@ fn seed_agents_md(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn seed_fnx_types(dir: &Path) -> Result<()> {
     let path = dir.join(FNX_TYPES_NAME);
     if !path.exists() {
@@ -864,6 +873,7 @@ const PRETTIERIGNORE: &str = "# Generated Fanta design source: the engine printe
 *.fnx
 ";
 
+#[cfg(feature = "native")]
 fn seed_prettierignore(dir: &Path) -> Result<()> {
     let path = dir.join(PRETTIERIGNORE_NAME);
     if !path.exists() {
@@ -872,6 +882,7 @@ fn seed_prettierignore(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn seed_fnx_prettier(dir: &Path) -> Result<()> {
     let existing_config = [
         ".prettierrc",
@@ -918,11 +929,24 @@ pub(crate) fn read_manifest(dir: &Path) -> Result<ProjectManifest> {
 }
 
 pub(crate) fn read_manifest_with_source(dir: &Path) -> Result<(ProjectManifest, String)> {
-    super::write::recover_project_transaction(dir)?;
+    read_manifest_with_source_in(&super::tree_source::TreeSource::Dir, dir)
+}
+
+pub(crate) fn read_manifest_with_source_in(
+    source: &super::tree_source::TreeSource<'_>,
+    dir: &Path,
+) -> Result<(ProjectManifest, String)> {
+    // Transaction recovery is disk-concurrency machinery; a memory map is a
+    // caller-owned snapshot with nothing to recover.
+    if matches!(source, super::tree_source::TreeSource::Dir) {
+        super::write::recover_project_transaction(dir)?;
+    }
     let not_a_project = || FormatError::NotAProject {
         path: dir.to_path_buf(),
     };
-    let text = fs::read_to_string(dir.join(FANTA_JSON)).map_err(|_| not_a_project())?;
+    let text = source
+        .read_to_string(&dir.join(FANTA_JSON))
+        .map_err(|_| not_a_project())?;
     let manifest: ProjectManifest = serde_json::from_str(&text).map_err(|_| not_a_project())?;
     if manifest.format != FORMAT_TAG {
         return Err(not_a_project());
@@ -950,6 +974,7 @@ pub(crate) fn json_bytes(value: &Value) -> Result<Vec<u8>> {
 }
 
 /// Write `value` in the [`json_bytes`] form, creating parent directories.
+#[cfg(feature = "native")]
 pub(crate) fn write_json_file(path: &Path, value: &Value) -> Result<()> {
     super::write::write_with_parents(path, &json_bytes(value)?)
 }
@@ -957,7 +982,14 @@ pub(crate) fn write_json_file(path: &Path, value: &Value) -> Result<()> {
 /// Read a JSON file. A missing file maps to [`FormatError::MissingFile`] with
 /// the full path so the error names the culprit.
 pub(crate) fn read_json_file(path: &Path) -> Result<Value> {
-    let text = fs::read_to_string(path).map_err(|e| {
+    read_json_file_in(&super::tree_source::TreeSource::Dir, path)
+}
+
+pub(crate) fn read_json_file_in(
+    source: &super::tree_source::TreeSource<'_>,
+    path: &Path,
+) -> Result<Value> {
+    let text = source.read_to_string(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             FormatError::MissingFile {
                 name: path.display().to_string(),
