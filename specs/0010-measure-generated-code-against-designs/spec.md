@@ -91,8 +91,8 @@ hypothesis needs (render code, compare with the design) is that check.
   as input to a format spec.
 - **R12.** Targets, in this order (founder, 2026-11-12): React for the web;
   React Native with Expo for mobile, scored through Expo's web build, with
-  the result labelled as a browser rendering of the mobile code; a Rust UI
-  for games as a later extension with the pixel score only, since it has no
+  the result labelled as a browser rendering of the mobile code; Bevy's UI
+  as the Rust target for games (founder, 2026-11-12), a later extension with the pixel score only, since it has no
   computed styles to read. The first reported run needs React; each further
   target is its own task.
 - **R13.** The design set is drawn from the most used free Figma Community
@@ -136,12 +136,14 @@ hypothesis needs (render code, compare with the design) is that check.
   for the web, React Native with Expo for mobile, possibly a Rust UI for
   games (R12).
 - **Q3.** ~~The design set.~~ **Resolved by the founder, 2026-11-12:** the
-  most used Community files (R13). Candidates found the same day, by
-  self-reported use since Figma publishes no ranking: Untitled UI (free
-  edition), the shadcn/ui design system, Google's Material 3 kit, Tailgrids,
-  and Apple's iOS kit. Apple's kit is under Apple's own terms and is likely
-  excluded by R13. Someone with a Figma account has to download the `.fig`
-  files; that step is manual.
+  most used Community files (R13). Six were downloaded the same day from
+  the Community's own popularity ranking for free UI kits, all listed as
+  CC BY 4.0: Obra Studio's shadcn ui kit (components and forms), CRM UI Kit
+  for SaaS Dashboards and DashStack (dashboards), Vectorfair's finance and
+  food-delivery kits (mobile), and Framer's AI Startup Website kit
+  (marketing). They are held outside the repository with an attribution
+  file until `design.md` says how large fixtures are stored: the six total
+  242 MB. Choosing the 20 screens and the tuning split is a task.
 - **Q4.** The JSON baseline. The founder suggested Pencil (2026-11-12). Open
   until `design.md` shows the same designs can be brought into Pencil and
   read back through its MCP server; if not, the fallback is a neutral node
@@ -152,8 +154,8 @@ hypothesis needs (render code, compare with the design) is that check.
 - **Q6.** The mapping attribute. Recommendation: the node `id`s Fanta's
   emitted files already carry, and a `data-fanta-id` attribute where they do
   not reach. To confirm in `design.md` against the emitted HTML.
-- **Q7.** Which Rust UI stands for "games" in R12 (for example Bevy's UI or
-  egui), and whether it is wanted in this spec at all or in a later one.
+- **Q7.** ~~Which Rust UI.~~ **Resolved by the founder, 2026-11-12:** Bevy's
+  UI (R12).
 
 ## Changes after acceptance
 
