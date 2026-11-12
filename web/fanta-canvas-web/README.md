@@ -23,6 +23,7 @@ const canvas = await createFantaCanvas({
     watch,                    // optional (onChange) -> dispose
   },
   engine,                     // optional FantaEngine from fanta-wasm-engine
+  editable,                   // optional: drag-move writes through the engine
   onSelect,                   // optional ([nodeId]) => void
 });
 await canvas.showPage(canvas.pages[0].slug);
@@ -45,5 +46,6 @@ await canvas.applyOps([{ op: "set_props", id, fill: "#FF5522" }], "Tint");
 [`demo/index.html`](demo/index.html) hosts the component over plain HTTP
 with in-memory writes; its header comment has the three build-and-serve
 steps. `node --test web/fanta-canvas-web/test/helpers.test.mjs` covers the
-pure parsing helpers; the DOM half is exercised against a served project
-(A3 lands with T3's browser host).
+pure parsing helpers; the DOM half is exercised against a project served by
+`script/serve-project`, the T3 browser host whose PUT channel persists edits
+(spec 0008 A3).

@@ -78,7 +78,13 @@ function asText(data) {
 }
 
 export async function createFantaCanvas(options) {
-  const { container, files, engine = null, onSelect = null } = options;
+  const {
+    container,
+    files,
+    engine = null,
+    onSelect = null,
+    editable = false,
+  } = options;
   if (!container || !files || typeof files.read !== "function") {
     throw new Error("createFantaCanvas needs a container and files.read");
   }
@@ -107,8 +113,27 @@ export async function createFantaCanvas(options) {
     offsetX: 0,
     offsetY: 0,
     selection: [],
+    // Display-form id -> [x, y, width, height] world bounds, from the
+    // page's emitted map.json; drag-move turns pixel deltas into the
+    // absolute coordinates `set_props` takes.
+    bounds: new Map(),
     disposed: false,
   };
+
+  async function loadBounds() {
+    state.bounds = new Map();
+    if (!editable || !state.page) return;
+    try {
+      const map = JSON.parse(
+        asText(await files.read(`pages/${state.page.slug}/map.json`)),
+      );
+      for (const [id, entry] of Object.entries(map.nodes || {})) {
+        if (Array.isArray(entry.bounds)) state.bounds.set(id, entry.bounds);
+      }
+    } catch (error) {
+      console.warn("fanta-canvas: map.json failed to load; drag-move is off", error);
+    }
+  }
 
   function apply() {
     sheet.style.transform =
@@ -176,6 +201,7 @@ export async function createFantaCanvas(options) {
     if (svg && options.resolveAssets !== false) {
       await resolveAssetHrefs(svg);
     }
+    await loadBounds();
     if (!keepView) fit();
     state.selection = state.selection.filter((id) =>
       sheet.querySelector(`[id^="${id}"]`),
@@ -240,15 +266,26 @@ export async function createFantaCanvas(options) {
   let gesture = null;
   stage.addEventListener("pointerdown", (event) => {
     if (event.button !== 0) return;
+    // Resolved now: setPointerCapture retargets the matching pointerup
+    // to the stage, so the up event no longer says what was under it.
+    const hit = hitNodeId(event.target);
+    const dragIds =
+      editable && hit
+        ? (state.selection.includes(hit) ? state.selection : [hit]).filter(
+            (id) => state.bounds.has(id),
+          )
+        : [];
     gesture = {
       startX: event.clientX,
       startY: event.clientY,
       originX: state.offsetX,
       originY: state.offsetY,
       moved: false,
-      // Resolved now: setPointerCapture retargets the matching pointerup
-      // to the stage, so the up event no longer says what was under it.
-      hit: hitNodeId(event.target),
+      hit,
+      // A drag on a node moves it (and the rest of the selection);
+      // dragging empty space pans.
+      drag: editable && hit && dragIds.length > 0 ? dragIds : null,
+      previews: null,
     };
     stage.setPointerCapture(event.pointerId);
   });
@@ -257,16 +294,66 @@ export async function createFantaCanvas(options) {
     const dx = event.clientX - gesture.startX;
     const dy = event.clientY - gesture.startY;
     if (Math.abs(dx) + Math.abs(dy) > 3) gesture.moved = true;
-    if (gesture.moved) {
+    if (!gesture.moved) return;
+    if (gesture.drag) {
+      const du = dx / state.scale;
+      const dv = dy / state.scale;
+      if (!gesture.previews) {
+        gesture.previews = gesture.drag.map((id) => {
+          const element = sheet.querySelector(`#${CSS.escape(id)}`);
+          return { element, transform: element?.getAttribute("transform") };
+        });
+      }
+      for (const preview of gesture.previews) {
+        if (!preview.element) continue;
+        const base = preview.transform ? `${preview.transform} ` : "";
+        preview.element.setAttribute(
+          "transform",
+          `${base}translate(${du} ${dv})`,
+        );
+      }
+      drawSelection();
+    } else {
       state.offsetX = gesture.originX + dx;
       state.offsetY = gesture.originY + dy;
       apply();
     }
   });
-  stage.addEventListener("pointerup", (event) => {
+  stage.addEventListener("pointerup", async (event) => {
     const finished = gesture;
     gesture = null;
-    if (!finished || finished.moved) return;
+    if (!finished) return;
+    if (finished.moved && finished.drag) {
+      // Revert the preview; the applied ops come back as re-emitted SVG.
+      for (const preview of finished.previews || []) {
+        if (!preview.element) continue;
+        if (preview.transform == null) {
+          preview.element.removeAttribute("transform");
+        } else {
+          preview.element.setAttribute("transform", preview.transform);
+        }
+      }
+      const du = (event.clientX - finished.startX) / state.scale;
+      const dv = (event.clientY - finished.startY) / state.scale;
+      if (!state.selection.includes(finished.hit)) select([finished.hit]);
+      const ops = finished.drag.flatMap((id) => {
+        const bounds = state.bounds.get(id);
+        return bounds
+          ? [{ op: "set_props", id, x: bounds[0] + du, y: bounds[1] + dv }]
+          : [];
+      });
+      if (ops.length > 0) {
+        try {
+          await applyOps(ops, "Move");
+        } catch (error) {
+          drawSelection();
+          console.warn("fanta-canvas: the move was not applied", error);
+          if (options.onError) options.onError(error);
+        }
+      }
+      return;
+    }
+    if (finished.moved) return;
     const id = finished.hit;
     if (!id) {
       select([]);

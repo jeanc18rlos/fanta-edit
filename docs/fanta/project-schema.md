@@ -13,7 +13,7 @@ file reconciliation path.
 | Path | Meaning | Edit by hand? |
 | --- | --- | --- |
 | `fanta.json` | Project ID, schema/layout versions, `"storage": "web"` | No |
-| `index.html`, `viewer.js`, `pages.js` | Dependency-free project viewer and its page manifest | No — regenerated each save |
+| `index.html`, `viewer.js`, `canvas.js`, `editor.js`, `pages.js` | Dependency-free project viewer, the browser editor it upgrades into under `script/serve-project`, and the page manifest | No — regenerated each save |
 | `design.css` | Imports each design's stylesheet; the home for project-wide rules | Yes — add theme-wide rules; keep the generated `@import` lines |
 | `tokens.css` | Variable collections and modes as CSS custom properties | No — generated from `doc/variables.json` |
 | `report.json` | The last save's warnings and anything a load could not keep, per node | No — the loader's report channel |
