@@ -35,12 +35,13 @@ hypothesis needs (render code, compare with the design) is that check.
 - A code generator product, prompts tuned per customer, or model training.
 - Pixel-identical output. A design renderer and a browser differ in text
   rasterization; the scorer has a tolerance.
-- Native targets (SwiftUI, Compose, Flutter). Web output only.
+- Platform-native toolkits (SwiftUI, Compose, Flutter). The targets are the
+  ones R12 names.
 - Interaction and accessibility testing. Accessibility findings on designs
   extend [spec 0009](../0009-check-repair-and-snapshot-project-files/spec.md)'s
   checker; interaction tests come with real-browser prototypes.
-- Giving the model Fanta's MCP tools during the benchmark. The first run
-  isolates the file format: every condition gets static input only.
+- Scoring on a phone or simulator. React Native output is scored through
+  Expo's web build (R12).
 
 ## Requirements
 
@@ -65,23 +66,41 @@ hypothesis needs (render code, compare with the design) is that check.
 - **R5.** The same inputs give the same score: the browser version is
   pinned, animations are disabled, and no network resource is fetched.
 - **R6.** A benchmark command runs a fixed set of at least 20 designs
-  through three input conditions with the same model and the same prompt
-  apart from the input: a screenshot; a JSON node tree of the kind other
-  design tools export; the Fanta project files. Each design and condition
-  runs three times, because model output varies.
+  through four input conditions with the same model and the same prompt
+  apart from the input: a screenshot; the node JSON another design tool
+  gives an agent for the same design (Pencil, read through its MCP server,
+  if Q4 proves feasible); the Fanta project files; the Fanta project files
+  plus Fanta's MCP tools. The models are the ones Fanta's agent already
+  offers. Each design and condition runs three times, because model output
+  varies.
 - **R7.** The design set is split before any run into a tuning set and a
   held-out set. Prompts may be adjusted against the tuning set only; the
   reported result is from the held-out set.
 - **R8.** A run records the model id, the date, the prompts, and both scores
   per design, condition and run, in a file committed with the result.
-- **R9.** The hypothesis holds when, on the held-out set, the Fanta
-  condition is at least 20% better than the better of the two baselines on
-  both the pixel score and the style score (founder, 2026-11-12). The
-  threshold is fixed here, before the first run.
+- **R9.** The hypothesis holds when, on the held-out set and the React
+  target, the Fanta-files condition is at least 20% better than the better
+  of the two baselines on both the pixel score and the style score (founder,
+  2026-11-12). The threshold is fixed here, before the first run. The
+  condition with MCP tools and the other targets are reported beside it and
+  do not change the verdict: they answer how much the tools add and whether
+  the result carries to mobile.
 - **R10.** If R9 holds, the design set, the prompts and the results are
   published with spec 0009's conformance fixtures. If it does not, the
   result lists the properties with the largest error in the Fanta condition,
   as input to a format spec.
+- **R12.** Targets, in this order (founder, 2026-11-12): React for the web;
+  React Native with Expo for mobile, scored through Expo's web build, with
+  the result labelled as a browser rendering of the mobile code; a Rust UI
+  for games as a later extension with the pixel score only, since it has no
+  computed styles to read. The first reported run needs React; each further
+  target is its own task.
+- **R13.** The design set is drawn from the most used free Figma Community
+  files (founder, 2026-11-12), several screens from each, mixing forms,
+  dashboards, marketing pages and mobile screens. Each file's licence is
+  checked and recorded; free Community files default to CC BY 4.0, which
+  allows redistribution with attribution, and the published set carries an
+  attribution file. A file under other terms is left out.
 - **R11.** A documented CI example runs `compare` on a repository and fails
   a change that moves the code away from the design.
 
@@ -96,32 +115,45 @@ hypothesis needs (render code, compare with the design) is that check.
   unmapped.
 - **A4 (R5).** Two runs on the same inputs produce byte-identical JSON.
 - **A5 (R6, R7, R8).** The benchmark command writes the result file for
-  three conditions, three runs each, over the committed design set, with
+  four conditions, three runs each, over the committed design set, with
   the split recorded.
 - **A6 (R9, R10).** The result file states whether R9 holds, and when it
   does not, lists the worst properties.
+- **A8 (R12).** The result file has a React section, and an Expo section
+  marked as scored on the web build.
+- **A9 (R13).** The committed set has an attribution file naming each
+  source file, its author and its licence, and a test fails when a design
+  has no entry.
 - **A7 (R11).** In the example repository, a change to one token's value in
   code only makes the CI job fail with that token named.
 
 ## Open questions
 
-- **Q1.** Which models. Recommendation: the current Claude model and one
-  from another vendor, so the result is not a property of one model.
-- **Q2.** Which target the model writes. Recommendation: plain HTML and CSS
-  first, since it needs no build step and isolates the format; React next.
-- **Q3.** The design set. The repository holds one sample `.fig`
-  (`docs/samples/`). The benchmark needs about 20 designs the founder may
-  publish. Who supplies them?
-- **Q4.** The JSON baseline. The honest competitor input is the JSON another
-  tool's API returns for the same file, which requires files the founder
-  owns in that tool. The alternative is a neutral node tree written here.
-  Which?
-- **Q5.** Where the browser half lives. The engine crates must not grow a
-  browser dependency; candidates are a script under `web/` that calls the
-  engine binary, or a binary that drives an installed browser. To settle in
-  `design.md`.
-- **Q6.** The mapping attribute's name, and whether Fanta's own emitted HTML
-  already carries enough (node `id`s) to serve as the convention.
+- **Q1.** ~~Which models.~~ **Resolved by the founder, 2026-11-12:** the
+  models Fanta's agent already offers, and a condition that also gives the
+  model Fanta's MCP tools (R6).
+- **Q2.** ~~Which target.~~ **Resolved by the founder, 2026-11-12:** React
+  for the web, React Native with Expo for mobile, possibly a Rust UI for
+  games (R12).
+- **Q3.** ~~The design set.~~ **Resolved by the founder, 2026-11-12:** the
+  most used Community files (R13). Candidates found the same day, by
+  self-reported use since Figma publishes no ranking: Untitled UI (free
+  edition), the shadcn/ui design system, Google's Material 3 kit, Tailgrids,
+  and Apple's iOS kit. Apple's kit is under Apple's own terms and is likely
+  excluded by R13. Someone with a Figma account has to download the `.fig`
+  files; that step is manual.
+- **Q4.** The JSON baseline. The founder suggested Pencil (2026-11-12). Open
+  until `design.md` shows the same designs can be brought into Pencil and
+  read back through its MCP server; if not, the fallback is a neutral node
+  tree written here, which is the weaker comparison.
+- **Q5.** ~~Where the browser half lives.~~ **Resolved by the founder,
+  2026-11-12:** a script under `web/` that drives a headless browser and
+  calls the engine binary; the engine crates gain no browser dependency.
+- **Q6.** The mapping attribute. Recommendation: the node `id`s Fanta's
+  emitted files already carry, and a `data-fanta-id` attribute where they do
+  not reach. To confirm in `design.md` against the emitted HTML.
+- **Q7.** Which Rust UI stands for "games" in R12 (for example Bevy's UI or
+  egui), and whether it is wanted in this spec at all or in a later one.
 
 ## Changes after acceptance
 
