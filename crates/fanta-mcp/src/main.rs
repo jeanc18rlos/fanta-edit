@@ -10,7 +10,11 @@
 //! saves the project before it answers, so the change is on disk (and in git)
 //! when the tool result arrives.
 //!
-//! Usage: `fanta-mcp <project-dir>`.
+//! Usage: `fanta-mcp <project-dir>`, or `fanta-mcp --frames <project-dir>
+//! --out <file.png>` to watch the project and keep a page rendered as a PNG
+//! for terminal panes (spec 0008 T4; see `frames.rs`).
+
+mod frames;
 
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -61,12 +65,70 @@ struct ReportActivityArgs {
     activity: AgentActivity,
 }
 
+const USAGE: &str = "usage: fanta-mcp <project-dir>\n       fanta-mcp --frames <project-dir> --out <file.png> \
+     [--page <index>] [--max-dimension <pixels>] [--interval-ms <ms>] [--once]";
+
+fn parse_frame_options(arguments: &[String]) -> Result<frames::FrameOptions> {
+    let mut root = None;
+    let mut out = None;
+    let mut page = None;
+    let mut max_dimension = 1024;
+    let mut interval_ms = 500;
+    let mut once = false;
+    let mut words = arguments.iter();
+    while let Some(word) = words.next() {
+        let mut value = |name: &str| words.next().with_context(|| format!("{name} needs a value"));
+        match word.as_str() {
+            "--frames" => {}
+            "--once" => once = true,
+            "--out" => out = Some(PathBuf::from(value("--out")?)),
+            "--page" => page = Some(value("--page")?.parse().context("--page takes an index")?),
+            "--max-dimension" => {
+                max_dimension = value("--max-dimension")?
+                    .parse()
+                    .context("--max-dimension takes pixels")?;
+            }
+            "--interval-ms" => {
+                interval_ms = value("--interval-ms")?
+                    .parse()
+                    .context("--interval-ms takes milliseconds")?;
+            }
+            positional if !positional.starts_with("--") && root.is_none() => {
+                root = Some(PathBuf::from(positional));
+            }
+            unknown => bail!("unknown argument {unknown}"),
+        }
+    }
+    Ok(frames::FrameOptions {
+        root: root.context("a project directory is required")?,
+        out: out.context("--out is required")?,
+        page,
+        max_dimension,
+        interval: std::time::Duration::from_millis(interval_ms),
+        once,
+    })
+}
+
 fn main() {
-    let mut arguments = std::env::args().skip(1);
-    let root = match (arguments.next(), arguments.next()) {
+    let all: Vec<String> = std::env::args().skip(1).collect();
+    if all.iter().any(|argument| argument == "--frames") {
+        let options = match parse_frame_options(&all) {
+            Ok(options) => options,
+            Err(error) => {
+                eprintln!("fanta-mcp: {error:#}\n{USAGE}");
+                std::process::exit(2);
+            }
+        };
+        if let Err(error) = frames::run(&options) {
+            eprintln!("fanta-mcp --frames: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let root = match (all.first(), all.get(1)) {
         (Some(root), None) if root != "--help" => PathBuf::from(root),
         _ => {
-            eprintln!("usage: fanta-mcp <project-dir>");
+            eprintln!("{USAGE}");
             std::process::exit(2);
         }
     };
