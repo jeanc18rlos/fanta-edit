@@ -1,9 +1,11 @@
-// The Fanta canvas pane (spec 0008 T4, terminal surface): /fanta-canvas opens
-// a pane that shows the current page as PNG frames, re-rendered whenever the
-// project changes on disk. The frames come from `fanta-mcp --frames`, which
-// watches the project and keeps one PNG fresh in the project's git-ignored
-// previews/ directory; the terminal reads that file itself, so no pixels
-// cross the plugin boundary. The desktop surface's interactive canvas is T5.
+// The Fanta canvas pane (spec 0008 T4/T5): /fanta-canvas opens a pane that
+// shows the current page, re-rendered whenever the project changes on disk.
+// The frames come from `fanta-mcp --frames`, which watches the project and
+// keeps one PNG fresh in the project's git-ignored previews/ directory. A
+// terminal reads that file itself, so no pixels cross the plugin boundary;
+// the desktop app draws the page's own SVG with its stylesheets inlined
+// (this build's plugin surfaces host no web component, so edits go through
+// the chat tools and appear here live).
 import { atom, read, update } from 'claude-code'
 import type { Hook, PluginOptions, Register } from 'claude-code'
 
@@ -14,8 +16,39 @@ const PANE = 'fanta-canvas'
 const view = atom(
   { plugin: 'fanta-canvas', key: 'view' } as const,
   { status: 'Run /fanta-canvas to start.', pages: [] },
-  { shape: 'view-1' },
+  { shape: 'view-2' },
 )
+
+/** The Svg element's source cap; larger pages fall back to a pointer. */
+const SVG_LIMIT = 131072
+
+/** The current page's SVG with its `<?xml-stylesheet?>` sheets inlined as a
+ * `<style>` element — a sandboxed vector frame resolves no relative hrefs. */
+async function inlineSvg($: Api, project: string, pageName: string) {
+  const manifest = await $.fs.read(`${project}/pages.js`, { as: 'text' })
+  const listed = manifest.slice(manifest.indexOf('['), manifest.lastIndexOf(']') + 1)
+  const entries: { slug: string; name: string }[] = JSON.parse(listed)
+  // pages.js lists visible pages only, so match by name, not index.
+  const slug = entries.find(entry => entry.name === pageName)?.slug
+  if (!slug) return undefined
+  const directory = `${project}/pages/${slug}`
+  let svg = await $.fs.read(`${directory}/page.svg`, { as: 'text' })
+  let styles = ''
+  for (const match of svg.matchAll(/<\?xml-stylesheet[^?]*href="([^"]+)"[^?]*\?>/g)) {
+    const parts = `${directory}/${match[1]}`.split('/')
+    const resolved: string[] = []
+    for (const part of parts) {
+      if (part === '..') resolved.pop()
+      else if (part !== '.') resolved.push(part)
+    }
+    styles += (await $.fs.read(resolved.join('/'), { as: 'text' })) + '\n'
+  }
+  svg = svg.replace(/<\?xml-stylesheet[^?]*\?>\s*/g, '')
+  if (styles) {
+    svg = svg.replace(/(<svg[^>]*>)/, `$1<style>\n${styles}</style>`)
+  }
+  return svg
+}
 
 // Which watch owns the child: bumping it makes the old for-await loop return,
 // which kills its child. Module state dies with the child on hot reload.
@@ -77,6 +110,13 @@ async function watch($: Api, options: PluginOptions, project: string, page: numb
             },
             pages: event.pages ?? current.pages,
           }))
+          const svg = await inlineSvg($, project, event.page.name).catch(() => undefined)
+          const tooLarge = svg !== undefined && svg.length > SVG_LIMIT
+          await update($, view, current => ({
+            ...current,
+            svg: tooLarge ? undefined : svg,
+            svgTooLarge: tooLarge,
+          }))
         } else if (event.event === 'error') {
           await update($, view, current => ({ ...current, status: `error: ${event.message}` }))
         }
@@ -133,7 +173,20 @@ export const register: Register = (on, options) => {
     const body = Math.max(10, Math.min(e.props.bodyColumns, 255))
 
     let frame = null
-    if (state.frame && 'Image' in elements) {
+    if (state.frame && 'Svg' in elements && (state.svg || state.svgTooLarge)) {
+      const { Svg } = elements
+      frame = state.svg ? (
+        <Svg
+          source={state.svg}
+          alt={`Fanta page ${state.frame.page.name}`}
+          isInteractive
+        />
+      ) : (
+        <Text dimColor>
+          {'This page is too large for the pane; serve it with script/serve-project instead.'}
+        </Text>
+      )
+    } else if (state.frame && 'Image' in elements) {
       const { Image } = elements
       // A terminal cell is roughly twice as tall as it is wide.
       const rows = Math.max(
@@ -173,7 +226,7 @@ export const register: Register = (on, options) => {
         )}
         {frame ??
           (state.frame ? (
-            <Text dimColor>{'This surface draws no images; the desktop canvas lands with T5.'}</Text>
+            <Text dimColor>{'Preparing the vector view…'}</Text>
           ) : (
             <Text dimColor>{'Waiting for the first frame…'}</Text>
           ))}

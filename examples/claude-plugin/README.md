@@ -40,8 +40,11 @@ override with the plugin's "Project directory" setting) and needs no
 running app. Build the binary once with `cargo build -p fanta-mcp`, then
 put it on PATH, export `FANTA_MCP_BIN`, or set the plugin's "fanta-mcp
 binary" setting. Terminals without image support (anything but kitty or
-Ghostty; tmux needs passthrough) draw the frame's description instead; the
-interactive desktop canvas is T5.
+Ghostty; tmux needs passthrough) draw the frame's description instead. On
+the desktop app the pane draws the page's own SVG with its stylesheets
+inlined (spec 0008 T5); edits made through the chat tools appear in it
+live, and pages past the vector frame's size cap fall back to a
+`script/serve-project` pointer.
 
 ## How it works
 
