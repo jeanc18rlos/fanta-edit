@@ -45,6 +45,8 @@
 
 #[cfg(feature = "native")]
 mod check;
+#[cfg(feature = "native")]
+pub mod history;
 mod component_dirs;
 mod diagnostic;
 mod layout;

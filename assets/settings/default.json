@@ -1797,6 +1797,7 @@
   // scans, file searches, and not be displayed in the project file tree. Takes precedence over `file_scan_inclusions`.
   "file_scan_exclusions": [
     "**/.git",
+    "**/.fanta",
     "**/.svn",
     "**/.hg",
     "**/.jj",

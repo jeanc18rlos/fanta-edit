@@ -12,7 +12,7 @@ use fanta_headless::{HeadlessProject, PageRef, RenderTarget, pages};
 use serde_json::{Value, json};
 
 /// Directories a change scan ignores, matching `script/serve-project`.
-const SKIPPED_DIRECTORIES: [&str; 4] = [".git", "exports", "previews", "node_modules"];
+const SKIPPED_DIRECTORIES: [&str; 5] = [".git", ".fanta", "exports", "previews", "node_modules"];
 
 pub struct FrameOptions {
     pub root: PathBuf,
@@ -145,6 +145,19 @@ mod tests {
     use super::*;
     use fanta_headless::document::HeadlessDocument;
     use std::collections::BTreeMap;
+
+    /// Spec 0009 R6: a snapshot must not look like a change to the project.
+    #[test]
+    fn the_snapshot_store_is_not_a_change() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::write(directory.path().join("fanta.json"), "{}").expect("manifest");
+        let out = directory.path().join("frame.png");
+        let before = latest_change(directory.path(), &out);
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::create_dir_all(directory.path().join(".fanta/history.git")).expect("history");
+        std::fs::write(directory.path().join(".fanta/history.git/HEAD"), "ref").expect("history");
+        assert_eq!(latest_change(directory.path(), &out), before);
+    }
 
     #[test]
     fn a_frame_lands_as_png_with_the_page_list() {

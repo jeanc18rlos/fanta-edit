@@ -1328,6 +1328,9 @@ mod tests {
         std::fs::write(root.join("new.txt"), "fresh").expect("add");
         std::fs::create_dir_all(root.join(".git")).expect("git");
         std::fs::write(root.join(".git").join("HEAD"), "ref").expect("hidden");
+        // Spec 0009 R6: the snapshot store is not project content.
+        std::fs::create_dir_all(root.join(".fanta/history.git")).expect("history");
+        std::fs::write(root.join(".fanta/history.git/HEAD"), "ref").expect("history");
 
         let changed = changeset(&loaded, root).expect("changeset");
         assert_eq!(

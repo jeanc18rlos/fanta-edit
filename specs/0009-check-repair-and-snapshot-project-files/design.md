@@ -67,9 +67,17 @@ answers Q5.
   `git gc`; a chained history could not drop its middle.
 - Restore records a snapshot of the current state, then makes the working
   files equal to the chosen snapshot's tree, removing files it lacks.
-- `.fanta/` is added to the project's `.gitignore` (created or appended),
-  and every walker of the project directory skips it: the loader, the
-  session hash index, the editor's watcher, `.fant` export and `fanta-site`.
+- `.fanta/` holds its own `.gitignore` containing `*`, so the user's git
+  ignores it and their `.gitignore` is not edited. Walkers of the whole
+  project directory skip it: the change scans in `fanta-mcp` and
+  `script/serve-project` by name, the headless change set and the cloud
+  worker because they skip hidden entries, and the editor through
+  `file_scan_exclusions`. The loader, the check, the save, `.fant` export
+  and `fanta-site` read named directories only and never reach it.
+- A snapshot holds every file under the project except `.fanta/` and a
+  `.git` directory, whatever the project's `.gitignore` says, with no
+  line-ending or filter conversion. The user's and the system's git
+  configuration are shut out of every command.
 
 **Wiring.** The save path in `fanta-format` (`project/write.rs`) calls the
 store, so the editor, `fanta-headless`, `fanta-mcp` and the cloud worker
@@ -110,12 +118,17 @@ pub struct SourceDiagnostic {
 pub fn check_project(dir: &Path) -> Result<Vec<SourceDiagnostic>>;
 
 // fanta-format, project/history.rs (not built for wasm)
-pub struct Snapshot { pub id: String, pub taken_at: String, pub reason: SnapshotReason }
+pub struct Snapshot { pub id: String, pub taken_at: SystemTime, pub reason: SnapshotReason }
 pub enum SnapshotReason { BeforeSave, AfterSave, BeforeRestore }
-pub fn record(dir: &Path, reason: SnapshotReason) -> Result<Snapshot>;
-pub fn list(dir: &Path) -> Result<Vec<Snapshot>>;
-pub fn restore(dir: &Path, id: &str) -> Result<Snapshot>; // returns the BeforeRestore snapshot
-pub fn prune(dir: &Path, now: SystemTime) -> Result<()>;  // 30 days, then one per day
+pub struct History { /* project directory, git binary */ }
+impl History {
+    pub fn new(dir: impl Into<PathBuf>) -> Self;          // `git` from PATH
+    pub fn with_git(self, git: impl Into<OsString>) -> Self; // the editor's bundled git
+    pub fn record(&self, reason: SnapshotReason) -> Result<Snapshot>;
+    pub fn list(&self) -> Result<Vec<Snapshot>>;           // newest first
+    pub fn restore(&self, id: &str) -> Result<Snapshot>;   // returns the BeforeRestore snapshot
+    pub fn prune(&self, now: SystemTime) -> Result<()>;    // 30 days, then one per day
+}
 ```
 
 - `fanta-check <dir> [--json]`: exit 0 with no `error` diagnostics, 1 with
@@ -133,6 +146,16 @@ pub fn prune(dir: &Path, now: SystemTime) -> Result<()>;  // 30 days, then one p
   `previous_seeds` (`fanta-format/AGENTS.md`).
 
 ## Changes during implementation
+
+- **T4.** The store is a `History` value holding the directory and the git
+  binary, not free functions: the editor ships its own git and has to say
+  which one to run. A snapshot's id is its time in milliseconds since the
+  Unix epoch, which is also its ref name; `taken_at` is a `SystemTime`.
+- **T4.** `.fanta/` ignores itself instead of being added to the project's
+  `.gitignore`: the same effect without editing a file the user owns.
+- **T4.** Measured on a generated project of 9,000 designs (36,000 files):
+  the first snapshot takes 1.6 s, each later one about 0.1 s, listing 1 ms.
+  The save-latency risk below stays open until T5 measures a real save.
 
 - **T3.** The design said the reader gains a collecting mode. Built
   instead as a pass before the read that names the folders to skip, reusing

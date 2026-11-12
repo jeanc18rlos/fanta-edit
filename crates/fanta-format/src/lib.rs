@@ -89,7 +89,7 @@ pub use project::{
     SaveBlocked, SaveResult, ScopedDoc, SessionError, SessionEvent,
     SourceProposalOutcome, SourceRebuildReason, SourceSync, WorkspaceDirty,
     WorkspaceDiskSnapshot, WorkspaceIr, WorkspaceSession, WorkspaceSharedState,
-    apply_project_json_edit, apply_project_source_edit, check_project,
+    apply_project_json_edit, apply_project_source_edit, check_project, history,
     apply_project_source_edit_with_diagnostics, artifact_op_impact, component_id_of_dir,
     ensure_project_editor_support, export_fant_snapshot, hash_file_set, import_fant_snapshot,
     is_project_dir, locate_master_source, locate_page_source, page_id_of_dir,
