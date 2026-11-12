@@ -767,6 +767,266 @@ mod tests {
         assert_eq!(doc2.pages(), f.doc.pages(), "page order survives");
     }
 
+    /// A3 (spec 0007 T2): write → load → write over web storage is
+    /// byte-identical, and the loaded document property-equals the written
+    /// one, on a fixture covering every `NodeData` kind (R5, R6).
+    #[test]
+    fn web_round_trip_is_byte_identical_over_every_node_kind() {
+        use fanta_doc::{
+            AiArtifactNode, AudioNode, BitmapNode, BooleanNode, Bounds, Camera3d, Color, EmbedNode,
+            GenerationStatus, ImageFitMode, InstanceNode, Model3dNode, NodeGraph, NodeGraphNode,
+            PathData, TextNode, TextPathNode, Transform2D, VectorNode, VideoNode,
+        };
+
+        let mut doc = Doc::new();
+        doc.metadata.title = "Every Kind".into();
+        doc.metadata.created_at = 1_700_000_000;
+        doc.metadata.modified_at = 1_700_000_001;
+        let (assets, _) = fixture_assets();
+        let image = *assets.keys().next().expect("fixture asset");
+
+        let mut insert = |node: CanvasNode| -> NodeId {
+            let id = node.id;
+            doc.scene.insert(node).unwrap();
+            id
+        };
+        let page = insert(group(None, "Everything"));
+        let comp_page = insert(group(None, "Components"));
+        let comp_root = insert(group(Some(comp_page), "Button"));
+        insert(group(Some(comp_root), "Button / Label"));
+        let comp_id = ComponentId::new();
+
+        let mut place = |data: NodeData, name: &str, x: f64| -> NodeId {
+            let mut node = CanvasNode::new(data);
+            node.name = name.into();
+            node.parent = Some(page);
+            node.transform = Transform2D::translation(x, 0.0);
+            let id = node.id;
+            doc.scene.insert(node).unwrap();
+            id
+        };
+        place(
+            NodeData::Vector(VectorNode::rect_solid(0.0, 0.0, 10.0, 10.0, Color::WHITE)),
+            "Shape",
+            0.0,
+        );
+        place(NodeData::Text(TextNode::new("Hello", 100.0, 20.0)), "Text", 20.0);
+        place(
+            NodeData::TextPath(TextPathNode::new(
+                PathData::rect(0.0, 0.0, 100.0, 20.0),
+                "Curve",
+            )),
+            "Text on Path",
+            40.0,
+        );
+        place(
+            NodeData::Bitmap(BitmapNode {
+                asset: image,
+                natural_size: [1, 1],
+                local_size: [10.0, 10.0],
+                crop: None,
+                fit: ImageFitMode::Fill,
+                tint: None,
+            }),
+            "Image",
+            60.0,
+        );
+        place(
+            NodeData::Video(VideoNode {
+                asset: image,
+                natural_size: [1, 1],
+                local_size: [10.0, 10.0],
+                time_range_us: [0, 1_000_000],
+                speed: 1.0,
+                muted: false,
+                volume: 1.0,
+                poster_frame_us: None,
+                poster: None,
+                fit: ImageFitMode::Fill,
+            }),
+            "Video",
+            80.0,
+        );
+        place(
+            NodeData::Audio(AudioNode {
+                asset: image,
+                local_size: [10.0, 4.0],
+                time_range_us: [0, 1_000_000],
+                volume: 1.0,
+                muted: false,
+                waveform_color: Color::default(),
+            }),
+            "Audio",
+            100.0,
+        );
+        place(
+            NodeData::NodeGraph(NodeGraphNode {
+                local_size: [10.0, 10.0],
+                graph: NodeGraph::default(),
+                preview: None,
+            }),
+            "Node Graph",
+            120.0,
+        );
+        place(
+            NodeData::Model3d(Model3dNode {
+                asset: image,
+                local_size: [10.0, 10.0],
+                camera: Camera3d::default(),
+                overrides: serde_json::Value::Null,
+            }),
+            "3D",
+            140.0,
+        );
+        place(
+            NodeData::AiArtifact(AiArtifactNode {
+                local_size: [10.0, 10.0],
+                prompt: "a cat".into(),
+                model: "gen-1".into(),
+                params: serde_json::Value::Null,
+                inputs: Vec::new(),
+                lineage_parent: None,
+                output: None,
+                status: GenerationStatus::Pending,
+                seed: None,
+            }),
+            "AI",
+            160.0,
+        );
+        place(
+            NodeData::Instance(InstanceNode {
+                component: comp_id,
+                overrides: Vec::new(),
+                prop_values: BTreeMap::new(),
+                derived: Vec::new(),
+                local_size: [10.0, 10.0],
+            }),
+            "Instance",
+            180.0,
+        );
+        let boolean = place(
+            NodeData::Boolean(BooleanNode::default()),
+            "Boolean",
+            200.0,
+        );
+        place(
+            NodeData::Embed(EmbedNode {
+                local_size: [10.0, 10.0],
+                kind: "iframe".into(),
+                payload: serde_json::Value::Null,
+            }),
+            "Embed",
+            220.0,
+        );
+        let mut operand = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            5.0,
+            5.0,
+            Color::BLACK,
+        )));
+        operand.name = "Operand".into();
+        operand.parent = Some(boolean);
+        doc.scene.insert(operand).unwrap();
+
+        doc.add_page(page);
+        doc.add_page(comp_page);
+        doc.components
+            .defs
+            .insert(comp_id, ComponentDef::new(comp_id, comp_root, "Button"));
+
+        let design_bounds = Bounds {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 240.0,
+            max_y: 40.0,
+        };
+        let mut inputs = WebWriteInputs::default();
+        inputs.bounds.insert(page, design_bounds);
+        inputs.bounds.insert(comp_root, design_bounds);
+        let write = |dir: &Path, doc: &Doc, inputs: &mut WebWriteInputs| {
+            loop {
+                match write_web_project_tree(dir, doc, &assets, inputs).expect("write") {
+                    WebWriteOutcome::Written { .. } => return,
+                    WebWriteOutcome::NeedsRasters(nodes) => {
+                        for node in nodes {
+                            let stale = inputs.rasters.insert(
+                                node,
+                                WebRaster {
+                                    bytes: b"\x89PNG\r\n\x1a\nfixture-raster".to_vec(),
+                                    bounds: Bounds {
+                                        min_x: 0.0,
+                                        min_y: 0.0,
+                                        max_x: 10.0,
+                                        max_y: 10.0,
+                                    },
+                                },
+                            );
+                            assert!(stale.is_none(), "the writer re-requested {node}");
+                        }
+                    }
+                }
+            }
+        };
+        let dir = tempdir().unwrap();
+        write(dir.path(), &doc, &mut inputs);
+        assert!(
+            !tree_snapshot(dir.path())
+                .keys()
+                .any(|path| path.ends_with(".fnx") || path.ends_with(".fss")),
+            "web storage must not write FNX sources"
+        );
+
+        let (loaded, loaded_assets) = read_project_tree(dir.path()).expect("read");
+        assert_eq!(persisted(&loaded), persisted(&doc), "R6 property equality");
+        assert_eq!(loaded_assets, assets);
+        assert_eq!(loaded.pages(), doc.pages(), "page order survives");
+
+        let second = tempdir().unwrap();
+        write(second.path(), &loaded, &mut inputs);
+        assert_eq!(
+            tree_snapshot(second.path()),
+            tree_snapshot(dir.path()),
+            "A3 byte identity across write → load → write"
+        );
+    }
+
+    /// A5 groundwork: writing web storage over an FNX tree converts it in
+    /// place — stale pruning removes the FNX sources, and the project still
+    /// loads property-equal.
+    #[test]
+    fn converting_a_project_to_web_storage_prunes_fnx_sources() {
+        let f = fixture();
+        let (assets, _) = fixture_assets();
+        let dir = tempdir().unwrap();
+        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        assert!(
+            tree_snapshot(dir.path())
+                .keys()
+                .any(|path| path.ends_with(".fnx")),
+            "the FNX writer must have written sources"
+        );
+
+        let inputs = WebWriteInputs::default();
+        let outcome = write_web_project_tree(dir.path(), &f.doc, &assets, &inputs).unwrap();
+        assert!(
+            matches!(outcome, WebWriteOutcome::Written { .. }),
+            "an all-group fixture needs no rasters"
+        );
+        let tree = tree_snapshot(dir.path());
+        assert!(
+            !tree
+                .keys()
+                .any(|path| path.ends_with(".fnx") || path.ends_with(".fss")),
+            "conversion must prune the FNX sources, kept: {:?}",
+            tree.keys().collect::<Vec<_>>()
+        );
+
+        let (loaded, loaded_assets) = read_project_tree(dir.path()).expect("read");
+        assert_eq!(persisted(&loaded), persisted(&f.doc));
+        assert_eq!(loaded_assets, assets);
+    }
+
     #[test]
     fn text_path_round_trips_through_canonical_page_source() {
         let mut doc = Doc::new();

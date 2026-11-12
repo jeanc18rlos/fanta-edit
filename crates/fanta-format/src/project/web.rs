@@ -44,7 +44,7 @@ use super::write::{
 
 const PAGE_SVG: &str = "page.svg";
 const MASTER_SVG: &str = "master.svg";
-const NODES_JSON: &str = "nodes.json";
+pub(crate) const NODES_JSON: &str = "nodes.json";
 const MAP_JSON: &str = "map.json";
 const INDEX_TEMPLATE: &str = include_str!("../../assets/web/index.html");
 const VIEWER_JS: &str = include_str!("../../assets/web/viewer.js");
