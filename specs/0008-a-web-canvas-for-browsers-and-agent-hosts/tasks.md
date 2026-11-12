@@ -28,9 +28,13 @@ request when it merges.
   (R4). Verify: A4 on a terminal session. `fanta-mcp --frames` watches
   and renders; the pane reads the PNG by file, so no pixels cross the
   plugin boundary.
-- [ ] **T5.** Claude Code pane, desktop surface: host the T2 component as
-  the pane's `Client` module with file read/write over the plugin host
-  (R4). Verify: A4 on the desktop app.
+- [x] **T5.** ([#200](https://github.com/jeanc18rlos/fanta-edit/pull/200)) Claude Code pane, desktop surface (R4). Verify: A4 on
+  the desktop app. Changed from the `Client`-module plan: on today's
+  plugin API a `Client` draws engine elements only (no DOM or `Svg`), so
+  a browser component cannot run there. The desktop pane draws the
+  page's own `page.svg` with its stylesheets inlined in the surface's
+  sandboxed vector frame, updating as the watcher re-fires; hosting the
+  T2 component waits for the plugin API to grow a web surface.
 - [ ] **T6.** Live-app attach: when the project is open in the desktop
   app, canvas hosts route edits through the live MCP server instead of
   writing files (R6). Verify: A5.
