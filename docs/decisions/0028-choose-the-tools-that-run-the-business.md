@@ -9,7 +9,7 @@ tags: [operations, vendors]
 
 ## Context
 
-[Spec 0009](../../specs/0009-internal-operations-platform/spec.md) asks for
+[Spec 0011](../../specs/0011-internal-operations-platform/spec.md) asks for
 alerts, a CRM, tickets, product analytics, error tracking, uptime checks, a
 community and a handbook. Some of this exists. The backend syncs Attio, sends
 PostHog events to the EU cloud and sends mail through Resend; Polar takes
@@ -79,7 +79,7 @@ These rules hold for every tool:
    Attio is already integrated.
 6. **PostHog for errors as well.** One vendor fewer and a larger free
    allowance (100,000 exceptions a month), but the app's crash path uploads
-   native minidumps, which Sentry symbolicates. Spec 0009's Q3 took Sentry
+   native minidumps, which Sentry symbolicates. Spec 0011's Q3 took Sentry
    as the default on 2026-11-07.
 
 ## Consequences
@@ -94,7 +94,7 @@ These rules hold for every tool:
   first month with revenue. Linear's Slack and email intake need its
   Business plan, so intake goes through the backend and the Linear API. Each
   new processor has to appear in the privacy policy before data reaches it.
-- Follow-up: the phases of spec 0009, and
+- Follow-up: the phases of spec 0011, and
   [ADR 0029](0029-deliver-business-events-through-the-backend-outbox.md) on
   how the backend delivers events to these tools.
 
@@ -107,7 +107,7 @@ moving one to a paid plan needs a record that supersedes this one.
 
 ## References
 
-- [Spec 0009: Internal operations platform](../../specs/0009-internal-operations-platform/spec.md)
+- [Spec 0011: Internal operations platform](../../specs/0011-internal-operations-platform/spec.md)
 - fanta-backend `v2/src/fanta_v2/events.py` (PostHog catalog),
   `v2/src/fanta_v2/core/crm.py` (Attio sync), `v2/src/fanta_v2/outbox.py`
 - fanta-admin `README.md` (the founder console)

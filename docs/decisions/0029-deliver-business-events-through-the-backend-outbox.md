@@ -9,7 +9,7 @@ tags: [operations, backend]
 
 ## Context
 
-[Spec 0009](../../specs/0009-internal-operations-platform/spec.md) sends
+[Spec 0011](../../specs/0011-internal-operations-platform/spec.md) sends
 business facts to Slack, Linear, Attio, Discord and email: signups,
 payments, refunds, failed webhooks, tickets and replies. The facts live in
 v2's Postgres. A notification must never block or fail the request that
@@ -57,7 +57,7 @@ pass through our code.
   webhook, Linear's GraphQL API, Discord's REST API and Resend. Each is a
   few dozen lines. Delivery is at least once, so handlers must be
   idempotent.
-- Follow-up: spec 0009's design and tasks.
+- Follow-up: spec 0011's design and tasks.
 
 ## Confirmation
 
@@ -68,7 +68,7 @@ request handler.
 
 ## References
 
-- [Spec 0009](../../specs/0009-internal-operations-platform/spec.md) and
-  its [design](../../specs/0009-internal-operations-platform/design.md)
+- [Spec 0011](../../specs/0011-internal-operations-platform/spec.md) and
+  its [design](../../specs/0011-internal-operations-platform/design.md)
 - [ADR 0028](0028-choose-the-tools-that-run-the-business.md)
 - fanta-backend `v2/src/fanta_v2/outbox.py`, `v2/src/fanta_v2/core/crm.py`
