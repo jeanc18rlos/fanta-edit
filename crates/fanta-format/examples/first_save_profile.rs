@@ -126,7 +126,7 @@ fn main() -> anyhow::Result<()> {
             ))
         })?;
         let report = stage("  write with overrides", || {
-            fanta_format::write_project_tree_cached_with_sources_checked(
+            fanta_format::write_legacy_project_tree_checked(
                 &root, &persisted, &assets, &mut cache, &sources, &expected,
             )
         })?;

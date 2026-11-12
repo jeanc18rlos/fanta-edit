@@ -9,7 +9,6 @@
 //! moved) asset still round-trips losslessly.
 
 use crate::error::{FormatError, Result};
-use crate::formats::FormatCapabilities;
 use fanta_doc::AssetId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -144,6 +143,46 @@ fn sha256_hex(bytes: &[u8]) -> String {
 pub(crate) const MEDIA_DIRS: [&str; 7] = [
     "images", "video", "audio", "models", "svg", "fonts", "other",
 ];
+
+/// The content-addressed [`AssetId`] for `bytes` — the same id [`FantaFile::put_asset`]
+/// would assign. Lets a caller mint an id (e.g. for an in-memory image about to
+/// be placed) that will match the container on save, so the asset round-trips
+/// without an id-remap.
+pub fn asset_id_for_bytes(bytes: &[u8]) -> AssetId {
+    compute_asset_id(bytes).0
+}
+
+/// SHA-256 the bytes and turn the digest into both an [`AssetId`] (top 128
+/// bits packed into `from_u128`) and the hex string used as the on-disk
+/// filename.
+pub(crate) fn compute_asset_id(bytes: &[u8]) -> (AssetId, String) {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut first_16 = [0u8; 16];
+    first_16.copy_from_slice(&digest[..16]);
+    let id = AssetId::from_u128(u128::from_be_bytes(first_16));
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        hex.push(HEX[usize::from(byte >> 4)] as char);
+        hex.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    (id, hex)
+}
+
+/// The affordances a format supports directly. `edit` and `version` refer to
+/// the original path, before any import into a native project directory.
+/// Lives here rather than in `formats` so the no-default-features build
+/// keeps media sniffing; `formats` (native) re-exports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatCapabilities {
+    pub import: bool,
+    pub export: bool,
+    pub display: bool,
+    pub edit: bool,
+    pub version: bool,
+}
 
 /// A binary format that can be recognized from a bounded header probe.
 /// Additional formats can register a probe without changing project I/O.

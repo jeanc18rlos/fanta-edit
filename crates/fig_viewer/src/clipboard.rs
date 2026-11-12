@@ -761,8 +761,15 @@ mod tests {
         assert!(doc.undo().expect("undo"));
         let mut actual = serde_json::to_value(&doc).expect("after undo");
         let mut expected = before;
-        actual.as_object_mut().expect("doc").remove("history");
-        expected.as_object_mut().expect("doc").remove("history");
+        for doc_json in [&mut actual, &mut expected] {
+            let object = doc_json.as_object_mut().expect("doc");
+            object.remove("history");
+            // Undo stamps a fresh modified_at; comparing wall-clock seconds
+            // makes the test flake across a second boundary.
+            if let Some(metadata) = object.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+                metadata.remove("modified_at");
+            }
+        }
         assert_eq!(actual, expected);
     }
 
@@ -816,8 +823,15 @@ mod tests {
         assert!(doc.undo().expect("undo"));
         let mut actual = serde_json::to_value(&doc).expect("after undo");
         let mut expected = before;
-        actual.as_object_mut().expect("doc").remove("history");
-        expected.as_object_mut().expect("doc").remove("history");
+        for doc_json in [&mut actual, &mut expected] {
+            let object = doc_json.as_object_mut().expect("doc");
+            object.remove("history");
+            // Undo stamps a fresh modified_at; comparing wall-clock seconds
+            // makes the test flake across a second boundary.
+            if let Some(metadata) = object.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+                metadata.remove("modified_at");
+            }
+        }
         assert_eq!(actual, expected);
     }
 

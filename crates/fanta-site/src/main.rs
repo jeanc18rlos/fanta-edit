@@ -15,9 +15,13 @@ struct Arguments {
     /// Directory to write the site into; created when missing. Re-exporting
     /// into a previous export replaces its pages and keeps other files.
     output: PathBuf,
-    /// Built @fanta/runtime package directory, containing dist/, src/ and site/.
+    /// Export plain web files instead of the runtime site: one SVG per page,
+    /// tokens.css, and a dependency-free HTML+JS viewer. Needs no --runtime.
     #[arg(long)]
-    runtime: PathBuf,
+    plain: bool,
+    /// Built @fanta/runtime package directory, containing dist/, src/ and site/.
+    #[arg(long, required_unless_present = "plain")]
+    runtime: Option<PathBuf>,
     /// Directory of font files that may be published with the site (repeatable).
     #[arg(long = "font-dir")]
     font_directories: Vec<PathBuf>,
@@ -34,6 +38,27 @@ struct Arguments {
 
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
+    if arguments.plain {
+        let report =
+            fanta_site::web::export_web(&arguments.project, Some(&arguments.output))?;
+        println!("Exported plain web files to {}", arguments.output.display());
+        for page in &report.pages {
+            match &page.error {
+                None => println!("  page  {}  {}", page.slug, page.name),
+                Some(error) => eprintln!("warning: page {} was not exported: {error}", page.name),
+            }
+        }
+        for skipped in &report.skipped_variables {
+            eprintln!(
+                "warning: variable {}/{} has no CSS form: {}",
+                skipped.collection, skipped.variable, skipped.reason
+            );
+        }
+        for warning in &report.warnings {
+            eprintln!("warning: {warning}");
+        }
+        return Ok(());
+    }
     let mut substitutions = BTreeMap::new();
     for substitution in &arguments.substitutions {
         let Some((family, replacement)) = fanta_site::parse_substitution(substitution) else {
@@ -41,10 +66,14 @@ fn main() -> Result<()> {
         };
         substitutions.insert(family, replacement);
     }
-    let assets = RuntimeAssets::read(&arguments.runtime).with_context(|| {
+    let runtime = arguments
+        .runtime
+        .as_deref()
+        .context("--runtime is required unless --plain is given")?;
+    let assets = RuntimeAssets::read(runtime).with_context(|| {
         format!(
             "--runtime must point at a built @fanta/runtime package from Fanta-JS (looked in {})",
-            arguments.runtime.display()
+            runtime.display()
         )
     })?;
     let options = SiteOptions {

@@ -37,10 +37,22 @@ import zlib
 from pathlib import Path
 
 PROFILE_DIRECTORY = os.environ.get("FANTA_USER_DATA_DIR", "")
+
+
+def default_data_dir() -> Path:
+    # Mirrors paths::data_dir(): Fanta on macOS/Windows, lowercase fanta
+    # under XDG on Linux.
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Fanta"
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA")
+        return (Path(local) if local else Path.home() / "AppData" / "Local") / "Fanta"
+    data_home = os.environ.get("XDG_DATA_HOME")
+    return (Path(data_home) if data_home else Path.home() / ".local" / "share") / "fanta"
+
+
 DISCOVERY_PATH = (
-    Path(PROFILE_DIRECTORY)
-    if PROFILE_DIRECTORY.strip()
-    else Path.home() / "Library" / "Application Support" / "Fanta"
+    Path(PROFILE_DIRECTORY) if PROFILE_DIRECTORY.strip() else default_data_dir()
 ) / "fanta_live_mcp.json"
 REQUIRED_TOOLS = [
     "get_editor_state",

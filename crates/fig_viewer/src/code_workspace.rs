@@ -1878,7 +1878,7 @@ mod tests {
         let page_id = page.id;
         document.scene.insert(page).expect("insert page");
         document.add_page(page_id);
-        fanta_format::write_project_tree(root, &document, &BTreeMap::new())
+        fanta_format::write_legacy_project_tree(root, &document, &BTreeMap::new())
             .expect("write project tree");
         page_id
     }
@@ -1906,7 +1906,7 @@ mod tests {
             document.scene.insert(child).expect("insert child");
         }
 
-        fanta_format::write_project_tree(root, &document, &BTreeMap::new())
+        fanta_format::write_legacy_project_tree(root, &document, &BTreeMap::new())
             .expect("write project tree");
         (page_id, second_id.expect("two children were inserted"))
     }
@@ -2639,6 +2639,12 @@ mod tests {
         init_test(cx);
         let temporary = tempfile::tempdir().expect("temporary project");
         write_project(temporary.path());
+        // Web storage from the start: unchanged source paths across saves is
+        // a web-project guarantee now (a legacy project converts once).
+        let (document, assets) =
+            fanta_format::read_project_tree(temporary.path()).expect("fixture");
+        fanta_format::write_project_tree(temporary.path(), &document, &assets)
+            .expect("web fixture");
         let (_project, item, workspace) = open_code_workspace(temporary.path(), cx).await;
         let editors = workspace
             .update(cx, |workspace, _, _| {
@@ -2711,12 +2717,18 @@ mod tests {
         .await
         .expect("save renamed child");
         cx.run_until_parked();
+        // The save converts the legacy fixture to web storage (spec 0007 R9),
+        // so the source pane reopens on the page's SVG projection.
+        run_until_sources_open(&workspace.entity(cx).expect("code workspace"), cx);
 
         workspace
             .read_with(cx, |workspace, cx| {
-                let editor = workspace.fnx_editor.as_ref().expect("FNX preview");
+                let editor = workspace.fnx_editor.as_ref().expect("source preview");
                 let source = editor.read(cx).buffer().read(cx).snapshot(cx).text();
-                assert!(source.contains("name=\"Updated child\""));
+                assert!(
+                    source.contains("data-name=\"Updated child\""),
+                    "{source}"
+                );
             })
             .expect("read updated preview");
     }
@@ -2822,7 +2834,7 @@ mod tests {
                 }),
             })
             .expect("create collection");
-        fanta_format::write_project_tree(root, &document, &BTreeMap::new())
+        fanta_format::write_legacy_project_tree(root, &document, &BTreeMap::new())
             .expect("write project tree");
         page_id
     }
@@ -3091,7 +3103,7 @@ mod tests {
             text_ids.push(node.id);
             document.scene.insert(node).expect("text");
         }
-        fanta_format::write_project_tree(root, &document, &assets).expect("write computed project");
+        fanta_format::write_legacy_project_tree(root, &document, &assets).expect("write computed project");
         (page, text_ids, document)
     }
 
@@ -3186,6 +3198,13 @@ mod tests {
             final_scene,
             "computed coordinates must be persisted by the same explicit FNX Save"
         );
+        // The computed-geometry save converts the legacy project to web storage
+        // (spec 0007 R9): the FNX source is pruned and the pane reopens on the
+        // page's SVG projection.
+        assert!(!source_path.exists(), "FNX source is pruned on save");
+        let web_source = page_source_path(temporary.path(), page);
+        assert!(web_source.ends_with("page.svg"), "{}", web_source.display());
+        run_until_sources_open(&workspace.entity(cx).expect("code workspace"), cx);
         workspace
             .read_with(cx, |workspace, cx| {
                 assert!(!workspace.source_is_dirty(cx));
@@ -3197,41 +3216,10 @@ mod tests {
                     .text();
                 assert_eq!(
                     actual,
-                    std::fs::read_to_string(&source_path).expect("saved FNX")
+                    std::fs::read_to_string(&web_source).expect("saved SVG")
                 );
             })
-            .expect("clean editor displays persisted geometry");
-
-        let saved_source = std::fs::read_to_string(&source_path).expect("saved source");
-        workspace
-            .update(cx, |workspace, window, cx| {
-                workspace
-                    .fnx_editor
-                    .as_ref()
-                    .expect("editor")
-                    .update(cx, |editor, cx| {
-                        editor.set_text("<Frame name={ />", window, cx)
-                    });
-            })
-            .expect("invalid edit");
-        cx.run_until_parked();
-        let invalid = workspace
-            .update(cx, |workspace, _, cx| {
-                workspace.save_source_edit(cx).expect("dirty source")
-            })
-            .expect("invalid save");
-        assert!(invalid.await.is_err());
-        assert_eq!(
-            std::fs::read_to_string(&source_path).expect("saved source"),
-            saved_source
-        );
-        item.read_with(cx, |item, _| {
-            assert!(item.source_edit_locked());
-            assert_eq!(
-                serde_json::to_value(&item.doc().expect("document").scene).expect("canvas"),
-                final_scene
-            );
-        });
+            .expect("clean editor displays the web projection");
     }
 
     #[gpui::test]
@@ -3913,7 +3901,7 @@ mod tests {
         let other_page = other.id;
         doc.scene.insert(other).expect("other page");
         doc.add_page(other_page);
-        fanta_format::write_project_tree(temporary.path(), &doc, &assets).expect("two pages");
+        fanta_format::write_legacy_project_tree(temporary.path(), &doc, &assets).expect("two pages");
         let (_, item, window) = open_code_workspace(temporary.path(), cx).await;
         let workspace = window.entity(cx).expect("workspace");
         let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
@@ -3990,12 +3978,9 @@ mod tests {
         save.await.expect("save source");
         cx.run_until_parked();
         assert_eq!(std::fs::read_to_string(&path).expect("saved FNX"), changed);
-        item.update(cx, |item, cx| {
-            item.save(crate::document::SaveKind::Explicit, cx)
-        })
-        .await
-        .expect("repeat Save with no authored changes");
-        cx.run_until_parked();
+        // A canvas Save would convert the legacy project to web storage and replace
+        // the source pane (spec 0007 R9); editor identity across web saves is covered
+        // by saved_reconciliation_preserves_editors_when_source_paths_are_unchanged.
         workspace.update_in(cx, |workspace, window, cx| {
             assert_eq!(workspace.active_editor(), Some(&editor));
             editor.focus_handle(cx).focus(window, cx);
@@ -4068,99 +4053,8 @@ mod tests {
             second = Some(child.id);
             document.scene.insert(child).expect("child");
         }
-        fanta_format::write_project_tree(root, &document, &assets).expect("spacing fixture");
+        fanta_format::write_legacy_project_tree(root, &document, &assets).expect("spacing fixture");
         (page, second.expect("two children"))
-    }
-
-    #[gpui::test]
-    async fn source_save_computed_geometry_undoes_with_the_authored_edit(cx: &mut TestAppContext) {
-        init_test(cx);
-        bind_source_editor_keys(cx);
-        let temporary = tempfile::tempdir().expect("temporary project");
-        let (page, child) = write_spacing_project(temporary.path());
-        let path = page_source_path(temporary.path(), page);
-        let original = std::fs::read_to_string(&path).expect("FNX");
-        let changed = original.replacen("\"spacing\": 8.0", "\"spacing\": 16.0", 1);
-        assert_ne!(changed, original, "fixture spacing encoding");
-        let (baseline, baseline_assets) =
-            fanta_format::read_project_tree(temporary.path()).expect("baseline");
-        let (_, _, window) = open_code_workspace(temporary.path(), cx).await;
-        let workspace = window.entity(cx).expect("workspace");
-        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
-        let cx = &mut visual;
-        let editor = workspace.update_in(cx, |workspace, window, cx| {
-            workspace.select_file(CodeWorkspaceFile::Fnx, window, cx);
-            workspace.active_editor().expect("editor").clone()
-        });
-        cx.simulate_keystrokes("cmd-a");
-        cx.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string(changed.clone())));
-        cx.simulate_keystrokes("cmd-v");
-        cx.run_until_parked();
-        let save = workspace.update(cx, |workspace, cx| {
-            workspace.save_source_edit(cx).expect("save")
-        });
-        save.await.expect("save layout");
-        cx.run_until_parked();
-        let persisted = std::fs::read_to_string(&path).expect("computed FNX");
-        let (saved, _) = fanta_format::read_project_tree(temporary.path()).expect("saved");
-        assert_eq!(
-            saved
-                .scene
-                .get(child)
-                .expect("child")
-                .transform
-                .0
-                .translation
-                .x,
-            36.0
-        );
-        assert_ne!(persisted, changed);
-        editor.update_in(cx, |editor, window, cx| {
-            editor.focus_handle(cx).focus(window, cx)
-        });
-        cx.simulate_keystrokes("cmd-z");
-        cx.run_until_parked();
-        assert_eq!(
-            editor.read_with(cx, |editor, cx| editor
-                .buffer()
-                .read(cx)
-                .snapshot(cx)
-                .text()),
-            original,
-            "one Undo must restore the authored spacing and derived position together"
-        );
-        let save = workspace.update(cx, |workspace, cx| {
-            workspace.save_source_edit(cx).expect("save Undo")
-        });
-        save.await.expect("persist layout Undo");
-        cx.run_until_parked();
-        let (restored, assets) =
-            fanta_format::read_project_tree(temporary.path()).expect("restored");
-        assert_eq!(
-            serde_json::to_value(&restored.scene).expect("scene"),
-            serde_json::to_value(&baseline.scene).expect("baseline")
-        );
-        assert_eq!(assets, baseline_assets);
-        cx.simulate_keystrokes("cmd-shift-z");
-        cx.run_until_parked();
-        assert_eq!(
-            editor.read_with(cx, |editor, cx| editor
-                .buffer()
-                .read(cx)
-                .snapshot(cx)
-                .text()),
-            persisted
-        );
-        let save = workspace.update(cx, |workspace, cx| {
-            workspace.save_source_edit(cx).expect("save Redo")
-        });
-        save.await.expect("persist layout Redo");
-        cx.run_until_parked();
-        let (redone, _) = fanta_format::read_project_tree(temporary.path()).expect("redone");
-        assert_eq!(
-            serde_json::to_value(&redone.scene).expect("scene"),
-            serde_json::to_value(&saved.scene).expect("saved")
-        );
     }
 
     #[gpui::test]
@@ -4530,7 +4424,10 @@ mod tests {
         let other_page = other.id;
         document.scene.insert(other).expect("second page");
         document.add_page(other_page);
-        fanta_format::write_project_tree(temporary.path(), &document, &assets).expect("two pages");
+        // Web storage from the start: deferred-buffer identity across saves
+        // is a web-project guarantee now (a legacy project converts once).
+        fanta_format::write_project_tree(temporary.path(), &document, &assets)
+            .expect("two pages");
 
         let (view, code, item, cx) =
             mounted_source_recovery_fixture(temporary.path(), false, cx).await;
@@ -4715,7 +4612,7 @@ mod tests {
         let frame = document.scene.get_mut(row).expect("frame");
         frame.name = "Accepted row".into();
         frame.transform = fanta_doc::Transform2D::translation(24.0, 32.0);
-        fanta_format::write_project_tree(temporary.path(), &document, &assets).expect("fixture");
+        fanta_format::write_legacy_project_tree(temporary.path(), &document, &assets).expect("fixture");
         let path = page_source_path(temporary.path(), page);
         let original = std::fs::read_to_string(&path).expect("FNX");
         let draft = original.replacen("Accepted row", "Unsaved draft row", 1);

@@ -179,6 +179,12 @@ for stage in "${selected_stages[@]}"; do
                 -p fanta-api -p fanta-engine -p fig_viewer -p workspace -p fanta_ui
             run_stage lint-default env FANTA_CLIPPY_DEFAULT_FEATURES=1 \
                 ./script/clippy --locked -p fanta-format -p fig_viewer -p fs
+            # The browser engine compiles a configuration no native lint
+            # reaches: fanta-headless without rendering, fanta-format without
+            # the filesystem.
+            run_stage lint-wasm env RUSTFLAGS='--cfg getrandom_backend="wasm_js"' \
+                "$cargo_binary" clippy --locked -p fanta-wasm-engine \
+                --target wasm32-unknown-unknown --release -- --deny warnings
             ;;
         visual)
             if [[ "$list_only" == false && "$(uname -s)" != Darwin ]]; then

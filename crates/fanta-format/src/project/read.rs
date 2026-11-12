@@ -14,15 +14,15 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use super::layout::{
     ACTIVE_MODES_JSON, ASSET_LIBRARY_JSON, ASSETS_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR,
     FLOW_START_JSON, FLOWS_JSON, LOOSE_DIR, MASTER_FNX, MASTER_IDS, METADATA_JSON, MOTION_JSON,
     NODES_DIR, PAGE_FNX, PAGE_IDS, PAGE_JSON, PAGES_DIR, PRESENTATION_JSON, SET_JSON, STYLES_JSON,
-    VARIABLES_JSON, id_from_key, is_project_dir, json_key, read_json_file, read_manifest,
-    sorted_entries,
+    VARIABLES_JSON, id_from_key, is_project_dir, json_key, read_json_file_in,
+    read_manifest_with_source_in,
 };
+use super::tree_source::TreeSource;
 
 /// Load a project directory back into a [`Doc`] plus its asset blobs.
 ///
@@ -32,6 +32,49 @@ use super::layout::{
 /// are migrated in JSON space before deserialization.
 pub fn read_project_tree(dir: &Path) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
     read_project_tree_with_source_override(dir, None)
+}
+
+/// [`read_project_tree`], also returning the loader's diagnostics: hand edits
+/// in a web-storage projection that could not be kept (R7). The next save
+/// carries them into `report.json`.
+pub fn read_project_tree_with_warnings(
+    dir: &Path,
+) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>, Vec<String>)> {
+    super::layout::with_project_read_lock(dir, || {
+        let mut warnings = Vec::new();
+        let (doc, assets) = read_project_tree_with_source_override_locked(
+            &TreeSource::Dir,
+            dir,
+            None,
+            None,
+            None,
+            None,
+            Some(&mut warnings),
+        )?;
+        Ok((doc, assets, warnings))
+    })
+}
+
+/// [`read_project_tree_with_warnings`] over an in-memory file set instead of
+/// a directory: keys are the project-relative paths, exactly as
+/// [`emit_web_project_tree`](super::web::emit_web_project_tree) returns them.
+/// The full assembler runs — migrations, legacy FNX branches and the
+/// web-storage hand-edit overlay included — so a hand-edited `page.svg` in
+/// the map wins exactly as it would on disk (spec 0008 R1).
+pub fn read_project_files(
+    files: &BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>, Vec<String>)> {
+    let mut warnings = Vec::new();
+    let (doc, assets) = read_project_tree_with_source_override_locked(
+        &TreeSource::Mem(files),
+        Path::new(""),
+        None,
+        None,
+        None,
+        None,
+        Some(&mut warnings),
+    )?;
+    Ok((doc, assets, warnings))
 }
 
 pub(crate) struct LoadedSourceIdentity {
@@ -49,6 +92,8 @@ pub(crate) struct LoadedProjectEvidence {
     pub(crate) sources: LoadedSourceIdentities,
     pub(crate) files: LoadedFileHashes,
     pub(crate) pages: Vec<NodeId>,
+    /// Loader diagnostics: web-storage hand edits that could not be kept (R7).
+    pub(crate) warnings: Vec<String>,
 }
 
 pub(crate) fn read_project_tree_with_source_identities(
@@ -57,11 +102,13 @@ pub(crate) fn read_project_tree_with_source_identities(
     super::layout::with_project_read_lock(dir, || {
         let mut evidence = LoadedProjectEvidence::default();
         let (doc, assets) = read_project_tree_with_source_override_locked(
+            &TreeSource::Dir,
             dir,
             None,
             None,
             Some(&mut evidence.sources),
             Some(&mut evidence.files),
+            Some(&mut evidence.warnings),
         )?;
         evidence.pages = doc.pages().to_vec();
         Ok((doc, assets, evidence))
@@ -79,7 +126,15 @@ pub(super) fn read_project_tree_with_source_override(
     source_override: Option<&FnxSourceOverride<'_>>,
 ) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
     super::layout::with_project_read_lock(dir, || {
-        read_project_tree_with_source_override_locked(dir, source_override, None, None, None)
+        read_project_tree_with_source_override_locked(
+            &TreeSource::Dir,
+            dir,
+            source_override,
+            None,
+            None,
+            None,
+            None,
+        )
     })
 }
 
@@ -93,31 +148,41 @@ pub(super) fn read_project_tree_with_json_override(
     source_override: &JsonSourceOverride<'_>,
 ) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
     super::layout::with_project_read_lock(dir, || {
-        read_project_tree_with_source_override_locked(dir, None, Some(source_override), None, None)
+        read_project_tree_with_source_override_locked(
+            &TreeSource::Dir,
+            dir,
+            None,
+            Some(source_override),
+            None,
+            None,
+            None,
+        )
     })
 }
 
 fn read_project_json(
+    source: &TreeSource<'_>,
     path: &Path,
     source_override: Option<&JsonSourceOverride<'_>>,
 ) -> Result<Value> {
-    let value = match source_override.filter(|source| source.path == path) {
-        Some(source) => source.value.clone(),
-        None => read_json_file(path)?,
+    let value = match source_override.filter(|override_| override_.path == path) {
+        Some(override_) => override_.value.clone(),
+        None => read_json_file_in(source, path)?,
     };
     validate_project_json_shape(path, &value)?;
     Ok(value)
 }
 
 fn read_project_json_with_hash(
+    source: &TreeSource<'_>,
     path: &Path,
     source_override: Option<&JsonSourceOverride<'_>>,
     capture_hash: bool,
 ) -> Result<(Value, Option<[u8; 32]>)> {
-    if !capture_hash || source_override.is_some_and(|source| source.path == path) {
-        return read_project_json(path, source_override).map(|value| (value, None));
+    if !capture_hash || source_override.is_some_and(|override_| override_.path == path) {
+        return read_project_json(source, path, source_override).map(|value| (value, None));
     }
-    let text = std::fs::read_to_string(path).map_err(|error| {
+    let text = source.read_to_string(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             FormatError::MissingFile {
                 name: path.display().to_string(),
@@ -133,13 +198,14 @@ fn read_project_json_with_hash(
 }
 
 fn read_tracked_project_json(
+    source: &TreeSource<'_>,
     path: &Path,
     fallback: Option<Value>,
     source_override: Option<&JsonSourceOverride<'_>>,
     files: Option<&mut LoadedFileHashes>,
 ) -> Result<Value> {
-    if !path.exists()
-        && source_override.is_none_or(|source| source.path != path)
+    if !source.exists(path)
+        && source_override.is_none_or(|override_| override_.path != path)
         && let Some(value) = fallback
     {
         validate_project_json_shape(path, &value)?;
@@ -148,7 +214,8 @@ fn read_tracked_project_json(
         }
         return Ok(value);
     }
-    let (value, hash) = read_project_json_with_hash(path, source_override, files.is_some())?;
+    let (value, hash) =
+        read_project_json_with_hash(source, path, source_override, files.is_some())?;
     if let Some(files) = files {
         files.insert(path.to_path_buf(), hash);
     }
@@ -172,44 +239,45 @@ pub(super) fn validate_project_json_shape(path: &Path, value: &Value) -> Result<
 }
 
 fn read_project_tree_with_source_override_locked(
+    source: &TreeSource<'_>,
     dir: &Path,
     source_override: Option<&FnxSourceOverride<'_>>,
     json_override: Option<&JsonSourceOverride<'_>>,
     mut source_identities: Option<&mut LoadedSourceIdentities>,
     mut loaded_files: Option<&mut LoadedFileHashes>,
+    warnings: Option<&mut Vec<String>>,
 ) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
-    let manifest =
-        match json_override.filter(|source| source.path == dir.join(super::layout::FANTA_JSON)) {
-            Some(source) => {
-                validate_project_json_shape(source.path, source.value)?;
-                let manifest: super::layout::ProjectManifest =
-                    serde_json::from_value(source.value.clone())?;
-                if manifest.format != super::layout::FORMAT_TAG {
-                    return Err(FormatError::NotAProject {
-                        path: dir.to_path_buf(),
-                    });
-                }
-                if manifest.version > super::layout::PROJECT_VERSION {
-                    return Err(FormatError::UnsupportedProjectVersion {
-                        found: manifest.version,
-                        supported: super::layout::PROJECT_VERSION,
-                    });
-                }
-                manifest
+    let manifest = match json_override
+        .filter(|override_| override_.path == dir.join(super::layout::FANTA_JSON))
+    {
+        Some(override_) => {
+            validate_project_json_shape(override_.path, override_.value)?;
+            let manifest: super::layout::ProjectManifest =
+                serde_json::from_value(override_.value.clone())?;
+            if manifest.format != super::layout::FORMAT_TAG {
+                return Err(FormatError::NotAProject {
+                    path: dir.to_path_buf(),
+                });
             }
-            None => {
-                if let Some(files) = &mut loaded_files {
-                    let (manifest, source) = super::layout::read_manifest_with_source(dir)?;
-                    files.insert(
-                        dir.join(super::layout::FANTA_JSON),
-                        Some(Sha256::digest(source.as_bytes()).into()),
-                    );
-                    manifest
-                } else {
-                    read_manifest(dir)?
-                }
+            if manifest.version > super::layout::PROJECT_VERSION {
+                return Err(FormatError::UnsupportedProjectVersion {
+                    found: manifest.version,
+                    supported: super::layout::PROJECT_VERSION,
+                });
             }
-        };
+            manifest
+        }
+        None => {
+            let (manifest, manifest_source) = read_manifest_with_source_in(source, dir)?;
+            if let Some(files) = &mut loaded_files {
+                files.insert(
+                    dir.join(super::layout::FANTA_JSON),
+                    Some(Sha256::digest(manifest_source.as_bytes()).into()),
+                );
+            }
+            manifest
+        }
+    };
     if manifest.schema_version > SCHEMA_VERSION {
         return Err(FormatError::UnsupportedSchema {
             found: manifest.schema_version,
@@ -235,6 +303,7 @@ fn read_project_tree_with_source_override_locked(
     root.insert(
         "metadata".to_owned(),
         read_tracked_project_json(
+            source,
             &doc_dir.join(METADATA_JSON),
             None,
             json_override,
@@ -244,6 +313,7 @@ fn read_project_tree_with_source_override_locked(
     root.insert(
         "asset_library".to_owned(),
         read_tracked_project_json(
+            source,
             &doc_dir.join(ASSET_LIBRARY_JSON),
             Some(json!({})),
             json_override,
@@ -251,6 +321,7 @@ fn read_project_tree_with_source_override_locked(
         )?,
     );
     let variables = read_tracked_project_json(
+        source,
         &doc_dir.join(VARIABLES_JSON),
         Some(json!({})),
         json_override,
@@ -260,6 +331,7 @@ fn read_project_tree_with_source_override_locked(
     root.insert(
         "styles".to_owned(),
         read_tracked_project_json(
+            source,
             &doc_dir.join(STYLES_JSON),
             Some(json!({})),
             json_override,
@@ -269,6 +341,7 @@ fn read_project_tree_with_source_override_locked(
     root.insert(
         "active_modes".to_owned(),
         read_tracked_project_json(
+            source,
             &doc_dir.join(ACTIVE_MODES_JSON),
             Some(json!({})),
             json_override,
@@ -278,6 +351,7 @@ fn read_project_tree_with_source_override_locked(
     root.insert(
         "motion".to_owned(),
         read_tracked_project_json(
+            source,
             &doc_dir.join(MOTION_JSON),
             Some(json!({})),
             json_override,
@@ -285,6 +359,7 @@ fn read_project_tree_with_source_override_locked(
         )?,
     );
     let flow_start = read_tracked_project_json(
+        source,
         &doc_dir.join(FLOW_START_JSON),
         Some(Value::Null),
         json_override,
@@ -296,6 +371,7 @@ fn read_project_tree_with_source_override_locked(
     root.insert(
         "flows".to_owned(),
         read_tracked_project_json(
+            source,
             &doc_dir.join(FLOWS_JSON),
             Some(json!([])),
             json_override,
@@ -303,6 +379,7 @@ fn read_project_tree_with_source_override_locked(
         )?,
     );
     let presentation = read_tracked_project_json(
+        source,
         &doc_dir.join(PRESENTATION_JSON),
         Some(Value::Null),
         json_override,
@@ -320,7 +397,7 @@ fn read_project_tree_with_source_override_locked(
     // deduped winner set. Names are emitted back only for layout v4+ trees;
     // resolution is accepted on read regardless (like the width/height
     // sugar), so a hand-named reference in an older tree still loads.
-    let component_scan = scan_components(dir, json_override)?;
+    let component_scan = scan_components(source, dir, json_override)?;
     let refs = crate::project::refs_ctx::build_ref_table_json(
         &component_scan.defs,
         &variables,
@@ -332,6 +409,7 @@ fn read_project_tree_with_source_override_locked(
     root.insert(
         "pages".to_owned(),
         read_pages(
+            source,
             dir,
             manifest.version,
             source_override,
@@ -344,6 +422,7 @@ fn read_project_tree_with_source_override_locked(
         )?,
     );
     read_component_masters(
+        source,
         &component_scan,
         manifest.version,
         source_override,
@@ -360,6 +439,25 @@ fn read_project_tree_with_source_override_locked(
             ("sets".to_owned(), component_scan.sets),
         ])),
     );
+    // Web storage: hand edits in the SVG and CSS win over the records (R7).
+    // Diagnostics about edits that could not be kept flow to the caller; the
+    // next save writes them into report.json. A caller with no sink gets the
+    // overlay applied all the same (the sink arrives with T5's session work).
+    if manifest.storage.as_deref() == Some(super::layout::STORAGE_WEB) {
+        let mut overlay_warnings = Vec::new();
+        super::web_read::apply_web_overlay(
+            source,
+            dir,
+            &mut nodes,
+            &variables,
+            &mut pending_layout,
+            &mut overlay_warnings,
+        )?;
+        if let Some(warnings) = warnings {
+            warnings.extend(overlay_warnings);
+        }
+    }
+
     root.insert(
         "scene".to_owned(),
         Value::Object(Map::from_iter([("nodes".to_owned(), Value::Object(nodes))])),
@@ -369,7 +467,7 @@ fn read_project_tree_with_source_override_locked(
     if manifest.schema_version < SCHEMA_VERSION {
         value = migrate(value, manifest.schema_version, SCHEMA_VERSION)?;
     }
-    let assets = read_assets(dir, json_override, loaded_files)?;
+    let assets = read_assets(source, dir, json_override, loaded_files)?;
     fanta_doc::prepare_doc_json(&mut value)
         .map_err(|error| FormatError::InvalidProjectTree(format!("{}: {error}", dir.display())))?;
     // Consume the assembled values so geometry JSON is released as typed
@@ -408,6 +506,7 @@ fn read_project_tree_with_source_override_locked(
     reason = "combined loading adds optional exact-byte evidence to the existing reader context"
 )]
 fn read_pages(
+    source: &TreeSource<'_>,
     dir: &Path,
     version: u32,
     source_override: Option<&FnxSourceOverride<'_>>,
@@ -428,22 +527,23 @@ fn read_pages(
     }
     let pages_dir = dir.join(PAGES_DIR);
     let mut pages: Vec<(u64, String, Value)> = Vec::new();
-    if pages_dir.is_dir() {
+    if source.is_dir(&pages_dir) {
         let mut candidates: Vec<PageDir> = Vec::new();
-        for entry in sorted_entries(&pages_dir)? {
-            if !entry.is_dir() {
+        for entry in source.sorted_entries(&pages_dir)? {
+            if !source.is_dir(&entry) {
                 continue;
             }
             let name = dir_name(&entry)?;
             if name == LOOSE_DIR {
                 // Orphans are kept as per-node JSON (they need not form a tree).
-                read_nodes_into(&entry.join(NODES_DIR), json_override, nodes, pending_layout)?;
+                read_nodes_into(source, &entry.join(NODES_DIR), json_override, nodes, pending_layout)?;
                 continue;
             }
-            if !entry.join(PAGE_JSON).is_file() {
+            if !source.is_file(&entry.join(PAGE_JSON)) {
                 continue;
             }
             let (header, header_hash) = read_project_json_with_hash(
+                source,
                 &entry.join(PAGE_JSON),
                 json_override,
                 loaded_files.is_some(),
@@ -464,7 +564,7 @@ fn read_pages(
                 None => match name
                     .parse::<NodeId>()
                     .ok()
-                    .or_else(|| sidecar_root_id(&entry))
+                    .or_else(|| sidecar_root_id_in(source, &entry))
                 {
                     Some(id) => (id, false),
                     None => {
@@ -493,7 +593,7 @@ fn read_pages(
                 )
             })
             .collect();
-        let winners = select_design_winners(&ranked);
+        let winners = select_design_winners_in(source, &ranked);
         drop(ranked);
         for (index, candidate) in candidates.into_iter().enumerate() {
             if !winners.contains(&index) {
@@ -505,6 +605,7 @@ fn read_pages(
             // A page always has at least its root node, so a missing `.fnx`
             // (with no `nodes/` fallback) in a v2 tree is corruption, not empty.
             let decoded_root = read_design_nodes(
+                source,
                 &candidate.entry,
                 PAGE_FNX,
                 PAGE_IDS,
@@ -585,6 +686,13 @@ fn read_pages(
 pub(super) fn select_design_winners<Id: Ord + Copy>(
     candidates: &[(Id, bool, &Path)],
 ) -> HashSet<usize> {
+    select_design_winners_in(&TreeSource::Dir, candidates)
+}
+
+pub(super) fn select_design_winners_in<Id: Ord + Copy>(
+    source: &TreeSource<'_>,
+    candidates: &[(Id, bool, &Path)],
+) -> HashSet<usize> {
     let mut groups: BTreeMap<Id, Vec<usize>> = BTreeMap::new();
     for (index, (id, _, _)) in candidates.iter().enumerate() {
         groups.entry(*id).or_default().push(index);
@@ -597,7 +705,7 @@ pub(super) fn select_design_winners<Id: Ord + Copy>(
         }
         let best = group.iter().copied().max_by_key(|&index| {
             let (_, id_from_header, dir) = candidates[index];
-            (id_from_header, newest_mtime(dir), std::cmp::Reverse(index))
+            (id_from_header, source.newest_mtime(dir), std::cmp::Reverse(index))
         });
         let Some(best) = best else {
             continue;
@@ -615,21 +723,6 @@ pub(super) fn select_design_winners<Id: Ord + Copy>(
         winners.insert(best);
     }
     winners
-}
-
-/// Newest modification time among the files directly inside `dir` — the
-/// freshness signal for duplicate-dir resolution. Unreadable entries simply
-/// don't contribute; freshness is best-effort, never an error.
-fn newest_mtime(dir: &Path) -> SystemTime {
-    let mut newest = SystemTime::UNIX_EPOCH;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) {
-                newest = newest.max(modified);
-            }
-        }
-    }
-    newest
 }
 
 /// The header half of a `components/` scan: every winning directory's def (the
@@ -655,6 +748,7 @@ struct ComponentScan {
 /// directories contribute neither a def nor nodes — see
 /// [`select_design_winners`].
 fn scan_components(
+    source: &TreeSource<'_>,
     dir: &Path,
     json_override: Option<&JsonSourceOverride<'_>>,
 ) -> Result<ComponentScan> {
@@ -668,20 +762,20 @@ fn scan_components(
     let mut defs = Map::new();
     let mut sets = json!({});
     let mut winner_dirs = Vec::new();
-    if comp_dir.is_dir() {
+    if source.is_dir(&comp_dir) {
         // v5 keeps a variant set's variants inside its folder beside its
         // `set.json`; v4 kept them flat with every set in `sets.json`.
-        let scanned = super::component_dirs::scan_component_dirs(dir)?;
+        let scanned = super::component_dirs::scan_component_dirs_in(source, dir)?;
         let set_files = scanned
             .set_files
             .iter()
-            .map(|path| Ok((path.clone(), read_project_json(path, json_override)?)))
+            .map(|path| Ok((path.clone(), read_project_json(source, path, json_override)?)))
             .collect::<Result<Vec<_>>>()?;
         sets = super::component_dirs::merge_set_files(&set_files)?;
         let mut candidates: Vec<ComponentDir> = Vec::new();
         for entry in scanned.component_dirs {
             let name = dir_name(&entry)?;
-            let def = read_project_json(&entry.join(DEF_JSON), json_override)?;
+            let def = read_project_json(source, &entry.join(DEF_JSON), json_override)?;
             let (id, id_from_header) = match def.get("id").and_then(Value::as_str) {
                 Some(key) => {
                     let id = id_from_key(key).map_err(|e| {
@@ -717,7 +811,7 @@ fn scan_components(
                 )
             })
             .collect();
-        let winners = select_design_winners(&ranked);
+        let winners = select_design_winners_in(source, &ranked);
         drop(ranked);
         for (index, candidate) in candidates.into_iter().enumerate() {
             if !winners.contains(&index) {
@@ -754,6 +848,7 @@ fn scan_components(
     reason = "combined loading adds optional exact-byte evidence to the existing reader context"
 )]
 fn read_component_masters(
+    source: &TreeSource<'_>,
     scan: &ComponentScan,
     version: u32,
     source_override: Option<&FnxSourceOverride<'_>>,
@@ -763,8 +858,11 @@ fn read_component_masters(
     pending_layout: &mut BTreeSet<NodeId>,
     source_identities: Option<&mut LoadedSourceIdentities>,
 ) -> Result<()> {
-    if version < 5 || scan.winner_dirs.len() < 256 {
+    // wasm has no threads; spawn failure there would abort an otherwise
+    // loadable project, so take the serial path outright.
+    if cfg!(target_arch = "wasm32") || version < 5 || scan.winner_dirs.len() < 256 {
         return read_component_masters_serial(
+            source,
             scan,
             version,
             source_override,
@@ -791,6 +889,7 @@ fn read_component_masters(
                         let mut nodes = Map::new();
                         let mut pending = BTreeSet::new();
                         read_component_master(
+                            source,
                             design,
                             version,
                             source_override,
@@ -853,6 +952,7 @@ fn read_component_masters(
     reason = "combined loading adds optional exact-byte evidence to the existing reader context"
 )]
 fn read_component_masters_serial(
+    source: &TreeSource<'_>,
     scan: &ComponentScan,
     version: u32,
     source_override: Option<&FnxSourceOverride<'_>>,
@@ -864,6 +964,7 @@ fn read_component_masters_serial(
 ) -> Result<()> {
     for design in &scan.winner_dirs {
         read_component_master(
+            source,
             design,
             version,
             source_override,
@@ -882,6 +983,7 @@ fn read_component_masters_serial(
     reason = "combined loading adds optional exact-byte evidence to the existing reader context"
 )]
 fn read_component_master(
+    source: &TreeSource<'_>,
     (entry, expected_root): &(PathBuf, Option<NodeId>),
     version: u32,
     source_override: Option<&FnxSourceOverride<'_>>,
@@ -893,6 +995,7 @@ fn read_component_master(
 ) -> Result<()> {
     // A dangling definition can legitimately have no remaining master source.
     let decoded_root = read_design_nodes(
+        source,
         entry,
         MASTER_FNX,
         MASTER_IDS,
@@ -924,6 +1027,7 @@ fn read_component_master(
     reason = "internal plumbing fn; a params struct would only rename the seven call-site facts"
 )]
 fn read_design_nodes(
+    source: &TreeSource<'_>,
     design_dir: &Path,
     fnx_name: &str,
     ids_name: &str,
@@ -938,9 +1042,9 @@ fn read_design_nodes(
 ) -> Result<Option<NodeId>> {
     let fnx_path = design_dir.join(fnx_name);
     let source_override = source_override.filter(|source| source.path == fnx_path);
-    if source_override.is_none() && !fnx_path.is_file() {
+    if source_override.is_none() && !source.is_file(&fnx_path) {
         if let Some(source_identities) = source_identities {
-            let sidecar_hash = match std::fs::read(design_dir.join(ids_name)) {
+            let sidecar_hash = match source.read(&design_dir.join(ids_name)) {
                 Ok(bytes) => Some(Sha256::digest(&bytes).into()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => return Err(error.into()),
@@ -954,14 +1058,55 @@ fn read_design_nodes(
                 },
             );
         }
+        // Web storage (spec 0007): the design's complete records live in one
+        // `nodes.json` beside its SVG; the SVG and CSS are the readable
+        // projection (their parsed fields win from T3's hand-edit contract
+        // onward).
+        let records_path = design_dir.join(super::web::NODES_JSON);
+        if source.is_file(&records_path) {
+            let Value::Object(records) = read_project_json(source, &records_path, json_override)? else {
+                return Err(FormatError::InvalidProjectTree(format!(
+                    "{} must be an object keyed by node id",
+                    records_path.display()
+                )));
+            };
+            // The design root is the one record whose parent lies outside the
+            // record set (a page root has no parent; a component master's
+            // parent is its page).
+            let mut roots = Vec::new();
+            for (key, record) in &records {
+                let id = id_from_key::<NodeId>(key).map_err(|error| {
+                    FormatError::InvalidProjectTree(format!(
+                        "{}: key {key:?}: {error}",
+                        records_path.display()
+                    ))
+                })?;
+                pending_layout.remove(&id);
+                let parent_inside = record
+                    .get("parent")
+                    .and_then(Value::as_str)
+                    .is_some_and(|parent| records.contains_key(parent));
+                if !parent_inside {
+                    roots.push(id);
+                }
+            }
+            for (key, record) in records {
+                nodes.insert(key, record);
+            }
+            return Ok(match roots.as_slice() {
+                [root] => Some(*root),
+                _ => None,
+            });
+        }
+
         // No `.fnx`. A `nodes/` dir means either a v1 tree or a v2 design that
         // fell back to per-node JSON (an un-encodable bucket) — read it either
         // way. With neither file present, a `required` design (a page) in a v2
         // tree is corruption (a dropped `.fnx` from a bad merge/partial write),
         // NOT a silently-empty page that the next save would erase forever.
         let nodes_dir = design_dir.join(NODES_DIR);
-        if nodes_dir.is_dir() {
-            read_nodes_into(&nodes_dir, json_override, nodes, pending_layout)?;
+        if source.is_dir(&nodes_dir) {
+            read_nodes_into(source, &nodes_dir, json_override, nodes, pending_layout)?;
             return Ok(None);
         }
         if required && version >= 2 {
@@ -973,7 +1118,7 @@ fn read_design_nodes(
     }
     let text = match source_override {
         Some(source_override) => std::borrow::Cow::Borrowed(source_override.source),
-        None => std::borrow::Cow::Owned(std::fs::read_to_string(&fnx_path)?),
+        None => std::borrow::Cow::Owned(source.read_to_string(&fnx_path)?),
     };
     let mut root = fanta_fnx::parse_doc(&text).map_err(|error| {
         FormatError::InvalidProjectTree(format!("{}: {error}", fnx_path.display()))
@@ -990,7 +1135,7 @@ fn read_design_nodes(
                 if let Some(source) = json_override.filter(|source| source.path == sidecar_path) {
                     Some(serde_json::to_vec(source.value)?)
                 } else {
-                    match std::fs::read(&sidecar_path) {
+                    match source.read(&sidecar_path) {
                         Ok(bytes) => Some(bytes),
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                         Err(error) => return Err(error.into()),
@@ -1443,15 +1588,16 @@ fn parsed_tree_matches_sidecar(
 /// Read every `<node-id>.json` in `nodes_dir` into the flat scene map, keyed
 /// by the id's serde form. The filename is the id of record.
 fn read_nodes_into(
+    source: &TreeSource<'_>,
     nodes_dir: &Path,
     json_override: Option<&JsonSourceOverride<'_>>,
     nodes: &mut Map<String, Value>,
     pending_layout: &mut BTreeSet<NodeId>,
 ) -> Result<()> {
-    if !nodes_dir.is_dir() {
+    if !source.is_dir(nodes_dir) {
         return Ok(());
     }
-    for path in sorted_entries(nodes_dir)? {
+    for path in source.sorted_entries(nodes_dir)? {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
@@ -1462,7 +1608,7 @@ fn read_nodes_into(
             FormatError::InvalidProjectTree(format!("node file {stem:?} is not a NodeId: {e}"))
         })?;
         pending_layout.remove(&id);
-        nodes.insert(json_key(&id)?, read_project_json(&path, json_override)?);
+        nodes.insert(json_key(&id)?, read_project_json(source, &path, json_override)?);
     }
     Ok(())
 }
@@ -1471,22 +1617,23 @@ fn read_nodes_into(
 /// Family folder and extension are projections only; files whose stem isn't an
 /// id (OS noise like `.DS_Store`) are skipped with a warning.
 fn read_assets(
+    source: &TreeSource<'_>,
     dir: &Path,
     json_override: Option<&JsonSourceOverride<'_>>,
     mut loaded_files: Option<&mut LoadedFileHashes>,
 ) -> Result<BTreeMap<AssetId, Vec<u8>>> {
     let mut assets = BTreeMap::new();
     let assets_dir = dir.join(ASSETS_DIR);
-    if assets_dir.is_dir() {
+    if source.is_dir(&assets_dir) {
         let index_path = assets_dir.join(super::media::ASSET_INDEX_FILE);
-        let index = match json_override.filter(|source| source.path == index_path) {
-            Some(source) => Some(super::media::read_asset_index(&serde_json::to_vec(
-                source.value,
+        let index = match json_override.filter(|override_| override_.path == index_path) {
+            Some(override_) => Some(super::media::read_asset_index(&serde_json::to_vec(
+                override_.value,
             )?)?),
             None => {
-                let bytes = index_path
-                    .is_file()
-                    .then(|| std::fs::read(&index_path))
+                let bytes = source
+                    .is_file(&index_path)
+                    .then(|| source.read(&index_path))
                     .transpose()?;
                 if let Some(files) = &mut loaded_files {
                     files.insert(
@@ -1499,7 +1646,7 @@ fn read_assets(
                     .transpose()?
             }
         };
-        collect_assets(&assets_dir, &mut assets, index.as_ref(), loaded_files)?;
+        collect_assets(source, &assets_dir, &mut assets, index.as_ref(), loaded_files)?;
         if let Some(index) = index {
             index.verify_complete(&assets)?;
         }
@@ -1508,14 +1655,15 @@ fn read_assets(
 }
 
 fn collect_assets(
+    source: &TreeSource<'_>,
     dir: &Path,
     assets: &mut BTreeMap<AssetId, Vec<u8>>,
     index: Option<&super::media::AssetIndex>,
     mut loaded_files: Option<&mut LoadedFileHashes>,
 ) -> Result<()> {
-    for path in sorted_entries(dir)? {
-        if path.is_dir() {
-            collect_assets(&path, assets, index, loaded_files.as_deref_mut())?;
+    for path in source.sorted_entries(dir)? {
+        if source.is_dir(&path) {
+            collect_assets(source, &path, assets, index, loaded_files.as_deref_mut())?;
             continue;
         }
         if path.parent() == Some(dir)
@@ -1532,7 +1680,7 @@ fn collect_assets(
             tracing::warn!(path = %path.display(), "skipping non-asset file in assets/");
             continue;
         };
-        let bytes = std::fs::read(&path)?;
+        let bytes = source.read(&path)?;
         if assets.contains_key(&id) {
             return Err(FormatError::InvalidProjectTree(format!(
                 "duplicate asset id {id} at {}",
@@ -1601,7 +1749,12 @@ pub fn page_id_of_dir(design_dir: &Path) -> Option<NodeId> {
 /// entry IS the design root) — the identity of last resort when a hand-edited
 /// `page.json` dropped the `id` and the dir is a v3 slug.
 fn sidecar_root_id(design_dir: &Path) -> Option<NodeId> {
-    let sidecar: fanta_fnx::FnxSidecar = std::fs::read_to_string(design_dir.join(PAGE_IDS))
+    sidecar_root_id_in(&TreeSource::Dir, design_dir)
+}
+
+fn sidecar_root_id_in(source: &TreeSource<'_>, design_dir: &Path) -> Option<NodeId> {
+    let sidecar: fanta_fnx::FnxSidecar = source
+        .read_to_string(&design_dir.join(PAGE_IDS))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())?;
     let root = sidecar.ids.first()?;
@@ -1626,6 +1779,7 @@ pub fn component_id_of_dir(design_dir: &Path) -> Option<ComponentId> {
 
 fn locate_design_source<Id: Copy + PartialEq>(
     designs_dir: &Path,
+    web_name: &str,
     fnx_name: &str,
     target: Id,
     id_of_dir: impl Fn(&Path) -> Option<Id>,
@@ -1637,38 +1791,45 @@ fn locate_design_source<Id: Copy + PartialEq>(
             continue;
         }
         if id_of_dir(&design_dir) == Some(target) {
-            let fnx_path = design_dir.join(fnx_name);
-            if fnx_path.is_file() {
-                return Some(fnx_path);
+            // Web storage first (spec 0007): a converted project keeps its
+            // legacy layout but its readable source is the SVG projection.
+            for name in [web_name, fnx_name] {
+                let path = design_dir.join(name);
+                if path.is_file() {
+                    return Some(path);
+                }
             }
         }
     }
     None
 }
 
-/// Find the `page.fnx` source of `page` under `project_root`, whatever the
-/// page's directory is named (v3 slug or v2 id). `None` when the page has no
-/// source file on disk.
+/// Find the readable source of `page` under `project_root` — `page.svg` in
+/// web storage, else the legacy `page.fnx` — whatever the page's directory is
+/// named (v3 slug or v2 id). `None` when the page has no source file on disk.
 pub fn locate_page_source(project_root: &Path, page: NodeId) -> Option<PathBuf> {
     locate_design_source(
         &project_root.join(PAGES_DIR),
+        crate::project::web::PAGE_SVG,
         PAGE_FNX,
         page,
         page_id_of_dir,
     )
 }
 
-/// Find the `master.fnx` source of `component` under `project_root`, whatever
-/// the component's directory is named (v3 slug or v2 id), standalone or a
-/// variant inside its set's folder (v5).
+/// Find the readable source of `component` — `master.svg` in web storage,
+/// else the legacy `master.fnx` — whatever the component's directory is named
+/// (v3 slug or v2 id), standalone or a variant inside its set's folder (v5).
 pub fn locate_master_source(project_root: &Path, component: ComponentId) -> Option<PathBuf> {
-    super::component_dirs::scan_component_dirs(project_root)
+    let dir = super::component_dirs::scan_component_dirs(project_root)
         .ok()?
         .component_dirs
         .into_iter()
-        .find(|dir| component_id_of_dir(dir) == Some(component))
-        .map(|dir| dir.join(MASTER_FNX))
-        .filter(|path| path.is_file())
+        .find(|dir| component_id_of_dir(dir) == Some(component))?;
+    [crate::project::web::MASTER_SVG, MASTER_FNX]
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
 }
 
 /// Resolve which project and design a `.fnx` source path belongs to.
@@ -1682,8 +1843,10 @@ pub fn page_scope_of_source(path: &Path) -> Option<(PathBuf, ScopedDesign)> {
     let file_name = path.file_name()?.to_str()?;
     let design_dir = path.parent()?;
     let mut designs_dir = design_dir.parent()?;
+    let page_source = file_name == PAGE_FNX || file_name == crate::project::web::PAGE_SVG;
+    let master_source = file_name == MASTER_FNX || file_name == crate::project::web::MASTER_SVG;
     // A variant's master sits one folder deeper, in its set's folder (v5).
-    if file_name == MASTER_FNX
+    if master_source
         && designs_dir.join(SET_JSON).is_file()
         && let Some(components) = designs_dir.parent()
         && components
@@ -1694,14 +1857,12 @@ pub fn page_scope_of_source(path: &Path) -> Option<(PathBuf, ScopedDesign)> {
     }
     let designs_dir_name = designs_dir.file_name()?.to_str()?;
     let project_root = designs_dir.parent()?;
-    let design = match (designs_dir_name, file_name) {
-        (n, f) if n == PAGES_DIR && f == PAGE_FNX => {
-            ScopedDesign::Page(page_id_of_dir(design_dir)?)
-        }
-        (n, f) if n == COMPONENTS_DIR && f == MASTER_FNX => {
-            ScopedDesign::Component(component_id_of_dir(design_dir)?)
-        }
-        _ => return None,
+    let design = if designs_dir_name == PAGES_DIR && page_source {
+        ScopedDesign::Page(page_id_of_dir(design_dir)?)
+    } else if designs_dir_name == COMPONENTS_DIR && master_source {
+        ScopedDesign::Component(component_id_of_dir(design_dir)?)
+    } else {
+        return None;
     };
     if !is_project_dir(project_root) {
         return None;
@@ -1810,6 +1971,7 @@ mod tests {
         let mut serial_nodes = initial_nodes.clone();
         let mut serial_pending = initial_pending.clone();
         read_component_masters_serial(
+            &TreeSource::Dir,
             &scan,
             5,
             Some(&source_override),
@@ -1822,6 +1984,7 @@ mod tests {
         let mut parallel_nodes = initial_nodes;
         let mut parallel_pending = initial_pending;
         read_component_masters(
+            &TreeSource::Dir,
             &scan,
             5,
             Some(&source_override),
@@ -1889,6 +2052,7 @@ mod tests {
         }
         let refs = fanta_fnx::RefTable::new(true);
         let expected = read_component_masters_serial(
+            &TreeSource::Dir,
             &scan,
             5,
             None,
@@ -1903,7 +2067,7 @@ mod tests {
         let mut nodes = Map::new();
         let mut pending = BTreeSet::new();
         let actual =
-            read_component_masters(&scan, 5, None, None, &refs, &mut nodes, &mut pending, None)
+            read_component_masters(&TreeSource::Dir, &scan, 5, None, None, &refs, &mut nodes, &mut pending, None)
                 .expect_err("invalid parallel source")
                 .to_string();
         assert_eq!(actual, expected);
@@ -2061,6 +2225,7 @@ mod tests {
             let mut pending = BTreeSet::new();
             let mut identities = LoadedSourceIdentities::new();
             let root = read_design_nodes(
+                &TreeSource::Dir,
                 directory.path(),
                 PAGE_FNX,
                 PAGE_IDS,
@@ -2111,6 +2276,7 @@ mod tests {
         };
         assert_eq!(
             read_design_nodes(
+                &TreeSource::Dir,
                 directory.path(),
                 PAGE_FNX,
                 PAGE_IDS,
@@ -2126,6 +2292,7 @@ mod tests {
             Some(page)
         );
         let error = read_design_nodes(
+            &TreeSource::Dir,
             directory.path(),
             PAGE_FNX,
             PAGE_IDS,
@@ -2206,7 +2373,7 @@ mod tests {
         assert!(report.removed.is_empty(), "{:?}", report.removed);
 
         let manifest_path = directory.path().join(super::super::layout::FANTA_JSON);
-        let mut manifest = read_json_file(&manifest_path)?;
+        let mut manifest = read_json_file_in(&TreeSource::Dir, &manifest_path)?;
         *manifest.get_mut("schema_version").ok_or("missing schema")? = 2.into();
         let (migrated, migrated_assets) = read_project_tree_with_json_override(
             directory.path(),
@@ -2252,7 +2419,7 @@ mod tests {
             other => return Err(format!("unexpected malformed metadata result: {other:?}").into()),
         }
         let manifest_path = directory.path().join(super::super::layout::FANTA_JSON);
-        let mut manifest = read_json_file(&manifest_path)?;
+        let mut manifest = read_json_file_in(&TreeSource::Dir, &manifest_path)?;
         *manifest.get_mut("schema_version").ok_or("missing schema")? = (SCHEMA_VERSION + 1).into();
         assert!(matches!(
             read_project_tree_with_json_override(
@@ -2276,7 +2443,7 @@ mod tests {
             .scene
             .insert(CanvasNode::new(NodeData::Group(GroupNode::default())))?;
         doc.add_page(page);
-        crate::write_project_tree(directory.path(), &doc, &BTreeMap::new())?;
+        crate::write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new())?;
         let source_path = crate::locate_page_source(directory.path(), page).ok_or("page source")?;
         let sidecar_path = source_path.with_file_name(PAGE_IDS);
         let mut sidecar: fanta_fnx::FnxSidecar =

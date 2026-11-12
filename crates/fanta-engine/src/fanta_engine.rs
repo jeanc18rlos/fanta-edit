@@ -790,7 +790,7 @@ mod tests {
             .as_array()
             .expect("files")
             .iter()
-            .find(|file| file["path"] == "pages/home/page.fnx")
+            .find(|file| file["path"] == "pages/home/nodes.json")
             .expect("the commented page changed");
         assert_eq!(page_file["status"], "modified");
         let source = base64::engine::general_purpose::STANDARD
@@ -860,7 +860,7 @@ mod tests {
                 file["status"] == "added"
                     && file["path"]
                         .as_str()
-                        .is_some_and(|path| path.ends_with("/page.fnx"))
+                        .is_some_and(|path| path.ends_with("/page.svg"))
             })
             .expect("the created page is a new source");
         let source = base64::engine::general_purpose::STANDARD
@@ -969,7 +969,7 @@ mod tests {
             .find(|file| {
                 file["path"]
                     .as_str()
-                    .is_some_and(|path| path.ends_with("/page.fnx"))
+                    .is_some_and(|path| path.ends_with("/page.svg"))
             })
             .and_then(|file| file["content_b64"].as_str())
             .map(|content| {
