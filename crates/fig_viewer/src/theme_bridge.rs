@@ -194,7 +194,7 @@ mod tests {
             Theme::global_mut(cx).colors.popover = stale;
 
             // `reload_theme` swaps the global directly, no settings write.
-            theme::GlobalTheme::update_theme(cx, fanta.clone());
+            theme::GlobalTheme::update_theme(cx, fanta);
         });
         cx.update(|cx| {
             let fanta = theme::ActiveTheme::theme(cx).clone();
