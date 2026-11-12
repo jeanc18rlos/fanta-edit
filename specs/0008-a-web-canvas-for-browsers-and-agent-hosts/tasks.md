@@ -28,7 +28,7 @@ request when it merges.
 - [ ] **T6.** Live-app attach: when the project is open in the desktop
   app, canvas hosts route edits through the live MCP server instead of
   writing files (R6). Verify: A5.
-- [ ] **T7.** Headless MCP server (R7): serve the live app's tool
+- [x] **T7.** ([#195](https://github.com/jeanc18rlos/fanta-edit/pull/195)) Headless MCP server (R7): serve the live app's tool
   vocabulary over MCP stdio against a project directory using
   `fanta-headless` (load, apply, save, `render_png` screenshots); the
   plugin bridge and the Codex config fall back to it when no live app is
