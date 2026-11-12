@@ -24,7 +24,7 @@ request when it merges.
 - [x] **T6.** ([#212](https://github.com/jeanc18rlos/fanta-edit/pull/212)) Automatic check: the editor runs it after an external change
   and shows the result; the `check_project` tool in the live and headless
   MCP servers (R5). Verify: A5, A6, and the `design_surface` sync checklist.
-- [ ] **T7.** Repair skill in the plugin and the seeded project guide; the
+- [x] **T7.** ([#213](https://github.com/jeanc18rlos/fanta-edit/pull/213)) Repair skill in the plugin and the seeded project guide; the
   in-app agent's proposal shown as a diff (R8). Verify: A7, and the
   seed-upgrade test with the replaced guide's hash.
 - [ ] **T8.** Publish the format's code list, the checker binary as a
