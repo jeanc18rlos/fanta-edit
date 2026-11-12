@@ -147,6 +147,19 @@ impl History {
 
 ## Changes during implementation
 
+- **T7.** The repair skill is one file,
+  `examples/claude-plugin/skills/fanta-repair/SKILL.md`, compiled into the
+  app as a built-in skill as well, so the plugin and the in-app agent
+  cannot drift. The seeded project guide carries the short form and names
+  the skill.
+- **T7.** No new code shows the in-app proposal: the agent repairs by
+  editing files, and file edits already go through the agent's edit review.
+- **T7.** The corpus folders carry no history, so the four deletion cases
+  are repairable only with a snapshot. The A7 run gave them one.
+- **T7.** A7 holds per design, not per file: `ref.missing_token` and
+  `edit.not_kept` name the design's SVG while the repair is in the
+  stylesheet beside it. The skill allows exactly that.
+
 - **T6.** The editor shows the check's result as a notice that stays until
   dismissed (counts and the first finding), not as a banner with a list:
   the full list is one `fanta-check` or `check_project` call away, and a

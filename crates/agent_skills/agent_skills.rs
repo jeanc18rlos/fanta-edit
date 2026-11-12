@@ -702,6 +702,9 @@ const FANTA_DESIGN_SKILL_CONTENT: &str = include_str!("builtin/fanta-design/SKIL
 
 /// Content of the built-in `fanta-media` SKILL.md, embedded at compile time.
 const FANTA_MEDIA_SKILL_CONTENT: &str = include_str!("builtin/fanta-media/SKILL.md");
+// One text for the Claude and Codex plugin and for the built-in agent.
+const FANTA_REPAIR_SKILL_CONTENT: &str =
+    include_str!("../../examples/claude-plugin/skills/fanta-repair/SKILL.md");
 
 /// Returns the set of skills that are compiled into the Fanta binary.
 pub fn builtin_skills() -> Vec<Skill> {
@@ -742,6 +745,7 @@ const BUILTIN_SKILL_ENTRIES: &[(&str, &str)] = &[
     ("create-skill", CREATE_SKILL_CONTENT),
     ("fanta-design", FANTA_DESIGN_SKILL_CONTENT),
     ("fanta-media", FANTA_MEDIA_SKILL_CONTENT),
+    ("fanta-repair", FANTA_REPAIR_SKILL_CONTENT),
 ];
 
 /// Look up the full embedded content of a built-in skill by its

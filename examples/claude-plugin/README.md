@@ -66,7 +66,9 @@ stdio bytes straight through; when no live server is up it serves the
 project headlessly with `fanta-mcp` (the same 15 tools, built with
 `cargo build -p fanta-mcp`, no app needed), and only launches the app
 when no headless server is available either. The bundled `fanta-canvas`
-skill teaches the agent the edit loop. Linux and macOS only for now.
+skill teaches the agent the edit loop, and `fanta-repair` how to clear the
+findings `check_project` reports after files were changed outside the app.
+Linux and macOS only for now.
 
 Codex users can skip the bridge's app paths entirely: point
 `[mcp_servers.fanta]` at `fanta-mcp <project-dir>` for a headless-only
