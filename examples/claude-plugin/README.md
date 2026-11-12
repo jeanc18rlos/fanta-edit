@@ -35,13 +35,20 @@ autosaves into the project's SVG/CSS/JSON sources as a git diff.
 The app advertises its live MCP server (a Unix socket speaking
 newline-delimited JSON-RPC) in `<data-dir>/fanta_live_mcp.json`.
 [`fanta-bridge.py`](fanta-bridge.py) attaches to that socket and pumps MCP
-stdio bytes straight through; when no live server is up it launches the
-app and waits for the discovery file. The bundled `fanta-canvas` skill
-teaches the agent the edit loop. Linux and macOS only for now.
+stdio bytes straight through; when no live server is up it serves the
+project headlessly with `fanta-mcp` (the same 14 tools, built with
+`cargo build -p fanta-mcp`, no app needed), and only launches the app
+when no headless server is available either. The bundled `fanta-canvas`
+skill teaches the agent the edit loop. Linux and macOS only for now.
+
+Codex users can skip the bridge's app paths entirely: point
+`[mcp_servers.fanta]` at `fanta-mcp <project-dir>` for a headless-only
+setup.
 
 | Variable | Meaning |
 | --- | --- |
 | `FANTA_BIN` | the fanta binary for launching; default is `fanta` on `PATH` |
-| `FANTA_PROJECT` | project directory to open when the bridge launches the app |
+| `FANTA_MCP_BIN` | the headless server; default is `fanta-mcp` on `PATH` |
+| `FANTA_PROJECT` | the project directory; default is the working directory when it holds a `fanta.json` |
 | `FANTA_USER_DATA_DIR` | isolated profile, used to find the discovery file |
 | `FANTA_LAUNCH_TIMEOUT` | seconds to wait for the live server (default 60) |

@@ -4,12 +4,16 @@
 The running app advertises its live MCP server (a Unix socket speaking
 newline-delimited JSON-RPC, the same framing as MCP stdio) in
 `<data-dir>/fanta_live_mcp.json`. This bridge attaches to it and pumps
-bytes both ways; when no live server is up it launches the app first.
-Attaching needs no Fanta binary at all — only launching does.
+bytes both ways; when no live server is up it serves the project headlessly
+with `fanta-mcp` (the same 14 tools, no app), and only launches the app when
+no headless server is available either. Attaching needs no Fanta binary at
+all — only the fallbacks do.
 
 Configuration, all optional:
     FANTA_BIN            the fanta binary for launching (default: `fanta` on PATH)
-    FANTA_PROJECT        a project directory to open when launching
+    FANTA_MCP_BIN        the headless server (default: `fanta-mcp` on PATH)
+    FANTA_PROJECT        the project directory (default: the working directory,
+                         when it holds a fanta.json)
     FANTA_USER_DATA_DIR  isolated profile, used to find the discovery file
     FANTA_LAUNCH_TIMEOUT seconds to wait for the live server (default 60)
 
@@ -54,12 +58,23 @@ def live_socket_path(discovery: Path):
     return path
 
 
+def headless_server():
+    binary = os.environ.get("FANTA_MCP_BIN", "").strip() or shutil.which("fanta-mcp")
+    if not binary or not Path(binary).exists():
+        return None
+    project = os.environ.get("FANTA_PROJECT", "").strip() or os.getcwd()
+    if not (Path(project) / "fanta.json").exists():
+        return None
+    return [binary, project]
+
+
 def launch_app(discovery: Path):
     fanta = os.environ.get("FANTA_BIN", "").strip() or shutil.which("fanta")
     if not fanta or not Path(fanta).exists():
         print(
-            "fanta-bridge: no running Fanta app and no binary to launch one; "
-            "start the app, or set FANTA_BIN (or put `fanta` on PATH)",
+            "fanta-bridge: no running Fanta app, no `fanta-mcp` for headless "
+            "serving, and no binary to launch the app; start the app, or set "
+            "FANTA_MCP_BIN or FANTA_BIN (or put one on PATH)",
             file=sys.stderr,
         )
         return None
@@ -104,7 +119,13 @@ def main() -> int:
         return 2
 
     discovery = data_dir() / "fanta_live_mcp.json"
-    path = live_socket_path(discovery) or launch_app(discovery)
+    path = live_socket_path(discovery)
+    if path is None:
+        headless = headless_server()
+        if headless is not None:
+            # Replaces the bridge: MCP stdio flows straight to fanta-mcp.
+            os.execv(headless[0], headless)
+        path = launch_app(discovery)
     if path is None:
         return 2
 
