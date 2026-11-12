@@ -35,6 +35,7 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 - Derive macOS video duration from native playback preparation. Raw MP4 track duration can include samples an edit list excludes. (#4)
 - A project folder that can be empty, such as `assets/`, may be missing: git does not track empty folders, so a cloned project without images has none. Treat `NotFound` from listing it as empty. A bare `read_dir(...)?` failed every save, autosave included, with "No such file or directory". (#173)
 - Ingest and roll back images through `document::AssetStores`, never the same-named `fanta_headless::assets::AssetStores` it wraps. Only the wrapper keeps the asset panel's GPUI thumbnail cache in step, so the headless store alone leaves new images without thumbnails and removed ones with stale ones. (#160)
+- The web writer checks nothing on disk, so any explicit save made during a conflict replaces the external edit and clears the conflict. The pane's Overwrite answer relies on that, and `autosave_allowed` keeps autosave off while `has_conflict()` holds. Agent tools and the code workspace also save explicitly, so they overwrite a conflicting external edit unless they check `has_conflict()` first. (#177)
 
 ## Templates
 

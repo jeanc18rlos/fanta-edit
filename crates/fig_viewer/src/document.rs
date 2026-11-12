@@ -7778,6 +7778,46 @@ mod tests {
         assert_eq!(page.opacity, 0.5.into());
     }
 
+    /// The pane's Overwrite answer to a conflict is a plain explicit save.
+    #[gpui::test]
+    async fn overwrite_resolves_a_conflict_with_an_external_edit(cx: &mut TestAppContext) {
+        let (directory, item, mut external, page) = reload_queue_fixture(cx).await;
+        let original_name = external.scene.get(page).expect("page").name.clone();
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetOpacity {
+                    id: page,
+                    old: 1.0.into(),
+                    new: 0.5.into(),
+                },
+                cx,
+            )
+        })
+        .expect("unsaved canvas edit");
+        let agent_page = external.scene.get_mut(page).expect("page");
+        agent_page.opacity = 0.25.into();
+        agent_page.name = "Renamed by an agent".into();
+        write_project(directory.path(), &external, &BTreeMap::new()).expect("external edit");
+        item.update(cx, |item, cx| item.schedule_merge(cx));
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 2);
+        cx.run_until_parked();
+        assert!(item.read_with(cx, |item, _| item.has_conflict()));
+
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("Overwrite writes the canvas");
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert!(!item.has_conflict());
+            assert!(!item.is_dirty());
+        });
+        let (reopened, _) =
+            fanta_format::read_project_tree(directory.path()).expect("reopen overwrite");
+        let page = reopened.scene.get(page).expect("page");
+        assert_eq!(page.opacity, 0.5.into());
+        assert_eq!(page.name, original_name);
+    }
+
     #[test]
     fn project_dir_avoids_a_non_project_collision_but_reuses_a_project() {
         let dir = tempfile::tempdir().unwrap();
