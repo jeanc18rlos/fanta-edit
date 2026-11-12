@@ -13,6 +13,10 @@ export type CanvasView = {
   project?: string
   frame?: CanvasFrame
   pages: CanvasPage[]
+  /** The current page's SVG with its stylesheets inlined, for surfaces
+   * that draw vectors instead of the PNG frame (the desktop app). */
+  svg?: string
+  svgTooLarge?: boolean
 }
 
 declare module 'claude-code' {
