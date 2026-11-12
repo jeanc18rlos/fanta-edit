@@ -1,12 +1,31 @@
 {
   "name": "fanta-canvas",
-  "description": "Fanta's live design tools in Claude Code: inspect and edit the running app's open document, screenshot the canvas, and review every change as a git diff.",
-  "version": "0.1.0",
-  "author": { "name": "Fanta" },
+  "description": "Fanta's live design tools in Claude Code: inspect and edit the running app's open document, screenshot the canvas, review every change as a git diff, and watch the page in a live canvas pane.",
+  "version": "0.2.0",
+  "author": {
+    "name": "Fanta"
+  },
+  "types": "./types/index.d.ts",
   "mcpServers": {
     "fanta": {
       "command": "python3",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/fanta-bridge.py"]
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/fanta-bridge.py"
+      ]
+    }
+  },
+  "userConfig": {
+    "project": {
+      "type": "string",
+      "default": "",
+      "description": "Fanta project directory for the canvas pane (default: find fanta.json at the session root or one level down)",
+      "title": "Project directory"
+    },
+    "mcpBinary": {
+      "type": "string",
+      "default": "",
+      "description": "Path to the fanta-mcp binary (default: $FANTA_MCP_BIN, then fanta-mcp on PATH)",
+      "title": "fanta-mcp binary"
     }
   }
 }

@@ -30,6 +30,19 @@ With the app open on a project, ask Claude to, for example, "add a
 rectangle named hello to the open Fanta page and screenshot it". The edit
 autosaves into the project's SVG/CSS/JSON sources as a git diff.
 
+## The canvas pane
+
+`/fanta-canvas` opens a pane beside the chat showing the current page as
+PNG frames, re-rendered whenever the project changes on disk — agent edits
+appear as they land (spec 0008 T4). It runs `fanta-mcp --frames` against
+the project (found via `fanta.json` at the session root or one level down;
+override with the plugin's "Project directory" setting) and needs no
+running app. Build the binary once with `cargo build -p fanta-mcp`, then
+put it on PATH, export `FANTA_MCP_BIN`, or set the plugin's "fanta-mcp
+binary" setting. Terminals without image support (anything but kitty or
+Ghostty; tmux needs passthrough) draw the frame's description instead; the
+interactive desktop canvas is T5.
+
 ## How it works
 
 The app advertises its live MCP server (a Unix socket speaking
