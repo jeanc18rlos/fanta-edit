@@ -71,6 +71,10 @@ pub enum FormatError {
     /// fails to reassemble from its parts.
     #[error("invalid project tree: {0}")]
     InvalidProjectTree(String),
+
+    /// The snapshot store could not record, list or restore (spec 0009 R6).
+    #[error("snapshot store: {0}")]
+    Snapshot(String),
 }
 
 /// Result alias used throughout the public API.

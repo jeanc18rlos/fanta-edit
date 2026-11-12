@@ -51,6 +51,7 @@ pub fn read_project_tree_with_warnings(
             None,
             None,
             Some(&mut warnings),
+            None,
         )?;
         Ok((doc, assets, warnings))
     })
@@ -74,6 +75,7 @@ pub fn read_project_files(
         None,
         None,
         Some(&mut warnings),
+        None,
     )?;
     Ok((doc, assets, warnings))
 }
@@ -95,6 +97,9 @@ pub(crate) struct LoadedProjectEvidence {
     pub(crate) pages: Vec<NodeId>,
     /// Loader diagnostics: web-storage hand edits that could not be kept (R7).
     pub(crate) warnings: Vec<SourceDiagnostic>,
+    /// Design directories left out because a file in them does not parse
+    /// (spec 0009 R11). The session index skips the same ones.
+    pub(crate) unavailable: BTreeSet<PathBuf>,
 }
 
 pub(crate) fn read_project_tree_with_source_identities(
@@ -102,6 +107,14 @@ pub(crate) fn read_project_tree_with_source_identities(
 ) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>, LoadedProjectEvidence)> {
     super::layout::with_project_read_lock(dir, || {
         let mut evidence = LoadedProjectEvidence::default();
+        #[cfg(feature = "native")]
+        let unavailable = {
+            let (unavailable, findings) = super::check::unparsable_designs(dir)?;
+            evidence.warnings = findings;
+            unavailable
+        };
+        #[cfg(not(feature = "native"))]
+        let unavailable = BTreeSet::new();
         let (doc, assets) = read_project_tree_with_source_override_locked(
             &TreeSource::Dir,
             dir,
@@ -110,8 +123,10 @@ pub(crate) fn read_project_tree_with_source_identities(
             Some(&mut evidence.sources),
             Some(&mut evidence.files),
             Some(&mut evidence.warnings),
+            Some(&unavailable),
         )?;
         evidence.pages = doc.pages().to_vec();
+        evidence.unavailable = unavailable;
         Ok((doc, assets, evidence))
     })
 }
@@ -135,6 +150,7 @@ pub(super) fn read_project_tree_with_source_override(
             None,
             None,
             None,
+            None,
         )
     })
 }
@@ -154,6 +170,7 @@ pub(super) fn read_project_tree_with_json_override(
             dir,
             None,
             Some(source_override),
+            None,
             None,
             None,
             None,
@@ -246,8 +263,14 @@ fn read_project_tree_with_source_override_locked(
     json_override: Option<&JsonSourceOverride<'_>>,
     mut source_identities: Option<&mut LoadedSourceIdentities>,
     mut loaded_files: Option<&mut LoadedFileHashes>,
-    warnings: Option<&mut Vec<SourceDiagnostic>>,
+    mut warnings: Option<&mut Vec<SourceDiagnostic>>,
+    // `Some` for the collecting load (spec 0009 R11): the design directories
+    // to leave out of the document. A listed asset whose file is gone is then
+    // a finding and not a failed open.
+    collecting: Option<&BTreeSet<PathBuf>>,
 ) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
+    let none_unavailable = BTreeSet::new();
+    let unavailable = collecting.unwrap_or(&none_unavailable);
     let manifest = match json_override
         .filter(|override_| override_.path == dir.join(super::layout::FANTA_JSON))
     {
@@ -398,7 +421,7 @@ fn read_project_tree_with_source_override_locked(
     // deduped winner set. Names are emitted back only for layout v4+ trees;
     // resolution is accepted on read regardless (like the width/height
     // sugar), so a hand-named reference in an older tree still loads.
-    let component_scan = scan_components(source, dir, json_override)?;
+    let component_scan = scan_components(source, dir, json_override, unavailable)?;
     let refs = crate::project::refs_ctx::build_ref_table_json(
         &component_scan.defs,
         &variables,
@@ -420,6 +443,7 @@ fn read_project_tree_with_source_override_locked(
             &mut pending_layout,
             source_identities.as_deref_mut(),
             loaded_files.as_deref_mut(),
+            unavailable,
         )?,
     );
     read_component_masters(
@@ -453,8 +477,9 @@ fn read_project_tree_with_source_override_locked(
             &variables,
             &mut pending_layout,
             &mut overlay_warnings,
+            unavailable,
         )?;
-        if let Some(warnings) = warnings {
+        if let Some(warnings) = warnings.as_deref_mut() {
             warnings.extend(overlay_warnings);
         }
     }
@@ -468,7 +493,13 @@ fn read_project_tree_with_source_override_locked(
     if manifest.schema_version < SCHEMA_VERSION {
         value = migrate(value, manifest.schema_version, SCHEMA_VERSION)?;
     }
-    let assets = read_assets(source, dir, json_override, loaded_files)?;
+    let assets = read_assets(
+        source,
+        dir,
+        json_override,
+        loaded_files,
+        collecting.and(warnings),
+    )?;
     fanta_doc::prepare_doc_json(&mut value)
         .map_err(|error| FormatError::InvalidProjectTree(format!("{}: {error}", dir.display())))?;
     // Consume the assembled values so geometry JSON is released as typed
@@ -517,6 +548,7 @@ fn read_pages(
     pending_layout: &mut BTreeSet<NodeId>,
     mut source_identities: Option<&mut LoadedSourceIdentities>,
     mut loaded_files: Option<&mut LoadedFileHashes>,
+    unavailable: &BTreeSet<PathBuf>,
 ) -> Result<Value> {
     struct PageDir {
         id: NodeId,
@@ -540,7 +572,7 @@ fn read_pages(
                 read_nodes_into(source, &entry.join(NODES_DIR), json_override, nodes, pending_layout)?;
                 continue;
             }
-            if !source.is_file(&entry.join(PAGE_JSON)) {
+            if !source.is_file(&entry.join(PAGE_JSON)) || unavailable.contains(&entry) {
                 continue;
             }
             let (header, header_hash) = read_project_json_with_hash(
@@ -752,6 +784,7 @@ fn scan_components(
     source: &TreeSource<'_>,
     dir: &Path,
     json_override: Option<&JsonSourceOverride<'_>>,
+    unavailable: &BTreeSet<PathBuf>,
 ) -> Result<ComponentScan> {
     struct ComponentDir {
         id: ComponentId,
@@ -775,6 +808,9 @@ fn scan_components(
         sets = super::component_dirs::merge_set_files(&set_files)?;
         let mut candidates: Vec<ComponentDir> = Vec::new();
         for entry in scanned.component_dirs {
+            if unavailable.contains(&entry) {
+                continue;
+            }
             let name = dir_name(&entry)?;
             let def = read_project_json(source, &entry.join(DEF_JSON), json_override)?;
             let (id, id_from_header) = match def.get("id").and_then(Value::as_str) {
@@ -1622,6 +1658,8 @@ fn read_assets(
     dir: &Path,
     json_override: Option<&JsonSourceOverride<'_>>,
     mut loaded_files: Option<&mut LoadedFileHashes>,
+    // Where a listed asset with no file is reported; `None` fails the read.
+    missing: Option<&mut Vec<SourceDiagnostic>>,
 ) -> Result<BTreeMap<AssetId, Vec<u8>>> {
     let mut assets = BTreeMap::new();
     let assets_dir = dir.join(ASSETS_DIR);
@@ -1649,7 +1687,13 @@ fn read_assets(
         };
         collect_assets(source, &assets_dir, &mut assets, index.as_ref(), loaded_files)?;
         if let Some(index) = index {
-            index.verify_complete(&assets)?;
+            match (index.verify_complete(&assets), missing) {
+                (Err(error), Some(missing)) => missing.push(
+                    SourceDiagnostic::error(super::diagnostic::REF_MISSING_ASSET, error.to_string())
+                        .in_file("assets/index.json"),
+                ),
+                (result, _) => result?,
+            }
         }
     }
     Ok(assets)

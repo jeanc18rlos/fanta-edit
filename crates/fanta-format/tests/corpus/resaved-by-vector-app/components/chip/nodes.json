@@ -1,0 +1,87 @@
+{
+  "01M78J2NED8V9QBVT6HY9D6N2F": {
+    "blend_mode": "normal",
+    "fills": [
+      {
+        "color": {
+          "a": 255,
+          "b": 0,
+          "g": 0,
+          "r": 0
+        },
+        "kind": "solid"
+      }
+    ],
+    "id": "01M78J2NED8V9QBVT6HY9D6N2F",
+    "index": 1.0,
+    "name": "Chip background",
+    "opacity": 1.0,
+    "parent": "01M78J2NEDEJWQYWMVS67TPF95",
+    "path": {
+      "segments": [
+        {
+          "op": "move",
+          "to": [
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "op": "line",
+          "to": [
+            48.0,
+            0.0
+          ]
+        },
+        {
+          "op": "line",
+          "to": [
+            48.0,
+            24.0
+          ]
+        },
+        {
+          "op": "line",
+          "to": [
+            0.0,
+            24.0
+          ]
+        },
+        {
+          "op": "close"
+        }
+      ]
+    },
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "type": "vector"
+  },
+  "01M78J2NEDEJWQYWMVS67TPF95": {
+    "blend_mode": "normal",
+    "clip_size": [
+      48.0,
+      24.0
+    ],
+    "id": "01M78J2NEDEJWQYWMVS67TPF95",
+    "index": 1.0,
+    "name": "Chip",
+    "opacity": 1.0,
+    "parent": "01M78J2NED7QX15H9HKM844EQ8",
+    "scrollable": false,
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "type": "group"
+  }
+}

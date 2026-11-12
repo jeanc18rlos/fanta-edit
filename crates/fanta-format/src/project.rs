@@ -43,6 +43,10 @@
 //! This module is the projection layer only — git plumbing and app wiring live
 //! upstream (`fanta-app`), per spec 09 §A.1/§A.3.
 
+#[cfg(feature = "native")]
+mod check;
+#[cfg(feature = "native")]
+pub mod history;
 mod component_dirs;
 mod diagnostic;
 mod layout;
@@ -85,7 +89,10 @@ pub use read::{
     component_id_of_dir, locate_master_source, locate_page_source, page_id_of_dir,
     page_scope_of_source, read_project_tree, read_project_tree_with_warnings,
 };
-pub use diagnostic::{DIAGNOSTIC_CODES, LOAD_OMITTED_GEOMETRY, SourceDiagnostic, SourceSeverity};
+#[cfg(feature = "native")]
+pub use check::{check_project, findings_json};
+pub use diagnostic::{
+    DESIGN_UNAVAILABLE, DIAGNOSTIC_CODES, LOAD_OMITTED_GEOMETRY, SourceDiagnostic, SourceSeverity};
 #[cfg(feature = "native")]
 pub use session::{
     ApplyReport, ArtifactDirty, ArtifactId, ArtifactMeta, ArtifactOpImpact, ArtifactRenderRevision,
@@ -1002,6 +1009,9 @@ mod tests {
                 .any(|path| path.ends_with(".fnx") || path.ends_with(".fss")),
             "web storage must not write FNX sources"
         );
+        // Spec 0009 A1: a freshly written project of every node kind has
+        // nothing for the checker to report.
+        assert_eq!(check_project(dir.path()).expect("check"), Vec::new());
 
         let (loaded, loaded_assets) = read_project_tree(dir.path()).expect("read");
         assert_eq!(persisted(&loaded), persisted(&doc), "R6 property equality");

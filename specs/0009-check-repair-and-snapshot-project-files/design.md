@@ -14,13 +14,36 @@ message for the legacy FNX path. They gain optional `file`, `line` and
 `WorkspaceSession::open_warnings` pass around today. `report.json` writes
 the same records.
 
-**Collecting load.** Today a file that does not parse returns `Err` and
-aborts the whole load. The reader gains a collecting mode: a design whose
-SVG, CSS or sidecar fails to parse is recorded as an `error` diagnostic and
-left out of the document, and the load continues. `check_project` is that
-mode plus the cross-file checks of R3 (duplicate ids, dangling references,
-records without elements, manifest against files). The strict mode stays
-for callers that need all-or-nothing.
+**Whole-project check.** `check_project` (`project/check.rs`) works in two
+passes. It first reads every source file on its own, so a file that does not
+parse, holds conflict markers or repeats an id is reported with its position
+instead of ending the run. It then loads the project through the editor's
+reader, adds what that reader reports, and checks what only the loaded
+document can show: instances of missing components, paints of missing
+assets, and, by projecting the document the way the writer would, files and
+elements that are gone from disk. After a file error the loader's own
+reports are left out, because they echo the cause.
+
+**Collecting load.** Before T3 a design record that did not parse failed
+the whole open, and a design SVG or stylesheet that did not parse was read
+past without a word: the page loaded from its records and the next save
+wrote over the broken file. Now the per-file pass of the check runs when a
+project opens. A page or component folder holding a file that does not
+parse (its header, its records, its SVG or its stylesheet) is left out of
+the document and out of the session's index, and is reported as
+`design.unavailable` with the parse finding beside it.
+
+A save must then not treat the folder as stale. Three things keep it:
+the writer skips folders named by `design.unavailable` findings it is
+handed; every session, also one opened later without a document, carries
+those findings; and before removing any file the writer checks for itself
+whether the file's folder parses. The last one is what holds when a caller
+passes no findings. A new design whose name maps to an unavailable folder
+fails the save instead of writing into it.
+
+A file outside a design folder (`fanta.json`, `doc/*.json`, a set's
+`set.json`) that does not parse still fails the open: there is no design to
+leave out.
 
 **Command.** A `[[bin]]` target `fanta-check` in `fanta-format`
 (`src/check_main.rs`): one path argument and `--json`, parsed from
@@ -44,9 +67,17 @@ answers Q5.
   `git gc`; a chained history could not drop its middle.
 - Restore records a snapshot of the current state, then makes the working
   files equal to the chosen snapshot's tree, removing files it lacks.
-- `.fanta/` is added to the project's `.gitignore` (created or appended),
-  and every walker of the project directory skips it: the loader, the
-  session hash index, the editor's watcher, `.fant` export and `fanta-site`.
+- `.fanta/` holds its own `.gitignore` containing `*`, so the user's git
+  ignores it and their `.gitignore` is not edited. Walkers of the whole
+  project directory skip it: the change scans in `fanta-mcp` and
+  `script/serve-project` by name, the headless change set and the cloud
+  worker because they skip hidden entries, and the editor through
+  `file_scan_exclusions`. The loader, the check, the save, `.fant` export
+  and `fanta-site` read named directories only and never reach it.
+- A snapshot holds every file under the project except `.fanta/` and a
+  `.git` directory, whatever the project's `.gitignore` says, with no
+  line-ending or filter conversion. The user's and the system's git
+  configuration are shut out of every command.
 
 **Wiring.** The save path in `fanta-format` (`project/write.rs`) calls the
 store, so the editor, `fanta-headless`, `fanta-mcp` and the cloud worker
@@ -87,12 +118,17 @@ pub struct SourceDiagnostic {
 pub fn check_project(dir: &Path) -> Result<Vec<SourceDiagnostic>>;
 
 // fanta-format, project/history.rs (not built for wasm)
-pub struct Snapshot { pub id: String, pub taken_at: String, pub reason: SnapshotReason }
+pub struct Snapshot { pub id: String, pub taken_at: SystemTime, pub reason: SnapshotReason }
 pub enum SnapshotReason { BeforeSave, AfterSave, BeforeRestore }
-pub fn record(dir: &Path, reason: SnapshotReason) -> Result<Snapshot>;
-pub fn list(dir: &Path) -> Result<Vec<Snapshot>>;
-pub fn restore(dir: &Path, id: &str) -> Result<Snapshot>; // returns the BeforeRestore snapshot
-pub fn prune(dir: &Path, now: SystemTime) -> Result<()>;  // 30 days, then one per day
+pub struct History { /* project directory, git binary */ }
+impl History {
+    pub fn new(dir: impl Into<PathBuf>) -> Self;          // `git` from PATH
+    pub fn with_git(self, git: impl Into<OsString>) -> Self; // the editor's bundled git
+    pub fn record(&self, reason: SnapshotReason) -> Result<Snapshot>;
+    pub fn list(&self) -> Result<Vec<Snapshot>>;           // newest first
+    pub fn restore(&self, id: &str) -> Result<Snapshot>;   // returns the BeforeRestore snapshot
+    pub fn prune(&self, now: SystemTime) -> Result<()>;    // 30 days, then one per day
+}
 ```
 
 - `fanta-check <dir> [--json]`: exit 0 with no `error` diagnostics, 1 with
@@ -108,6 +144,86 @@ pub fn prune(dir: &Path, now: SystemTime) -> Result<()>;  // 30 days, then one p
   `expected.json` (codes with file and line).
 - Seeded guide: changing `AGENTS_MD` needs the replaced text's SHA-256 in
   `previous_seeds` (`fanta-format/AGENTS.md`).
+
+## Changes during implementation
+
+- **T7.** The repair skill is one file,
+  `examples/claude-plugin/skills/fanta-repair/SKILL.md`, compiled into the
+  app as a built-in skill as well, so the plugin and the in-app agent
+  cannot drift. The seeded project guide carries the short form and names
+  the skill.
+- **T7.** No new code shows the in-app proposal: the agent repairs by
+  editing files, and file edits already go through the agent's edit review.
+- **T7.** The corpus folders carry no history, so the four deletion cases
+  are repairable only with a snapshot. The A7 run gave them one.
+- **T7.** A7 holds per design, not per file: `ref.missing_token` and
+  `edit.not_kept` name the design's SVG while the repair is in the
+  stylesheet beside it. The skill allows exactly that.
+
+- **T6.** The editor shows the check's result as a notice that stays until
+  dismissed (counts and the first finding), not as a banner with a list:
+  the full list is one `fanta-check` or `check_project` call away, and a
+  list view is a feature of its own. The findings are kept on the document
+  for that view to read.
+- **T6.** The check runs after every reload from disk, which is what an
+  outside change triggers. An outside change that conflicts with unsaved
+  edits does not reload, so it is not checked until the conflict is
+  resolved.
+- **T6.** `check_project` is an MCP tool in the live and the headless
+  server. The built-in agent has no tool of that name; it reads the same
+  guidance and can run `fanta-check`.
+
+- **T5.** The snapshots are taken by the two save functions (the editor's
+  and `fanta-headless`'s), not inside the writer: the writer also serves
+  exports and Save As staging folders, which must not gain a `.fanta`
+  directory.
+- **T5.** "Changed outside Fanta" is decided by git, not by the session's
+  hashes: a snapshot is taken before a save when the files differ from the
+  newest snapshot. Every save ends with one, so a difference is an outside
+  change. A save that changes nothing records nothing.
+- **T5.** Without git the save goes ahead and its report carries
+  `snapshot.unavailable`. Asking before a save that would rewrite an
+  outside change is not built; it belongs with the findings list in T6. The
+  App Store build runs no git and takes no snapshots.
+- **T5.** Restore is a native prompt listing five snapshots at a time, not
+  a picker. It saves first, so unsaved edits are in a snapshot too.
+- **T5.** A3 needed two more cases to open, so the collecting load of T3
+  grew: a design whose `nodes.json` is gone is left out like one that does
+  not parse, and an asset listed in the index with no file is a finding
+  where it used to fail the open. `fanta-check` no longer reports a missing
+  `nodes.json` for a legacy design, which keeps its nodes elsewhere.
+
+- **T4.** The store is a `History` value holding the directory and the git
+  binary, not free functions: the editor ships its own git and has to say
+  which one to run. A snapshot's id is its time in milliseconds since the
+  Unix epoch, which is also its ref name; `taken_at` is a `SystemTime`.
+- **T4.** `.fanta/` ignores itself instead of being added to the project's
+  `.gitignore`: the same effect without editing a file the user owns.
+- **T4.** Measured on a generated project of 9,000 designs (36,000 files):
+  the first snapshot takes 1.6 s, each later one about 0.1 s, listing 1 ms.
+  The save-latency risk below stays open until T5 measures a real save.
+
+- **T3.** The design said the reader gains a collecting mode. Built
+  instead as a pass before the read that names the folders to skip, reusing
+  the check's per-file pass, so the editor and `fanta-check` cannot disagree
+  on what "does not parse" means. Cost: design files are read twice on open.
+- **T3.** Protection moved into the writer and the session. Passing the
+  load's findings to the save was not enough: the editor opens a new
+  session after an outside change, and that session did not have them.
+- **T3.** The editor shows the unavailable designs in a notice when the
+  project opens. A notice after a reload, and the list of findings, come
+  with T6.
+
+- **T2.** The collecting load moved to T3. The check reports broken files
+  from its own per-file pass, which gives positions the loader's error does
+  not, so changing the load path was not needed to ship the checker and is
+  now done only where the editor needs it.
+- **T2.** The loader now reports an inline `style` attribute on a node's
+  element (`edit.not_kept`). Building the corpus showed that a colour
+  changed that way, which is how vector applications save paint, was dropped
+  with no report.
+- **T1.** Positions: the SVG reader gives offsets; the CSS reader does not,
+  so CSS findings are placed by searching the file for the selector.
 
 ## Alternatives
 
@@ -130,9 +246,8 @@ pub fn prune(dir: &Path, now: SystemTime) -> Result<()>;  // 30 days, then one p
 
 ## Risks
 
-- **Positions.** Line and column need the SVG and CSS parsers in
-  `web_read.rs` to keep offsets. Not yet verified; T1 starts by checking,
-  and falls back to file-level diagnostics for a parser that cannot.
+- **Positions.** Findings the loader raises about a node's styling point at
+  the node's element in the SVG, not at the declaration in the stylesheet.
 - **Collecting load reaches far.** Callers assume a loaded document is
   complete. A design left out must not be treated as deleted by the next
   save: the writer has to leave an unparsed design's files untouched (A10).

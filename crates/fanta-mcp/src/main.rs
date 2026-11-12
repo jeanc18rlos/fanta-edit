@@ -24,7 +24,7 @@ use base64::Engine as _;
 use fanta_design_ops::{
     AgentActivity, BatchDesignArgs, BatchGetArgs, CommentDraft, DEFAULT_CHILD_LIMIT,
     DESIGN_GUIDELINES, DesignAssetRequest, DesignSystemQuery, GetEditorStateArgs,
-    GetGuidelinesArgs, GetScreenshotArgs, ImportImageArgs, ListCommentsArgs,
+    CheckProjectArgs, GetGuidelinesArgs, GetScreenshotArgs, ImportImageArgs, ListCommentsArgs,
     MAX_JSON_RESPONSE_BYTES, NodeDetail, ReadFnxSourceArgs, ReplyCommentArgs,
     ValidateFnxSourceArgs, narrowing_hint, read_project_design_spec, slice_source,
 };
@@ -246,6 +246,10 @@ impl Server {
                 let _arguments: GetGuidelinesArgs = parse(arguments)?;
                 self.get_guidelines()?
             }
+            "check_project" => {
+                let _arguments: CheckProjectArgs = parse(arguments)?;
+                self.check_project()?
+            }
             "import_image" => self.import_image(parse(arguments)?)?,
             "list_comments" => self.list_comments(parse(arguments)?)?,
             "reply_comment" => self.reply_comment(parse(arguments)?)?,
@@ -297,6 +301,12 @@ impl Server {
             }
         }
         Ok(vec![text_content(&state)?])
+    }
+
+    /// Spec 0009 R5: the same JSON `fanta-check --json` prints.
+    fn check_project(&self) -> Result<Vec<Value>> {
+        let findings = fanta_format::check_project(&self.root)?;
+        Ok(vec![json!({ "type": "text", "text": fanta_format::findings_json(&findings)? })])
     }
 
     fn get_guidelines(&self) -> Result<Vec<Value>> {
@@ -737,6 +747,7 @@ fn tool_entries() -> Vec<Value> {
         tool::<ReadFnxSourceArgs>("read_fnx_source", read_only()),
         tool::<ValidateFnxSourceArgs>("validate_fnx_source", read_only()),
         tool::<GetGuidelinesArgs>("get_guidelines", read_only()),
+        tool::<CheckProjectArgs>("check_project", read_only()),
         tool::<ImportImageArgs>(
             "import_image",
             json!({
@@ -793,7 +804,7 @@ mod tests {
     #[test]
     fn every_tool_is_described() {
         let tools = tool_entries();
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 15);
         let names: Vec<&str> = tools
             .iter()
             .map(|tool| tool["name"].as_str().expect("tool name"))
@@ -810,6 +821,7 @@ mod tests {
                 "read_fnx_source",
                 "validate_fnx_source",
                 "get_guidelines",
+                "check_project",
                 "import_image",
                 "list_comments",
                 "reply_comment",
@@ -882,6 +894,43 @@ mod tests {
     /// The whole loop an agent runs without the app: initialize, list the
     /// fourteen tools, read the editor state, edit with `batch_design`, and
     /// find the edit saved to the project directory.
+    /// Spec 0009 A6: the tool returns exactly what `fanta-check --json` prints.
+    #[test]
+    fn check_project_returns_the_commands_json() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        new_project(directory.path()).expect("new project");
+        let mut server = Server::open(directory.path()).expect("open");
+        let text = |server: &mut Server, id| -> String {
+            let response = request(
+                server,
+                id,
+                "tools/call",
+                json!({ "name": "check_project", "arguments": {} }),
+            );
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{response}"))
+                .to_owned()
+        };
+        assert_eq!(text(&mut server, 1), "[]");
+
+        let pages = directory.path().join("pages");
+        let page = std::fs::read_dir(&pages)
+            .expect("pages")
+            .flatten()
+            .map(|entry| entry.path().join("page.svg"))
+            .find(|path| path.is_file())
+            .expect("a page");
+        std::fs::write(&page, "<<<<<<< HEAD\n").expect("conflicted page");
+        let found = text(&mut server, 2);
+        assert!(found.contains("parse.conflict_marker"), "{found}");
+        let command = fanta_format::findings_json(
+            &fanta_format::check_project(directory.path()).expect("check"),
+        )
+        .expect("json");
+        assert_eq!(found, command);
+    }
+
     #[test]
     fn edits_land_on_disk_without_the_app() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -891,7 +940,7 @@ mod tests {
         let tools = request(&mut server, 1, "tools/list", json!({}));
         assert_eq!(
             tools["result"]["tools"].as_array().map(Vec::len),
-            Some(14),
+            Some(15),
             "{tools}"
         );
 

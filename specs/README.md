@@ -47,6 +47,6 @@ has no open tasks. `script/architecture index --check` enforces both in CI.
 | [0007](0007-store-projects-as-plain-web-files/spec.md) | Store projects as plain web files | accepted | 2026-11-10 | 0027 |
 | [0008](0008-a-web-canvas-for-browsers-and-agent-hosts/spec.md) | A web canvas for browsers and agent hosts | accepted | 2026-11-11 | — |
 | [0009](0009-check-repair-and-snapshot-project-files/spec.md) | Check, repair and snapshot project files | accepted | 2026-11-12 | 0026, 0027 |
-| [0010](0010-measure-generated-code-against-designs/spec.md) | Measure generated code against designs | draft | 2026-11-12 | 0027 |
+| [0010](0010-measure-generated-code-against-designs/spec.md) | Measure generated code against designs | accepted | 2026-11-12 | 0027 |
 | [0011](0011-internal-operations-platform/spec.md) | Internal operations platform | draft | 2026-11-04 | 0028, 0029 |
 <!-- specs:end -->

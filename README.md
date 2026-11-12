@@ -84,14 +84,14 @@ Use the copied project-scoped instructions: they identify the running executable
 and its user-data directory. Keep that Fanta instance open, restart your agent,
 check its MCP connection and call `get_editor_state` before editing.
 
-The local bridge exposes 14 tools for the focused design, project source inspection and
+The local bridge exposes 15 tools for the focused design, project source inspection and
 validation, bounded design operations, screenshots and comments. It runs over a
 local Unix socket. External file edits enter through the project's reconciliation
 path. Built-in agent tools and hosted media generation have separate configuration
 and billing requirements. See the [agent quickstart](docs/fanta/agent-quickstart.md)
 for exact tool names and a bounded first task.
 
-Without the app, the same 14 tools run headlessly: `fanta-mcp <project-dir>`
+Without the app, the same 15 tools run headlessly: `fanta-mcp <project-dir>`
 (built with `cargo build -p fanta-mcp`) serves them over stdio straight from the
 project directory, saving each edit to disk.
 
