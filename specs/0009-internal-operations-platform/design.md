@@ -5,7 +5,7 @@
 Most of the platform is configuration: vendor accounts, their own
 integrations and a handbook. Code is written only where no integration
 exists, and almost all of it goes into fanta-backend v2 as two modules on
-the existing outbox ([ADR 0028](../../docs/decisions/0028-deliver-business-events-through-the-backend-outbox.md)):
+the existing outbox ([ADR 0029](../../docs/decisions/0029-deliver-business-events-through-the-backend-outbox.md)):
 
 - `v2/src/fanta_v2/ops.py`: the alert catalog, the Slack handler, the
   morning digest and the budget feed.
@@ -243,9 +243,9 @@ deletes their ticket rows. Sentry holds only ids.
 ## Alternatives
 
 - **PostHog destinations, Zapier, Make, n8n, or calls straight from request
-  handlers** for delivery: see ADR 0028.
+  handlers** for delivery: see ADR 0029.
 - **A shared help desk** instead of the Linear and Gmail pair: no free plan
-  fits ([ADR 0027](../../docs/decisions/0027-choose-the-tools-that-run-the-business.md)).
+  fits ([ADR 0028](../../docs/decisions/0028-choose-the-tools-that-run-the-business.md)).
 - **The credentials register in `system_settings`:** the backend could alert
   without a workflow, but you would maintain it in the console instead of the
   handbook. Two copies would drift, so it lives in the handbook only.

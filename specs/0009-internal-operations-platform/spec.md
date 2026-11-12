@@ -2,7 +2,7 @@
 status: draft
 date: 2026-11-04
 owner: Jean Rojas
-decisions: [0027, 0028]
+decisions: [0028, 0029]
 repositories: [fanta-backend, fanta-admin, fanta-edit, fantaisa-landing, fanta-dashboard, fanta-handbook]
 ---
 
@@ -99,7 +99,7 @@ What happens today:
 
 ## Operating map
 
-Each kind of data has one owner. [ADR 0027](../../docs/decisions/0027-choose-the-tools-that-run-the-business.md)
+Each kind of data has one owner. [ADR 0028](../../docs/decisions/0028-choose-the-tools-that-run-the-business.md)
 records the choice of tools and their free-plan limits.
 
 | Data | Owner | Written by |
