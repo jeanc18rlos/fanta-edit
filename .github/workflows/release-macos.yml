@@ -69,6 +69,12 @@ jobs:
             echo "::error::Release tag must match crates/fanta/Cargo.toml: v${version}"
             exit 1
           fi
+          # Every channel's installer has the same name, so a Preview build on a
+          # tag would replace the stable one in the tag's draft release.
+          if [[ "$FANTA_RELEASE_CHANNEL" != stable ]]; then
+            echo "::error::A release tag builds the stable channel; build Preview from a branch"
+            exit 1
+          fi
 
       - name: Check distribution credentials
         if: env.FANTA_REQUIRE_NOTARIZATION == 'true'
@@ -279,14 +285,18 @@ jobs:
           name: fanta-macos-aarch64-notarized
           path: target
 
+      # Its own step, so no package's install code runs with the key in its environment.
+      - name: Install the update signer
+        run: |
+          python3 -m venv "$RUNNER_TEMP/update-signing"
+          "$RUNNER_TEMP/update-signing/bin/pip" install --quiet --require-hashes --only-binary :all: \
+            -r script/update-signing-requirements.txt
+
       - name: Sign the DMG
         env:
           FANTA_UPDATE_SIGNING_KEY: ${{ secrets.FANTA_UPDATE_SIGNING_KEY }}
         run: |
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
-          python3 -m venv "$RUNNER_TEMP/update-signing"
-          "$RUNNER_TEMP/update-signing/bin/pip" install --quiet --require-hashes --only-binary :all: \
-            -r script/update-signing-requirements.txt
           "$RUNNER_TEMP/update-signing/bin/python" script/update_signing.py sign \
             --asset Fanta-aarch64.dmg --version "$version" \
             --file target/Fanta-aarch64.dmg \

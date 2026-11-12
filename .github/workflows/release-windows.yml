@@ -117,6 +117,13 @@ jobs:
           name: fanta-windows-x86_64
           path: target
 
+      # Its own step, so no package's install code runs with the key in its environment.
+      - name: Install the update signer
+        run: |
+          python3 -m venv "$RUNNER_TEMP/update-signing"
+          "$RUNNER_TEMP/update-signing/bin/pip" install --quiet --require-hashes --only-binary :all: \
+            -r script/update-signing-requirements.txt
+
       - name: Sign the installer
         env:
           FANTA_UPDATE_SIGNING_KEY: ${{ secrets.FANTA_UPDATE_SIGNING_KEY }}
@@ -126,9 +133,6 @@ jobs:
             exit 0
           fi
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
-          python3 -m venv "$RUNNER_TEMP/update-signing"
-          "$RUNNER_TEMP/update-signing/bin/pip" install --quiet --require-hashes --only-binary :all: \
-            -r script/update-signing-requirements.txt
           "$RUNNER_TEMP/update-signing/bin/python" script/update_signing.py sign \
             --asset Fanta-x86_64.exe --version "$version" \
             --file target/Fanta-x86_64.exe \

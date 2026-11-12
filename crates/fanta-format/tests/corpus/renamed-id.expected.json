@@ -1,0 +1,13 @@
+[
+  {
+    "code": "record.no_element",
+    "file": "pages/home/page.svg",
+    "severity": "warning"
+  },
+  {
+    "code": "id.not_a_node",
+    "file": "pages/home/page.svg",
+    "line": 11,
+    "severity": "warning"
+  }
+]

@@ -1,0 +1,200 @@
+name: Engine image
+
+# Builds the container image that fanta-backend's v2/deploy/gcp-engine-deploy.sh
+# deploys as the private fanta-engine Cloud Run service
+# (docs/cloud-engine-contracts.md). Pull requests build and smoke-test it.
+# Pushes to main also push it to Artifact Registry as
+# <GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/fanta/fanta-engine:<commit sha>;
+# that sha is the deploy script's ENGINE_TAG.
+#
+# Pushing needs repository variables, set once:
+#   GCP_PROJECT_ID, GCP_REGION (europe-west1 when unset),
+#   GCP_WORKLOAD_IDENTITY_PROVIDER: a provider that trusts only this
+#     repository's refs/heads/main,
+#   GCP_ENGINE_IMAGE_PUSHER: a service account with
+#     roles/artifactregistry.writer on the `fanta` Docker repository.
+# Until they are set, main builds and tests the image and pushes nothing.
+
+on:
+  pull_request:
+    paths: &engine-paths
+      - 'crates/fanta-api/**'
+      - 'crates/fanta-bundle/**'
+      - 'crates/fanta-canvas/**'
+      - 'crates/fanta-design-ops/**'
+      - 'crates/fanta-doc/**'
+      - 'crates/fanta-engine/**'
+      - 'crates/fanta-fnx/**'
+      - 'crates/fanta-format/**'
+      - 'crates/fanta-headless/**'
+      - 'crates/fanta-render/**'
+      - 'crates/fanta-text/**'
+      - 'crates/fanta-tools/**'
+      - 'vendor/skia-bindings-0.153.3/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/engine-image.yml'
+  push:
+    branches: [main]
+    paths: *engine-paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      IMAGE: fanta-engine:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install native Skia dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libfreetype6-dev
+
+      - name: Install Rust 1.95
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup override set 1.95.0
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: engine-image-rust-1.95
+
+      - uses: ./.github/actions/prepare-skia-source
+        with:
+          offline: 'true'
+
+      - name: Build the engine
+        env:
+          FANTA_ENGINE_GIT_SHA: ${{ github.sha }}
+        run: |
+          cargo build --locked --release -p fanta-engine
+          mkdir -p "$RUNNER_TEMP/context"
+          cp target/release/fanta-engine "$RUNNER_TEMP/context/"
+
+      - name: Build the image
+        run: docker build --file crates/fanta-engine/Dockerfile --tag "$IMAGE" "$RUNNER_TEMP/context"
+
+      - name: Run a render inside the image
+        run: |
+          mkdir -p "$RUNNER_TEMP/smoke"
+          cat > "$RUNNER_TEMP/smoke/request.json" <<'EOF'
+          {"request_id": "image-smoke", "deadline_ms": 60000, "source": {"kind": "dir", "dir": "/project"},
+           "steps": [{"step": "inspect"}, {"step": "render", "targets": [{"id": "first", "page": {"index": 0}, "max_dimension": 512}]}]}
+          EOF
+          docker run --rm \
+            --volume "$PWD/docs/samples/auth-wizard:/project:ro" \
+            --volume "$RUNNER_TEMP/smoke:/smoke:ro" \
+            "$IMAGE" run --request /smoke/request.json > "$RUNNER_TEMP/smoke-response.json"
+          python3 - "$RUNNER_TEMP/smoke-response.json" <<'EOF'
+          import json, os, sys
+          response = json.load(open(sys.argv[1]))
+          assert response["engine"]["git_sha"] == os.environ["GITHUB_SHA"], response["engine"]
+          failed = [result for result in response["results"] if not result["ok"]]
+          assert not failed, failed
+          image = response["results"][-1]["result"]["images"][0]
+          assert image["png_b64"] and image["width"] > 0, image
+          print("rendered", image["width"], "x", image["height"], "fonts:", json.dumps(response["source"]["fonts"]))
+          EOF
+
+      - name: Serve from the image
+        run: |
+          docker run --detach --name engine --env ENGINE_HMAC_SECRET=image-smoke --publish 8080:8080 "$IMAGE"
+          for attempt in $(seq 30); do
+            curl -fsS http://127.0.0.1:8080/healthz && break
+            sleep 1
+          done
+          echo
+
+          expect() {
+            if [ "$1" != "$2" ]; then
+              echo "$3 answered $1, expected $2" >&2
+              docker logs engine
+              exit 1
+            fi
+          }
+          unsigned=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data '{}' http://127.0.0.1:8080/v1/run)
+          expect "$unsigned" 401 "An unsigned run"
+
+          # Signed as v2 signs (HMAC of "{t}.{sha256 of the body}"). The engine
+          # serves only GitHub sources, so a well-signed dir source is a 400:
+          # proof that the secret reached the server.
+          body='{"request_id": "image-smoke", "deadline_ms": 1000, "source": {"kind": "dir", "dir": "/project"}, "steps": [{"step": "inspect"}]}'
+          timestamp=$(date +%s)
+          digest=$(printf '%s' "$body" | sha256sum | cut -d' ' -f1)
+          signature=$(printf '%s.%s' "$timestamp" "$digest" | openssl dgst -sha256 -hmac image-smoke -r | cut -d' ' -f1)
+          signed=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data "$body" \
+            --header "X-Fanta-Internal: t=$timestamp,v1=$signature" http://127.0.0.1:8080/v1/run)
+          expect "$signed" 400 "A signed dir run"
+          docker rm --force engine
+
+      - name: Save the image
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: docker save "$IMAGE" | gzip > "$RUNNER_TEMP/fanta-engine-image.tar.gz"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        with:
+          name: fanta-engine-image
+          path: ${{ runner.temp }}/fanta-engine-image.tar.gz
+          retention-days: 1
+
+  # A separate job so that only main, never a pull request, can ask for the
+  # GitHub OIDC token that Google exchanges for push access.
+  push:
+    needs: image
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      LOCAL_IMAGE: fanta-engine:${{ github.sha }}
+      REGISTRY: ${{ vars.GCP_REGION || 'europe-west1' }}-docker.pkg.dev
+      REMOTE_IMAGE: ${{ vars.GCP_REGION || 'europe-west1' }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/fanta/fanta-engine:${{ github.sha }}
+    steps:
+      - name: Skip without Google Cloud settings
+        if: vars.GCP_WORKLOAD_IDENTITY_PROVIDER == '' || vars.GCP_ENGINE_IMAGE_PUSHER == '' || vars.GCP_PROJECT_ID == ''
+        run: echo "::notice::The engine image was built and tested but not pushed; set the GCP_* repository variables to push it."
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && vars.GCP_ENGINE_IMAGE_PUSHER != '' && vars.GCP_PROJECT_ID != ''
+        with:
+          name: fanta-engine-image
+          path: ${{ runner.temp }}
+
+      - id: google
+        if: vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && vars.GCP_ENGINE_IMAGE_PUSHER != '' && vars.GCP_PROJECT_ID != ''
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_ENGINE_IMAGE_PUSHER }}
+          token_format: access_token
+
+      - name: Push to Artifact Registry
+        if: steps.google.outcome == 'success'
+        env:
+          ACCESS_TOKEN: ${{ steps.google.outputs.access_token }}
+        run: |
+          gunzip -c "$RUNNER_TEMP/fanta-engine-image.tar.gz" | docker load
+          printf '%s' "$ACCESS_TOKEN" | docker login --username oauth2accesstoken --password-stdin "https://$REGISTRY"
+          docker tag "$LOCAL_IMAGE" "$REMOTE_IMAGE"
+          docker push "$REMOTE_IMAGE"
+          echo "Pushed \`$REMOTE_IMAGE\`. Deploy it with \`ENGINE_TAG=$GITHUB_SHA v2/deploy/gcp-engine-deploy.sh\` in fanta-backend." >> "$GITHUB_STEP_SUMMARY"

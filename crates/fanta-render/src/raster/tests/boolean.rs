@@ -469,3 +469,48 @@ fn boolean_stroke_outline_instance_keeps_paint_when_derived_path_changes() {
         "derived outline retains its source stroke paint"
     );
 }
+
+/// The web projection's outline seam (spec 0007 T4): `boolean_outline` folds
+/// the operands into document path data in the node's local space, and
+/// answers `None` for a non-boolean node.
+#[test]
+fn boolean_outline_returns_the_fold_as_path_data() {
+    use fanta_doc::PathSegment;
+
+    let doc = two_rect_boolean(BooleanOp::Union);
+    let boolean_id = doc
+        .scene
+        .children_of(None)
+        .first()
+        .copied()
+        .expect("the boolean node");
+    let outline =
+        boolean_outline(&doc.scene, boolean_id).expect("a union of two rects has a silhouette");
+    assert!(!outline.segments.is_empty());
+    // Operand B lies inside operand A, so the union is A's rect.
+    let mut low = [f64::MAX; 2];
+    let mut high = [f64::MIN; 2];
+    for segment in &outline.segments {
+        let to = match segment {
+            PathSegment::Move { to } | PathSegment::Line { to } => to,
+            PathSegment::Close => continue,
+            other => panic!("a rect union folds to lines, got {other:?}"),
+        };
+        for axis in 0..2 {
+            low[axis] = low[axis].min(to[axis]);
+            high[axis] = high[axis].max(to[axis]);
+        }
+    }
+    assert_eq!((low, high), ([-20.0, -20.0], [20.0, 20.0]));
+
+    let operand = doc
+        .scene
+        .children_of(Some(boolean_id))
+        .first()
+        .copied()
+        .expect("an operand");
+    assert!(
+        boolean_outline(&doc.scene, operand).is_none(),
+        "non-boolean nodes have no fold"
+    );
+}

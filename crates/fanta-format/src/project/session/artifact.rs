@@ -2682,7 +2682,7 @@ mod tests {
             CanvasNode::new(fanta_doc::NodeData::Group(fanta_doc::GroupNode::default()));
         child.parent = Some(page);
         let child = document.scene.insert(child).expect("child");
-        crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+        crate::write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())
             .expect("initial project");
         let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
         let artifact = ArtifactId::Page(page);

@@ -43,54 +43,88 @@
 //! This module is the projection layer only — git plumbing and app wiring live
 //! upstream (`fanta-app`), per spec 09 §A.1/§A.3.
 
+#[cfg(feature = "native")]
+mod check;
+#[cfg(feature = "native")]
+pub mod history;
 mod component_dirs;
+mod diagnostic;
 mod layout;
 mod media;
 mod merge;
 mod read;
 mod refs_ctx;
+// The editing session, the disk writer's transactional half, scaffolding and
+// media import registry are filesystem machinery; the non-native build keeps
+// only the pure read/emit core (spec 0008 R1).
+#[cfg(feature = "native")]
 pub mod session;
+// `.fant` snapshots ride on the zip container, which stays native-only.
+#[cfg(feature = "native")]
 mod snapshot;
+// Source edits persist through `tempfile`, the one non-native dependency.
+#[cfg(feature = "native")]
 mod source_edit;
+mod tree_source;
+mod web;
+mod web_read;
 mod write;
 
 pub use fanta_fnx::canonicalize_legacy_source;
-pub use layout::{
-    ProjectManifest, ensure_project_editor_support, is_project_dir, scaffold_project_tree,
-};
+pub use layout::ProjectManifest;
+#[cfg(feature = "native")]
+pub use layout::{ensure_project_editor_support, is_project_dir, scaffold_project_tree};
+pub use media::{FormatCapabilities, asset_id_for_bytes};
+#[cfg(feature = "native")]
+pub(crate) use media::compute_asset_id;
+#[cfg(feature = "native")]
 pub use media::{MediaFormat, MediaRegistry, MediaRegistryError};
 pub use merge::{
     ArtifactAddress, ArtifactMerge, DocMerge, JsonPathSegment, NodeMapEdition, PresenceValue,
     PropertyConflict, merge_artifact, merge_docs,
 };
+pub use read::ScopedDesign;
+#[cfg(feature = "native")]
 pub use read::{
-    ScopedDesign, component_id_of_dir, locate_master_source, locate_page_source, page_id_of_dir,
-    page_scope_of_source, read_project_tree,
+    component_id_of_dir, locate_master_source, locate_page_source, page_id_of_dir,
+    page_scope_of_source, read_project_tree, read_project_tree_with_warnings,
 };
+#[cfg(feature = "native")]
+pub use check::{check_project, findings_json};
+pub use diagnostic::{
+    DESIGN_UNAVAILABLE, DIAGNOSTIC_CODES, LOAD_OMITTED_GEOMETRY, SourceDiagnostic, SourceSeverity};
+#[cfg(feature = "native")]
 pub use session::{
     ApplyReport, ArtifactDirty, ArtifactId, ArtifactMeta, ArtifactOpImpact, ArtifactRenderRevision,
     ArtifactRenderSnapshot, ArtifactSession, ClosePolicy, ConflictResolution, ContentHash,
     DependencyGraph, DocMutGuard, FsEvent, IncrementalDocApply, MergeReview, MotionIndex,
     MotionSource, ProposalApplied, ReviewConflict, ReviewResolution, SaveBlocked, SaveResult,
-    ScopedDoc, SessionError, SessionEvent, SourceDiagnostic, SourceProposalOutcome,
-    SourceRebuildReason, SourceSeverity, SourceSync, WorkspaceDirty, WorkspaceDiskSnapshot,
+    ScopedDoc, SessionError, SessionEvent, SourceProposalOutcome,
+    SourceRebuildReason, SourceSync, WorkspaceDirty, WorkspaceDiskSnapshot,
     WorkspaceIr, WorkspaceSession, WorkspaceSharedState, artifact_op_impact, hash_file_set,
     read_motion_dual, synthesize_workspace_fnx, write_artifact_files,
 };
+#[cfg(feature = "native")]
 pub use snapshot::{export_fant_snapshot, import_fant_snapshot};
+pub use read::read_project_files;
+pub use web::{
+    WebDesignReport, WebProjection, WebRaster, WebReport, WebRenderSource,
+    emit_web_project_tree, web_project_files,
+};
+#[cfg(feature = "native")]
+pub use web::write_web_project_tree;
+#[cfg(feature = "native")]
 pub use source_edit::{
     ProjectSourceEdit, apply_project_json_edit, apply_project_source_edit,
     apply_project_source_edit_with_diagnostics, validate_project_json_edit,
     validate_project_source_edit, validate_project_source_edit_with_diagnostics,
 };
+pub use write::{ProjectWriteCache, WriteReport, is_project_managed_path};
+#[cfg(feature = "native")]
 pub use write::{
-    ProjectUpgrade, ProjectWriteCache, WriteReport, is_project_managed_path, projected_design_dirs,
-    stage_new_project_tree_cached, upgrade_project, write_project_tree, write_project_tree_cached,
-    write_project_tree_cached_with_media_registry, write_project_tree_cached_with_sources,
-    write_project_tree_cached_with_sources_and_media_registry,
-    write_project_tree_cached_with_sources_checked,
-    write_project_tree_cached_with_sources_checked_and_media_registry,
-    write_project_tree_with_media_registry,
+    ProjectUpgrade, projected_design_dirs, stage_new_project_tree, upgrade_project,
+    write_legacy_project_tree, write_legacy_project_tree_checked, write_project_tree,
+    write_project_tree_cached,
 };
 
 #[cfg(test)]
@@ -98,6 +132,7 @@ mod tests {
     use super::*;
     use crate::asset_id_for_bytes;
     use crate::error::FormatError;
+    use std::path::PathBuf;
     use fanta_doc::{
         AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, AssetId, CanvasNode,
         ComponentDef, ComponentId, Doc, Easing, GroupNode, History, Interpolation, Keyframe,
@@ -276,7 +311,7 @@ mod tests {
                     serde_json::json!(phase.elapsed().as_secs_f64()),
                 );
                 let phase = Instant::now();
-                let report = write_project_tree_cached_with_sources_checked(
+                let report = write_legacy_project_tree_checked(
                     &project,
                     &document,
                     &assets,
@@ -624,7 +659,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let p = dir.path();
         assert!(p.join("pages/page-1/page.json").is_file());
@@ -668,7 +703,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let p = dir.path();
         // v3: the component dir is the def name's slug; def.json's id is the
@@ -719,7 +754,7 @@ mod tests {
         let f = fixture();
         let (assets, expected_paths) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let p = dir.path();
         for (id, family, ext) in &expected_paths {
@@ -742,7 +777,7 @@ mod tests {
             },
         );
         let assets = BTreeMap::from([(asset, bytes.clone())]);
-        write_project_tree(directory.path(), &doc, &assets).expect("write project");
+        write_legacy_project_tree(directory.path(), &doc, &assets).expect("write project");
         let (reloaded, reloaded_assets) =
             read_project_tree(directory.path()).expect("reopen project");
         assert_eq!(reloaded.asset_library, doc.asset_library);
@@ -754,12 +789,741 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let (doc2, assets2) = read_project_tree(dir.path()).unwrap();
         assert_eq!(persisted(&doc2), persisted(&f.doc));
         assert_eq!(assets2, assets);
         assert_eq!(doc2.pages(), f.doc.pages(), "page order survives");
+    }
+
+    /// A3 (spec 0007 T2): write → load → write over web storage is
+    /// byte-identical, and the loaded document property-equals the written
+    /// one, on a fixture covering every `NodeData` kind (R5, R6).
+    #[test]
+    fn web_round_trip_is_byte_identical_over_every_node_kind() {
+        use fanta_doc::{
+            AiArtifactNode, AudioNode, BitmapNode, BooleanNode, Bounds, Camera3d, Color, EmbedNode,
+            GenerationStatus, ImageFitMode, InstanceNode, Model3dNode, NodeGraph, NodeGraphNode,
+            PathData, TextNode, TextPathNode, Transform2D, VectorNode, VideoNode,
+        };
+
+        let mut doc = Doc::new();
+        doc.metadata.title = "Every Kind".into();
+        doc.metadata.created_at = 1_700_000_000;
+        doc.metadata.modified_at = 1_700_000_001;
+        let (assets, _) = fixture_assets();
+        let image = *assets.keys().next().expect("fixture asset");
+
+        let mut insert = |node: CanvasNode| -> NodeId {
+            let id = node.id;
+            doc.scene.insert(node).unwrap();
+            id
+        };
+        let page = insert(group(None, "Everything"));
+        let comp_page = insert(group(None, "Components"));
+        let comp_root = insert(group(Some(comp_page), "Button"));
+        insert(group(Some(comp_root), "Button / Label"));
+        let comp_id = ComponentId::new();
+
+        let mut place = |data: NodeData, name: &str, x: f64| -> NodeId {
+            let mut node = CanvasNode::new(data);
+            node.name = name.into();
+            node.parent = Some(page);
+            node.transform = Transform2D::translation(x, 0.0);
+            let id = node.id;
+            doc.scene.insert(node).unwrap();
+            id
+        };
+        place(
+            NodeData::Vector(VectorNode::rect_solid(0.0, 0.0, 10.0, 10.0, Color::WHITE)),
+            "Shape",
+            0.0,
+        );
+        place(NodeData::Text(TextNode::new("Hello", 100.0, 20.0)), "Text", 20.0);
+        place(
+            NodeData::TextPath(TextPathNode::new(
+                PathData::rect(0.0, 0.0, 100.0, 20.0),
+                "Curve",
+            )),
+            "Text on Path",
+            40.0,
+        );
+        place(
+            NodeData::Bitmap(BitmapNode {
+                asset: image,
+                natural_size: [1, 1],
+                local_size: [10.0, 10.0],
+                crop: None,
+                fit: ImageFitMode::Fill,
+                tint: None,
+            }),
+            "Image",
+            60.0,
+        );
+        place(
+            NodeData::Video(VideoNode {
+                asset: image,
+                natural_size: [1, 1],
+                local_size: [10.0, 10.0],
+                time_range_us: [0, 1_000_000],
+                speed: 1.0,
+                muted: false,
+                volume: 1.0,
+                poster_frame_us: None,
+                poster: None,
+                fit: ImageFitMode::Fill,
+            }),
+            "Video",
+            80.0,
+        );
+        place(
+            NodeData::Audio(AudioNode {
+                asset: image,
+                local_size: [10.0, 4.0],
+                time_range_us: [0, 1_000_000],
+                volume: 1.0,
+                muted: false,
+                waveform_color: Color::default(),
+            }),
+            "Audio",
+            100.0,
+        );
+        place(
+            NodeData::NodeGraph(NodeGraphNode {
+                local_size: [10.0, 10.0],
+                graph: NodeGraph::default(),
+                preview: None,
+            }),
+            "Node Graph",
+            120.0,
+        );
+        place(
+            NodeData::Model3d(Model3dNode {
+                asset: image,
+                local_size: [10.0, 10.0],
+                camera: Camera3d::default(),
+                overrides: serde_json::Value::Null,
+            }),
+            "3D",
+            140.0,
+        );
+        place(
+            NodeData::AiArtifact(AiArtifactNode {
+                local_size: [10.0, 10.0],
+                prompt: "a cat".into(),
+                model: "gen-1".into(),
+                params: serde_json::Value::Null,
+                inputs: Vec::new(),
+                lineage_parent: None,
+                output: None,
+                status: GenerationStatus::Pending,
+                seed: None,
+            }),
+            "AI",
+            160.0,
+        );
+        place(
+            NodeData::Instance(InstanceNode {
+                component: comp_id,
+                overrides: Vec::new(),
+                prop_values: BTreeMap::new(),
+                derived: Vec::new(),
+                local_size: [10.0, 10.0],
+            }),
+            "Instance",
+            180.0,
+        );
+        let boolean = place(
+            NodeData::Boolean(BooleanNode::default()),
+            "Boolean",
+            200.0,
+        );
+        place(
+            NodeData::Embed(EmbedNode {
+                local_size: [10.0, 10.0],
+                kind: "iframe".into(),
+                payload: serde_json::Value::Null,
+            }),
+            "Embed",
+            220.0,
+        );
+        let mut operand = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            5.0,
+            5.0,
+            Color::BLACK,
+        )));
+        operand.name = "Operand".into();
+        operand.parent = Some(boolean);
+        doc.scene.insert(operand).unwrap();
+
+        doc.add_page(page);
+        doc.add_page(comp_page);
+        doc.components
+            .defs
+            .insert(comp_id, ComponentDef::new(comp_id, comp_root, "Button"));
+
+        // The format layer has no renderer; stand in for fanta-headless's
+        // exporter with fixed bytes and a fixed outline.
+        struct FixtureRender {
+            bounds: BTreeMap<NodeId, Bounds>,
+        }
+        impl WebRenderSource for FixtureRender {
+            fn design_bounds(&self, root: NodeId) -> Option<Bounds> {
+                self.bounds.get(&root).copied()
+            }
+            fn raster(&self, _node: NodeId) -> Option<WebRaster> {
+                Some(WebRaster {
+                    bytes: b"\x89PNG\r\n\x1a\nfixture-raster".to_vec(),
+                    bounds: Bounds {
+                        min_x: 0.0,
+                        min_y: 0.0,
+                        max_x: 10.0,
+                        max_y: 10.0,
+                    },
+                })
+            }
+            fn outline(&self, _node: NodeId) -> Option<fanta_doc::PathData> {
+                Some(fanta_doc::PathData::rect(0.0, 0.0, 5.0, 5.0))
+            }
+        }
+        let design_bounds = Bounds {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 240.0,
+            max_y: 40.0,
+        };
+        let render = FixtureRender {
+            bounds: BTreeMap::from([(page, design_bounds), (comp_root, design_bounds)]),
+        };
+        let write = |dir: &Path, doc: &Doc| {
+            write_web_project_tree(dir, doc, &assets, Some(&render), &[]).expect("write");
+        };
+        let dir = tempdir().unwrap();
+        write(dir.path(), &doc);
+        assert!(
+            !tree_snapshot(dir.path())
+                .keys()
+                .any(|path| path.ends_with(".fnx") || path.ends_with(".fss")),
+            "web storage must not write FNX sources"
+        );
+        // Spec 0009 A1: a freshly written project of every node kind has
+        // nothing for the checker to report.
+        assert_eq!(check_project(dir.path()).expect("check"), Vec::new());
+
+        let (loaded, loaded_assets) = read_project_tree(dir.path()).expect("read");
+        assert_eq!(persisted(&loaded), persisted(&doc), "R6 property equality");
+        assert_eq!(loaded_assets, assets);
+        assert_eq!(loaded.pages(), doc.pages(), "page order survives");
+
+        let second = tempdir().unwrap();
+        write(second.path(), &loaded);
+        assert_eq!(
+            tree_snapshot(second.path()),
+            tree_snapshot(dir.path()),
+            "A3 byte identity across write → load → write"
+        );
+    }
+
+    /// A4 and A6 (spec 0007 T3, R7/R8): hand edits inside the emitted dialect
+    /// — a fill in `design.css`, a width in the page SVG, text content, a
+    /// `var()` swapped for a literal and back, auto-layout intent — survive
+    /// load, win over the `nodes.json` records, and the next save keeps them.
+    /// What the loader cannot keep is reported, never silently dropped.
+    #[test]
+    fn web_hand_edits_win_over_the_records() {
+        use fanta_doc::{AutoLayout, Color, PathData, TextNode, Transform2D, VectorNode};
+
+        let mut doc = Doc::new();
+        doc.metadata.title = "Hand Edits".into();
+        let mut insert = |node: CanvasNode| -> NodeId {
+            let id = node.id;
+            doc.scene.insert(node).unwrap();
+            id
+        };
+        let page = insert(group(None, "Home"));
+        let mut stack = group(Some(page), "Stack");
+        if let NodeData::Group(frame) = &mut stack.data {
+            frame.local_size = Some([100.0, 100.0]);
+            frame.auto_layout = Some(
+                serde_json::from_value::<AutoLayout>(serde_json::json!({
+                    "mode": "vertical",
+                    "spacing": 10.0,
+                }))
+                .expect("auto layout"),
+            );
+        }
+        let stack_id = stack.id;
+        insert(stack);
+        let collection_id = VariableCollectionId::new();
+        let variable_id = VariableId::new();
+        let mut place = |data: NodeData, name: &str, parent: NodeId, x: f64| -> NodeId {
+            let mut node = CanvasNode::new(data);
+            node.name = name.into();
+            node.parent = Some(parent);
+            node.transform = Transform2D::translation(x, 0.0);
+            let id = node.id;
+            doc.scene.insert(node).unwrap();
+            id
+        };
+        let card = place(
+            NodeData::Vector(VectorNode::rect_solid(0.0, 0.0, 120.0, 80.0, Color::WHITE)),
+            "Card",
+            page,
+            0.0,
+        );
+        let panel = place(
+            NodeData::Vector(VectorNode::rect_solid(
+                0.0,
+                0.0,
+                64.0,
+                32.0,
+                Color::from_hex("#123456").unwrap(),
+            )),
+            "Panel",
+            page,
+            140.0,
+        );
+        let label = place(
+            NodeData::Text(TextNode::new("Hello", 100.0, 20.0)),
+            "Label",
+            page,
+            220.0,
+        );
+        let child_a = place(
+            NodeData::Vector(VectorNode::rect_solid(0.0, 0.0, 10.0, 10.0, Color::BLACK)),
+            "A",
+            stack_id,
+            0.0,
+        );
+        doc.scene
+            .get_mut(card)
+            .unwrap()
+            .bindings
+            .insert(fanta_doc::BoundProp::FillColor { index: 0 }, variable_id);
+        doc.add_page(page);
+        let mode = ModeId::new();
+        doc.variables.collections.insert(
+            collection_id,
+            VariableCollection {
+                id: collection_id,
+                name: "Theme".into(),
+                modes: vec![Mode {
+                    id: mode,
+                    name: "Light".into(),
+                }],
+                default_mode: mode,
+                variable_order: Vec::new(),
+            },
+        );
+        doc.variables.variables.insert(
+            variable_id,
+            Variable {
+                id: variable_id,
+                collection: collection_id,
+                name: "Surface".into(),
+                ty: VariableType::Color,
+                values_by_mode: BTreeMap::from([(
+                    mode,
+                    VarValue::Color {
+                        value: Color::WHITE,
+                    },
+                )]),
+                scopes: Vec::new(),
+                options: Vec::new(),
+            },
+        );
+
+        let dir = tempdir().unwrap();
+        let assets = BTreeMap::new();
+        write_web_project_tree(dir.path(), &doc, &assets, None, &[]).unwrap();
+
+        // A pristine projection loads with nothing to report.
+        let (_, _, warnings) = read_project_tree_with_warnings(dir.path()).unwrap();
+        assert_eq!(warnings, Vec::<crate::SourceDiagnostic>::new());
+
+        // Hand edits: unbind the card's fill to a literal, bind the panel's
+        // literal to the token, widen the gap, plus one unknown declaration.
+        let css_path = dir.path().join("pages/home/page.css");
+        let css = fs::read_to_string(&css_path).unwrap();
+        assert!(css.contains("fill: var(--theme-surface, #FFFFFF);"), "{css}");
+        let css = css
+            .replace(
+                "fill: var(--theme-surface, #FFFFFF);",
+                "fill: #FF0000;",
+            )
+            .replace(
+                "fill: #123456;",
+                "fill: var(--theme-surface, #123456);",
+            )
+            .replace("--fanta-gap: 10;", "--fanta-gap: 24;");
+        fs::write(&css_path, css).unwrap();
+        // A project-wide rule hand-added to the root design.css (after the
+        // generated @import lines) applies on load too.
+        let root_css_path = dir.path().join("design.css");
+        let root_css = fs::read_to_string(&root_css_path).unwrap();
+        assert!(root_css.contains("@import url(\"pages/home/page.css\");"), "{root_css}");
+        let root_css = format!("{root_css}\n#{card} {{ zzz-unknown: 1; }}\n");
+        fs::write(&root_css_path, root_css).unwrap();
+        let svg_path = dir.path().join("pages/home/page.svg");
+        let svg = fs::read_to_string(&svg_path).unwrap();
+        assert!(svg.contains("width=\"120\""), "{svg}");
+        let svg = svg
+            .replace("width=\"120\"", "width=\"200\"")
+            .replace(">Hello<", ">Edited<");
+        fs::write(&svg_path, svg).unwrap();
+
+        let (loaded, _, warnings) = read_project_tree_with_warnings(dir.path()).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        // Spec 0009 R2: the finding is a record a tool can act on, not a sentence.
+        let finding = &warnings[0];
+        assert!(finding.message.contains("zzz-unknown"), "{warnings:?}");
+        assert_eq!(finding.code, "edit.not_kept");
+        assert_eq!(finding.node_id.as_deref(), Some(card.to_string().as_str()));
+        assert_eq!(finding.file.as_deref(), Some("pages/home/page.svg"));
+        let svg = fs::read_to_string(&svg_path).unwrap();
+        let id_offset = svg.find(&format!("id=\"{card}\"")).unwrap();
+        let expected_line = u32::try_from(svg[..id_offset].matches('\n').count() + 1).unwrap();
+        assert_eq!(finding.line, Some(expected_line));
+        assert!(finding.column.is_some());
+        let loaded_card = loaded.scene.get(card).unwrap();
+        assert!(loaded_card.bindings.is_empty(), "literal fill unbinds");
+        let NodeData::Vector(vector) = &loaded_card.data else {
+            panic!("card stays a vector");
+        };
+        assert_eq!(
+            vector.fills.first(),
+            Some(&fanta_doc::Fill::Solid {
+                color: Color::from_hex("#FF0000").unwrap(),
+                blend: fanta_doc::BlendMode::Normal,
+            })
+        );
+        assert_eq!(
+            vector.path.to_svg_d(),
+            PathData::rect(0.0, 0.0, 200.0, 80.0).to_svg_d(),
+            "the SVG width wins over the record"
+        );
+        let loaded_panel = loaded.scene.get(panel).unwrap();
+        assert_eq!(
+            loaded_panel
+                .bindings
+                .get(&fanta_doc::BoundProp::FillColor { index: 0 }),
+            Some(&variable_id),
+            "a var() swap binds the fill"
+        );
+        let NodeData::Text(text) = &loaded.scene.get(label).unwrap().data else {
+            panic!("label stays text");
+        };
+        assert_eq!(text.content, "Edited");
+        let NodeData::Group(frame) = &loaded.scene.get(stack_id).unwrap().data else {
+            panic!("stack stays a frame");
+        };
+        assert_eq!(frame.auto_layout.as_ref().unwrap().spacing, 24.0);
+        assert!(
+            loaded.pending_layout.contains(&stack_id)
+                && loaded.pending_layout.contains(&child_a),
+            "changed intent re-solves the derived geometry (R8): {:?}",
+            loaded.pending_layout
+        );
+
+        // The next save canonicalizes and keeps every edit (A4).
+        write_web_project_tree(dir.path(), &loaded, &assets, None, &[]).unwrap();
+        let css = fs::read_to_string(&css_path).unwrap();
+        assert!(css.contains("fill: #FF0000;"), "{css}");
+        // The canonical fallback literal is the token's resolved value.
+        assert!(css.contains("fill: var(--theme-surface, #FFFFFF);"), "{css}");
+        assert!(css.contains("--fanta-gap: 24;"), "{css}");
+        assert!(!css.contains("zzz-unknown"), "unknown declarations canonicalize away");
+        let svg = fs::read_to_string(&svg_path).unwrap();
+        assert!(svg.contains("width=\"200\""), "{svg}");
+        assert!(svg.contains(">Edited<"), "{svg}");
+    }
+
+    /// T4 (R11): gradients, stacked fills, masks, baked booleans and
+    /// instances emit natively — the writer asks for no renderer help and
+    /// stores no raster stand-ins — and the projection loads back with zero
+    /// warnings and rewrites byte-identical (R5).
+    #[test]
+    fn web_t4_features_emit_natively_without_rasters() {
+        use fanta_doc::{
+            BlendMode, BooleanBakedGeometry, BooleanNode, Color, Fill, Gradient, GradientStop,
+            InstanceNode, PathData, TextNode, Transform2D, VectorNode,
+        };
+
+        let mut doc = Doc::new();
+        doc.metadata.title = "Parity".into();
+        let mut insert = |node: CanvasNode| -> NodeId {
+            let id = node.id;
+            doc.scene.insert(node).unwrap();
+            id
+        };
+        let page = insert(group(None, "Home"));
+        let comp_page = insert(group(None, "Components"));
+        let comp_root = insert(group(Some(comp_page), "Chip"));
+        let mut chip_shape = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            8.0,
+            8.0,
+            Color::BLACK,
+        )));
+        chip_shape.name = "Chip / Shape".into();
+        chip_shape.parent = Some(comp_root);
+        // A level style on instance content must share the fill's one style
+        // attribute; a second style="" made the SVG malformed XML.
+        chip_shape.opacity = fanta_doc::UnitInterval::new(0.5);
+        insert(chip_shape);
+        let mut chip_label = CanvasNode::new(NodeData::Text(TextNode::new("Chip", 40.0, 12.0)));
+        if let NodeData::Text(text) = &mut chip_label.data {
+            text.style.font_family = "Source Serif Pro".into();
+        }
+        chip_label.name = "Chip / Label".into();
+        chip_label.parent = Some(comp_root);
+        insert(chip_label);
+        let comp_id = ComponentId::new();
+
+        let mut gradient_rect = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            40.0,
+            40.0,
+            Color::WHITE,
+        )));
+        if let NodeData::Vector(vector) = &mut gradient_rect.data {
+            if let Some(first) = vector.fills.first_mut() {
+                *first = Fill::Gradient {
+                    gradient: Gradient::Linear {
+                        start: [0.0, 0.0],
+                        end: [1.0, 1.0],
+                        stops: vec![
+                            GradientStop {
+                                position: 0.0,
+                                color: Color::WHITE,
+                            },
+                            GradientStop {
+                                position: 1.0,
+                                color: Color::BLACK,
+                            },
+                        ],
+                    },
+                    blend: BlendMode::Normal,
+                };
+            }
+            vector.fills.push(Fill::Solid {
+                color: Color {
+                    r: 255,
+                    g: 0,
+                    b: 0,
+                    a: 128,
+                },
+                blend: BlendMode::Normal,
+            });
+        }
+        gradient_rect.name = "Gradient".into();
+        gradient_rect.parent = Some(page);
+        let gradient_id = insert(gradient_rect);
+
+        let mut frame = group(Some(page), "Masked");
+        if let NodeData::Group(data) = &mut frame.data {
+            data.local_size = Some([60.0, 60.0]);
+        }
+        frame.transform = Transform2D::translation(60.0, 0.0);
+        let frame_id = insert(frame);
+        let mut mask = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            30.0,
+            30.0,
+            Color::WHITE,
+        )));
+        mask.name = "Mask".into();
+        mask.parent = Some(frame_id);
+        mask.is_mask = true;
+        let mask_id = insert(mask);
+        let mut masked = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            60.0,
+            60.0,
+            Color::BLACK,
+        )));
+        masked.name = "Masked content".into();
+        masked.parent = Some(frame_id);
+        insert(masked);
+
+        let mut boolean_data = BooleanNode::default();
+        boolean_data.fills.push(Fill::Solid {
+            color: Color::BLACK,
+            blend: BlendMode::Normal,
+        });
+        boolean_data.baked = Some(BooleanBakedGeometry {
+            vector: VectorNode {
+                path: PathData::rect(0.0, 0.0, 12.0, 12.0),
+                ..VectorNode::default()
+            },
+            source: "import".into(),
+            stroke_outline: false,
+        });
+        let mut boolean = CanvasNode::new(NodeData::Boolean(boolean_data));
+        boolean.name = "Union".into();
+        boolean.parent = Some(page);
+        boolean.transform = Transform2D::translation(140.0, 0.0);
+        let boolean_id = insert(boolean);
+
+        let mut instance = CanvasNode::new(NodeData::Instance(InstanceNode {
+            component: comp_id,
+            overrides: Vec::new(),
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [8.0, 8.0],
+        }));
+        instance.name = "Chip instance".into();
+        instance.parent = Some(page);
+        instance.transform = Transform2D::translation(180.0, 0.0);
+        insert(instance);
+
+        doc.add_page(page);
+        doc.add_page(comp_page);
+        doc.components
+            .defs
+            .insert(comp_id, ComponentDef::new(comp_id, comp_root, "Chip"));
+
+        let assets = BTreeMap::new();
+        let dir = tempdir().unwrap();
+        // No render source at all: these features must not need one (R11).
+        let (_, report) = write_web_project_tree(dir.path(), &doc, &assets, None, &[]).unwrap();
+        let not_drawn: Vec<_> = report
+            .pages
+            .iter()
+            .chain(report.components.iter())
+            .flat_map(|design| design.approximations.iter())
+            .filter(|approximation| approximation.what.starts_with("not drawn"))
+            .collect();
+        assert!(
+            not_drawn.is_empty(),
+            "R11: none of these features may need renderer help: {not_drawn:?}"
+        );
+
+        let svg = fs::read_to_string(dir.path().join("pages/home/page.svg")).unwrap();
+        assert!(
+            svg.starts_with(
+                "<?xml-stylesheet type=\"text/css\" href=\"../../tokens.css\"?>\n\
+                 <?xml-stylesheet type=\"text/css\" href=\"page.css\"?>\n<svg "
+            ),
+            "a standalone open of the SVG must load the project's styling: {svg}"
+        );
+        assert!(svg.contains("<linearGradient id=\""), "{svg}");
+        assert!(
+            svg.contains(&format!("id=\"{gradient_id}-f1\"")),
+            "stacked fills clone the geometry: {svg}"
+        );
+        assert!(svg.contains(&format!("<mask id=\"{mask_id}-mask\"")), "{svg}");
+        assert!(
+            svg.contains(&format!("<g mask=\"url(#{mask_id}-mask)\">")),
+            "{svg}"
+        );
+        // The baked outline here is a rect, so it canonicalizes to <rect>.
+        assert!(
+            svg.contains(&format!("<rect id=\"{boolean_id}\" class=\"union\" data-name=\"Union\"")),
+            "a baked boolean emits its outline geometry: {svg}"
+        );
+        assert!(
+            svg.contains("data-virtual=\"true\""),
+            "instance content emits inline, without ids: {svg}"
+        );
+        assert!(
+            svg.contains("font-family: 'Source Serif Pro'"),
+            "a spaced family in an inline style must stay XML-safe (single quotes): {svg}"
+        );
+        assert!(
+            svg.contains("<svg xmlns=\"http://www.w3.org/2000/svg\" data-fanta=\"page\""),
+            "the root element identifies the file as Fanta source and its kind: {svg}"
+        );
+        assert!(
+            svg.contains("style=\"opacity: 0.5; fill:"),
+            "a level style on instance content shares the fill's style attribute: {svg}"
+        );
+        let master = fs::read_to_string(dir.path().join("components/chip/master.svg")).unwrap();
+        assert!(master.contains("data-fanta=\"master\""), "{master}");
+        let css = fs::read_to_string(dir.path().join("pages/home/page.css")).unwrap();
+        assert!(
+            css.contains(&format!("fill: url(#{gradient_id}-grad);")),
+            "{css}"
+        );
+        assert!(
+            !tree_snapshot(dir.path())
+                .keys()
+                .any(|path| path.ends_with(".png")),
+            "no raster stand-ins in storage (R11)"
+        );
+
+        let (loaded, _, warnings) = read_project_tree_with_warnings(dir.path()).unwrap();
+        assert_eq!(warnings, Vec::<crate::SourceDiagnostic>::new(), "a pristine projection loads clean");
+        assert_eq!(persisted(&loaded), persisted(&doc));
+        let second = tempdir().unwrap();
+        write_web_project_tree(second.path(), &loaded, &assets, None, &[]).unwrap();
+        assert_eq!(
+            tree_snapshot(second.path()),
+            tree_snapshot(dir.path()),
+            "byte identity across write → load → write (R5)"
+        );
+
+        // A hand edit on the stacked-fill clone element wins (R7).
+        let css_path = second.path().join("pages/home/page.css");
+        let css = fs::read_to_string(&css_path).unwrap();
+        let marker = format!("#{gradient_id}-f1 {{\n  fill: rgba(255, 0, 0, 0.502);");
+        assert!(css.contains(&marker), "{css}");
+        fs::write(
+            &css_path,
+            css.replace("rgba(255, 0, 0, 0.502)", "#00FF00"),
+        )
+        .unwrap();
+        let (edited, _, warnings) = read_project_tree_with_warnings(second.path()).unwrap();
+        assert_eq!(warnings, Vec::<crate::SourceDiagnostic>::new(), "{warnings:?}");
+        let NodeData::Vector(vector) = &edited.scene.get(gradient_id).unwrap().data else {
+            panic!("the gradient rect stays a vector");
+        };
+        assert_eq!(
+            vector.fills.get(1),
+            Some(&Fill::Solid {
+                color: Color::from_hex("#00FF00").unwrap(),
+                blend: BlendMode::Normal,
+            }),
+            "the second fill takes the hand-edited color"
+        );
+    }
+
+    /// A5 groundwork: writing web storage over an FNX tree converts it in
+    /// place — stale pruning removes the FNX sources, and the project still
+    /// loads property-equal.
+    #[test]
+    fn converting_a_project_to_web_storage_prunes_fnx_sources() {
+        let f = fixture();
+        let (assets, _) = fixture_assets();
+        let dir = tempdir().unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        assert!(
+            tree_snapshot(dir.path())
+                .keys()
+                .any(|path| path.ends_with(".fnx")),
+            "the FNX writer must have written sources"
+        );
+
+        write_web_project_tree(dir.path(), &f.doc, &assets, None, &[]).unwrap();
+        let tree = tree_snapshot(dir.path());
+        assert!(
+            !tree
+                .keys()
+                .any(|path| path.ends_with(".fnx") || path.ends_with(".fss")),
+            "conversion must prune the FNX sources, kept: {:?}",
+            tree.keys().collect::<Vec<_>>()
+        );
+
+        let (loaded, loaded_assets) = read_project_tree(dir.path()).expect("read");
+        assert_eq!(persisted(&loaded), persisted(&f.doc));
+        assert_eq!(loaded_assets, assets);
     }
 
     #[test]
@@ -801,7 +1565,7 @@ mod tests {
         doc.scene.insert(node).unwrap();
 
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
         let page_dir = dir.path().join("pages/page-1");
         let source = fs::read_to_string(page_dir.join("page.fnx")).unwrap();
@@ -833,7 +1597,7 @@ mod tests {
         let expected_motion = fixture.doc.motion.clone();
         let dir = tempdir().unwrap();
 
-        write_project_tree(dir.path(), &fixture.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &fixture.doc, &BTreeMap::new()).unwrap();
 
         let motion_path = dir.path().join("doc/motion.json");
         let written_motion: Value =
@@ -852,7 +1616,7 @@ mod tests {
         let target = fixture.frame;
         add_motion_fixture(&mut fixture.doc, target);
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &fixture.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &fixture.doc, &BTreeMap::new()).unwrap();
         fs::remove_file(dir.path().join("doc/motion.json")).unwrap();
 
         let (restored, _) = read_project_tree(dir.path()).unwrap();
@@ -885,7 +1649,7 @@ mod tests {
         }
 
         let first = tempdir().unwrap();
-        write_project_tree(first.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(first.path(), &f.doc, &assets).unwrap();
         assert!(
             fs::read_to_string(first.path().join("pages/page-1/page.fnx"))
                 .unwrap()
@@ -895,7 +1659,7 @@ mod tests {
 
         let (reloaded, reloaded_assets) = read_project_tree(first.path()).unwrap();
         let second = tempdir().unwrap();
-        write_project_tree(second.path(), &reloaded, &reloaded_assets).unwrap();
+        write_legacy_project_tree(second.path(), &reloaded, &reloaded_assets).unwrap();
 
         let before = tree_snapshot(first.path());
         let after = tree_snapshot(second.path());
@@ -942,7 +1706,7 @@ mod tests {
         doc.scene.insert(rect).unwrap();
 
         let first = tempdir().unwrap();
-        write_project_tree(first.path(), &doc, &assets).unwrap();
+        write_legacy_project_tree(first.path(), &doc, &assets).unwrap();
         let source = first.path().join("pages/page-1/page.fnx");
         assert!(
             fs::read_to_string(&source).unwrap().contains("<Rect "),
@@ -954,7 +1718,7 @@ mod tests {
         let (mut reloaded, reloaded_assets) = read_project_tree(first.path()).unwrap();
         fanta_doc::backfill_vector_viewports(&mut reloaded.scene);
         let second = tempdir().unwrap();
-        write_project_tree(second.path(), &reloaded, &reloaded_assets).unwrap();
+        write_legacy_project_tree(second.path(), &reloaded, &reloaded_assets).unwrap();
         let after_reload = fs::read_to_string(second.path().join("pages/page-1/page.fnx")).unwrap();
         assert!(
             after_reload.contains("<Rect ") && !after_reload.contains("path="),
@@ -965,7 +1729,7 @@ mod tests {
         let (mut again, again_assets) = read_project_tree(second.path()).unwrap();
         fanta_doc::backfill_vector_viewports(&mut again.scene);
         let third = tempdir().unwrap();
-        write_project_tree(third.path(), &again, &again_assets).unwrap();
+        write_legacy_project_tree(third.path(), &again, &again_assets).unwrap();
         assert_eq!(tree_snapshot(second.path()), tree_snapshot(third.path()));
     }
 
@@ -975,8 +1739,8 @@ mod tests {
         let (assets, _) = fixture_assets();
         let a = tempdir().unwrap();
         let b = tempdir().unwrap();
-        write_project_tree(a.path(), &f.doc, &assets).unwrap();
-        write_project_tree(b.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(a.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(b.path(), &f.doc, &assets).unwrap();
         assert_eq!(tree_snapshot(a.path()), tree_snapshot(b.path()));
     }
 
@@ -985,7 +1749,7 @@ mod tests {
         let mut f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let page1_ids = dir.path().join("pages/page-1/page.ids.json");
         let page2_dir = dir.path().join("pages/page-2");
@@ -1001,7 +1765,7 @@ mod tests {
         f.doc.scene.remove(f.inner).unwrap();
         f.doc.remove_page(f.page2);
         f.doc.scene.remove(f.page2).unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         assert!(
             !read_sidecar(&page1_ids)
@@ -1023,7 +1787,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let page_dir = dir.path().join("pages/page-1");
         fs::remove_file(page_dir.join("page.fnx")).unwrap();
@@ -1047,7 +1811,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
         let baseline = {
             let (doc2, _) = read_project_tree(dir.path()).unwrap();
             persisted(&doc2)
@@ -1153,7 +1917,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
         let baseline = {
             let (doc2, _) = read_project_tree(dir.path()).unwrap();
             persisted(&doc2)
@@ -1178,7 +1942,7 @@ mod tests {
             "v2 id-named dirs must read identically to the v3 slug tree"
         );
 
-        write_project_tree(dir.path(), &doc_v2, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &doc_v2, &assets).unwrap();
         assert!(
             dir.path().join("pages/page-1/page.fnx").is_file(),
             "save upgrades page dirs to slugs"
@@ -1210,7 +1974,7 @@ mod tests {
         let child = insert(group(Some(page), "Old Child"));
         doc.add_page(page);
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
         let snapshot = tempdir().unwrap();
         copy_design_dir(
@@ -1220,7 +1984,7 @@ mod tests {
 
         doc.scene.get_mut(page).unwrap().name = "Home Renamed".to_owned();
         doc.scene.get_mut(child).unwrap().name = "New Child".to_owned();
-        write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
         assert!(
             !dir.path().join("pages/home").exists(),
             "the rename save pruned the old dir"
@@ -1289,7 +2053,7 @@ mod tests {
             .defs
             .insert(cid, ComponentDef::new(cid, comp_root, "Button"));
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
         let snapshot = tempdir().unwrap();
         copy_design_dir(
@@ -1299,7 +2063,7 @@ mod tests {
 
         doc.components.defs.get_mut(&cid).unwrap().name = "Button Renamed".to_owned();
         doc.scene.get_mut(label).unwrap().name = "New Label".to_owned();
-        write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
         assert!(!dir.path().join("components/button").exists());
 
         // The v2-style leftover: id-named dir whose def.json still carries the
@@ -1333,14 +2097,14 @@ mod tests {
         let mut f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         f.doc.remove_page(f.page2);
         f.doc.scene.remove(f.page2).unwrap();
 
         let pages_root = dir.path().join("pages");
         fs::set_permissions(&pages_root, fs::Permissions::from_mode(0o555)).unwrap();
-        let result = write_project_tree(dir.path(), &f.doc, &assets);
+        let result = write_legacy_project_tree(dir.path(), &f.doc, &assets);
         fs::set_permissions(&pages_root, fs::Permissions::from_mode(0o755)).unwrap();
 
         let report = result.expect("a failed dir removal must not abort the save");
@@ -1361,7 +2125,7 @@ mod tests {
         // Once the generated files are gone, an empty directory has no
         // ownership marker. Keep it rather than deleting an indistinguishable
         // user-created empty directory on a later save.
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
         assert!(dir.path().join("pages/page-2").is_dir());
         let (reread, _) = read_project_tree(dir.path()).unwrap();
         assert_eq!(persisted(&reread), persisted(&f.doc));
@@ -1384,7 +2148,7 @@ mod tests {
         let high = add_page(2, "Home");
         let symbols = add_page(3, "🎨🎨");
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
 
         // Collisions get -2, -3 suffixes in id order; unsluggable names use
         // the fallback.
@@ -1419,7 +2183,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         // v3 slug dirs: identity comes from the headers.
         assert_eq!(
@@ -1453,7 +2217,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let root = dir.path().to_path_buf();
         assert_eq!(
@@ -1486,7 +2250,7 @@ mod tests {
     fn presence_state_never_reaches_disk_and_reads_back_as_defaults() {
         let f = fixture();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
 
         for (rel, bytes) in tree_snapshot(dir.path()) {
             let text = String::from_utf8_lossy(&bytes);
@@ -1523,7 +2287,7 @@ mod tests {
     fn orphan_nodes_round_trip_via_loose() {
         let f = fixture();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
 
         for id in [f.orphan, f.orphan_child] {
             assert!(
@@ -1561,7 +2325,7 @@ mod tests {
     fn newer_doc_schema_is_rejected_older_is_migrated() {
         let f = fixture();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
         let manifest_path = dir.path().join("fanta.json");
         let manifest_text = fs::read_to_string(&manifest_path).unwrap();
 
@@ -1614,7 +2378,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
         let slugged = dir.path().join("pages/page-1");
         assert!(slugged.join("page.fnx").is_file());
 
@@ -1623,7 +2387,7 @@ mod tests {
         fs::rename(&slugged, &via).unwrap();
         fs::rename(&via, dir.path().join("pages/Page-1")).unwrap();
 
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         assert!(
             slugged.join("page.fnx").is_file(),
@@ -1637,6 +2401,36 @@ mod tests {
         );
     }
 
+    /// The same holds below the design folder: an asset family folder, and a
+    /// file inside a design, renamed by case only.
+    #[test]
+    fn case_only_renames_of_asset_folders_and_files_never_delete_them() {
+        let f = fixture();
+        let (assets, expected) = fixture_assets();
+        let dir = tempdir().unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        let rename_case = |from: &str, to: &str| {
+            let via = dir.path().join("case-tmp");
+            fs::rename(dir.path().join(from), &via).unwrap();
+            fs::rename(&via, dir.path().join(to)).unwrap();
+        };
+        rename_case("assets/images", "assets/Images");
+        rename_case("pages/page-1/page.fnx", "pages/page-1/Page.fnx");
+
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
+
+        let (image, _, extension) = expected[0];
+        assert!(
+            dir.path()
+                .join(format!("assets/images/{image}.{extension}"))
+                .is_file()
+        );
+        assert!(dir.path().join("pages/page-1/page.fnx").is_file());
+        let (reread, reread_assets) = read_project_tree(dir.path()).unwrap();
+        assert!(reread.scene.get(f.page1).is_some());
+        assert_eq!(reread_assets, assets);
+    }
+
     /// A symlink planted at a projected file path (e.g. from a cloned repo)
     /// must be replaced with a real file — never written THROUGH, which would
     /// clobber whatever the link points at outside the project.
@@ -1646,7 +2440,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let outside = tempdir().unwrap();
         let target = outside.path().join("precious.txt");
@@ -1655,7 +2449,7 @@ mod tests {
         fs::remove_file(&fnx).unwrap();
         std::os::unix::fs::symlink(&target, &fnx).unwrap();
 
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         assert_eq!(
             fs::read(&target).unwrap(),
@@ -1678,7 +2472,7 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let design = dir.path().join("pages/page-1");
         let external = tempdir().unwrap();
@@ -1686,7 +2480,7 @@ mod tests {
         fs::rename(&design, &moved).unwrap();
         std::os::unix::fs::symlink(&moved, &design).unwrap();
 
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let metadata = fs::symlink_metadata(&design).unwrap();
         assert!(metadata.file_type().is_dir(), "real directory again");
@@ -1700,12 +2494,12 @@ mod tests {
         let f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
         let before = tree_snapshot(dir.path());
         let probe = dir.path().join("pages/page-1/page.fnx");
         let probe_mtime = mtime(&probe);
 
-        let report = write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        let report = write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         assert!(report.written.is_empty(), "written: {:?}", report.written);
         assert!(report.removed.is_empty(), "removed: {:?}", report.removed);
@@ -1718,7 +2512,7 @@ mod tests {
         let mut f = fixture();
         let (assets, _) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         let untouched = [
             "pages/page-1/page.fnx",
@@ -1733,7 +2527,7 @@ mod tests {
 
         f.doc.scene.get_mut(f.comp_child).unwrap().name = "Button / Relabeled".to_owned();
         f.doc.metadata.modified_at = 1_700_000_002;
-        let report = write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        let report = write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
         // The sidecar rewrites too: it fingerprints element names. `fanta.json`
         // does NOT: the manifest carries no per-save timestamp, so the project's
@@ -1758,7 +2552,7 @@ mod tests {
 
         // The net disk state is byte-identical to a fresh full projection.
         let fresh = tempdir().unwrap();
-        write_project_tree(fresh.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(fresh.path(), &f.doc, &assets).unwrap();
         assert_eq!(tree_snapshot(dir.path()), tree_snapshot(fresh.path()));
     }
 
@@ -1766,11 +2560,11 @@ mod tests {
     fn renaming_a_page_moves_its_directory_and_prunes_the_old() {
         let mut f = fixture();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
         assert!(dir.path().join("pages/page-2/page.fnx").is_file());
 
         f.doc.scene.get_mut(f.page2).unwrap().name = "Landing".to_owned();
-        let report = write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+        let report = write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
 
         assert!(
             !dir.path().join("pages/page-2").exists(),
@@ -1795,7 +2589,7 @@ mod tests {
         );
 
         let fresh = tempdir().unwrap();
-        write_project_tree(fresh.path(), &f.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(fresh.path(), &f.doc, &BTreeMap::new()).unwrap();
         assert_eq!(tree_snapshot(dir.path()), tree_snapshot(fresh.path()));
     }
 
@@ -1804,7 +2598,7 @@ mod tests {
         let f = fixture();
         let (mut assets, expected) = fixture_assets();
         let dir = tempdir().unwrap();
-        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
         let (png_id, png_family, png_ext) = expected[0];
         let png_path = dir
             .path()
@@ -1812,7 +2606,7 @@ mod tests {
         let png_mtime = mtime(&png_path);
 
         // Content-addressed: an existing asset file is never rewritten.
-        let report = write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        let report = write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
         assert!(report.written.is_empty(), "written: {:?}", report.written);
         assert_eq!(mtime(&png_path), png_mtime);
 
@@ -1820,7 +2614,7 @@ mod tests {
         // and now-empty family directory.
         let (gone_id, gone_family, gone_ext) = expected[1];
         assets.remove(&gone_id);
-        let report = write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+        let report = write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
         assert_eq!(
             report.written,
             vec![std::path::PathBuf::from("assets/index.json")]
@@ -1832,7 +2626,7 @@ mod tests {
         assert!(!dir.path().join(format!("assets/{gone_family}")).exists());
 
         let fresh = tempdir().unwrap();
-        write_project_tree(fresh.path(), &f.doc, &assets).unwrap();
+        write_legacy_project_tree(fresh.path(), &f.doc, &assets).unwrap();
         assert_eq!(tree_snapshot(dir.path()), tree_snapshot(fresh.path()));
     }
 
@@ -1842,16 +2636,167 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".git")).unwrap();
         fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/dev\n").unwrap();
-        write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
         fs::write(dir.path().join("previews/p.png"), b"png").unwrap();
         fs::write(dir.path().join("exports/e.fant"), b"zip").unwrap();
 
-        write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+        write_legacy_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
         assert_eq!(
             fs::read_to_string(dir.path().join(".git/HEAD")).unwrap(),
             "ref: refs/heads/dev\n"
         );
         assert!(dir.path().join("previews/p.png").is_file());
         assert!(dir.path().join("exports/e.fant").is_file());
+    }
+
+    /// Files as the in-memory reader takes them: every regular file under
+    /// `root`, keyed by its relative path.
+    fn mem_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        tree_snapshot(root)
+            .into_iter()
+            .filter(|(path, _)| !path.ends_with('/'))
+            .map(|(path, bytes)| (PathBuf::from(path), bytes))
+            .collect()
+    }
+
+    /// R1 (spec 0008 T1): the in-memory reader assembles the same document,
+    /// assets and warnings from the written bytes as the disk reader does.
+    #[test]
+    fn mem_reader_agrees_with_disk_reader() {
+        let f = fixture();
+        let (assets, _) = fixture_assets();
+        let dir = tempdir().unwrap();
+        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+
+        let (mem_doc, mem_assets, mem_warnings) = read_project_files(&mem_tree(dir.path())).unwrap();
+        let (disk_doc, disk_assets, disk_warnings) =
+            read_project_tree_with_warnings(dir.path()).unwrap();
+        assert_eq!(persisted(&mem_doc), persisted(&disk_doc));
+        assert_eq!(mem_assets, disk_assets);
+        assert_eq!(mem_doc.pages(), disk_doc.pages(), "page order agrees");
+        assert_eq!(mem_warnings, disk_warnings);
+    }
+
+    /// R3 (spec 0008 T1): one writer — the in-memory emitter produces exactly
+    /// the disk writer's bytes, and emit after a read of those bytes is a
+    /// fixed point, with no filesystem involved.
+    #[test]
+    fn emit_web_project_tree_matches_the_disk_writer_and_is_a_fixed_point() {
+        let f = fixture();
+        let (assets, _) = fixture_assets();
+        let dir = tempdir().unwrap();
+        write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+
+        let (emitted, _) = emit_web_project_tree(&f.doc, &assets, None, &[]).unwrap();
+        let emitted: BTreeMap<PathBuf, Vec<u8>> = emitted
+            .into_iter()
+            .map(|(path, bytes)| (path, bytes.to_vec()))
+            .collect();
+        let assert_trees_equal = |left: &BTreeMap<PathBuf, Vec<u8>>,
+                                  right: &BTreeMap<PathBuf, Vec<u8>>,
+                                  what: &str| {
+            assert_eq!(
+                left.keys().collect::<Vec<_>>(),
+                right.keys().collect::<Vec<_>>(),
+                "{what}: file lists differ"
+            );
+            for (path, bytes) in left {
+                assert_eq!(
+                    String::from_utf8_lossy(bytes),
+                    String::from_utf8_lossy(&right[path]),
+                    "{what}: {} differs",
+                    path.display()
+                );
+            }
+        };
+        // The disk sync also seeds editor support (AGENTS.md, .gitignore, …).
+        // Those are stateful on disk — a fresh copy in the emitted map would
+        // clobber a user-customized seed on write-back — so emit leaves them
+        // out and everything else matches byte for byte.
+        let mut disk = mem_tree(dir.path());
+        for (relative, _) in layout::fresh_project_editor_support() {
+            assert!(disk.remove(Path::new(relative)).is_some(), "{relative} seeded");
+        }
+        assert_trees_equal(&emitted, &disk, "emit vs disk writer");
+
+        let (loaded, loaded_assets, _) = read_project_files(&emitted).unwrap();
+        let (second, _) = emit_web_project_tree(&loaded, &loaded_assets, None, &[]).unwrap();
+        let second: BTreeMap<PathBuf, Vec<u8>> = second
+            .into_iter()
+            .map(|(path, bytes)| (path, bytes.to_vec()))
+            .collect();
+        assert_trees_equal(&second, &emitted, "emit after a read");
+    }
+
+    /// R1 + spec 0007 R7 in memory: a hand edit inside the map — a CSS fill,
+    /// SVG text content — takes the same overlay path as a disk hand edit.
+    #[test]
+    fn mem_reader_adopts_hand_edits() {
+        use fanta_doc::{Color, TextNode, Transform2D, VectorNode};
+
+        let mut doc = Doc::new();
+        doc.metadata.title = "Hand Edits In Memory".into();
+        let page = {
+            let node = group(None, "Home");
+            let id = node.id;
+            doc.scene.insert(node).unwrap();
+            id
+        };
+        let mut place = |data: NodeData, name: &str, x: f64| -> NodeId {
+            let mut node = CanvasNode::new(data);
+            node.name = name.into();
+            node.parent = Some(page);
+            node.transform = Transform2D::translation(x, 0.0);
+            let id = node.id;
+            doc.scene.insert(node).unwrap();
+            id
+        };
+        let panel = place(
+            NodeData::Vector(VectorNode::rect_solid(
+                0.0,
+                0.0,
+                64.0,
+                32.0,
+                Color::from_hex("#123456").unwrap(),
+            )),
+            "Panel",
+            0.0,
+        );
+        let label = place(NodeData::Text(TextNode::new("Hello", 100.0, 20.0)), "Label", 80.0);
+        doc.add_page(page);
+
+        let (emitted, _) = emit_web_project_tree(&doc, &BTreeMap::new(), None, &[]).unwrap();
+        let mut files: BTreeMap<PathBuf, Vec<u8>> = emitted
+            .into_iter()
+            .map(|(path, bytes)| (path, bytes.to_vec()))
+            .collect();
+        let css_path = PathBuf::from("pages/home/page.css");
+        let css = String::from_utf8(files[&css_path].clone()).unwrap();
+        assert!(css.contains("fill: #123456;"), "{css}");
+        files.insert(
+            css_path,
+            css.replace("fill: #123456;", "fill: #FF0000;").into_bytes(),
+        );
+        let svg_path = PathBuf::from("pages/home/page.svg");
+        let svg = String::from_utf8(files[&svg_path].clone()).unwrap();
+        assert!(svg.contains(">Hello<"), "{svg}");
+        files.insert(svg_path, svg.replace(">Hello<", ">Edited<").into_bytes());
+
+        let (loaded, _, warnings) = read_project_files(&files).unwrap();
+        assert_eq!(warnings, Vec::<crate::SourceDiagnostic>::new());
+        let NodeData::Vector(vector) = &loaded.scene.get(panel).unwrap().data else {
+            panic!("panel stays a vector");
+        };
+        assert_eq!(
+            vector.fills.first(),
+            Some(&fanta_doc::Fill::Solid {
+                color: Color::from_hex("#FF0000").unwrap(),
+                blend: fanta_doc::BlendMode::Normal,
+            })
+        );
+        let NodeData::Text(text) = &loaded.scene.get(label).unwrap().data else {
+            panic!("label stays text");
+        };
+        assert_eq!(text.content, "Edited");
     }
 }

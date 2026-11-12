@@ -47,7 +47,7 @@
 //! through to the next step. Nothing here ever panics on a missing or hostile
 //! network.
 
-use std::io::{Cursor, Read as _};
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -148,54 +148,82 @@ pub(super) fn fetch_google_font(family: &str) -> Option<Vec<u8>> {
     }
 
     // Network path: discover the real filename, then download it.
-    let bytes = download_family(&slug);
+    let fetched = download_family(&slug);
 
     // Persist the outcome (best-effort): the face on success, a miss marker
-    // otherwise, so subsequent runs don't repeat the network probe.
+    // only when the bank answered that it has no such family. Any other
+    // failure (offline, a timeout, a rate limit) is retried on the next run.
     if let Some(dir) = font_cache_dir() {
         // A cache write is an optimization, not correctness: on failure the
         // next run just repeats the network probe. Log at debug so a broken
         // cache dir is diagnosable without being noisy.
-        let (path, contents): (_, &[u8]) = match &bytes {
-            Some(b) if !b.is_empty() => (dir.join(format!("{slug}.ttf")), b),
-            _ => (dir.join(format!("{slug}.miss")), &[]),
+        let entry: Option<(_, &[u8])> = match &fetched {
+            Fetched::Body(bytes) => Some((dir.join(format!("{slug}.ttf")), bytes)),
+            Fetched::NotFound => Some((dir.join(format!("{slug}.miss")), &[])),
+            Fetched::Failed => None,
         };
-        if let Err(error) = std::fs::write(&path, contents) {
+        if let Some((path, contents)) = entry
+            && let Err(error) = std::fs::write(&path, contents)
+        {
             tracing::debug!(target: "fanta-text.font_cache", ?path, %error, "font cache write failed");
         }
     }
 
-    bytes
+    match fetched {
+        Fetched::Body(bytes) => Some(bytes),
+        Fetched::NotFound | Fetched::Failed => None,
+    }
+}
+
+/// What one fetch from the font bank produced.
+#[derive(Debug, PartialEq)]
+enum Fetched {
+    Body(Vec<u8>),
+    /// The bank answered that it has no such file.
+    NotFound,
+    /// Anything else: no network, a timeout, a rate limit, an oversized body.
+    Failed,
 }
 
 /// Resolve `slug`'s upright face filename from its `METADATA.pb` and download
-/// the file, scanning the license trees in [`TREES`] order. `None` if the family
-/// isn't found on any tree or the download fails.
-fn download_family(slug: &str) -> Option<Vec<u8>> {
-    if let Some(bytes) = download_adobe_legacy_source_pro(slug) {
-        return Some(bytes);
+/// the file, scanning the license trees in [`TREES`] order. `NotFound` only
+/// when every tree answered that it has no usable face.
+fn download_family(slug: &str) -> Fetched {
+    if let Some(fetched) = download_adobe_legacy_source_pro(slug) {
+        return fetched;
     }
 
+    let mut failed = false;
     for tree in TREES {
         let meta_url = format!("{RAW_BASE}/{tree}/{slug}/METADATA.pb");
-        let Some(meta_bytes) = http_get(&meta_url) else {
-            continue;
+        let meta_bytes = match http_get(&meta_url) {
+            Fetched::Body(bytes) => bytes,
+            Fetched::NotFound => continue,
+            Fetched::Failed => {
+                failed = true;
+                continue;
+            }
         };
         let meta_text = String::from_utf8_lossy(&meta_bytes);
         let Some(filename) = pick_upright_filename(&meta_text) else {
             continue;
         };
         let file_url = format!("{RAW_BASE}/{tree}/{slug}/{}", encode_filename(&filename));
-        if let Some(bytes) = http_get(&file_url) {
-            if !bytes.is_empty() {
-                return Some(bytes);
-            }
+        match http_get(&file_url) {
+            Fetched::Body(bytes) if !bytes.is_empty() => return Fetched::Body(bytes),
+            Fetched::Body(_) | Fetched::NotFound => {}
+            Fetched::Failed => failed = true,
         }
     }
-    None
+    if failed {
+        Fetched::Failed
+    } else {
+        Fetched::NotFound
+    }
 }
 
-fn download_adobe_legacy_source_pro(slug: &str) -> Option<Vec<u8>> {
+/// `None` for a family that is not one of the legacy Source Pro names.
+fn download_adobe_legacy_source_pro(slug: &str) -> Option<Fetched> {
     let spec = match slug {
         "sourcesanspro" => LegacyAdobeSourceSpec {
             url: SOURCE_SANS_PRO_ZIP,
@@ -213,8 +241,13 @@ fn download_adobe_legacy_source_pro(slug: &str) -> Option<Vec<u8>> {
         },
         _ => return None,
     };
-    let zip_bytes = http_get(spec.url)?;
-    extract_preferred_font_from_zip(&zip_bytes, spec.preferred_suffixes)
+    Some(match http_get(spec.url) {
+        Fetched::Body(zip_bytes) => {
+            extract_preferred_font_from_zip(&zip_bytes, spec.preferred_suffixes)
+                .map_or(Fetched::NotFound, Fetched::Body)
+        }
+        other => other,
+    })
 }
 
 struct LegacyAdobeSourceSpec {
@@ -401,31 +434,49 @@ fn field_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     Some(rest)
 }
 
-/// One blocking HTTP GET with a short timeout, returning the body bytes on a 200
-/// response. Any error (no network, non-200, too large, timeout) yields `None`
-/// so callers fall through. Capped at [`MAX_BYTES`] to bound memory.
-fn http_get(url: &str) -> Option<Vec<u8>> {
+/// One blocking HTTP GET with a short timeout: the body of a 200 response, or
+/// `NotFound` for a 404. Bodies larger than [`MAX_BYTES`] fail rather than
+/// arrive truncated, since a cut font file would be cached as a good one.
+fn http_get(url: &str) -> Fetched {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(HTTP_TIMEOUT))
         .build();
     let agent: ureq::Agent = config.into();
-    let mut resp = agent.get(url).call().ok()?;
+    let mut resp = match agent.get(url).call() {
+        Ok(resp) => resp,
+        Err(ureq::Error::StatusCode(404)) => return Fetched::NotFound,
+        Err(_) => return Fetched::Failed,
+    };
     if resp.status() != 200 {
-        return None;
+        return Fetched::Failed;
     }
+    read_capped(resp.body_mut().as_reader())
+}
+
+fn read_capped(reader: impl Read) -> Fetched {
     let mut bytes = Vec::new();
-    resp.body_mut()
-        .as_reader()
-        .take(MAX_BYTES)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    Some(bytes)
+    match reader.take(MAX_BYTES + 1).read_to_end(&mut bytes) {
+        Ok(_) if bytes.len() as u64 <= MAX_BYTES => Fetched::Body(bytes),
+        _ => Fetched::Failed,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn bodies_over_the_cap_fail_instead_of_arriving_cut() {
+        assert!(matches!(
+            read_capped(std::io::repeat(0).take(MAX_BYTES)),
+            Fetched::Body(bytes) if bytes.len() as u64 == MAX_BYTES
+        ));
+        assert_eq!(
+            read_capped(std::io::repeat(0).take(MAX_BYTES + 1)),
+            Fetched::Failed
+        );
+    }
 
     #[test]
     fn slug_strips_spaces_and_punctuation_lowercased() {

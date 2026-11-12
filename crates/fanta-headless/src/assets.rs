@@ -3,12 +3,17 @@
 //! render resolver), and the overlay that makes a new image drawable without
 //! re-decoding every embedded asset.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, PoisonError, RwLock, Weak};
+use std::collections::BTreeMap;
+#[cfg(feature = "render")]
+use std::collections::HashMap;
+use std::sync::Arc;
+#[cfg(feature = "render")]
+use std::sync::{PoisonError, RwLock, Weak};
 
 use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
 use fanta_doc::AssetId;
+#[cfg(feature = "render")]
 use fanta_render::{AssetResolver, DecodeListener, DecodedImage, LevelLookup, LeveledImage};
 
 /// Cap on the encoded bytes of one image ingested as a project asset (a paste,
@@ -17,6 +22,24 @@ use fanta_render::{AssetResolver, DecodeListener, DecodedImage, LevelLookup, Lev
 /// decoding, since a decoder handed arbitrary bytes can allocate far more
 /// than it was given.
 pub const MAX_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+
+/// The most pixels one image may decode to: four times Figma's own 4096 x
+/// 4096 limit. A small, highly compressed file can otherwise decode to
+/// gigabytes, and the image crate's allocation limit is advisory.
+pub const MAX_IMAGE_PIXELS: u64 = 64 << 20;
+
+/// Decode `bytes` to straight-alpha RGBA8, refusing an image larger than
+/// [`MAX_IMAGE_PIXELS`] from its header, before its pixels are allocated.
+pub fn decode_rgba(bytes: &[u8]) -> Result<image::RgbaImage> {
+    let reader = || image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format();
+    let (width, height) = reader()?.into_dimensions()?;
+    anyhow::ensure!(
+        u64::from(width) * u64::from(height) <= MAX_IMAGE_PIXELS,
+        "the image is {width} x {height} pixels; the limit is {MAX_IMAGE_PIXELS} pixels"
+    );
+    // `into_rgba8` moves an RGBA8 decode instead of cloning it.
+    Ok(reader()?.decode()?.into_rgba8())
+}
 
 /// Somewhere an edit batch can ingest images and, when the batch fails, take
 /// them out again. The editor's implementation also keeps its thumbnail cache
@@ -88,8 +111,7 @@ impl PreparedImage {
             bytes.len()
         );
         let id = fanta_format::asset_id_for_bytes(&bytes);
-        let decoded = image::load_from_memory(&bytes).context("decoding image bytes")?;
-        let rgba = decoded.to_rgba8();
+        let rgba = decode_rgba(&bytes).context("decoding image bytes")?;
         let (width, height) = rgba.dimensions();
         anyhow::ensure!(width > 0 && height > 0, "the image has no pixels");
         let format = image::guess_format(&bytes).ok();
@@ -117,12 +139,14 @@ impl PreparedImage {
 /// one image is O(1) instead of a re-decode of every embedded asset. Interior
 /// mutability because the resolver is shared as an `Arc<dyn AssetResolver>`
 /// with background renders; reads take the lock only on the overlay map.
+#[cfg(feature = "render")]
 pub struct OverlayAssetResolver {
     base: Option<Arc<dyn AssetResolver>>,
     added: RwLock<HashMap<AssetId, DecodedImage>>,
     added_bytes: RwLock<HashMap<AssetId, Arc<Vec<u8>>>>,
 }
 
+#[cfg(feature = "render")]
 impl OverlayAssetResolver {
     /// Whether no ingested image is layered over the base resolver.
     pub fn is_empty(&self) -> bool {
@@ -138,6 +162,7 @@ impl OverlayAssetResolver {
     }
 }
 
+#[cfg(feature = "render")]
 impl AssetResolver for OverlayAssetResolver {
     fn resolve(&self, id: AssetId) -> Option<DecodedImage> {
         if let Some(image) = self
@@ -211,19 +236,23 @@ impl AssetResolver for OverlayAssetResolver {
 /// new images over it.
 pub struct AssetStores<'a> {
     raw_assets: &'a mut Arc<BTreeMap<AssetId, Vec<u8>>>,
+    #[cfg(feature = "render")]
     asset_resolver: &'a mut Option<Arc<dyn AssetResolver>>,
+    #[cfg(feature = "render")]
     overlay: &'a mut Option<Arc<OverlayAssetResolver>>,
 }
 
 impl<'a> AssetStores<'a> {
     pub fn new(
         raw_assets: &'a mut Arc<BTreeMap<AssetId, Vec<u8>>>,
-        asset_resolver: &'a mut Option<Arc<dyn AssetResolver>>,
-        overlay: &'a mut Option<Arc<OverlayAssetResolver>>,
+        #[cfg(feature = "render")] asset_resolver: &'a mut Option<Arc<dyn AssetResolver>>,
+        #[cfg(feature = "render")] overlay: &'a mut Option<Arc<OverlayAssetResolver>>,
     ) -> Self {
         Self {
             raw_assets,
+            #[cfg(feature = "render")]
             asset_resolver,
+            #[cfg(feature = "render")]
             overlay,
         }
     }
@@ -237,20 +266,25 @@ impl<'a> AssetStores<'a> {
             );
             return Ok((id, false));
         }
-        Arc::make_mut(self.raw_assets).insert(id, bytes.clone());
-        let overlay = self.overlay.get_or_insert_with(|| {
-            Arc::new(OverlayAssetResolver {
-                base: self.asset_resolver.clone(),
-                added: RwLock::new(HashMap::default()),
-                added_bytes: RwLock::new(HashMap::default()),
-            })
-        });
-        overlay
-            .added_bytes
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id, Arc::new(bytes));
-        *self.asset_resolver = Some(overlay.clone() as Arc<dyn AssetResolver>);
+        #[cfg(feature = "render")]
+        let overlay_bytes = Arc::new(bytes.clone());
+        Arc::make_mut(self.raw_assets).insert(id, bytes);
+        #[cfg(feature = "render")]
+        {
+            let overlay = self.overlay.get_or_insert_with(|| {
+                Arc::new(OverlayAssetResolver {
+                    base: self.asset_resolver.clone(),
+                    added: RwLock::new(HashMap::default()),
+                    added_bytes: RwLock::new(HashMap::default()),
+                })
+            });
+            overlay
+                .added_bytes
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(id, overlay_bytes);
+            *self.asset_resolver = Some(overlay.clone() as Arc<dyn AssetResolver>);
+        }
         Ok((id, true))
     }
 
@@ -280,16 +314,21 @@ impl<'a> AssetStores<'a> {
         }
 
         self.add_raw_bytes_tracked(bytes)?;
-        let overlay = self
-            .overlay
-            .as_ref()
-            .context("ingested image has no resolver")?;
-        overlay
-            .added
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id, DecodedImage::new(&rgba, width, height));
-        *self.asset_resolver = Some(overlay.clone() as Arc<dyn AssetResolver>);
+        #[cfg(feature = "render")]
+        {
+            let overlay = self
+                .overlay
+                .as_ref()
+                .context("ingested image has no resolver")?;
+            overlay
+                .added
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(id, DecodedImage::new(&rgba, width, height));
+            *self.asset_resolver = Some(overlay.clone() as Arc<dyn AssetResolver>);
+        }
+        #[cfg(not(feature = "render"))]
+        let _ = rgba;
         Ok((id, [width, height], true))
     }
 
@@ -299,6 +338,7 @@ impl<'a> AssetStores<'a> {
         if self.raw_assets.contains_key(&id) {
             Arc::make_mut(self.raw_assets).remove(&id);
         }
+        #[cfg(feature = "render")]
         if let Some(overlay) = self.overlay.as_ref() {
             overlay
                 .added
@@ -387,5 +427,31 @@ mod tests {
             decode_image_source(&wrapped).expect("wrapped base64 decodes"),
             png(1, 1)
         );
+    }
+
+    /// A 54-byte BMP header claiming `width` x `height` 24-bit pixels, with no
+    /// pixel data: BMP headers carry no checksum.
+    fn bmp_header(width: i32, height: i32) -> Vec<u8> {
+        let mut bytes = b"BM".to_vec();
+        bytes.extend(54u32.to_le_bytes());
+        bytes.extend(0u32.to_le_bytes());
+        bytes.extend(54u32.to_le_bytes());
+        bytes.extend(40u32.to_le_bytes());
+        bytes.extend(width.to_le_bytes());
+        bytes.extend(height.to_le_bytes());
+        bytes.extend(1u16.to_le_bytes());
+        bytes.extend(24u16.to_le_bytes());
+        bytes.extend([0; 24]);
+        bytes
+    }
+
+    #[test]
+    fn images_over_the_pixel_limit_are_refused_from_their_header() {
+        let error = PreparedImage::new(bmp_header(10_000, 10_000))
+            .err()
+            .expect("a 100-megapixel image is refused");
+        assert!(format!("{error:#}").contains("the limit is"), "{error:#}");
+        let image = PreparedImage::new(png(3, 2)).expect("a small image decodes");
+        assert_eq!(image.size, [3, 2]);
     }
 }

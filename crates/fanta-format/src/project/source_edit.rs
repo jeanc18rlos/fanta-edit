@@ -354,13 +354,16 @@ fn checked_source_path(project_root: &Path, source_path: &Path) -> Result<(PathB
             Component::Normal(file)
         ] if *root == "pages" && *file == "page.fnx"
     );
+    // A standalone component, or a variant inside its set's folder.
     let is_component = matches!(
         components.as_slice(),
-        [
-            Component::Normal(root),
-            Component::Normal(_),
-            Component::Normal(file)
-        ] if *root == "components" && *file == "master.fnx"
+        [Component::Normal(root), Component::Normal(_), Component::Normal(file)]
+            | [
+                Component::Normal(root),
+                Component::Normal(_),
+                Component::Normal(_),
+                Component::Normal(file)
+            ] if *root == "components" && *file == "master.fnx"
     );
     if !is_page && !is_component {
         return Err(FormatError::InvalidProjectTree(format!(
@@ -386,7 +389,7 @@ mod tests {
 
         let directory = tempfile::tempdir().expect("temporary project");
         super::super::layout::scaffold_project_tree(directory.path()).expect("scaffold project");
-        super::super::write::write_project_tree(directory.path(), &document, &BTreeMap::new())
+        super::super::write::write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())
             .expect("write project");
         let source_path = super::super::read::locate_page_source(directory.path(), page_id)
             .expect("locate page source");
@@ -676,7 +679,7 @@ mod tests {
                 fs::read_to_string(&source_path).expect("authored source"),
                 *source
             );
-            super::super::write::write_project_tree(directory.path(), &edit.document, &edit.assets)
+            super::super::write::write_legacy_project_tree(directory.path(), &edit.document, &edit.assets)
                 .expect("save regenerated document");
             assert_eq!(fs::read(&ids_path).expect("saved sidecar"), bytes);
         }

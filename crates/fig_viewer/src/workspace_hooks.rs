@@ -32,6 +32,120 @@ use crate::view::FigView;
 /// design.
 const MANIFEST: &str = "fanta.json";
 
+/// Spec 0009 R7: choose a snapshot and put the project's files back to it.
+// shortcut: a native prompt listing five snapshots at a time; a searchable
+// picker when people keep enough snapshots to want one.
+#[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+fn restore_snapshot(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    const SHOWN: usize = 5;
+    let item = workspace
+        .active_item_as::<FigView>(cx)
+        .map(|view| view.read(cx).item().clone());
+    let root = item
+        .as_ref()
+        .and_then(|item| item.read(cx).project_root().map(Path::to_path_buf));
+    let (Some(item), Some(root)) = (item, root) else {
+        crate::view::show_workspace_canvas_notice(
+            workspace,
+            "Open a saved project to restore a snapshot.".into(),
+            cx,
+        );
+        return;
+    };
+    // Unsaved edits are saved first, so they are in a snapshot too.
+    let save = item.update(cx, |item, cx| {
+        item.save(crate::document::SaveKind::Explicit, cx)
+    });
+    cx.spawn_in(window, async move |workspace, cx| {
+        let restored: anyhow::Result<Option<String>> = async {
+            save.await?;
+            let snapshots = cx
+                .background_spawn({
+                    let root = root.clone();
+                    async move { crate::document::project_history(&root).list() }
+                })
+                .await?;
+            if snapshots.is_empty() {
+                return Ok(Some("This project has no snapshots yet.".to_owned()));
+            }
+            let mut first = 0;
+            let chosen = loop {
+                let shown = snapshots.iter().skip(first).take(SHOWN).collect::<Vec<_>>();
+                let now = std::time::SystemTime::now();
+                let mut answers: Vec<String> = shown
+                    .iter()
+                    .map(|snapshot| snapshot_label(snapshot, now))
+                    .collect();
+                let older = first + SHOWN < snapshots.len();
+                if older {
+                    answers.push("Older…".to_owned());
+                }
+                answers.push("Cancel".to_owned());
+                let answers: Vec<&str> = answers.iter().map(String::as_str).collect();
+                let answer = cx
+                    .prompt(
+                        gpui::PromptLevel::Info,
+                        "Restore a snapshot",
+                        Some("The project's files go back to the moment you choose. The files as they are now are recorded first, so you can undo this from the same list."),
+                        &answers,
+                    )
+                    .await?;
+                match shown.get(answer) {
+                    Some(snapshot) => break snapshot.id.clone(),
+                    None if older && answer == shown.len() => first += SHOWN,
+                    None => return Ok(None),
+                }
+            };
+            cx.background_spawn(async move {
+                crate::document::project_history(&root).restore(&chosen)
+            })
+            .await?;
+            item.update(cx, |item, cx| item.reload_after_restore(cx));
+            Ok(Some("Restored the snapshot.".to_owned()))
+        }
+        .await;
+        let notice = match restored {
+            Ok(Some(notice)) => notice,
+            Ok(None) => return anyhow::Ok(()),
+            Err(error) => {
+                log::error!("restoring a snapshot failed: {error:#}");
+                format!("The snapshot could not be restored: {error:#}")
+            }
+        };
+        workspace.update(cx, |workspace, cx| {
+            crate::view::show_workspace_canvas_notice(workspace, notice, cx);
+        })?;
+        anyhow::Ok(())
+    })
+    .detach_and_log_err(cx);
+}
+
+/// "12 minutes ago, before a save": when a snapshot was taken and why.
+#[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+fn snapshot_label(
+    snapshot: &fanta_format::history::Snapshot,
+    now: std::time::SystemTime,
+) -> String {
+    use fanta_format::history::SnapshotReason;
+    let seconds = now
+        .duration_since(snapshot.taken_at)
+        .unwrap_or_default()
+        .as_secs();
+    let (count, unit) = match seconds {
+        0..60 => (seconds, "second"),
+        60..3600 => (seconds / 60, "minute"),
+        3600..86_400 => (seconds / 3600, "hour"),
+        _ => (seconds / 86_400, "day"),
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    let reason = match snapshot.reason {
+        SnapshotReason::BeforeSave => "before a save rewrote outside changes",
+        SnapshotReason::AfterSave => "after a save",
+        SnapshotReason::BeforeRestore => "before a restore",
+    };
+    format!("{count} {unit}{plural} ago, {reason}")
+}
+
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
@@ -66,6 +180,12 @@ pub fn init(cx: &mut App) {
                         cx,
                     );
                 }
+            },
+        );
+        #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+        workspace.register_action(
+            |workspace, _: &fanta_actions::fanta::RestoreSnapshot, window, cx| {
+                restore_snapshot(workspace, window, cx);
             },
         );
         crate::generation_workspace::register(workspace);

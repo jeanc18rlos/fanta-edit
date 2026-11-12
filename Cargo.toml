@@ -51,9 +51,11 @@ members = [
     "crates/fanta-fnx",
     "crates/fanta-format",
     "crates/fanta-headless",
+    "crates/fanta-mcp",
     "crates/fanta-present",
     "crates/fanta-render",
     "crates/fanta-runtime",
+    "crates/fanta-wasm-engine",
     "crates/fanta-site",
     "crates/fanta-text",
     "crates/fanta-tools",
@@ -93,8 +95,6 @@ members = [
     "crates/oauth_callback_server",
     "crates/open_ai",
     "crates/open_path_prompt",
-    "crates/outline",
-    "crates/outline_panel",
     "crates/panel",
     "crates/paths",
     "crates/picker",
@@ -137,7 +137,6 @@ members = [
     "crates/time_format",
     "crates/title_bar",
     "crates/ui_prompt",
-    "crates/vim",
     "crates/vim_mode_setting",
     "crates/watch",
     "crates/web_search",
@@ -326,8 +325,6 @@ notifications = { path = "crates/notifications" }
 oauth_callback_server = { path = "crates/oauth_callback_server" }
 open_ai = { path = "crates/open_ai" }
 open_path_prompt = { path = "crates/open_path_prompt" }
-outline = { path = "crates/outline" }
-outline_panel = { path = "crates/outline_panel" }
 panel = { path = "crates/panel" }
 paths = { path = "crates/paths" }
 perf = {package = "fanta-gpui-perf", version = "=0.5.0"}
@@ -383,7 +380,6 @@ ui_macros = {package = "fanta-gpui-ui-macros", version = "=0.5.0"}
 ui_prompt = { path = "crates/ui_prompt" }
 util = {package = "fanta-gpui-util", version = "=0.5.0"}
 util_macros = {package = "fanta-gpui-util-macros", version = "=0.5.0"}
-vim = { path = "crates/vim" }
 vim_mode_setting = { path = "crates/vim_mode_setting" }
 
 watch = { path = "crates/watch" }
@@ -512,11 +508,15 @@ heck = "0.5"
 hdrhistogram = "7"
 heed = { version = "0.21.0", features = ["read-txn-no-tls"] }
 hex = "0.4.3"
+hmac = "0.12"
 human_bytes = "0.4.1"
 html5ever = "0.27.0"
 http = "1.1"
 http-body = "1.0"
+http-body-util = "0.1"
 httparse = "1.10"
+hyper = "1"
+hyper-util = "0.1"
 idna = "1.0"
 ignore = "0.4.22"
 image = "0.25.1"
@@ -679,6 +679,7 @@ syn = { version = "2.0.101", features = ["full", "extra-traits", "visit-mut"] }
 sys-locale = "0.3.1"
 sysinfo = "0.37.0"
 take-until = "0.2.0"
+tar = "0.4"
 tempfile = "3.20.0"
 thiserror = "2.0.12"
 time = { version = "0.3", features = [
@@ -919,7 +920,6 @@ image_viewer = { codegen-units = 1 }
 install_cli = { codegen-units = 1 }
 json_schema_store = { codegen-units = 1 }
 notifications = { codegen-units = 1 }
-outline = { codegen-units = 1 }
 paths = { codegen-units = 1 }
 prettier = { codegen-units = 1 }
 release_channel = { codegen-units = 1 }

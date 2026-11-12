@@ -1,0 +1,8 @@
+[
+  {
+    "code": "ref.missing_asset",
+    "file": "assets/index.json",
+    "line": 4,
+    "severity": "error"
+  }
+]

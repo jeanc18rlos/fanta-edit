@@ -16,6 +16,7 @@ path = "src/wasm.rs"
 
 [dependencies]
 fanta-bundle.workspace = true
+fanta-canvas.workspace = true
 fanta-doc.workspace = true
 fanta-present.workspace = true
 fanta-render.workspace = true
@@ -30,6 +31,7 @@ thiserror.workspace = true
 [dev-dependencies]
 base64.workspace = true
 fanta-format.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(target_os = "emscripten")'.dependencies]
 skia-safe = { workspace = true, features = ["gl"] }

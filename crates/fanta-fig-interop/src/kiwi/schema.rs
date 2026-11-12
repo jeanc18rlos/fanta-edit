@@ -1,12 +1,9 @@
 //! The Kiwi schema model — [`DefKind`], [`Field`], [`Def`], [`Schema`] — and the
-//! self-describing binary-schema codec plus unknown-field skipping.
+//! self-describing binary-schema codec.
 
 use crate::error::{FigError, FigResult};
 use crate::kiwi::reader::ByteReader;
-use crate::kiwi::types::{
-    KiwiType, TYPE_BOOL, TYPE_BYTE, TYPE_FLOAT, TYPE_INT, TYPE_INT64, TYPE_MIN, TYPE_STRING,
-    TYPE_UINT, TYPE_UINT64,
-};
+use crate::kiwi::types::{KiwiType, TYPE_MIN};
 use crate::kiwi::writer::ByteWriter;
 use std::collections::HashMap;
 
@@ -171,6 +168,11 @@ impl Schema {
     pub fn decode_binary(bytes: &[u8]) -> FigResult<Schema> {
         let mut r = ByteReader::new(bytes);
         let def_count = r.read_var_uint()?;
+        // Each definition takes at least three bytes; a larger count is corrupt
+        // and must not size the allocation.
+        if def_count as usize > r.remaining() {
+            return Err(FigError::Truncated);
+        }
         let mut defs = Vec::with_capacity(def_count as usize);
 
         for _ in 0..def_count {
@@ -186,6 +188,9 @@ impl Schema {
                 }
             };
             let field_count = r.read_var_uint()?;
+            if field_count as usize > r.remaining() {
+                return Err(FigError::Truncated);
+            }
             let mut fields = Vec::with_capacity(field_count as usize);
             for _ in 0..field_count {
                 let fname = r.read_string()?;
@@ -234,105 +239,6 @@ impl Schema {
         }
         w.into_bytes()
     }
-
-    // ---- skipping unknown fields -------------------------------------------
-
-    /// Advance `r` past a value of `ty` without materializing it.
-    ///
-    /// This is the keystone of Kiwi's forward compatibility: when a message
-    /// carries a field id we do not recognize, we still know its *type* from
-    /// the schema, so we can skip exactly the right number of bytes and keep
-    /// going. Without this a newer `.fig` would be unreadable by an older
-    /// schema; with it, unknown fields are silently stepped over.
-    ///
-    /// Exposed publicly because skipping is a first-class capability of the
-    /// format — a tolerant reader that wants to ignore (rather than reject)
-    /// unknown content drives it directly.
-    pub fn skip_type(&self, r: &mut ByteReader, ty: KiwiType) -> FigResult<()> {
-        match ty.0 {
-            TYPE_BOOL => {
-                r.read_bool()?;
-            }
-            TYPE_BYTE => {
-                r.read_byte()?;
-            }
-            TYPE_INT => {
-                r.read_var_int()?;
-            }
-            TYPE_UINT => {
-                r.read_var_uint()?;
-            }
-            TYPE_FLOAT => {
-                r.read_var_float()?;
-            }
-            TYPE_STRING => {
-                r.read_string()?;
-            }
-            TYPE_INT64 => {
-                r.read_var_int64()?;
-            }
-            TYPE_UINT64 => {
-                r.read_var_uint64()?;
-            }
-            idx if idx >= 0 => {
-                let def = self
-                    .defs
-                    .get(idx as usize)
-                    .ok_or(FigError::UnknownType(idx))?;
-                match def.kind {
-                    // An enum is just its uint constant; consume it. We do not
-                    // validate the constant here (unlike the reference's
-                    // optional strict mode) because tolerance is the right
-                    // default when skipping data we already do not understand.
-                    DefKind::Enum => {
-                        r.read_var_uint()?;
-                    }
-                    DefKind::Struct => {
-                        for f in &def.fields {
-                            self.skip_field(r, f)?;
-                        }
-                    }
-                    DefKind::Message => loop {
-                        let id = r.read_var_uint()?;
-                        if id == 0 {
-                            break;
-                        }
-                        match def.field_by_value(id) {
-                            Some(f) => self.skip_field(r, f)?,
-                            // Unknown id inside an unknown message: we cannot
-                            // know its type, so the stream is unreadable from
-                            // here. This matches the reference (it errors).
-                            None => {
-                                return Err(FigError::Schema(format!(
-                                    "unknown field id {id} in message '{}'",
-                                    def.name
-                                )));
-                            }
-                        }
-                    },
-                }
-            }
-            other => return Err(FigError::UnknownType(other)),
-        }
-        Ok(())
-    }
-
-    /// Skip a single field, accounting for the array length prefix.
-    pub fn skip_field(&self, r: &mut ByteReader, field: &Field) -> FigResult<()> {
-        if field.is_array {
-            let len = r.read_var_uint()?;
-            if field.ty == KiwiType::BYTE {
-                r.read_bytes(len as usize)?;
-                return Ok(());
-            }
-            for _ in 0..len {
-                self.skip_type(r, field.ty)?;
-            }
-        } else {
-            self.skip_type(r, field.ty)?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -373,6 +279,22 @@ mod tests {
         assert!(matches!(
             Schema::decode_binary(&bytes),
             Err(FigError::Schema(_))
+        ));
+    }
+
+    #[test]
+    fn binary_schema_counts_larger_than_the_data_are_refused_before_allocating() {
+        // def_count = u32::MAX in five bytes.
+        let bytes = [0xFF, 0xFF, 0xFF, 0xFF, 0x0F];
+        assert!(matches!(
+            Schema::decode_binary(&bytes),
+            Err(FigError::Truncated)
+        ));
+        // One message, "M", claiming u32::MAX fields.
+        let bytes = [1, b'M', 0, 2, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F];
+        assert!(matches!(
+            Schema::decode_binary(&bytes),
+            Err(FigError::Truncated)
         ));
     }
 

@@ -1,7 +1,11 @@
 # Connect an agent to a Fanta project
 
-Current source guidance, **11 October 2026**. Connection instructions should come
-from the installed app to target its executable and user-data directory.
+Current source guidance, **11 November 2026**. Connection instructions should come
+from the installed app to target its executable and user-data directory. Projects
+now store designs as web files (spec 0007): SVG per design, styling in the
+stylesheet beside it (`page.css` / `master.css`, aggregated by the root
+`design.css`), complete node records in `nodes.json`; legacy FNX projects
+convert on their first save.
 
 The [12 October recorded example](../alpha/DEMO_GUIDE.md#an-agent-edits-your-design)
 uses an external Opus 5.5 agent through Fanta MCP for one bounded CTA edit.
@@ -28,9 +32,14 @@ a local Unix socket. The setting `fanta_live_mcp.enabled` is on by default; set
 it to `false` to disable the local server. With the app closed or server disabled,
 the bridge fails visibly instead of claiming a connection.
 
+Without the app, run the same tools headlessly: `fanta-mcp <project-dir>` is a
+stdio MCP server over the project directory alone (`serverInfo.name` is
+`fanta-headless`). It serves the same 15 tools and saves each edit to disk;
+`prepare_design_asset` and image downloads by URL still need the app.
+
 ## Tool scopes
 
-The inspected source registers these **14 local MCP tools**. Their target is the
+The inspected source registers these **15 local MCP tools**. Their target is the
 focused open design. A tool listing is an interface inventory, not proof every
 end-to-end use has passed on a particular installer.
 
@@ -40,8 +49,9 @@ end-to-end use has passed on a particular installer.
 | `get_guidelines` | Design guidance and the current project's design specification |
 | `batch_get` | Read selected IDs or paginated page children; narrow large results |
 | `get_design_system` | Read components, typed variables, modes and bindings |
-| `read_fnx_source` | List source files or read a bounded, line-based slice |
-| `validate_fnx_source` | Validate a complete FNX or managed JSON candidate without writing |
+| `read_fnx_source` | List design source files or read a bounded, line-based slice |
+| `validate_fnx_source` | Validate a complete legacy FNX or managed JSON candidate without writing |
+| `check_project` | List everything wrong with the project's files on disk, as `fanta-check --json` does; writes nothing |
 | `get_screenshot` | Render the current page or an addressed node |
 | `batch_design` | Apply typed design operations as one undoable content transaction |
 | `import_image` | Register an image in the open project's asset workflow |
@@ -58,14 +68,22 @@ Never treat a truncated slice as a whole file.
 ## Edit source safely
 
 Use paths returned by `get_editor_state`. Read complete relevant source, preserve
-node IDs and build a complete candidate. Call `validate_fnx_source` before saving
-it with the agent's normal file tools. There is no local MCP `edit_fnx_source`
-tool. Inspect the reloaded canvas and Git diff after the write.
+node IDs, and edit inside the emitted dialect: geometry attributes, `data-name`,
+text content and element order in the design's SVG; declaration values,
+`var(--token, literal)` swaps and `--fanta-*` layout intent in the design's
+own stylesheet (`page.css` / `master.css`; project-wide rules go in the root
+`design.css`); everything else through the design's `nodes.json` records. Anything a load
+cannot keep is reported per node in `report.json`. For a legacy `.fnx` edit,
+call `validate_fnx_source` before saving it with the agent's normal file tools.
+There is no local MCP `edit_fnx_source` tool. Inspect the reloaded canvas and
+Git diff after the write.
 
-The in-app **Code** workspace edits supported FNX and managed JSON. Invalid or
-conflicting drafts retain the last valid scene and file. An unsaved source draft
-locks conflicting canvas writes. **Saved Code** in Dev mode is read-only.
-Multiple buffer saves are sequential rather than one atomic transaction.
+The in-app **Code** workspace shows each design's SVG and edits managed JSON
+(and legacy FNX); SVG buffers have no in-app save path yet, so edit them with
+external file tools and let the canvas reload. Invalid or conflicting drafts
+retain the last valid scene and file. An unsaved source draft locks conflicting
+canvas writes. **Saved Code** in Dev mode is read-only. Multiple buffer saves
+are sequential rather than one atomic transaction.
 
 `batch_design` validates typed content operations and groups a successful content
 batch in Undo history. External file edits follow reconciliation rules and must

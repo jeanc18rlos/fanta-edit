@@ -8,7 +8,7 @@
 use fanta_doc::{
     AssetId, CanvasNode, ComponentDef, ComponentId, Doc, GroupNode, NodeData, NodeId, Viewport,
 };
-use fanta_format::{asset_id_for_bytes, read_project_tree, write_project_tree};
+use fanta_format::{asset_id_for_bytes, read_project_tree, write_legacy_project_tree};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -109,7 +109,7 @@ fn walk_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
 fn verify_presence_grep_finds_nothing() {
     let f = doc_with_presence();
     let dir = tempdir().unwrap();
-    write_project_tree(dir.path(), &f.doc, &fixture_assets()).unwrap();
+    write_legacy_project_tree(dir.path(), &f.doc, &fixture_assets()).unwrap();
 
     let tree = walk_tree(dir.path());
     assert!(!tree.is_empty(), "tree was written");
@@ -141,7 +141,7 @@ fn verify_ids_survive_and_paths_are_derivable() {
     let f = doc_with_presence();
     let assets = fixture_assets();
     let dir = tempdir().unwrap();
-    write_project_tree(dir.path(), &f.doc, &assets).unwrap();
+    write_legacy_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
     let bare = |id| {
         serde_json::to_value(id)
@@ -209,8 +209,8 @@ fn verify_two_writes_are_byte_identical() {
     let assets = fixture_assets();
     let a = tempdir().unwrap();
     let b = tempdir().unwrap();
-    write_project_tree(a.path(), &f.doc, &assets).unwrap();
-    write_project_tree(b.path(), &f.doc, &assets).unwrap();
+    write_legacy_project_tree(a.path(), &f.doc, &assets).unwrap();
+    write_legacy_project_tree(b.path(), &f.doc, &assets).unwrap();
 
     let ta = walk_tree(a.path());
     let tb = walk_tree(b.path());
@@ -235,8 +235,8 @@ fn verify_git_and_previews_survive_rewrites() {
     fs::create_dir_all(dir.path().join("previews")).unwrap();
     fs::write(dir.path().join("previews/keep.png"), b"png bytes").unwrap();
 
-    write_project_tree(dir.path(), &f.doc, &fixture_assets()).unwrap();
-    write_project_tree(dir.path(), &f.doc, &fixture_assets()).unwrap();
+    write_legacy_project_tree(dir.path(), &f.doc, &fixture_assets()).unwrap();
+    write_legacy_project_tree(dir.path(), &f.doc, &fixture_assets()).unwrap();
 
     assert_eq!(
         fs::read(dir.path().join(".git/marker")).unwrap(),

@@ -38,19 +38,23 @@ use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+#[cfg(feature = "native")]
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use super::layout::{
     ACTIVE_MODES_JSON, ASSET_LIBRARY_JSON, ASSETS_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR,
-    EXPORTS_DIR, FANTA_JSON, FLOW_START_JSON, FLOWS_JSON, LOOSE_DIR, MASTER_FNX, MASTER_IDS,
-    METADATA_JSON, MOTION_JSON, NODES_DIR, PAGE_FNX, PAGE_IDS, PAGE_JSON, PAGES_DIR,
-    PRESENTATION_JSON, PREVIEWS_DIR, PROJECT_VERSION, ProjectManifest, SET_JSON, SETS_JSON,
-    STYLES_JSON, VARIABLES_JSON, WORKSPACE_FNX, id_from_key, json_bytes, json_key, slugify,
-    sorted_entries,
+    FANTA_JSON, FLOW_START_JSON, FLOWS_JSON, LOOSE_DIR, MASTER_FNX, MASTER_IDS, METADATA_JSON,
+    MOTION_JSON, NODES_DIR, PAGE_FNX, PAGE_IDS, PAGE_JSON, PAGES_DIR, PRESENTATION_JSON,
+    PROJECT_VERSION, ProjectManifest, SET_JSON, SETS_JSON, STYLES_JSON, VARIABLES_JSON,
+    WORKSPACE_FNX, id_from_key, json_bytes, json_key, slugify, sorted_entries,
 };
-use super::media::{ASSET_INDEX_FILE, MediaRegistry, asset_index_bytes, sniff_media};
+#[cfg(feature = "native")]
+use super::layout::{EXPORTS_DIR, PREVIEWS_DIR};
+#[cfg(feature = "native")]
+use super::media::asset_index_bytes;
+use super::media::{ASSET_INDEX_FILE, MediaRegistry, sniff_media};
 
 const TRANSACTION_DIR: &str = ".fanta-transaction";
 static PROJECT_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
@@ -134,7 +138,7 @@ pub struct WriteReport {
 /// The in-memory projection: every non-asset file the tree should contain,
 /// keyed by project-relative path. Bytes are shared with the
 /// [`ProjectWriteCache`] so a cache hit costs a refcount, not a copy.
-type ProjectedFiles = BTreeMap<PathBuf, Arc<Vec<u8>>>;
+pub(crate) type ProjectedFiles = BTreeMap<PathBuf, Arc<Vec<u8>>>;
 
 /// Memo of the per-design projection across successive writes of the same
 /// document. Owned by whoever saves repeatedly (the editor's autosave);
@@ -177,82 +181,60 @@ impl ProjectWriteCache {
 ///
 /// Projects from scratch; a caller that saves the same document repeatedly
 /// should use [`write_project_tree_cached`].
+/// Write `doc` as web storage (spec 0007): THE project writer since the T5
+/// flip. Callers with a renderer should use
+/// [`crate::project::web::write_web_project_tree`] directly so nodes beyond
+/// the SVG subset get their raster fallbacks; this renderer-less form still
+/// writes a complete, lossless tree (`nodes.json` carries every record) and
+/// reports the nodes it could not draw.
+#[cfg(feature = "native")]
 pub fn write_project_tree(
     dir: &Path,
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
 ) -> Result<WriteReport> {
-    write_project_tree_cached(dir, doc, assets, &mut ProjectWriteCache::default())
+    Ok(crate::project::web::write_web_project_tree(dir, doc, assets, None, &[])?.0)
 }
 
-/// [`write_project_tree`] reusing the per-design projection memoized in
-/// `cache` from the previous write of this document. Output and disk
-/// semantics are identical to the uncached call — including rewriting a file
-/// someone edited externally back to the projected bytes.
+/// [`write_project_tree`] with the FNX-era projection cache. The web
+/// projection is not cached yet, so the cache is accepted and ignored.
+// shortcut: full web projection on every save; add per-design caching when
+// large-project save profiles call for it.
+#[cfg(feature = "native")]
 pub fn write_project_tree_cached(
     dir: &Path,
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
-    cache: &mut ProjectWriteCache,
+    _cache: &mut ProjectWriteCache,
 ) -> Result<WriteReport> {
-    write_project_tree_cached_impl(dir, doc, assets, cache, None, &BTreeMap::new(), None)
+    write_project_tree(dir, doc, assets)
 }
 
-/// Write using registered binary probes to choose asset extensions and family
-/// folders. The default writer uses the built-in probes.
-pub fn write_project_tree_cached_with_media_registry(
+/// The legacy FNX/FSS tree writer, kept for the R9 migration story and for
+/// fixtures that exercise the legacy readers. No product save path reaches
+/// it: every save writes web storage.
+#[cfg(feature = "native")]
+pub fn write_legacy_project_tree(
     dir: &Path,
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
-    cache: &mut ProjectWriteCache,
-    media_registry: &MediaRegistry,
 ) -> Result<WriteReport> {
-    write_project_tree_cached_impl(
-        dir,
-        doc,
-        assets,
-        cache,
-        Some(media_registry),
-        &BTreeMap::new(),
-        None,
-    )
-}
-
-/// Write with a custom media registry without keeping a projection cache.
-pub fn write_project_tree_with_media_registry(
-    dir: &Path,
-    doc: &Doc,
-    assets: &BTreeMap<AssetId, Vec<u8>>,
-    media_registry: &MediaRegistry,
-) -> Result<WriteReport> {
-    write_project_tree_cached_impl(
+    write_legacy_project_tree_impl(
         dir,
         doc,
         assets,
         &mut ProjectWriteCache::default(),
-        Some(media_registry),
         &BTreeMap::new(),
         None,
     )
 }
 
-/// Persist validated `.fnx` source and ID sidecars from a live source session.
-/// Keys must name a projected `pages/<slug>` or `components/<slug>` directory;
-/// other paths are rejected before any project file is touched.
-pub fn write_project_tree_cached_with_sources(
-    dir: &Path,
-    doc: &Doc,
-    assets: &BTreeMap<AssetId, Vec<u8>>,
-    cache: &mut ProjectWriteCache,
-    sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
-) -> Result<WriteReport> {
-    write_project_tree_cached_impl(dir, doc, assets, cache, None, sources, None)
-}
-
-/// Save retained source bytes only if the caller's last reconciled disk hashes
-/// still match. A `None` value requires the path to remain absent. This can
-/// also guard singleton JSON and the asset index during a live canvas save.
-pub fn write_project_tree_cached_with_sources_checked(
+/// [`write_legacy_project_tree`] with the projection cache, validated authored
+/// source overrides and disk preconditions — the complete FNX-era editor save.
+/// Kept with the legacy writer so the legacy reconciliation tests keep their
+/// coverage until the FNX readers are deprecated.
+#[cfg(feature = "native")]
+pub fn write_legacy_project_tree_checked(
     dir: &Path,
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
@@ -260,9 +242,10 @@ pub fn write_project_tree_cached_with_sources_checked(
     sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
     expected_disk: &BTreeMap<PathBuf, Option<[u8; 32]>>,
 ) -> Result<WriteReport> {
-    write_project_tree_cached_impl(dir, doc, assets, cache, None, sources, Some(expected_disk))
+    write_legacy_project_tree_impl(dir, doc, assets, cache, sources, Some(expected_disk))
 }
 
+#[cfg(feature = "native")]
 pub(crate) fn write_project_artifacts_checked(
     dir: &Path,
     doc: &Doc,
@@ -343,48 +326,18 @@ pub(crate) fn write_project_artifacts_checked(
     Ok((report, projected_hashes))
 }
 
-/// Apply live source and disk preconditions with a custom media registry.
-pub fn write_project_tree_cached_with_sources_checked_and_media_registry(
-    dir: &Path,
-    doc: &Doc,
-    assets: &BTreeMap<AssetId, Vec<u8>>,
-    cache: &mut ProjectWriteCache,
-    sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
-    expected_disk: &BTreeMap<PathBuf, Option<[u8; 32]>>,
-    media_registry: &MediaRegistry,
-) -> Result<WriteReport> {
-    write_project_tree_cached_impl(
-        dir,
-        doc,
-        assets,
-        cache,
-        Some(media_registry),
-        sources,
-        Some(expected_disk),
-    )
-}
-
-/// Preserve live sources while using registered binary format probes.
-pub fn write_project_tree_cached_with_sources_and_media_registry(
-    dir: &Path,
-    doc: &Doc,
-    assets: &BTreeMap<AssetId, Vec<u8>>,
-    cache: &mut ProjectWriteCache,
-    sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
-    media_registry: &MediaRegistry,
-) -> Result<WriteReport> {
-    write_project_tree_cached_impl(dir, doc, assets, cache, Some(media_registry), sources, None)
-}
 
 /// Populate an owned, empty, unpublished staging directory without durability
 /// calls. The caller must durably flush the complete staged filesystem before
 /// exclusively publishing this directory, then durably flush its parent.
-/// Existing projects must use the checked, transactional writer instead.
-pub fn stage_new_project_tree_cached(
+/// Existing projects must use the transactional writer instead.
+#[cfg(feature = "native")]
+pub fn stage_new_project_tree(
     dir: &Path,
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
-    cache: &mut ProjectWriteCache,
+    render: Option<&dyn crate::project::web::WebRenderSource>,
+    warnings: &[super::diagnostic::SourceDiagnostic],
 ) -> Result<WriteReport> {
     if !fs::symlink_metadata(dir)?.file_type().is_dir()
         || fs::read_dir(dir)?.next().transpose()?.is_some()
@@ -394,7 +347,9 @@ pub fn stage_new_project_tree_cached(
         ));
     }
     let syncs_before = SUCCESSFUL_PROJECT_SYNCS.get();
-    let mut files = project_files_cached_with_sources(doc, cache, &BTreeMap::new())?;
+    let asset_hrefs = crate::project::web::asset_hrefs(assets);
+    let mut files =
+        crate::project::web::web_project_files(doc, &asset_hrefs, render, warnings)?.files;
     files.insert(
         PathBuf::from(ASSETS_DIR).join(ASSET_INDEX_FILE),
         Arc::new(asset_index_bytes(assets)?),
@@ -421,6 +376,7 @@ pub fn stage_new_project_tree_cached(
     Ok(report)
 }
 
+#[cfg(feature = "native")]
 fn write_unpublished_file(
     path: &Path,
     write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
@@ -439,18 +395,16 @@ fn write_unpublished_file(
     Ok(())
 }
 
-fn write_project_tree_cached_impl(
+#[cfg(feature = "native")]
+fn write_legacy_project_tree_impl(
     dir: &Path,
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
     cache: &mut ProjectWriteCache,
-    media_registry: Option<&MediaRegistry>,
     sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
     expected_disk: Option<&BTreeMap<PathBuf, Option<[u8; 32]>>>,
 ) -> Result<WriteReport> {
-    // The writer is synchronous; a per-thread delta includes shared recovery and
-    // editor-support helpers without counting concurrent saves on other threads.
-    let syncs_before = SUCCESSFUL_PROJECT_SYNCS.get();
+    let media_registry: Option<&MediaRegistry> = None;
     validate_source_override_keys(sources)?;
     if let Some(expected_disk) = expected_disk {
         validate_expected_disk_paths(expected_disk)?;
@@ -461,7 +415,26 @@ fn write_project_tree_cached_impl(
         Arc::new(asset_index_bytes(assets)?),
     );
     let asset_files = project_asset_files(assets, media_registry)?;
+    sync_project_files(dir, &files, &asset_files, expected_disk, &[])
+}
 
+/// Bring the tree at `dir` to exactly `files` + `asset_files`: plan the byte
+/// diff, apply it transactionally under the project lock, prune stale managed
+/// files, and seed editor support. Shared by every on-disk format the writer
+/// projects (FNX and web), so the locking, symlink defense, case healing and
+/// stale pruning never fork.
+#[cfg(feature = "native")]
+pub(crate) fn sync_project_files(
+    dir: &Path,
+    files: &ProjectedFiles,
+    asset_files: &BTreeMap<PathBuf, &[u8]>,
+    expected_disk: Option<&BTreeMap<PathBuf, Option<[u8; 32]>>>,
+    // Design directories whose files are never removed (spec 0009 R11).
+    unavailable: &[PathBuf],
+) -> Result<WriteReport> {
+    // The writer is synchronous; a per-thread delta includes shared recovery and
+    // editor-support helpers without counting concurrent saves on other threads.
+    let syncs_before = SUCCESSFUL_PROJECT_SYNCS.get();
     fs::create_dir_all(dir)?;
 
     fs::create_dir_all(dir.join(PREVIEWS_DIR))?;
@@ -477,7 +450,7 @@ fn write_project_tree_cached_impl(
     }
 
     // Do not traverse a planted symlink or case-aliased design directory.
-    heal_directory_case(dir, &files)?;
+    heal_path_case(dir, files.keys().chain(asset_files.keys()));
     remove_symlinks_on_projected_paths(dir, files.keys().chain(asset_files.keys()))?;
 
     let keep: BTreeSet<&Path> = files
@@ -487,13 +460,25 @@ fn write_project_tree_cached_impl(
         .collect();
 
     let mut writes = Vec::new();
-    for (relative, bytes) in &files {
+    for (relative, bytes) in files.iter() {
         plan_write(dir, relative, bytes, &mut writes)?;
     }
-    for (relative, bytes) in &asset_files {
+    for (relative, bytes) in asset_files.iter() {
         plan_write(dir, relative, bytes, &mut writes)?;
     }
-    let removals = stale_managed_files(dir, &keep)?;
+    let mut removals = stale_managed_files(dir, &keep)?;
+    if !removals.is_empty() {
+        // A design that does not parse now is kept whoever the caller is: a
+        // session opened after the load does not always carry its findings.
+        let (broken, _) = super::check::unparsable_designs(dir)?;
+        removals.retain(|removal| {
+            let absolute = dir.join(&removal.relative);
+            !unavailable
+                .iter()
+                .any(|design| removal.relative.starts_with(design))
+                && !broken.iter().any(|design| absolute.starts_with(design))
+        });
+    }
     if let Some(expected_disk) = expected_disk {
         if let Some(untracked) = removals
             .iter()
@@ -537,87 +522,90 @@ fn write_project_tree_cached_impl(
     })
 }
 
-/// Rename design directories whose on-disk name differs from a projected
-/// design dir only by ASCII case. On a case-insensitive filesystem (APFS,
-/// NTFS) such a directory ALIASES the projected path: the byte-diff succeeds
-/// through the alias while the exact-case prune deletes the live files — a
-/// case-only folder rename would silently destroy the design. Healing is a
-/// two-step rename (via a temp name, since a direct case-only rename is a
-/// no-op-or-error on some filesystems); on a case-sensitive filesystem where
-/// the projected name is genuinely occupied the rename fails harmlessly and
-/// the differently-cased dir is pruned as the stale dir it really is.
-fn heal_directory_case(dir: &Path, files: &ProjectedFiles) -> Result<()> {
-    let mut expected: BTreeSet<(&str, &str)> = BTreeSet::new();
-    for relative in files.keys() {
-        let mut components = relative.components();
-        let (Some(managed), Some(design), Some(_file)) =
-            (components.next(), components.next(), components.next())
-        else {
-            continue;
-        };
-        if let (Some(managed), Some(design)) =
-            (managed.as_os_str().to_str(), design.as_os_str().to_str())
-            && (managed == PAGES_DIR || managed == COMPONENTS_DIR)
-        {
-            expected.insert((managed, design));
-        }
-    }
-    // List each managed parent once and index it by lowercase name: listing
-    // it again for every design made this quadratic (2.5 s per save on a
-    // project with ~2,400 components).
-    let mut listings: BTreeMap<&str, BTreeMap<String, Vec<String>>> = BTreeMap::new();
-    for (managed, design) in expected {
-        let listing = listings.entry(managed).or_insert_with(|| {
-            let mut by_lowercase: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            if let Ok(entries) = fs::read_dir(dir.join(managed)) {
-                for entry in entries.flatten() {
-                    if let Ok(name) = entry.file_name().into_string() {
-                        by_lowercase
-                            .entry(name.to_ascii_lowercase())
-                            .or_default()
-                            .push(name);
-                    }
+/// Rename every folder or file on a projected path whose on-disk name differs
+/// from the projected one only by ASCII case. On a case-insensitive filesystem
+/// (APFS, NTFS) such an entry ALIASES the projected path: the byte-diff
+/// succeeds through the alias while the exact-case prune deletes the live
+/// files, so a case-only rename of a design, variant or asset folder would
+/// silently destroy it. Healing is a two-step rename (via a temp name, since a
+/// direct case-only rename is a no-op-or-error on some filesystems). On a
+/// case-sensitive filesystem an entry with the exact name is a different file,
+/// so the differently-cased one is left for the prune as the stale entry it
+/// really is.
+fn heal_path_case<'a>(dir: &Path, projected: impl IntoIterator<Item = &'a PathBuf>) {
+    // List each parent once and index it by lowercase name: listing it again
+    // for every design made this quadratic (2.5 s per save on a project with
+    // ~2,400 components).
+    let mut listings: BTreeMap<PathBuf, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+    let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
+    for relative in projected {
+        let mut parent = PathBuf::new();
+        for component in relative.components() {
+            let Some(name) = component.as_os_str().to_str() else {
+                break;
+            };
+            let path = parent.join(name);
+            if visited.insert(path.clone()) {
+                let listing = listings
+                    .entry(parent.clone())
+                    .or_insert_with(|| names_by_lowercase(&dir.join(&parent)));
+                if let Some(names) = listing.get(&name.to_ascii_lowercase())
+                    && !names.iter().any(|existing| existing == name)
+                    && let Some(existing) = names.first()
+                {
+                    rename_case(&dir.join(&parent), existing, name);
                 }
             }
-            by_lowercase
-        });
-        let Some(names) = listing.get(&design.to_ascii_lowercase()) else {
-            continue;
-        };
-        let parent = dir.join(managed);
-        for name in names {
-            let name = name.as_str();
-            if name != design {
-                let from = parent.join(name);
-                let via = parent.join(format!("{design}.case-heal"));
-                let to = parent.join(design);
-                match fs::rename(&from, &via) {
-                    Ok(()) => {
-                        if let Err(error) = fs::rename(&via, &to) {
-                            tracing::warn!(
-                                target: "fanta::format",
-                                "healing dir case for {} failed ({error}); restoring",
-                                from.display()
-                            );
-                            if let Err(error) = fs::rename(&via, &from) {
-                                tracing::warn!(
-                                    target: "fanta::format",
-                                    "restoring {} after failed case heal failed: {error}",
-                                    from.display()
-                                );
-                            }
-                        }
-                    }
-                    Err(error) => tracing::warn!(
+            parent = path;
+        }
+    }
+}
+
+fn names_by_lowercase(dir: &Path) -> BTreeMap<String, Vec<String>> {
+    let mut by_lowercase: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(name) = entry.file_name().into_string() {
+                by_lowercase
+                    .entry(name.to_ascii_lowercase())
+                    .or_default()
+                    .push(name);
+            }
+        }
+    }
+    for names in by_lowercase.values_mut() {
+        names.sort();
+    }
+    by_lowercase
+}
+
+fn rename_case(parent: &Path, existing: &str, projected: &str) {
+    let from = parent.join(existing);
+    let via = parent.join(format!("{projected}.case-heal"));
+    let to = parent.join(projected);
+    match fs::rename(&from, &via) {
+        Ok(()) => {
+            if let Err(error) = fs::rename(&via, &to) {
+                tracing::warn!(
+                    target: "fanta::format",
+                    "healing case for {} failed ({error}); restoring",
+                    from.display()
+                );
+                if let Err(error) = fs::rename(&via, &from) {
+                    tracing::warn!(
                         target: "fanta::format",
-                        "case heal of {} skipped: {error}",
+                        "restoring {} after failed case heal failed: {error}",
                         from.display()
-                    ),
+                    );
                 }
             }
         }
+        Err(error) => tracing::warn!(
+            target: "fanta::format",
+            "case heal of {} skipped: {error}",
+            from.display()
+        ),
     }
-    Ok(())
 }
 
 /// Unlink any symlink sitting on (or on an ancestor of) a projected path, so
@@ -700,7 +688,7 @@ fn project_files_cached_with_sources(
 /// it, including the `skip_serializing_if` cases, where the whole-document
 /// projection had no key and the writer substituted an empty object — the
 /// bytes must not move when a document gains or loses its first variable.
-fn project_doc_singletons(files: &mut ProjectedFiles, doc: &Doc) -> Result<()> {
+pub(crate) fn project_doc_singletons(files: &mut ProjectedFiles, doc: &Doc) -> Result<()> {
     let doc_dir = PathBuf::from(DOC_DIR);
     if !doc.styles.is_empty() {
         files.insert(
@@ -789,6 +777,7 @@ pub struct ProjectUpgrade {
 /// and drops `components/sets.json`). A project already at the current
 /// layout is left untouched. Nothing is lost: every design, asset and
 /// workspace file round-trips.
+#[cfg(feature = "native")]
 pub fn upgrade_project(dir: &Path) -> Result<ProjectUpgrade> {
     let from = super::layout::read_manifest(dir)?.version;
     if from >= PROJECT_VERSION {
@@ -826,15 +815,25 @@ pub fn projected_design_dirs(
     (pages, components)
 }
 
-/// Page headers, component defs/sets, and one source (or fallback node file)
-/// per design.
-fn project_designs(
-    files: &mut ProjectedFiles,
-    doc: &Doc,
-    refs: &fanta_fnx::RefTable,
-    cache: &mut ProjectWriteCache,
-    sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
-) -> Result<()> {
+/// Everything a writer needs to place nodes in the tree: directory slugs for
+/// pages, components and sets, and every scene node grouped by the design
+/// directory it belongs to, in sorted-key order (the determinism contract).
+/// Shared by the FNX projection and the web projection, so both formats file
+/// every node in the same place.
+pub(crate) struct DesignGrouping {
+    pub(crate) page_slugs: BTreeMap<NodeId, String>,
+    pub(crate) component_slugs: BTreeMap<ComponentId, String>,
+    pub(crate) set_dirs: BTreeMap<ComponentId, PathBuf>,
+    /// Component design root → its directory under `components/`.
+    pub(crate) component_roots: BTreeMap<NodeId, String>,
+    /// Page slug → the page's nodes.
+    pub(crate) page_nodes: BTreeMap<String, Vec<NodeId>>,
+    /// Component directory → the design's nodes.
+    pub(crate) comp_nodes: BTreeMap<String, Vec<NodeId>>,
+    pub(crate) loose: Vec<NodeId>,
+}
+
+pub(crate) fn design_grouping(doc: &Doc) -> Result<DesignGrouping> {
     // v3: design directories are named by a slug of the design's name; the
     // ids move into the JSON headers (`page.json` "id", `def.json`).
     let page_slugs: BTreeMap<NodeId, String> = design_slugs(
@@ -860,71 +859,24 @@ fn project_designs(
             (*cid, under.to_string_lossy().replace('\\', "/"))
         })
         .collect();
-    let slug_of_page = |page: &NodeId| -> Result<&String> {
-        page_slugs.get(page).ok_or_else(|| {
-            FormatError::InvalidProjectTree(format!("page {page} has no directory slug"))
-        })
-    };
-    let slug_of_component = |cid: &ComponentId| -> Result<&String> {
-        component_slugs.get(cid).ok_or_else(|| {
-            FormatError::InvalidProjectTree(format!("component {cid} has no directory slug"))
-        })
-    };
 
     // Design root → directory slug for the two kinds of design roots.
     let mut component_roots: BTreeMap<NodeId, String> = BTreeMap::new();
     for (cid, def) in &doc.components.defs {
-        component_roots.insert(def.root, slug_of_component(cid)?.clone());
+        let slug = component_slugs.get(cid).ok_or_else(|| {
+            FormatError::InvalidProjectTree(format!("component {cid} has no directory slug"))
+        })?;
+        component_roots.insert(def.root, slug.clone());
     }
     let mut page_dirs: BTreeMap<NodeId, String> = BTreeMap::new();
     for page in &doc.pages {
-        page_dirs.insert(*page, slug_of_page(page)?.clone());
-    }
-
-    // pages/<slug>/page.json — id + name + order. The id is the page's
-    // identity of record (the directory name is only a readable projection).
-    // `order` is the position in `doc.pages` today; the fractional-IndexKey
-    // ordering discipline (spec 02 §1, a shared prerequisite of spec 09)
-    // replaces this u32 with an order key string when that migration lands.
-    for (order, page) in doc.pages.iter().enumerate() {
-        let mut header = Map::new();
-        header.insert("id".to_owned(), Value::from(page.to_string()));
-        if let Some(node) = doc.scene.get(*page) {
-            header.insert("name".to_owned(), Value::from(node.name.clone()));
-        }
-        header.insert("order".to_owned(), Value::from(order as u32));
-        files.insert(
-            PathBuf::from(PAGES_DIR)
-                .join(slug_of_page(page)?)
-                .join(PAGE_JSON),
-            Arc::new(json_bytes(&Value::Object(header))?),
-        );
-    }
-
-    // components/…/def.json + components/<set>/set.json — each def and set
-    // exactly as `Doc` serializes it (both carry their id).
-    for (cid, def) in &doc.components.defs {
-        files.insert(
-            PathBuf::from(COMPONENTS_DIR)
-                .join(slug_of_component(cid)?)
-                .join(DEF_JSON),
-            Arc::new(json_bytes(&serde_json::to_value(def)?)?),
-        );
-    }
-    for (set_id, set) in &doc.components.sets {
-        let set_dir = component_dirs.sets.get(set_id).ok_or_else(|| {
-            FormatError::InvalidProjectTree(format!("set {set_id} has no directory"))
+        let slug = page_slugs.get(page).ok_or_else(|| {
+            FormatError::InvalidProjectTree(format!("page {page} has no directory slug"))
         })?;
-        files.insert(
-            set_dir.join(SET_JSON),
-            Arc::new(json_bytes(&serde_json::to_value(set)?)?),
-        );
+        page_dirs.insert(*page, slug.clone());
     }
 
-    // v2: one readable `.fnx` source + an `.ids` sidecar per page / component
-    // (was one JSON file per node). Keys are sorted (determinism contract) then
-    // grouped by their design; `_loose` orphans stay per-node JSON because they
-    // need not form a single-rooted tree.
+    // Keys are sorted (determinism contract) then grouped by their design.
     let mut keyed_nodes: Vec<(String, NodeId)> = Vec::with_capacity(doc.scene.len());
     for id in scene_node_ids(doc)? {
         keyed_nodes.push((json_key(&id)?, id));
@@ -947,16 +899,122 @@ fn project_designs(
             Bucket::Loose => loose.push(id),
         }
     }
+    Ok(DesignGrouping {
+        page_slugs,
+        component_slugs,
+        set_dirs: component_dirs.sets,
+        component_roots,
+        page_nodes,
+        comp_nodes,
+        loose,
+    })
+}
 
+/// `pages/<slug>/page.json`, `components/…/def.json` and
+/// `components/<set>/set.json` — the design headers both formats share.
+pub(crate) fn project_design_headers(
+    files: &mut ProjectedFiles,
+    doc: &Doc,
+    grouping: &DesignGrouping,
+) -> Result<()> {
+    // pages/<slug>/page.json — id + name + order. The id is the page's
+    // identity of record (the directory name is only a readable projection).
+    // `order` is the position in `doc.pages` today; the fractional-IndexKey
+    // ordering discipline (spec 02 §1, a shared prerequisite of spec 09)
+    // replaces this u32 with an order key string when that migration lands.
+    for (order, page) in doc.pages.iter().enumerate() {
+        let mut header = Map::new();
+        header.insert("id".to_owned(), Value::from(page.to_string()));
+        if let Some(node) = doc.scene.get(*page) {
+            header.insert("name".to_owned(), Value::from(node.name.clone()));
+        }
+        header.insert("order".to_owned(), Value::from(order as u32));
+        let slug = grouping.page_slugs.get(page).ok_or_else(|| {
+            FormatError::InvalidProjectTree(format!("page {page} has no directory slug"))
+        })?;
+        files.insert(
+            PathBuf::from(PAGES_DIR).join(slug).join(PAGE_JSON),
+            Arc::new(json_bytes(&Value::Object(header))?),
+        );
+    }
+
+    // components/…/def.json + components/<set>/set.json — each def and set
+    // exactly as `Doc` serializes it (both carry their id).
+    for (cid, def) in &doc.components.defs {
+        let slug = grouping.component_slugs.get(cid).ok_or_else(|| {
+            FormatError::InvalidProjectTree(format!("component {cid} has no directory slug"))
+        })?;
+        files.insert(
+            PathBuf::from(COMPONENTS_DIR).join(slug).join(DEF_JSON),
+            Arc::new(json_bytes(&serde_json::to_value(def)?)?),
+        );
+    }
+    for (set_id, set) in &doc.components.sets {
+        let set_dir = grouping.set_dirs.get(set_id).ok_or_else(|| {
+            FormatError::InvalidProjectTree(format!("set {set_id} has no directory"))
+        })?;
+        files.insert(
+            set_dir.join(SET_JSON),
+            Arc::new(json_bytes(&serde_json::to_value(set)?)?),
+        );
+    }
+    Ok(())
+}
+
+/// `pages/_loose/nodes/<id>.json` for orphans, which need not form a
+/// single-rooted tree.
+pub(crate) fn project_loose_nodes(
+    files: &mut ProjectedFiles,
+    doc: &Doc,
+    loose: &[NodeId],
+) -> Result<()> {
+    for id in loose {
+        let node = doc
+            .scene
+            .get(*id)
+            .ok_or_else(|| FormatError::InvalidProjectTree(format!("node {id} vanished")))?;
+        files.insert(
+            PathBuf::from(PAGES_DIR)
+                .join(LOOSE_DIR)
+                .join(NODES_DIR)
+                .join(format!("{id}.json")),
+            Arc::new(json_bytes(&{
+                let mut value = serde_json::to_value(node)?;
+                crate::project::read::repair_non_finite_geometry(&mut value);
+                value
+            })?),
+        );
+    }
+    Ok(())
+}
+
+/// Page headers, component defs/sets, and one source (or fallback node file)
+/// per design.
+fn project_designs(
+    files: &mut ProjectedFiles,
+    doc: &Doc,
+    refs: &fanta_fnx::RefTable,
+    cache: &mut ProjectWriteCache,
+    sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
+) -> Result<()> {
+    let grouping = design_grouping(doc)?;
+    project_design_headers(files, doc, &grouping)?;
+
+    // v2: one readable `.fnx` source + an `.ids` sidecar per page / component
+    // (was one JSON file per node); `_loose` orphans stay per-node JSON.
     let refs_digest = ref_table_digest(doc);
-    let page_by_slug: BTreeMap<&String, NodeId> =
-        page_slugs.iter().map(|(id, slug)| (slug, *id)).collect();
-    let component_by_slug: BTreeMap<&String, ComponentId> = component_slugs
+    let page_by_slug: BTreeMap<&String, NodeId> = grouping
+        .page_slugs
+        .iter()
+        .map(|(id, slug)| (slug, *id))
+        .collect();
+    let component_by_slug: BTreeMap<&String, ComponentId> = grouping
+        .component_slugs
         .iter()
         .map(|(id, slug)| (slug, *id))
         .collect();
     let mut live_designs: BTreeSet<PathBuf> = BTreeSet::new();
-    for (pdir, group) in &page_nodes {
+    for (pdir, group) in &grouping.page_nodes {
         let name = page_by_slug
             .get(pdir)
             .and_then(|id| doc.scene.get(*id))
@@ -978,7 +1036,7 @@ fn project_designs(
         .map_err(|e| FormatError::InvalidProjectTree(format!("page {pdir}: {e}")))?;
         live_designs.insert(design_dir);
     }
-    for (cdir, group) in &comp_nodes {
+    for (cdir, group) in &grouping.comp_nodes {
         let name = component_by_slug
             .get(cdir)
             .and_then(|id| doc.components.defs.get(id))
@@ -1012,24 +1070,7 @@ fn project_designs(
             unknown.display()
         )));
     }
-    for id in loose {
-        let node = doc
-            .scene
-            .get(id)
-            .ok_or_else(|| FormatError::InvalidProjectTree(format!("node {id} vanished")))?;
-        files.insert(
-            PathBuf::from(PAGES_DIR)
-                .join(LOOSE_DIR)
-                .join(NODES_DIR)
-                .join(format!("{id}.json")),
-            Arc::new(json_bytes(&{
-                let mut value = serde_json::to_value(node)?;
-                crate::project::read::repair_non_finite_geometry(&mut value);
-                value
-            })?),
-        );
-    }
-    Ok(())
+    project_loose_nodes(files, doc, &grouping.loose)
 }
 
 /// Every node id in the scene. The scene exposes no whole-map iterator, so
@@ -1303,7 +1344,7 @@ fn classify(
 
 /// `assets/<family>/<asset-id>.<ext>` — family and extension sniffed from the
 /// bytes (see [`super::media`]); the id in the filename is the truth.
-fn project_asset_files<'a>(
+pub(crate) fn project_asset_files<'a>(
     assets: &'a BTreeMap<AssetId, Vec<u8>>,
     media_registry: Option<&MediaRegistry>,
 ) -> Result<BTreeMap<PathBuf, &'a [u8]>> {
@@ -1457,6 +1498,9 @@ fn is_generated_artifact(relative: &Path) -> bool {
     else {
         return false;
     };
+    if is_web_artifact(&parts) {
+        return true;
+    }
     match parts.as_slice() {
         [DOC_DIR, name] => [
             METADATA_JSON,
@@ -1473,9 +1517,8 @@ fn is_generated_artifact(relative: &Path) -> bool {
         [COMPONENTS_DIR, SETS_JSON] | [ASSETS_DIR, ASSET_INDEX_FILE] => true,
         [PAGES_DIR, _, name] => [PAGE_JSON, PAGE_FNX, PAGE_IDS].contains(name),
         [COMPONENTS_DIR, _, name] => [DEF_JSON, MASTER_FNX, MASTER_IDS, SET_JSON].contains(name),
-        [COMPONENTS_DIR, _, variant, name] if *variant != NODES_DIR => {
-            [DEF_JSON, MASTER_FNX, MASTER_IDS].contains(name)
-        }
+        // A variant folder is named after the variant, so it can be `nodes`.
+        [COMPONENTS_DIR, _, _, name] if [DEF_JSON, MASTER_FNX, MASTER_IDS].contains(name) => true,
         [PAGES_DIR | COMPONENTS_DIR, _, NODES_DIR, name] => {
             Path::new(name)
                 .extension()
@@ -1489,6 +1532,40 @@ fn is_generated_artifact(relative: &Path) -> bool {
             .file_stem()
             .and_then(|stem| stem.to_str())
             .is_some_and(|stem| stem.parse::<AssetId>().is_ok()),
+        _ => false,
+    }
+}
+
+/// The files web storage (spec 0007) writes beyond the shared set. Managed,
+/// so the transactional sync writes them and stale pruning converts a project
+/// between storage formats by deleting the other format's files.
+fn is_web_artifact(parts: &[&str]) -> bool {
+    fn node_raster(name: &str) -> bool {
+        let name = Path::new(name);
+        name.extension().is_some_and(|extension| extension == "png")
+            && name
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.parse::<NodeId>().is_ok())
+    }
+    match parts {
+        [name] => [
+            "index.html",
+            "viewer.js",
+            "canvas.js",
+            "editor.js",
+            "tokens.css",
+            "design.css",
+            "pages.js",
+            "report.json",
+        ]
+        .contains(name),
+        [PAGES_DIR, _, name] => {
+            ["page.svg", "page.css", "nodes.json", "map.json"].contains(name) || node_raster(name)
+        }
+        [COMPONENTS_DIR, _, name] | [COMPONENTS_DIR, _, _, name] => {
+            ["master.svg", "master.css", "nodes.json"].contains(name) || node_raster(name)
+        }
         _ => false,
     }
 }
@@ -1717,6 +1794,7 @@ fn validate_unchanged(dir: &Path, relative: &Path, expected: &FileState) -> Resu
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn apply_single_change(
     dir: &Path,
     writes: &[PlannedWrite<'_>],
@@ -1780,6 +1858,7 @@ fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn apply_project_transaction(
     dir: &Path,
     writes: &[PlannedWrite<'_>],
@@ -1813,6 +1892,9 @@ fn apply_project_transaction(
             new_sha256: hash_hex(&write.new_hash),
         });
     }
+    // Recovery replays the journal on every open and refuses one it cannot
+    // validate, so an invalid plan must fail here, before it is in place.
+    validate_transaction(&transaction)?;
     write_with_parents(
         &staging.path().join("plan.json"),
         &serde_json::to_vec(&transaction)?,
@@ -2030,10 +2112,12 @@ fn sync_file(file: &fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 pub(super) fn write_with_parents(path: &Path, bytes: &[u8]) -> Result<()> {
     write_with_parents_with(path, |file| file.write_all(bytes))
 }
 
+#[cfg(feature = "native")]
 fn write_with_parents_with(
     path: &Path,
     write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
@@ -2065,6 +2149,7 @@ fn write_with_parents_with(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn discard_project_temporary(
     temporary: tempfile::NamedTempFile,
     primary: std::io::Error,
@@ -2133,9 +2218,7 @@ mod tests {
                 })
                 .collect::<BTreeMap<_, _>>();
             assert_eq!(assets.len(), asset_count);
-            let mut cache = ProjectWriteCache::default();
-            let report =
-                stage_new_project_tree_cached(staged.path(), &document, &assets, &mut cache)?;
+            let report = stage_new_project_tree(staged.path(), &document, &assets, None, &[])?;
             super::super::scaffold_project_tree(existing.path())?;
             write_project_tree(existing.path(), &document, &assets)?;
             let mut actual = BTreeMap::new();
@@ -2151,7 +2234,6 @@ mod tests {
                 report.sync_count, 0,
                 "publication must supply the durability barrier"
             );
-            assert!(cache.cached_designs() > 0);
             assert!(report.removed.is_empty());
             assert_eq!(report.written.len(), report.written_hashes.len());
             for (relative, hash) in &report.written_hashes {
@@ -2163,7 +2245,7 @@ mod tests {
             assert_eq!(project_files(&reopened)?, project_files(&document)?);
             assert_eq!(reopened_assets, assets);
             assert_eq!(
-                write_project_tree_cached(staged.path(), &document, &assets, &mut cache)?,
+                write_project_tree(staged.path(), &document, &assets)?,
                 WriteReport::default()
             );
         }
@@ -2175,12 +2257,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let sentinel = directory.path().join("sentinel");
         fs::write(&sentinel, b"existing bytes")?;
-        let result = stage_new_project_tree_cached(
-            directory.path(),
-            &Doc::new(),
-            &BTreeMap::new(),
-            &mut ProjectWriteCache::default(),
-        );
+        let result =
+            stage_new_project_tree(directory.path(), &Doc::new(), &BTreeMap::new(), None, &[]);
         assert!(result.is_err());
         assert_eq!(fs::read(&sentinel)?, b"existing bytes");
         assert_eq!(
@@ -2200,15 +2278,7 @@ mod tests {
         let linked = parent.path().join("linked");
         fs::create_dir(&target)?;
         std::os::unix::fs::symlink(&target, &linked)?;
-        assert!(
-            stage_new_project_tree_cached(
-                &linked,
-                &Doc::new(),
-                &BTreeMap::new(),
-                &mut ProjectWriteCache::default()
-            )
-            .is_err()
-        );
+        assert!(stage_new_project_tree(&linked, &Doc::new(), &BTreeMap::new(), None, &[]).is_err());
         assert_eq!(
             fs::read_dir(target)?
                 .collect::<std::io::Result<Vec<_>>>()?
@@ -2250,7 +2320,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let document = Doc::new();
         let assets = BTreeMap::new();
-        let fresh = write_project_tree(directory.path(), &document, &assets)?;
+        let fresh = write_legacy_project_tree(directory.path(), &document, &assets)?;
         assert_eq!(fresh.written.len(), 10);
         assert!(fresh.removed.is_empty());
         // Ten projected files, one journal, six support files; Unix additionally
@@ -2268,11 +2338,11 @@ mod tests {
             assert!(directory.path().join(relative).is_file());
         }
 
-        let unchanged = write_project_tree(directory.path(), &document, &assets)?;
+        let unchanged = write_legacy_project_tree(directory.path(), &document, &assets)?;
         assert_eq!(unchanged, WriteReport::default());
 
         fs::remove_file(directory.path().join("fanta.md"))?;
-        let repaired_support = write_project_tree(directory.path(), &document, &assets)?;
+        let repaired_support = write_legacy_project_tree(directory.path(), &document, &assets)?;
         assert!(repaired_support.written.is_empty());
         assert!(repaired_support.removed.is_empty());
         assert_eq!(repaired_support.sync_count, 1);
@@ -2287,10 +2357,10 @@ mod tests {
     fn sync_count_tracks_single_file_save_and_parent_directories() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut document = Doc::new();
-        write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         document.metadata.title = "Changed title".into();
 
-        let changed = write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        let changed = write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         assert_eq!(changed.written, vec![PathBuf::from("doc/metadata.json")]);
         assert!(changed.removed.is_empty());
         assert_eq!(changed.sync_count, if cfg!(unix) { 3 } else { 1 });
@@ -2304,7 +2374,7 @@ mod tests {
     fn sync_count_tracks_multi_file_transaction_without_double_counting_parents() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let document = Doc::new();
-        write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         let mut originals = BTreeMap::new();
         for relative in ["doc/active_modes.json", "doc/variables.json"] {
             let path = directory.path().join(relative);
@@ -2315,7 +2385,7 @@ mod tests {
             originals.insert(PathBuf::from(relative), original);
         }
 
-        let repaired = write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        let repaired = write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         assert_eq!(
             repaired.written,
             originals.keys().cloned().collect::<Vec<_>>()
@@ -2334,12 +2404,12 @@ mod tests {
     fn sync_count_tracks_removal_without_a_file_sync() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let document = Doc::new();
-        write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         let relative = PathBuf::from(format!("pages/_loose/nodes/{}.json", NodeId::from_u128(19)));
         fs::create_dir_all(directory.path().join("pages/_loose/nodes"))?;
         fs::write(directory.path().join(&relative), b"{}\n")?;
 
-        let removed = write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        let removed = write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         assert!(removed.written.is_empty());
         assert_eq!(removed.removed, vec![relative.clone()]);
         assert_eq!(removed.sync_count, if cfg!(unix) { 4 } else { 0 });
@@ -2352,7 +2422,7 @@ mod tests {
     fn sync_count_includes_pending_recovery_before_an_unchanged_save() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut document = Doc::new();
-        write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         let relative = PathBuf::from("doc/metadata.json");
         let old = fs::read(directory.path().join(&relative))?;
         document.metadata.title = "Recovered title".into();
@@ -2373,14 +2443,14 @@ mod tests {
             })?,
         )?;
 
-        let recovered = write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        let recovered = write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?;
         assert!(recovered.written.is_empty());
         assert!(recovered.removed.is_empty());
         assert_eq!(recovered.sync_count, if cfg!(unix) { 3 } else { 0 });
         assert_eq!(fs::read(directory.path().join(relative))?, new);
         assert!(!journal.exists());
         assert_eq!(
-            write_project_tree(directory.path(), &document, &BTreeMap::new())?,
+            write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())?,
             WriteReport::default()
         );
         Ok(())
@@ -2425,7 +2495,7 @@ mod tests {
         document.set_active_page(Some(first));
         let assets = BTreeMap::new();
         let mut cache = ProjectWriteCache::default();
-        write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+        write_legacy_project_tree_impl(directory.path(), &document, &assets, &mut cache, &BTreeMap::new(), None)
             .expect("initial save");
 
         let mut second = CanvasNode::new(NodeData::Group(GroupNode::default()));
@@ -2446,7 +2516,7 @@ mod tests {
                 ],
             })
             .expect("add page transaction");
-        write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+        write_legacy_project_tree_impl(directory.path(), &document, &assets, &mut cache, &BTreeMap::new(), None)
             .expect("save added page");
         let source =
             crate::locate_page_source(directory.path(), second_id).expect("second page source");
@@ -2462,7 +2532,7 @@ mod tests {
                 new_active_page: Some(second_id),
             })
             .expect("registry-only reorder");
-        let reordered = write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+        let reordered = write_legacy_project_tree_impl(directory.path(), &document, &assets, &mut cache, &BTreeMap::new(), None)
             .expect("save registry-only reorder");
         assert!(
             reordered
@@ -2490,7 +2560,7 @@ mod tests {
                 ],
             })
             .expect("delete page transaction");
-        let removed = write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+        let removed = write_legacy_project_tree_impl(directory.path(), &document, &assets, &mut cache, &BTreeMap::new(), None)
             .expect("save deleted page");
         assert!(!source.exists());
         assert!(
@@ -2502,7 +2572,7 @@ mod tests {
         let (saved, _) = crate::read_project_tree(directory.path()).expect("reopen deleted page");
         assert_eq!(saved.pages(), &[first]);
         assert!(document.undo().expect("undo deletion"));
-        write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+        write_legacy_project_tree_impl(directory.path(), &document, &assets, &mut cache, &BTreeMap::new(), None)
             .expect("save restored page");
         assert_eq!(
             fs::read(&source).expect("restored page source"),
@@ -2515,7 +2585,7 @@ mod tests {
             document.scene.get(second_id).expect("live page").meta
         );
         assert!(document.redo().expect("redo deletion"));
-        write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+        write_legacy_project_tree_impl(directory.path(), &document, &assets, &mut cache, &BTreeMap::new(), None)
             .expect("save redone deletion");
         assert!(!source.exists());
     }
@@ -2540,7 +2610,7 @@ mod tests {
             landscape: false,
             frame_color: Some(fanta_doc::Color::rgb(0x12, 0x34, 0x56)),
         });
-        write_project_tree(directory.path(), &document, &BTreeMap::new())
+        write_legacy_project_tree(directory.path(), &document, &BTreeMap::new())
             .expect("save presentation");
         let (reopened, _) =
             super::super::read_project_tree(directory.path()).expect("reopen presentation");
@@ -2627,7 +2697,7 @@ mod tests {
         assert!(error.to_string().contains("injected asset write failure"));
 
         let assets = BTreeMap::from([(asset, bytes)]);
-        write_project_tree(directory.path(), &Doc::new(), &assets).expect("retry project save");
+        write_legacy_project_tree(directory.path(), &Doc::new(), &assets).expect("retry project save");
         let (_, reopened_assets) =
             super::super::read_project_tree(directory.path()).expect("reopen saved project");
         assert_eq!(
@@ -2643,11 +2713,11 @@ mod tests {
         let asset = crate::asset_id_for_bytes(&bytes);
         let relative = PathBuf::from(format!("assets/images/{asset}.png"));
         let assets = BTreeMap::from([(asset, bytes.clone())]);
-        write_project_tree(directory.path(), &Doc::new(), &assets).expect("initial project save");
+        write_legacy_project_tree(directory.path(), &Doc::new(), &assets).expect("initial project save");
         fs::write(directory.path().join(&relative), &bytes[..8])
             .expect("simulate an interrupted write from an older app version");
 
-        let report = write_project_tree(directory.path(), &Doc::new(), &assets)
+        let report = write_legacy_project_tree(directory.path(), &Doc::new(), &assets)
             .expect("repair project save");
         let (_, reopened_assets) =
             super::super::read_project_tree(directory.path()).expect("reopen repaired project");
@@ -2665,12 +2735,12 @@ mod tests {
         let asset = crate::asset_id_for_bytes(&bytes);
         let relative = PathBuf::from(format!("assets/images/{asset}.png"));
         let assets = BTreeMap::from([(asset, bytes.clone())]);
-        write_project_tree(directory.path(), &Doc::new(), &assets).expect("initial save");
+        write_legacy_project_tree(directory.path(), &Doc::new(), &assets).expect("initial save");
         let mut damaged = bytes.clone();
         damaged[10] ^= 1;
         fs::write(directory.path().join(&relative), damaged).expect("damage existing asset");
 
-        let report = write_project_tree(directory.path(), &Doc::new(), &assets).expect("repair");
+        let report = write_legacy_project_tree(directory.path(), &Doc::new(), &assets).expect("repair");
         assert!(report.written.contains(&relative));
         assert_eq!(
             fs::read(directory.path().join(relative)).expect("asset"),
@@ -2682,7 +2752,7 @@ mod tests {
     fn regeneration_preserves_unmanaged_files_and_has_an_empty_second_diff() {
         let directory = tempfile::tempdir().expect("project directory");
         let (doc, _, _, _) = cache_fixture();
-        write_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
+        write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
         for relative in [
             "doc/README.md",
             "pages/home/notes.md",
@@ -2704,7 +2774,7 @@ mod tests {
             fs::create_dir_all(directory.path().join(relative)).expect("authored directory");
         }
 
-        let second = write_project_tree(directory.path(), &doc, &BTreeMap::new())
+        let second = write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new())
             .expect("second generation");
         assert_eq!(second, WriteReport::default());
         for relative in [
@@ -2754,7 +2824,7 @@ mod tests {
 
         let directory = tempfile::tempdir().expect("project directory");
         let doc = Doc::new();
-        write_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
+        write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
 
         let outside = tempfile::tempdir().expect("outside directory");
         let external_page = outside.path().join("ghost/page.json");
@@ -2763,7 +2833,7 @@ mod tests {
         fs::write(&external_page, b"external page").expect("external file");
         symlink(outside.path(), directory.path().join(PAGES_DIR)).expect("managed root link");
 
-        let report = write_project_tree(directory.path(), &doc, &BTreeMap::new())
+        let report = write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new())
             .expect("save does not traverse symlink");
         assert_eq!(report, WriteReport::default());
         assert_eq!(
@@ -2777,8 +2847,15 @@ mod tests {
         let directory = tempfile::tempdir().expect("project directory");
         let (doc, _, _, _) = cache_fixture();
         let mut cache = ProjectWriteCache::default();
-        write_project_tree_cached(directory.path(), &doc, &BTreeMap::new(), &mut cache)
-            .expect("initial save");
+        write_legacy_project_tree_impl(
+            directory.path(),
+            &doc,
+            &BTreeMap::new(),
+            &mut cache,
+            &BTreeMap::new(),
+            None,
+        )
+        .expect("initial save");
         let source_path = directory.path().join("pages/home/page.fnx");
         let mut source = b"// Author note retained across canvas saves\n".to_vec();
         source.extend(fs::read(&source_path).expect("generated source"));
@@ -2786,12 +2863,13 @@ mod tests {
             fs::read(directory.path().join("pages/home/page.ids.json")).expect("generated IDs");
         let sources = BTreeMap::from([(PathBuf::from("pages/home"), (source.clone(), sidecar))]);
 
-        let report = write_project_tree_cached_with_sources(
+        let report = write_legacy_project_tree_impl(
             directory.path(),
             &doc,
             &BTreeMap::new(),
             &mut cache,
             &sources,
+            None,
         )
         .expect("save authored source");
         assert_eq!(report.written, vec![PathBuf::from("pages/home/page.fnx")]);
@@ -2806,12 +2884,13 @@ mod tests {
             2,
             "override does not cache a reprint"
         );
-        let second = write_project_tree_cached_with_sources(
+        let second = write_legacy_project_tree_impl(
             directory.path(),
             &doc,
             &BTreeMap::new(),
             &mut cache,
             &sources,
+            None,
         )
         .expect("repeat save");
         assert_eq!(second, WriteReport::default());
@@ -2827,12 +2906,13 @@ mod tests {
                 PathBuf::from(relative),
                 (b"<Frame />".to_vec(), b"{}".to_vec()),
             )]);
-            let error = write_project_tree_cached_with_sources(
+            let error = write_legacy_project_tree_impl(
                 directory.path(),
                 &doc,
                 &BTreeMap::new(),
                 &mut ProjectWriteCache::default(),
                 &sources,
+                None,
             )
             .expect_err("unprojected source must be rejected");
             assert!(matches!(error, FormatError::InvalidProjectTree(_)));
@@ -2910,7 +2990,7 @@ mod tests {
     fn checked_write_rejects_an_external_source_edit_without_overwriting_it() {
         let directory = tempfile::tempdir().expect("project directory");
         let (doc, _, _, _) = cache_fixture();
-        write_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
+        write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
         let relative = PathBuf::from("pages/home/page.fnx");
         let source = fs::read(directory.path().join(&relative)).expect("source");
         let sidecar = fs::read(directory.path().join("pages/home/page.ids.json")).expect("sidecar");
@@ -2921,7 +3001,7 @@ mod tests {
         external.extend_from_slice(b"\n// external edit\n");
         fs::write(directory.path().join(&relative), &external).expect("external edit");
 
-        let error = write_project_tree_cached_with_sources_checked(
+        let error = write_legacy_project_tree_checked(
             directory.path(),
             &doc,
             &BTreeMap::new(),
@@ -2942,13 +3022,13 @@ mod tests {
     fn checked_write_guards_singleton_files_and_rejects_unsafe_paths() {
         let directory = tempfile::tempdir().expect("project directory");
         let doc = Doc::new();
-        write_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
+        write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
         let metadata = PathBuf::from("doc/metadata.json");
         let original = fs::read(directory.path().join(&metadata)).expect("metadata");
         fs::write(directory.path().join(&metadata), b"{}\n").expect("external metadata edit");
         let preconditions =
             BTreeMap::from([(metadata.clone(), Some(Sha256::digest(&original).into()))]);
-        let error = write_project_tree_cached_with_sources_checked(
+        let error = write_legacy_project_tree_checked(
             directory.path(),
             &doc,
             &BTreeMap::new(),
@@ -2964,7 +3044,7 @@ mod tests {
         );
 
         let unsafe_preconditions = BTreeMap::from([(PathBuf::from("doc/../../outside"), None)]);
-        let error = write_project_tree_cached_with_sources_checked(
+        let error = write_legacy_project_tree_checked(
             directory.path(),
             &doc,
             &BTreeMap::new(),
@@ -2980,7 +3060,7 @@ mod tests {
     fn checked_write_requires_a_baseline_for_each_generated_file_it_removes() {
         let directory = tempfile::tempdir().expect("project directory");
         let doc = Doc::new();
-        write_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
+        write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
         let relative = PathBuf::from(format!("pages/_loose/nodes/{}.json", NodeId::from_u128(19)));
         let path = directory.path().join(&relative);
         fs::create_dir_all(path.parent().expect("generated file parent"))
@@ -2988,7 +3068,7 @@ mod tests {
         let bytes = b"{\"id\":\"stale\"}\n";
         fs::write(&path, bytes).expect("external generated file");
 
-        let error = write_project_tree_cached_with_sources_checked(
+        let error = write_legacy_project_tree_checked(
             directory.path(),
             &doc,
             &BTreeMap::new(),
@@ -3006,7 +3086,7 @@ mod tests {
 
         let preconditions =
             BTreeMap::from([(relative.clone(), Some(Sha256::digest(bytes).into()))]);
-        let report = write_project_tree_cached_with_sources_checked(
+        let report = write_legacy_project_tree_checked(
             directory.path(),
             &doc,
             &BTreeMap::new(),
@@ -3023,7 +3103,7 @@ mod tests {
     fn deleted_design_prunes_generated_artifacts_but_keeps_unmanaged_files() {
         let directory = tempfile::tempdir().expect("project directory");
         let (doc, _, _, _) = cache_fixture();
-        write_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
+        write_legacy_project_tree(directory.path(), &doc, &BTreeMap::new()).expect("initial save");
         fs::write(directory.path().join("pages/home/notes.md"), b"keep")
             .expect("author page notes");
         fs::create_dir_all(directory.path().join("pages/custom-empty"))
@@ -3032,7 +3112,7 @@ mod tests {
         empty.id = doc.id;
         empty.metadata = doc.metadata;
         let report =
-            write_project_tree(directory.path(), &empty, &BTreeMap::new()).expect("remove designs");
+            write_legacy_project_tree(directory.path(), &empty, &BTreeMap::new()).expect("remove designs");
 
         for generated in ["page.json", "page.fnx", "page.ids.json"] {
             assert!(
@@ -3056,7 +3136,7 @@ mod tests {
     #[test]
     fn opening_replays_an_interrupted_multi_file_transaction() {
         let directory = tempfile::tempdir().expect("project directory");
-        write_project_tree(directory.path(), &Doc::new(), &BTreeMap::new()).expect("initial save");
+        write_legacy_project_tree(directory.path(), &Doc::new(), &BTreeMap::new()).expect("initial save");
         let journal = directory.path().join(TRANSACTION_DIR);
         fs::create_dir_all(journal.join("staged")).expect("journal staging");
         let mut writes = Vec::new();

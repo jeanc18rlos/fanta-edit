@@ -129,6 +129,29 @@ pub(crate) fn with_layout_engine<R>(operation: impl FnOnce(&LayoutEngine) -> R) 
     operation(&current_text_context().0.engine)
 }
 
+/// Each of `families` that no installed, bundled or downloadable face carries,
+/// with the family this thread's renders use instead (`None` when none of the
+/// fallbacks resolves either).
+pub fn missing_font_families<'a>(
+    families: impl IntoIterator<Item = &'a str>,
+) -> Vec<(String, Option<String>)> {
+    with_layout_engine(|engine| {
+        families
+            .into_iter()
+            .filter_map(|family| {
+                // Resolving first registers a downloadable face, if there is one.
+                let candidates = engine.resolve_families(family);
+                (!engine.supports_family(family)).then(|| {
+                    let used = candidates.into_iter().find(|candidate| {
+                        !candidate.eq_ignore_ascii_case(family) && engine.supports_family(candidate)
+                    });
+                    (family.to_owned(), used)
+                })
+            })
+            .collect()
+    })
+}
+
 /// Keep recently measured or painted runs warm when new text exceeds the cap.
 const LAYOUT_CACHE_CAP: NonZeroUsize = NonZeroUsize::MIN.saturating_add(16_383);
 const TEXT_GEOMETRY_CACHE_CAP: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4_095);

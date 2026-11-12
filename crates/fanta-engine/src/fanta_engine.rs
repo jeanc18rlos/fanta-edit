@@ -18,8 +18,14 @@ use fanta_headless::{HeadlessProject, MAX_RENDER_DIMENSION, PageRef, RenderTarge
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+pub mod server;
+pub mod source;
+
 /// The longest a run may take; Cloud Run ends the request at 300 s.
 pub const MAX_DEADLINE_MS: u64 = 280_000;
+/// The most steps one run takes. Each render and export step is capped, and
+/// this caps how many a run can stack before the deadline is next checked.
+pub const MAX_STEPS: usize = 32;
 pub const MAX_RENDER_TARGETS: usize = 8;
 /// The most data rows one `export_batch` step renders.
 pub const MAX_BATCH_ROWS: usize = 8;
@@ -356,8 +362,39 @@ pub fn validate(request: &RunRequest) -> Result<(), EngineError> {
             "deadline_ms must be between 1 and {MAX_DEADLINE_MS}"
         ));
     }
-    if request.steps.is_empty() {
-        return bad_request("a run needs at least one step".into());
+    if request.steps.is_empty() || request.steps.len() > MAX_STEPS {
+        return bad_request(format!("a run takes 1 to {MAX_STEPS} steps"));
+    }
+    if let Source::Github {
+        repo,
+        sha,
+        path,
+        overlay,
+        ..
+    } = &request.source
+    {
+        // Both parts go into GitHub API paths, so `..` must not pass.
+        let name = |part: &str| {
+            !matches!(part, "" | "." | "..")
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        };
+        if !repo
+            .split_once('/')
+            .is_some_and(|(owner, name_part)| name(owner) && name(name_part))
+        {
+            return bad_request(format!("repo {repo:?} must be owner/name"));
+        }
+        if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            return bad_request("sha must be a full 40-character commit SHA".into());
+        }
+        source::relative_path(path)?;
+        for file in overlay.iter().flat_map(|overlay| &overlay.files) {
+            if source::relative_path(&file.path)?.as_os_str().is_empty() {
+                return bad_request("an overlay file needs a path".into());
+            }
+        }
     }
     for (index, step) in request.steps.iter().enumerate() {
         if let Step::Render { targets } = step
@@ -413,8 +450,20 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
     validate(request)?;
     let started = Instant::now();
     let deadline = Duration::from_millis(request.deadline_ms);
-    let project = HeadlessProject::open(work_dir)
-        .map_err(|error| EngineError::new(ErrorCode::ProjectLoadFailed, format!("{error:#}")))?;
+    let project = HeadlessProject::open(work_dir).map_err(|error| {
+        let code = if fanta_headless::saved_by_newer_fanta(&error) {
+            ErrorCode::SchemaTooNew
+        } else {
+            ErrorCode::ProjectLoadFailed
+        };
+        EngineError::new(code, format!("{error:#}"))
+    })?;
+    if started.elapsed() >= deadline {
+        return Err(EngineError::new(
+            ErrorCode::DeadlineExceeded,
+            "the deadline passed before the project loaded",
+        ));
+    }
     let mut session = DesignSession::from_project(project);
     // Template images come from data: URIs or this checkout's own files,
     // never from the network.
@@ -465,12 +514,29 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
             sha: None,
             project_id: project.map(|project| project.doc().id.to_string()),
             warnings: project
-                .map(|project| project.warnings().to_vec())
+                // The cloud contract is frozen (ADR 0021): one sentence per finding.
+                .map(|project| project.warnings().iter().map(ToString::to_string).collect())
                 .unwrap_or_default(),
-            fonts: FontReport::default(),
+            fonts: project.map(font_report).unwrap_or_default(),
         },
         results,
     })
+}
+
+fn font_report(project: &HeadlessProject) -> FontReport {
+    let missing = project.missing_fonts();
+    FontReport {
+        substituted: missing
+            .iter()
+            .filter_map(|(family, used)| {
+                Some(FontSubstitution {
+                    family: family.clone(),
+                    used: used.clone()?,
+                })
+            })
+            .collect(),
+        missing: missing.into_iter().map(|(family, _)| family).collect(),
+    }
 }
 
 fn run_step(session: &mut DesignSession, step: &Step) -> anyhow::Result<serde_json::Value> {
@@ -705,15 +771,46 @@ mod tests {
         assert_eq!(code(wide), Err(ErrorCode::BadRequest));
 
         let mut ambiguous = base.clone();
-        ambiguous["source"] = json!({"kind": "github", "repo": "a/b", "sha": "c", "token": "t",
+        ambiguous["source"] = json!({"kind": "github", "repo": "a/b", "sha": "0123456789abcdef0123456789abcdef01234567", "token": "t",
             "overlay": {"files": [{"path": "fanta.json", "content_b64": "e30=", "deleted": true}]}});
         assert_eq!(code(ambiguous), Err(ErrorCode::BadRequest));
 
-        let mut large = base;
-        large["source"] = json!({"kind": "github", "repo": "a/b", "sha": "c", "token": "t",
+        let mut large = base.clone();
+        large["source"] = json!({"kind": "github", "repo": "a/b", "sha": "0123456789abcdef0123456789abcdef01234567", "token": "t",
             "overlay": {"files": [{"path": "big.bin",
                 "content_b64": "A".repeat(MAX_OVERLAY_BYTES / 3 * 4 + 8)}]}});
         assert_eq!(code(large), Err(ErrorCode::PayloadTooLarge));
+
+        let mut long = base.clone();
+        long["steps"] = json!(vec![json!({"step": "inspect"}); MAX_STEPS + 1]);
+        assert_eq!(code(long), Err(ErrorCode::BadRequest));
+
+        let github = |repo: &str, sha: &str, path: &str, overlay_path: &str| {
+            let mut value = base.clone();
+            value["source"] = json!({"kind": "github", "repo": repo, "sha": sha, "path": path,
+                "token": "t", "overlay": {"files": [{"path": overlay_path, "content_b64": "e30="}]}});
+            code(value)
+        };
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(github("acme/site", sha, "design", "pages/a.fnx"), Ok(()));
+        for (repo, sha, path, overlay_path) in [
+            ("acme", sha, "", "a.fnx"),
+            ("acme/site/extra", sha, "", "a.fnx"),
+            ("../site", sha, "", "a.fnx"),
+            ("acme/site", "0123456", "", "a.fnx"),
+            ("acme/site", &"g".repeat(40), "", "a.fnx"),
+            ("acme/site", sha, "../other", "a.fnx"),
+            ("acme/site", sha, "/abs", "a.fnx"),
+            ("acme/site", sha, "", "../../app/x"),
+            ("acme/site", sha, "", "/etc/x"),
+            ("acme/site", sha, "", ""),
+        ] {
+            assert_eq!(
+                github(repo, sha, path, overlay_path),
+                Err(ErrorCode::BadRequest),
+                "{repo} {sha} {path} {overlay_path}"
+            );
+        }
     }
 
     #[test]
@@ -790,7 +887,7 @@ mod tests {
             .as_array()
             .expect("files")
             .iter()
-            .find(|file| file["path"] == "pages/home/page.fnx")
+            .find(|file| file["path"] == "pages/home/nodes.json")
             .expect("the commented page changed");
         assert_eq!(page_file["status"], "modified");
         let source = base64::engine::general_purpose::STANDARD
@@ -860,7 +957,7 @@ mod tests {
                 file["status"] == "added"
                     && file["path"]
                         .as_str()
-                        .is_some_and(|path| path.ends_with("/page.fnx"))
+                        .is_some_and(|path| path.ends_with("/page.svg"))
             })
             .expect("the created page is a new source");
         let source = base64::engine::general_purpose::STANDARD
@@ -969,7 +1066,7 @@ mod tests {
             .find(|file| {
                 file["path"]
                     .as_str()
-                    .is_some_and(|path| path.ends_with("/page.fnx"))
+                    .is_some_and(|path| path.ends_with("/page.svg"))
             })
             .and_then(|file| file["content_b64"].as_str())
             .map(|content| {
@@ -1015,5 +1112,63 @@ mod tests {
             json!({"error": {"code": "schema_too_new", "message": "saved by a newer Fanta"}})
         );
         assert_eq!(error.error.code.status(), 409);
+    }
+
+    /// A page holding one text layer set in `font_family`, written as a project.
+    fn text_project(font_family: &str) -> tempfile::TempDir {
+        use fanta_doc::{CanvasNode, Doc, GroupNode, NodeData, Operation, TextNode};
+        let mut doc = Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = "Home".into();
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page)).expect("page");
+        doc.add_page(page_id);
+        let mut text = TextNode::new("Hello", 120.0, 24.0);
+        text.style.font_family = font_family.into();
+        let mut label = CanvasNode::new(NodeData::Text(text));
+        label.parent = Some(page_id);
+        doc.apply(Operation::create_node(label)).expect("text");
+        let directory = tempfile::tempdir().expect("project directory");
+        fanta_format::write_project_tree(directory.path(), &doc, &Default::default())
+            .expect("write the project");
+        directory
+    }
+
+    fn inspect(directory: &Path) -> Result<RunResponse, EngineError> {
+        run_in(
+            &request(json!({
+                "request_id": "r",
+                "deadline_ms": 60000,
+                "source": {"kind": "dir", "dir": directory},
+                "steps": [{"step": "inspect"}]
+            })),
+            directory,
+        )
+    }
+
+    #[test]
+    fn a_project_saved_by_a_newer_fanta_answers_schema_too_new() {
+        let directory = text_project("Inter");
+        let manifest_path = directory.path().join("fanta.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("read")).expect("json");
+        manifest["schema_version"] = json!(fanta_doc::SCHEMA_VERSION + 1);
+        std::fs::write(&manifest_path, manifest.to_string()).expect("write");
+        let error = inspect(directory.path()).expect_err("refused");
+        assert_eq!(error.error.code, ErrorCode::SchemaTooNew, "{error}");
+    }
+
+    #[test]
+    fn the_response_names_the_fonts_renders_substitute() {
+        // Adobe Clean is Adobe's own UI face, never installed on a build
+        // machine; it renders with the bundled Source substitute.
+        let directory = text_project("Adobe Clean");
+        let fonts = inspect(directory.path()).expect("run").source.fonts;
+        assert_eq!(fonts.missing, ["Adobe Clean"]);
+        let [substitution] = fonts.substituted.as_slice() else {
+            panic!("one substitution: {fonts:?}");
+        };
+        assert_eq!(substitution.family, "Adobe Clean");
+        assert!(substitution.used.starts_with("Source"), "{substitution:?}");
     }
 }
