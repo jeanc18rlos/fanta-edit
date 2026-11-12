@@ -249,7 +249,9 @@ impl<'a> AssetStores<'a> {
             );
             return Ok((id, false));
         }
-        Arc::make_mut(self.raw_assets).insert(id, bytes.clone());
+        #[cfg(feature = "render")]
+        let overlay_bytes = Arc::new(bytes.clone());
+        Arc::make_mut(self.raw_assets).insert(id, bytes);
         #[cfg(feature = "render")]
         {
             let overlay = self.overlay.get_or_insert_with(|| {
@@ -263,11 +265,9 @@ impl<'a> AssetStores<'a> {
                 .added_bytes
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(id, Arc::new(bytes));
+                .insert(id, overlay_bytes);
             *self.asset_resolver = Some(overlay.clone() as Arc<dyn AssetResolver>);
         }
-        #[cfg(not(feature = "render"))]
-        let _ = bytes;
         Ok((id, true))
     }
 
