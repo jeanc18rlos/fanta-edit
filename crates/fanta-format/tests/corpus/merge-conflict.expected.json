@@ -1,0 +1,8 @@
+[
+  {
+    "code": "parse.conflict_marker",
+    "file": "pages/home/page.css",
+    "line": 8,
+    "severity": "error"
+  }
+]

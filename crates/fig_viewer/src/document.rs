@@ -275,6 +275,10 @@ pub struct FigItem {
     /// Retained artifact sources and their disk baselines. The live document
     /// is an editing/render cache; this session owns authored FNX text.
     workspace_session: Option<fanta_format::WorkspaceSession>,
+    /// What the project check found after the last change made outside
+    /// Fanta (spec 0009 R5), and the check still running, if any.
+    external_findings: Vec<fanta_format::SourceDiagnostic>,
+    external_check: Option<Task<()>>,
     /// Worktree-event subscriptions, one per [`Project`] that opened this
     /// item. The item is shared across windows and each window brings its OWN
     /// `Project` entity, so watching only the first opener's project would
@@ -1635,6 +1639,13 @@ impl project::ProjectItem for FigItem {
                             if adopting_import && let Some(warning) = import_warning {
                                 crate::view::show_canvas_notice_deferred(warning, cx);
                             }
+                            if let Some(notice) = this
+                                .workspace_session
+                                .as_ref()
+                                .and_then(|session| unavailable_designs_notice(&session.open_warnings))
+                            {
+                                crate::view::show_unavailable_designs_notice_deferred(notice, cx);
+                            }
                         }) {
                             log::debug!("dropping loaded update for closed .fig item: {error:#}");
                             return;
@@ -1729,6 +1740,8 @@ impl project::ProjectItem for FigItem {
                     reload_task: None,
                     _load_task: Some(load_task),
                     workspace_session: None,
+                    external_findings: Vec::new(),
+                    external_check: None,
                     project_subscriptions: vec![(project.downgrade(), project_subscription)],
                 }
             });
@@ -2425,6 +2438,12 @@ impl FigItem {
     /// Content gestures dirty the item on their first preview frame, so a
     /// mid-gesture reload can only interrupt selection-style gestures, which
     /// tolerate having their selection reset.
+    /// Read the project again after its files were replaced under the editor.
+    #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+    pub(crate) fn reload_after_restore(&mut self, cx: &mut Context<Self>) {
+        self.schedule_reload_with_full(true, cx);
+    }
+
     #[cfg(test)]
     fn schedule_reload(&mut self, cx: &mut Context<Self>) {
         self.schedule_reload_with_full(false, cx);
@@ -2583,7 +2602,43 @@ impl FigItem {
         if !self.source_edit_locked {
             self.mark_source_layout_unsaved(cx);
         }
+        self.check_after_external_change(cx);
         cx.notify();
+    }
+
+    /// Spec 0009 R5: the files changed outside Fanta, so check them and show
+    /// what is wrong before any save. Runs off the foreground; a newer change
+    /// replaces a check still running.
+    fn check_after_external_change(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.project_root.clone() else {
+            return;
+        };
+        self.external_check = Some(cx.spawn(async move |this, cx| {
+            let checked = cx
+                .background_spawn(async move { fanta_format::check_project(&root) })
+                .await;
+            let applied = this.update(cx, |this, cx| {
+                this.external_check = None;
+                match checked {
+                    Ok(findings) => {
+                        if let Some(notice) = external_findings_notice(&findings) {
+                            crate::view::show_external_findings_notice_deferred(notice, cx);
+                        }
+                        this.external_findings = findings;
+                        cx.notify();
+                    }
+                    Err(error) => log::error!("checking the project failed: {error:#}"),
+                }
+            });
+            if let Err(error) = applied {
+                log::debug!("dropping the project check for a closed item: {error:#}");
+            }
+        }));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn external_findings(&self) -> &[fanta_format::SourceDiagnostic] {
+        &self.external_findings
     }
 
     /// Reload the project from disk immediately, discarding unsaved canvas
@@ -3299,7 +3354,17 @@ impl FigItem {
                             let session = workspace_session
                                 .as_mut()
                                 .context("The Fanta source session is unavailable")?;
-                            let warnings = session.open_warnings.clone();
+                            #[cfg_attr(
+                                all(target_os = "macos", feature = "mac_app_store"),
+                                expect(unused_mut)
+                            )]
+                            let mut warnings = session.open_warnings.clone();
+                            // Spec 0009 R6: a snapshot before the write when
+                            // the files changed outside Fanta, and one after.
+                            #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+                            let history = project_history(&target);
+                            #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+                            warnings.extend(history.before_save());
                             let report =
                                 write_project_cached_report(&target, &doc, &raw_assets, &warnings)?;
                             // The web write prunes the FNX sources it replaces
@@ -3308,6 +3373,10 @@ impl FigItem {
                             // the session adopts its own write while
                             // rebuilding its disk view.
                             session.accept_own_write(&report)?;
+                            #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+                            if let Some(finding) = history.after_save() {
+                                log::warn!("{}: {}", target.display(), finding.message);
+                            }
                             Ok(report)
                         })();
                         #[cfg(test)]
@@ -3616,6 +3685,8 @@ pub(crate) fn ready_item_with_root_for_test(
         reload_task: None,
         _load_task: None,
         workspace_session: None,
+        external_findings: Vec::new(),
+        external_check: None,
         project_subscriptions: Vec::new(),
     });
     item.update(cx, |item, cx| item.subscribe_to_project(project, cx));
@@ -3938,7 +4009,7 @@ fn write_project_cached_report(
     root: &Path,
     doc: &Doc,
     raw_assets: &BTreeMap<AssetId, Vec<u8>>,
-    warnings: &[String],
+    warnings: &[fanta_format::SourceDiagnostic],
 ) -> Result<fanta_format::WriteReport> {
     if root.join("fanta.json").exists() {
         anyhow::ensure!(
@@ -4039,6 +4110,14 @@ fn git_init_if_needed(root: &Path) {
         ),
         Err(error) => log::warn!("running git init in {} failed: {error}", root.display()),
     }
+}
+
+/// The snapshot store of the project at `root`, run with the git the editor
+/// ships. The sandboxed App Store build runs no git, so it has none.
+#[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+pub(crate) fn project_history(root: &Path) -> fanta_format::history::History {
+    fanta_format::history::History::new(root)
+        .with_git(project_git_binary(std::env::current_exe().ok().as_deref()))
 }
 
 #[cfg(any(test, not(all(target_os = "macos", feature = "mac_app_store"))))]
@@ -4436,6 +4515,42 @@ pub(crate) fn load_project_document(root: &Path) -> Result<FigDocument> {
     let mut document = FigDocument::from_doc(doc, assets);
     document.prewarm_default_page_assets();
     Ok(document)
+}
+
+/// What to tell the user after files changed outside Fanta: how many
+/// problems the check found, and the first one. `None` when it found none.
+fn external_findings_notice(findings: &[fanta_format::SourceDiagnostic]) -> Option<String> {
+    let first = findings.first()?;
+    let errors = findings
+        .iter()
+        .filter(|finding| finding.severity == fanta_format::SourceSeverity::Error)
+        .count();
+    let place = match (&first.file, first.line) {
+        (Some(file), Some(line)) => format!("{file}:{line}: "),
+        (Some(file), None) => format!("{file}: "),
+        _ => String::new(),
+    };
+    Some(format!(
+        "The project's files changed outside Fanta and the check found {errors} errors and {} warnings. First: {place}{}. Run fanta-check on the project, or ask the agent to call check_project, for the rest.",
+        findings.len() - errors,
+        first.message
+    ))
+}
+
+/// What to tell the user about designs the load left out (spec 0009 R11).
+fn unavailable_designs_notice(findings: &[fanta_format::SourceDiagnostic]) -> Option<String> {
+    let designs: Vec<&str> = findings
+        .iter()
+        .filter(|finding| finding.code == fanta_format::DESIGN_UNAVAILABLE)
+        .filter_map(|finding| finding.file.as_deref())
+        .collect();
+    if designs.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Not loaded, because a file in it does not parse: {}. Saving leaves these folders as they are. Run fanta-check on the project to see what to repair.",
+        designs.join(", ")
+    ))
 }
 
 fn load_project_document_with_session(
@@ -7279,6 +7394,68 @@ mod tests {
         );
     }
 
+    /// Spec 0009 A5: an edit made outside Fanta that breaks a reference shows
+    /// up as a finding in the editor, without a save.
+    #[gpui::test]
+    async fn an_external_edit_that_breaks_a_reference_is_reported_without_a_save(
+        cx: &mut TestAppContext,
+    ) {
+        let project = empty_project(cx).await;
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("project");
+        let mut doc = doc_with_one_page();
+        let page = doc.active_page().expect("page");
+        let mut card = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Vector(
+            fanta_doc::VectorNode::rect_solid(0.0, 0.0, 20.0, 30.0, fanta_doc::Color::BLACK),
+        ));
+        card.parent = Some(page);
+        let card_id = card.id;
+        doc.apply(Operation::create_node(card)).expect("card");
+        write_project(directory.path(), &doc, &BTreeMap::new()).expect("initial project");
+        let session = fanta_format::WorkspaceSession::open(directory.path()).expect("session");
+        let item = ready_item(
+            &project,
+            directory.path().join("fanta.json"),
+            Some(directory.path().to_path_buf()),
+            doc.clone_for_persist(),
+            cx,
+        );
+        item.update(cx, |item, _| {
+            item.workspace_session = Some(session);
+            item.merge_base = Some(doc.clone_for_persist());
+            item.last_saved_assets = Some(Arc::new(BTreeMap::new()));
+        });
+        let stylesheet = fanta_format::locate_page_source(directory.path(), page)
+            .expect("page source")
+            .with_file_name("page.css");
+        let mut css = std::fs::read_to_string(&stylesheet).expect("stylesheet");
+        css.push_str(&format!("#{card_id} {{ fill: var(--no-such-token, #ff0000); }}\n"));
+        std::fs::write(&stylesheet, &css).expect("external edit");
+        item.read_with(cx, |item, _| assert!(item.external_findings().is_empty()));
+
+        item.update(cx, |item, cx| {
+            item.queue_watcher_paths_for_test([stylesheet.clone()], cx);
+        });
+        for _ in 0..3 {
+            cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+            cx.run_until_parked();
+        }
+        item.read_with(cx, |item, _| {
+            let codes: Vec<_> = item
+                .external_findings()
+                .iter()
+                .map(|finding| finding.code)
+                .collect();
+            assert_eq!(codes, ["ref.missing_token"]);
+            assert!(external_findings_notice(item.external_findings()).is_some());
+        });
+        assert_eq!(
+            std::fs::read_to_string(&stylesheet).expect("stylesheet"),
+            css,
+            "the finding must not need a save"
+        );
+    }
+
     #[gpui::test]
     async fn project_reload_queue_keeps_startup_edits_after_hash_seeding(cx: &mut TestAppContext) {
         let (directory, item, _, page) = reload_queue_fixture(cx).await;
@@ -8921,6 +9098,164 @@ mod tests {
 
     /// A document with a single (empty) page, so a save writes a `pages/<id>/`
     /// subtree instead of pruning the empty `pages/` directory.
+    /// Spec 0009 A10: a page whose SVG holds merge-conflict markers opens as
+    /// unavailable, and its files are unchanged after a save, also once the
+    /// editor has replaced its session.
+    #[gpui::test]
+    async fn a_page_with_conflict_markers_opens_unavailable_and_survives_saves(
+        cx: &mut TestAppContext,
+    ) {
+        let project = empty_project(cx).await;
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("project");
+        let mut doc = doc_with_one_page();
+        let kept = doc.active_page().expect("page");
+        let mut second = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+        second.name = "Broken".to_owned();
+        let broken = second.id;
+        doc.apply(Operation::create_node(second)).expect("second page");
+        doc.add_page(broken);
+        write_project(directory.path(), &doc, &BTreeMap::new()).expect("initial project");
+        let folder = fanta_format::locate_page_source(directory.path(), broken)
+            .expect("page source")
+            .parent()
+            .expect("page folder")
+            .to_path_buf();
+        std::fs::write(
+            folder.join("page.svg"),
+            "<<<<<<< HEAD\n<svg/>\n=======\n>>>>>>> theirs\n",
+        )
+        .expect("conflicted page");
+        let files = |folder: &Path| -> BTreeMap<PathBuf, Vec<u8>> {
+            std::fs::read_dir(folder)
+                .expect("page folder")
+                .map(|entry| entry.expect("entry").path())
+                .map(|path| (path.clone(), std::fs::read(&path).expect("page file")))
+                .collect()
+        };
+        let hostile = files(&folder);
+
+        let (loaded, _, session) =
+            fanta_format::WorkspaceSession::open_project_document(directory.path())
+                .expect("a project with a conflicted page opens");
+        assert_eq!(loaded.pages(), [kept]);
+        let notice = unavailable_designs_notice(&session.open_warnings).expect("notice");
+        assert!(notice.contains("pages/broken"), "{notice}");
+
+        let item = ready_item(
+            &project,
+            directory.path().join("fanta.json"),
+            Some(directory.path().to_path_buf()),
+            loaded.clone_for_persist(),
+            cx,
+        );
+        item.update(cx, |item, _| {
+            item.workspace_session = Some(session);
+            item.merge_base = Some(loaded.clone_for_persist());
+            item.last_saved_assets = Some(Arc::new(BTreeMap::new()));
+        });
+        for replace_session in [false, true] {
+            if replace_session {
+                item.update(cx, |item, _| item.workspace_session = None);
+            }
+            item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+                .await
+                .expect("save");
+            assert_eq!(files(&folder), hostile, "replaced session: {replace_session}");
+        }
+        let design_css =
+            std::fs::read_to_string(directory.path().join("design.css")).expect("design.css");
+        assert!(!design_css.contains("broken"), "the save did not run: {design_css}");
+    }
+
+    /// Spec 0009 A3: for each hostile-edit case, open it, save it, and restore
+    /// the snapshot taken before the save. The files are byte-identical to
+    /// the hostile state.
+    #[gpui::test]
+    async fn every_corpus_case_is_restored_byte_identical_after_a_save(cx: &mut TestAppContext) {
+        fn copy(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).expect("folder");
+            for entry in std::fs::read_dir(from).expect("corpus folder") {
+                let path = entry.expect("entry").path();
+                let target = to.join(path.file_name().expect("name"));
+                if path.is_dir() {
+                    copy(&path, &target);
+                } else {
+                    std::fs::copy(&path, &target).expect("copy");
+                }
+            }
+        }
+        fn project_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+            let mut found = BTreeMap::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(folder) = pending.pop() {
+                for entry in std::fs::read_dir(&folder).expect("folder") {
+                    let path = entry.expect("entry").path();
+                    if path.is_dir() {
+                        // Fanta's snapshots and the repository the editor
+                        // creates are not project files.
+                        if !path.ends_with(".fanta") && !path.ends_with(".git") {
+                            pending.push(path);
+                        }
+                    } else {
+                        found.insert(path.clone(), std::fs::read(&path).expect("file"));
+                    }
+                }
+            }
+            found
+        }
+        let project = empty_project(cx).await;
+        cx.executor().allow_parking();
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fanta-format/tests/corpus");
+        let mut restored = Vec::new();
+        for entry in std::fs::read_dir(&corpus).expect("corpus") {
+            let case = entry.expect("case").path();
+            if !case.is_dir() {
+                continue;
+            }
+            let name = case.file_name().expect("name").to_string_lossy().into_owned();
+            let directory = tempfile::tempdir().expect("project");
+            copy(&case, directory.path());
+            let hostile = project_files(directory.path());
+            // A case that does not open has no save to undo.
+            let Ok((loaded, assets, session)) =
+                fanta_format::WorkspaceSession::open_project_document(directory.path())
+            else {
+                continue;
+            };
+            let item = ready_item(
+                &project,
+                directory.path().join("fanta.json"),
+                Some(directory.path().to_path_buf()),
+                loaded.clone_for_persist(),
+                cx,
+            );
+            item.update(cx, |item, _| {
+                item.workspace_session = Some(session);
+                item.merge_base = Some(loaded.clone_for_persist());
+                item.last_saved_assets = Some(Arc::new(assets));
+            });
+            item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+                .await
+                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            assert_ne!(project_files(directory.path()), hostile, "{name}: the save wrote nothing");
+
+            let history = project_history(directory.path());
+            let before = history
+                .list()
+                .expect("snapshots")
+                .into_iter()
+                .find(|snapshot| {
+                    snapshot.reason == fanta_format::history::SnapshotReason::BeforeSave
+                })
+                .unwrap_or_else(|| panic!("{name}: no snapshot before the save"));
+            history.restore(&before.id).expect("restore");
+            assert_eq!(project_files(directory.path()), hostile, "{name}");
+            restored.push(name);
+        }
+        assert!(restored.len() >= 10, "{restored:?}");
+    }
+
     fn doc_with_one_page() -> Doc {
         use fanta_doc::{CanvasNode, GroupNode, NodeData};
         let mut doc = Doc::new();
@@ -9287,6 +9622,8 @@ mod tests {
             reload_task: None,
             _load_task: None,
             workspace_session: None,
+            external_findings: Vec::new(),
+            external_check: None,
             project_subscriptions: Vec::new(),
         });
         item.update(cx, |item, cx| item.subscribe_to_project(project, cx));

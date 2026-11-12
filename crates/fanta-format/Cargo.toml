@@ -11,6 +11,11 @@ description = ".fant zip container (JSON doc + content-addressed assets), git-na
 default = ["native"]
 native = ["dep:tempfile"]
 
+[[bin]]
+name = "fanta-check"
+path = "src/check_main.rs"
+required-features = ["native"]
+
 [dependencies]
 # Doc model — the thing we serialize and load.
 fanta-doc.workspace = true

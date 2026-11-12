@@ -57,6 +57,7 @@ DISCOVERY_PATH = (
 REQUIRED_TOOLS = [
     "get_editor_state",
     "get_guidelines",
+    "check_project",
     "batch_get",
     "batch_design",
     "get_screenshot",

@@ -5366,6 +5366,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "fanta-bundle",
+ "fanta-canvas",
  "fanta-doc",
  "fanta-format",
  "fanta-present",
@@ -5375,6 +5376,7 @@ dependencies = [
  "serde",
  "serde_json",
  "skia-safe",
+ "tempfile",
  "thiserror 2.0.17",
 ]
 
