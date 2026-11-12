@@ -84,12 +84,16 @@ validator that runs without the editor.
   that would rewrite a file changed outside Fanta, and after every
   successful save. Recording a snapshot must not change the user's branch,
   index, working tree or any ref under `refs/heads`, and must work whether
-  or not the project is inside a git repository.
+  or not the project is inside a git repository. Snapshots live in a private
+  git directory inside the project that the user's git ignores; Fanta never
+  writes to a repository it does not own. Every snapshot is kept for 30
+  days, then one per day.
 - **R7.** The user can list snapshots and restore one. A restore first
   snapshots the current state, so a restore can itself be undone.
 - **R8.** A repair skill ships with the agent plugins and the in-app agent.
   It takes the `--json` output, proposes file changes, and re-runs the check.
-  In the app the proposal is shown as a diff and applies only when accepted.
+  It may read the snapshots, and the user's own git history where there is
+  one, to reconcile a broken state against the last valid one. In the app the proposal is shown as a diff and applies only when accepted.
 - **R9.** The checker builds as a binary whose normal dependency tree
   contains no GPUI, Skia or editor crate. The founder's direction
   (2026-11-12) is that the format specification, the checker and the
@@ -100,6 +104,10 @@ validator that runs without the editor.
 - **R10.** A corpus of hostile edits lives in the repository, each case with
   the diagnostics it must produce. It is the checker's regression suite and
   the conformance set for other tools.
+- **R11.** A project with errors still opens, with the diagnostics shown,
+  and can be saved, because R6 makes that save reversible. Only a file that
+  does not parse is refused: it is left untouched on disk and its design is
+  shown as unavailable.
 
 ## Acceptance criteria
 
@@ -131,29 +139,34 @@ validator that runs without the editor.
   for its own boundary.
 - **A9 (R4).** The documented code list and the codes the corpus exercises
   match; a test fails when a code is added without documentation.
+- **A10 (R11).** A project with a broken reference opens and saves; a
+  project whose page SVG holds merge-conflict markers opens with that page
+  unavailable and the file unchanged on disk after a save.
 
 ## Open questions
 
-- **Q1.** Where snapshots live. A hidden ref in the user's repository is
-  the smallest idea but does nothing for a project outside a repository and
-  writes into a repository Fanta does not own. Recommendation: a private
-  git directory inside the project (ignored by the user's git), used in
-  both cases, so Fanta never writes to the user's repository at all.
-- **Q2.** Retention. Recommendation: keep every snapshot for 30 days, then
-  one per day.
-- **Q3.** What the editor does with a project that has errors.
-  Recommendation: open it with the diagnostics shown and allow saving,
-  because R6 makes the save reversible; refuse only files that do not parse.
+- **Q1.** ~~Where snapshots live.~~ **Resolved by the founder, 2026-11-12:**
+  a private git directory inside the project, in every case (R6).
+- **Q2.** ~~Retention.~~ **Resolved by the founder, 2026-11-12:** everything
+  for 30 days, then one per day (R6).
+- **Q3.** ~~What the editor does with a project that has errors.~~
+  **Resolved by the founder, 2026-11-12:** open with diagnostics and allow
+  saving; refuse only files that do not parse (R11). The founder added that
+  the repair agent should see git to reconcile changes (R8).
 - **Q4.** Where the binary lives: a new crate, or a subcommand of an
   existing engine binary (`fanta-site`, `fanta-mcp`). A new crate needs a
   layer in `layers.toml`. To settle in `design.md`.
-- **Q5.** `project/snapshot.rs` says "the lifecycle layer owns git (spec 09
-  §A.1)". No such spec is in this repository and no Fanta crate calls git
-  today. Is there earlier git lifecycle work to reuse or a constraint to
-  respect?
-- **Q6.** Does R9's licence direction cover only a thin checker crate, or
-  `fanta-format` and `fanta-doc`, which the checker links and which are GPL
-  today? The second is ADR 0026 option 2 for those crates.
+- **Q5.** ~~Earlier git lifecycle work.~~ **Founder, 2026-11-12:** look in
+  the inherited Zed code. `crates/git` has `checkpoint`,
+  `restore_checkpoint`, `compare_checkpoints` and `diff_checkpoints`
+  (`src/repository.rs`), which snapshot a working tree without moving a
+  branch. `design.md` must say whether they can target a private git
+  directory or whether the snapshot store is written beside them.
+- **Q6.** Licence scope. The founder answered "yes" (2026-11-12) to whether
+  the permissive licence covers the crates the checker links. Read here as:
+  it covers `fanta-format` and `fanta-doc`, not only a thin checker crate.
+  That is ADR 0026 option 2 for those crates and is confirmed, or corrected,
+  when the founder accepts ADR 0026.
 
 ## Changes after acceptance
 
