@@ -50,4 +50,5 @@ has no open tasks. `script/architecture index --check` enforces both in CI.
 | [0010](0010-measure-generated-code-against-designs/spec.md) | Measure generated code against designs | accepted | 2026-11-12 | 0027 |
 | [0011](0011-internal-operations-platform/spec.md) | Internal operations platform | draft | 2026-11-04 | 0028, 0029 |
 | [0013](0013-split-the-editors-largest-files-and-cap-file-size/spec.md) | Split the editor's largest files and cap file size | draft | 2026-11-12 | 0023, 0031 |
+| [0014](0014-evaluate-the-product-agent-on-design-tasks/spec.md) | Evaluate the product agent on design tasks | draft | 2026-11-12 | — |
 <!-- specs:end -->
