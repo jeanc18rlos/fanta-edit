@@ -16,7 +16,7 @@ file reconciliation path.
 | `index.html`, `viewer.js`, `canvas.js`, `editor.js`, `pages.js` | Dependency-free project viewer, the browser editor it upgrades into under `script/serve-project`, and the page manifest | No — regenerated each save |
 | `design.css` | Imports each design's stylesheet; the home for project-wide rules | Yes — add theme-wide rules; keep the generated `@import` lines |
 | `tokens.css` | Variable collections and modes as CSS custom properties | No — generated from `doc/variables.json` |
-| `report.json` | The last save's warnings and anything a load could not keep, per node | No — the loader's report channel |
+| `report.json` | The last save's findings and anything a load could not keep, as [diagnostic records](#diagnostic-codes) | No — the loader's report channel |
 | `pages/<slug>/page.json` | Page ID, name, and order | Change name/order with care; keep the ID |
 | `pages/<slug>/page.svg` | The page's tree: element order, ids, `data-name`, geometry, path data, text | Yes |
 | `pages/<slug>/page.css` | The page's styling: one rule per node, selected by node id; `var(--token, fallback)` where a property is bound | Yes — declaration values, `var()` swaps, `--fanta-*` layout intent |
@@ -78,6 +78,25 @@ rewrites it.
 | CSS formatters on `design.css`, `page.css`, `master.css` | Values survive; formatting is canonicalized on the next save |
 | Illustrator, Inkscape and other SVG apps that re-serialize whole files | No — structure outside the emitted dialect is reported and regenerated, not guessed at |
 | Anything editing `tokens.css`, `map.json`, `pages.js`, `report.json`, the viewer files | No — regenerated every save |
+
+## Diagnostic codes
+
+A finding from reading a project is a record: `severity`, `code`, `message`,
+and where known `file` (project-relative), `line`, `column` and `node_id`.
+`report.json` lists them under `warnings`. A code is permanent: new codes are
+added, and an existing code never changes meaning.
+
+| Code | Meaning |
+| --- | --- |
+| `edit.not_kept` | A hand edit to a node's SVG or CSS was read but could not be applied; the next save regenerates it |
+| `edit.selector_outside_dialect` | A CSS rule's selector is not a single node id; the rule is regenerated on save |
+| `id.not_a_node` | An `id` in the SVG or CSS is not a node id |
+| `load.omitted_geometry` | Auto-layout geometry left out of the source could not be solved on load |
+| `parse.svg` | A design SVG stopped parsing; edits after that point are ignored |
+| `record.missing` | An element or rule names a node that has no record in `nodes.json` |
+| `record.unreadable` | A `nodes.json` record does not decode as a node |
+| `ref.ambiguous_token` | Two variables produce the same CSS token; `var()` edits resolve to the first |
+| `source.unknown_attribute` | An attribute on a legacy FNX node is not in the vocabulary; it is preserved and ignored by the renderer |
 
 ## Asset identity
 

@@ -7,6 +7,7 @@ use super::artifact::{
 use super::catalog::ComponentCatalog;
 use super::error::{SaveBlocked, SessionError};
 use super::hash::{ContentHash, hash_file_set};
+use crate::project::diagnostic::SourceDiagnostic;
 use super::types::{
     ArtifactDirty, ArtifactId, ArtifactMeta, ClosePolicy, ConflictResolution, FsEvent, SaveResult,
     SessionEvent, WorkspaceDirty,
@@ -235,7 +236,7 @@ pub struct WorkspaceSession {
     /// Loader diagnostics from the open that produced this session: hand
     /// edits in a web-storage projection that could not be kept (R7). The
     /// next save carries them into `report.json`.
-    pub open_warnings: Vec<String>,
+    pub open_warnings: Vec<SourceDiagnostic>,
 }
 
 impl WorkspaceSession {

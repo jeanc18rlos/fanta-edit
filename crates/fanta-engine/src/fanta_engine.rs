@@ -465,7 +465,8 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
             sha: None,
             project_id: project.map(|project| project.doc().id.to_string()),
             warnings: project
-                .map(|project| project.warnings().to_vec())
+                // The cloud contract is frozen (ADR 0021): one sentence per finding.
+                .map(|project| project.warnings().iter().map(ToString::to_string).collect())
                 .unwrap_or_default(),
             fonts: FontReport::default(),
         },

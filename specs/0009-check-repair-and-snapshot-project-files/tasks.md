@@ -4,7 +4,8 @@ One task per pull request, in order. Each task says what it changes, which
 requirements it serves and how it is verified. Tick it and link the pull
 request when it merges.
 
-- [ ] **T1.** Structured diagnostics: extend `SourceDiagnostic` with file,
+- [x] **T1.** ([#207](https://github.com/jeanc18rlos/fanta-edit/pull/207))
+  Structured diagnostics: extend `SourceDiagnostic` with file,
   line and column; replace the `Vec<String>` warnings in `web_read.rs`,
   `read.rs` and `WorkspaceSession::open_warnings`; write the records to
   `report.json`; add the documented code list (R2, R4). Verify: A9, and the
