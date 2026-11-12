@@ -379,3 +379,126 @@ fn regenerate_corpus() {
         fs::write(case.with_extension("expected.json"), expected).unwrap();
     }
 }
+
+fn files_in(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut found = BTreeMap::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(folder) = pending.pop() {
+        for entry in fs::read_dir(&folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                found.insert(path.clone(), fs::read(&path).unwrap());
+            }
+        }
+    }
+    found
+}
+
+/// Spec 0009 R11, A10 at the format layer: a design with a file that does
+/// not parse is left out of the opened document, a save leaves its folder
+/// byte-identical, and repairing the file brings the design back.
+#[test]
+fn a_design_that_does_not_parse_is_left_out_and_survives_a_save() {
+    for (broken, design, pages_left) in [
+        ("pages/home/page.svg", "pages/home", 1),
+        ("pages/home/page.css", "pages/home", 1),
+        ("pages/home/nodes.json", "pages/home", 1),
+        ("pages/home/page.json", "pages/home", 1),
+        ("components/chip/master.svg", "components/chip", 2),
+        ("components/chip/def.json", "components/chip", 2),
+    ] {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().canonicalize().unwrap();
+        copy_tree(&corpus_dir().join("pristine"), &root);
+        let original = fs::read_to_string(root.join(broken)).unwrap();
+        fs::write(
+            root.join(broken),
+            format!("<<<<<<< HEAD\n{original}=======\n>>>>>>> theirs\n"),
+        )
+        .unwrap();
+        let hostile = files_in(&root.join(design));
+
+        let (doc, assets, session) =
+            fanta_format::WorkspaceSession::open_project_document(&root)
+                .unwrap_or_else(|error| panic!("{broken}: {error}"));
+        assert_eq!(doc.pages().len(), pages_left, "{broken}");
+        let found: Vec<_> = session
+            .open_warnings
+            .iter()
+            .filter(|finding| finding.severity == fanta_format::SourceSeverity::Error)
+            .map(|finding| (finding.code, finding.file.as_deref().unwrap_or_default()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("parse.conflict_marker", broken),
+                (fanta_format::DESIGN_UNAVAILABLE, design)
+            ],
+            "{broken}"
+        );
+
+        fanta_format::write_web_project_tree(&root, &doc, &assets, None, &session.open_warnings)
+            .unwrap_or_else(|error| panic!("{broken}: {error}"));
+        assert_eq!(files_in(&root.join(design)), hostile, "{broken}: the save touched the design");
+
+        fs::write(root.join(broken), original).unwrap();
+        let (repaired, _, session) =
+            fanta_format::WorkspaceSession::open_project_document(&root).unwrap();
+        assert_eq!(repaired.pages().len(), 2, "{broken}");
+        assert!(
+            !session
+                .open_warnings
+                .iter()
+                .any(|finding| finding.severity == fanta_format::SourceSeverity::Error),
+            "{broken}: {:#?}",
+            session.open_warnings
+        );
+    }
+}
+
+/// A new page whose name maps to the unavailable design's folder must not
+/// write over it.
+#[test]
+fn a_save_refuses_to_write_into_an_unavailable_design() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().canonicalize().unwrap();
+    copy_tree(&corpus_dir().join("pristine"), &root);
+    fs::write(root.join("pages/home/page.svg"), "<<<<<<< HEAD\n").unwrap();
+    let hostile = files_in(&root.join("pages/home"));
+    let (mut doc, assets, session) =
+        fanta_format::WorkspaceSession::open_project_document(&root).unwrap();
+    let page = doc
+        .scene
+        .insert(node(NodeData::Group(GroupNode::default()), "Home", None, 0.0))
+        .unwrap();
+    doc.add_page(page);
+    let error =
+        fanta_format::write_web_project_tree(&root, &doc, &assets, None, &session.open_warnings)
+            .unwrap_err();
+    assert!(error.to_string().contains("could not be loaded"), "{error}");
+    assert_eq!(files_in(&root.join("pages/home")), hostile);
+}
+
+/// The editor replaces its session after an outside change, and other hosts
+/// save with no findings at all. Neither may cost the user the broken design.
+#[test]
+fn a_save_without_the_load_findings_still_keeps_an_unparsable_design() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().canonicalize().unwrap();
+    copy_tree(&corpus_dir().join("pristine"), &root);
+    fs::write(root.join("pages/home/page.svg"), "<<<<<<< HEAD\n").unwrap();
+    let hostile = files_in(&root.join("pages/home"));
+    let (doc, assets, _) = fanta_format::WorkspaceSession::open_project_document(&root).unwrap();
+
+    let reopened = fanta_format::WorkspaceSession::open(&root).unwrap();
+    assert!(
+        reopened
+            .open_warnings
+            .iter()
+            .any(|finding| finding.code == fanta_format::DESIGN_UNAVAILABLE)
+    );
+    fanta_format::write_web_project_tree(&root, &doc, &assets, None, &[]).unwrap();
+    assert_eq!(files_in(&root.join("pages/home")), hostile);
+}

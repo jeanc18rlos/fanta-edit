@@ -2793,7 +2793,7 @@ fn checked_canvas_save_migrates_indexed_legacy_nodes() {
 }
 
 #[test]
-fn session_skips_headerless_design_dirs_but_rejects_malformed_headers() {
+fn session_skips_headerless_design_dirs_and_leaves_out_malformed_headers() {
     let (directory, page) = page_fixture();
     let notes = directory.path().join("pages/hand-notes");
     std::fs::create_dir_all(&notes).unwrap();
@@ -2805,7 +2805,15 @@ fn session_skips_headerless_design_dirs_but_rejects_malformed_headers() {
         .design_dir
         .join("page.json");
     std::fs::write(directory.path().join(header), b"{bad json").unwrap();
-    assert!(WorkspaceSession::open(directory.path()).is_err());
+    // Spec 0009 R11: the page is left out and reported, not a failed open.
+    let workspace = WorkspaceSession::open(directory.path()).unwrap();
+    assert_eq!(workspace.list_pages(), Vec::new());
+    assert!(
+        workspace
+            .open_warnings
+            .iter()
+            .any(|finding| finding.code == crate::DESIGN_UNAVAILABLE)
+    );
 }
 
 #[test]

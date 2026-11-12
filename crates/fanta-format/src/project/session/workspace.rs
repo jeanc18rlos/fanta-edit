@@ -307,6 +307,15 @@ impl WorkspaceSession {
         if !is_project_dir(&root) {
             return Err(SessionError::NotAProject { path: root });
         }
+        // Designs with a file that does not parse are indexed by no session,
+        // and every session carries the findings that make a save leave them
+        // alone: the editor replaces its session after an outside change, and
+        // that one must protect them too (spec 0009 R11).
+        let (found_unavailable, open_warnings) = match loaded {
+            Some(_) => Default::default(),
+            None => crate::project::check::unparsable_designs(&root)?,
+        };
+        let unavailable = loaded.map_or(&found_unavailable, |evidence| &evidence.unavailable);
         let manifest = read_manifest(&root)?;
         let manifest_disk_hash = sha256_bytes(&std::fs::read(root.join(FANTA_JSON))?);
         let asset_index_disk_hash = file_sha256_if_present(
@@ -373,7 +382,9 @@ impl WorkspaceSession {
                 if slug == crate::project::layout::LOOSE_DIR {
                     continue;
                 }
-                if !entry.join(PAGE_JSON).is_file() {
+                if !entry.join(PAGE_JSON).is_file()
+                    || unavailable.contains(&entry)
+                {
                     continue;
                 }
                 let header: Value = read_json_file(&entry.join(PAGE_JSON))?;
@@ -439,6 +450,9 @@ impl WorkspaceSession {
                 .map_err(|error| SessionError::other(format!("bad component sets: {error}")))?;
             let mut candidates = Vec::new();
             for entry in scanned.component_dirs {
+                if unavailable.contains(&entry) {
+                    continue;
+                }
                 let slug = entry
                     .file_name()
                     .and_then(|s| s.to_str())
@@ -623,7 +637,7 @@ impl WorkspaceSession {
             file_hash_index,
             workspace_ir,
             motion,
-            open_warnings: Vec::new(),
+            open_warnings,
         };
         if let Some(evidence) = loaded {
             session.validate_loaded_project_evidence(evidence)?;

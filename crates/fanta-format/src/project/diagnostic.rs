@@ -18,6 +18,9 @@ pub(crate) const RECORD_MISSING: &str = "record.missing";
 pub(crate) const RECORD_UNREADABLE: &str = "record.unreadable";
 /// Two variables that produce the same CSS token.
 pub(crate) const REF_AMBIGUOUS_TOKEN: &str = "ref.ambiguous_token";
+/// A page or component left out of the loaded document because one of its
+/// files does not parse. `file` is its directory, which a save leaves alone.
+pub const DESIGN_UNAVAILABLE: &str = "design.unavailable";
 /// The same `id` on two elements of one design SVG.
 pub(crate) const ID_DUPLICATE: &str = "id.duplicate";
 /// The project does not load, for a reason no other finding explains.
@@ -44,6 +47,7 @@ pub const LOAD_OMITTED_GEOMETRY: &str = "load.omitted_geometry";
 /// Every diagnostic code this crate and the engine hosts emit. Codes are
 /// permanent: add to this list, never repurpose an entry (spec 0009 R4).
 pub const DIAGNOSTIC_CODES: &[&str] = &[
+    DESIGN_UNAVAILABLE,
     EDIT_NOT_KEPT,
     EDIT_SELECTOR_OUTSIDE_DIALECT,
     ID_DUPLICATE,

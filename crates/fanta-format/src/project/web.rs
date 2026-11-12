@@ -166,7 +166,23 @@ pub fn write_web_project_tree(
         Arc::new(asset_index_bytes(assets)?),
     );
     let asset_files = project_asset_files(assets, None)?;
-    let write = sync_project_files(dir, &files, &asset_files, None)?;
+    // Designs the load left out are not in `doc`. Their files are not stale:
+    // they are what the user has to repair (spec 0009 R11).
+    let unavailable: Vec<PathBuf> = warnings
+        .iter()
+        .filter(|finding| finding.code == super::diagnostic::DESIGN_UNAVAILABLE)
+        .filter_map(|finding| finding.file.as_deref().map(PathBuf::from))
+        .collect();
+    if let Some(taken) = files
+        .keys()
+        .find(|path| unavailable.iter().any(|design| path.starts_with(design)))
+    {
+        return Err(FormatError::InvalidProjectTree(format!(
+            "{} would overwrite a design that could not be loaded; repair its files or rename the new design",
+            taken.display()
+        )));
+    }
+    let write = sync_project_files(dir, &files, &asset_files, None, &unavailable)?;
     Ok((write, projection.report))
 }
 
