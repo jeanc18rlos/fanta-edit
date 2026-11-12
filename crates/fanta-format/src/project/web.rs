@@ -63,6 +63,10 @@ pub(crate) const PAGE_CSS: &str = "page.css";
 pub(crate) const MASTER_CSS: &str = "master.css";
 const INDEX_TEMPLATE: &str = include_str!("../../assets/web/index.html");
 const VIEWER_JS: &str = include_str!("../../assets/web/viewer.js");
+// The host-neutral canvas component (spec 0008 T2), emitted verbatim so the
+// served project and agent-host panes run the same canvas.
+const CANVAS_JS: &str = include_str!("../../../../web/fanta-canvas-web/src/fanta-canvas.js");
+const EDITOR_JS: &str = include_str!("../../assets/web/editor.js");
 /// Aliases may chain; past this many hops the chain is reported, not followed.
 const MAX_ALIAS_HOPS: usize = 8;
 
@@ -327,6 +331,14 @@ pub fn web_project_files(
     files.insert(
         PathBuf::from("viewer.js"),
         Arc::new(VIEWER_JS.as_bytes().to_vec()),
+    );
+    files.insert(
+        PathBuf::from("canvas.js"),
+        Arc::new(CANVAS_JS.as_bytes().to_vec()),
+    );
+    files.insert(
+        PathBuf::from("editor.js"),
+        Arc::new(EDITOR_JS.as_bytes().to_vec()),
     );
 
     let manifest: Vec<_> = pages

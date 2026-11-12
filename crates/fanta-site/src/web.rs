@@ -171,6 +171,8 @@ mod tests {
             "fanta.json",
             "index.html",
             "viewer.js",
+            "canvas.js",
+            "editor.js",
             "tokens.css",
             "design.css",
             "pages.js",

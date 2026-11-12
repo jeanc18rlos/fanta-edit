@@ -1536,6 +1536,8 @@ fn is_web_artifact(parts: &[&str]) -> bool {
         [name] => [
             "index.html",
             "viewer.js",
+            "canvas.js",
+            "editor.js",
             "tokens.css",
             "design.css",
             "pages.js",

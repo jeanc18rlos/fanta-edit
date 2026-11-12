@@ -206,6 +206,8 @@ on its first save. For a legacy `.fnx` edit, external file agents can call
 ```
 fanta.json                       # project manifest (format tag, versions, "storage": "web") — do not hand-edit
 index.html, viewer.js            # dependency-free viewer: open index.html in a browser — generated
+canvas.js, editor.js             # the browser canvas component and its edit mode; editing
+                                 #   activates under `script/serve-project` — generated
 design.css                       # imports each design's stylesheet; add project-wide rules here
 tokens.css                       # variable collections/modes as CSS custom properties — generated
                                  #   from doc/variables.json; not a hand-edit surface
@@ -324,9 +326,11 @@ Some of the SVG is derived and ignored (never applied back) on load:
 - Preserve each element's `id` and the matching record key in `nodes.json`.
   To add or duplicate nodes, prefer the canvas ops below; a hand edit outside
   the dialect above lands in `report.json` rather than being guessed at.
-- `tokens.css`, `pages.js`, `map.json`, `report.json`, `index.html` and
-  `viewer.js` are regenerated on every save. Edit variable values in
-  `doc/variables.json` (or with the variable ops), never in `tokens.css`.
+- `tokens.css`, `pages.js`, `map.json`, `report.json`, `index.html`,
+  `viewer.js`, `canvas.js` and `editor.js` are regenerated on every save.
+  Edit variable values in `doc/variables.json` (or with the variable ops),
+  never in `tokens.css`. Serving the folder with `script/serve-project`
+  turns the viewer into an editor that saves through the same writer.
 - Assets are shared **by reference**: they live under `assets/<family>/` and
   are named by content id. `assets/index.json` records full SHA-256 digests
   and sizes. Reference assets by id; never paste binary data inline.
@@ -836,6 +840,7 @@ fn seed_agents_md(dir: &Path) -> Result<()> {
         "b95dd139e72304af8d38947f10b594bb70c455db8c75f2332ff45b33423ec756",
         "cb02692ceaa70322e52d03b14a2b7ffa029ebce479f3216645b45eb65a1d52b3",
         "e8d497228bc1bd876e263bef5320438ca39e57520ec240398c8ee5760d152026",
+        "43f0a9f47c7fdc11a6cb38db65958a57cb38a4f4f7a04387a8132abe42dd867d",
     ];
     let should_write = match fs::read(&path) {
         Ok(contents) => {
