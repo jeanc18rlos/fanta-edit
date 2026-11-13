@@ -101,7 +101,7 @@ tree until the in-tree crates are deleted.
   The CE.SDK work (#160 to #166) would have needed about six of them. Build
   settings (lints, profiles, the Skia opt-level) must be kept in step by
   hand in two workspaces.
-- Follow-up, done in #227: the cloud worker crate, `fanta-engine` until
+- Follow-up, done in #229: the cloud worker crate, `fanta-engine` until
   then, is `fanta-worker` (founder, 2026-11-12), so the name can belong to
   the repository and an optional facade crate. Its binary, image and Cloud
   Run service keep the name `fanta-engine`, so its deployment in

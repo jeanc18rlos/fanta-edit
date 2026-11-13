@@ -16,7 +16,7 @@
   the pull request.
 - [x] **T3.** Rename the cloud worker crate from `fanta-engine` to
   `fanta-worker` (Q2), paired with its deployment change in `fanta-backend`.
-  Verify: both repositories' CI. Done in #227: the package, its directory
+  Verify: both repositories' CI. Done in #229: the package, its directory
   and its library are `fanta-worker`. The binary, the container image, the
   Cloud Run service and the environment variables keep the name
   `fanta-engine`, because the backend's `gcp-engine-deploy.sh` reads the

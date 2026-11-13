@@ -8,7 +8,7 @@ The engine group in [`layers.toml`](../../docs/architecture/layers.toml):
 18 crates on 2026-11-12. `fanta-doc`, `fanta-design-ops`, `fanta-canvas`,
 `fanta-tools`, `fanta-fnx`, `fanta-format`, `fanta-fig-interop`,
 `fanta-text`, `fanta-render`, `fanta-present`, `fanta-headless`,
-`fanta-api`, `fanta-worker` (`fanta-engine` until T3, #227), `fanta-runtime`
+`fanta-api`, `fanta-worker` (`fanta-engine` until T3, #229), `fanta-runtime`
 and `fanta-site` were in the dry run below. `fanta-bundle` (#158),
 `fanta-mcp` and `fanta-wasm-engine` were added after it. The extraction
 takes the group as `layers.toml` lists it on the day, not this list. With
@@ -104,7 +104,7 @@ The editor keeps
 2. Sweep the engine crates for code of Zed, GPL or other third-party
    origin, then set their licence fields to `Apache-2.0` in the editor, so
    the extracted history starts right.
-3. Rename the worker crate to `fanta-worker`. Done in #227. The binary, the
+3. Rename the worker crate to `fanta-worker`. Done in #229. The binary, the
    image and the Cloud Run service keep the name `fanta-engine`, so the
    backend's deployment did not change.
 4. Create `fantaisa-ai/fanta-engine` as private, push the extraction and
