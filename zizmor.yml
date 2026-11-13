@@ -16,3 +16,6 @@ rules:
     ignore:
       # Deferred with the same pull request, which owns this file for now.
       - release-macos.yml
+      # The two reusable-workflow calls keep `./`: the `$/` form is proven here
+      # for actions only. Switch them after a nightly run has shown it works.
+      - nightly.yml
