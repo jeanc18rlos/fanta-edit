@@ -79,7 +79,7 @@ jobs:
           shared-key: engine-image-rust-1.95
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - uses: ./.github/actions/prepare-skia-source
+      - uses: $/.github/actions/prepare-skia-source
         with:
           offline: 'true'
 
