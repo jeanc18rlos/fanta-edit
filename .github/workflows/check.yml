@@ -75,8 +75,9 @@ jobs:
     needs: changes
     if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true') }}
     continue-on-error: true
-    # The same system as the Linux workflow and the Linux release.
-    runs-on: ubuntu-22.04
+    # Skia's PDF backend needs C++20 ranges that Ubuntu 22.04's libstdc++ 12 lacks under
+    # clang; the runtime and engine image workflows build Skia on 24.04 for the same reason.
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
       RUST_BACKTRACE: '1'
