@@ -23,6 +23,9 @@ FAST_CHECKS = [
     ("architecture", ["script/architecture", "verify"]),
     ("bash-guard", ["python3", ".claude/hooks/guard_bash.py", "--self-test"]),
     ("gate", ["script/gate", "--self-test"]),
+    ("typos", ["typos", "--config", "typos.toml"]),
+    # Offline: the online audits need a GitHub token. Ignores are in zizmor.yml.
+    ("zizmor", ["zizmor", "--offline", ".github/workflows", ".github/actions"]),
 ]
 
 

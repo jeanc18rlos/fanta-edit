@@ -43,7 +43,7 @@ jobs:
           shared-key: macos-check
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - uses: ./.github/actions/prepare-skia-source
+      - uses: $/.github/actions/prepare-skia-source
         with:
           offline: 'true'
 
@@ -246,7 +246,7 @@ jobs:
           # The check job's build is the superset, and three saved copies would not fit the 10 GB cache limit.
           save-if: 'false'
 
-      - uses: ./.github/actions/prepare-skia-source
+      - uses: $/.github/actions/prepare-skia-source
         with:
           offline: 'true'
 
@@ -336,7 +336,7 @@ jobs:
           # The check job's build is the superset, and three saved copies would not fit the 10 GB cache limit.
           save-if: 'false'
 
-      - uses: ./.github/actions/prepare-skia-source
+      - uses: $/.github/actions/prepare-skia-source
         with:
           offline: 'true'
 
@@ -509,7 +509,7 @@ jobs:
           persist-credentials: false
       - name: Install the repository Rust toolchain
         run: rustup show active-toolchain
-      - uses: ./.github/actions/prepare-skia-source
+      - uses: $/.github/actions/prepare-skia-source
         with:
           offline: 'true'
       - name: Test canvas video rendering

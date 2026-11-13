@@ -87,7 +87,7 @@ jobs:
             xcrun -sdk macosx --find metallib
           } 2>&1 | tee "${RUNNER_TEMP}/fanta-lint/toolchain.log"
 
-      - uses: ./.github/actions/prepare-skia-source
+      - uses: $/.github/actions/prepare-skia-source
         with:
           offline: 'true'
 
