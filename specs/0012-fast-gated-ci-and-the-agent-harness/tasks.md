@@ -64,7 +64,7 @@ Gates:
   Verify: A6.
 - [ ] **T13.** (plan G4) `script/verify-required-tests --names` in
   `script/gate` (R9). Needs T2. Verify: A6.
-- [ ] **T14.** (plan G5) Fuzz targets for the four parsers and their nightly
+- [x] **T14.** (plan G5) Fuzz targets for the four parsers and their nightly
   job (R13, R14). Needs T3. Verify: A8.
 - [ ] **T15.** (plan G6) Measure `clippy::unwrap_used` and
   `let_underscore_must_use` in the four parser crates; enable per crate

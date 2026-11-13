@@ -1,0 +1,58 @@
+name: Fuzz
+
+# Five minutes on each fuzz target of the parsers that read files from outside (spec 0012 R13, R14).
+# Called by the Nightly workflow; a crash fails the job and leaves the input as an artifact.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+jobs:
+  fuzz:
+    name: ${{ matrix.crate }} ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { crate: fanta-fig-interop, target: read_fig }
+          - { crate: fanta-fig-interop, target: kiwi }
+          - { crate: fanta-fnx, target: parse }
+          - { crate: fanta-format, target: read_project }
+          - { crate: fanta-bundle, target: load_bundle }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned nightly and cargo-fuzz
+        run: |
+          toolchain="$(script/fuzz --toolchain)"
+          rustup toolchain install "$toolchain" --profile minimal
+          cargo "+$toolchain" install --locked cargo-fuzz@0.13.2
+
+      - name: Fuzz for five minutes
+        env:
+          CRATE: ${{ matrix.crate }}
+          TARGET: ${{ matrix.target }}
+        run: script/fuzz "$CRATE" "$TARGET" 300
+
+      - name: Keep the crashing input
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-${{ matrix.crate }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: crates/${{ matrix.crate }}/fuzz/artifacts
+          if-no-files-found: ignore
+          retention-days: 14

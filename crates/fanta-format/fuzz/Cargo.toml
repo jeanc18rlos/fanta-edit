@@ -1,0 +1,24 @@
+[package]
+name = "fanta-format-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "GPL-3.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace: libfuzzer-sys and the nightly toolchain stay out of the
+# root workspace and its Cargo.lock.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fanta-format = { path = ".." }
+
+[[bin]]
+name = "read_project"
+path = "fuzz_targets/read_project.rs"
+test = false
+doc = false
+bench = false
