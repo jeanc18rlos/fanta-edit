@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
-use fanta_engine::{EngineInfo, RunRequest, Source};
+use fanta_worker::{EngineInfo, RunRequest, Source};
 
 /// Fanta's cloud engine: runs design steps on a project without the app.
 #[derive(Parser)]
@@ -48,18 +48,18 @@ fn main() -> Result<()> {
                     token,
                     overlay,
                 } => {
-                    fanta_engine::validate(&request)?;
-                    let github = fanta_engine::source::Github::new(
+                    fanta_worker::validate(&request)?;
+                    let github = fanta_worker::source::Github::new(
                         std::env::var("FANTA_ENGINE_GITHUB_API")
                             .unwrap_or_else(|_| "https://api.github.com".into()),
                     );
                     github.fetch(repo, sha, path, token, &project)?;
                     if let Some(overlay) = overlay {
-                        fanta_engine::source::apply_overlay(overlay, &project)?;
+                        fanta_worker::source::apply_overlay(overlay, &project)?;
                     }
                 }
             }
-            match fanta_engine::server::run_isolated(&request, &project) {
+            match fanta_worker::server::run_isolated(&request, &project) {
                 Ok(response) => println!("{}", serde_json::to_string_pretty(&response)?),
                 Err(error) => {
                     println!("{}", serde_json::to_string_pretty(&error)?);
@@ -81,11 +81,11 @@ fn main() -> Result<()> {
             let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
                 .with_context(|| format!("listening on port {port}"))?;
             eprintln!("fanta-engine listening on port {port}");
-            fanta_engine::server::serve(
+            fanta_worker::server::serve(
                 listener,
-                fanta_engine::server::Config {
+                fanta_worker::server::Config {
                     secret: secret.into_bytes(),
-                    github: fanta_engine::source::Github::new(github),
+                    github: fanta_worker::source::Github::new(github),
                 },
             )?;
         }

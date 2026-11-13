@@ -31,6 +31,12 @@ extend-exclude = [
     "crates/multi_buffer/src/multi_buffer_tests.rs",
     # Tests contain `baˇr` that cause `"ba" should be "by" or "be".`-like false-positives
     "crates/editor/src/document_symbols.rs",
+    # Inherited test data: `GHIzJ` is a buffer fragment.
+    "crates/text/src/tests.rs",
+    # Vendored upstream package, kept byte-for-byte (see its FANTA-PROVENANCE.txt).
+    "vendor/",
+    # Golden output of a real .fig import; its text is the designer's.
+    "crates/fanta-fig-interop/tests/golden/",
 ]
 
 [default]
@@ -64,6 +70,44 @@ extend-ignore-re = [
     # Abbreviation for foreignObject in mermaid SVG processing
     "fo",
     # Mermaid CSS class name for state diagram composites
-    "composit"
+    "composit",
+    # ULIDs: persisted node, component and mode ids
+    '[0-9A-HJKMNP-TV-Z]{26}',
+    # Plurals of .fig node kinds in prose: FRAMEs, BOOLEAN_OPERATIONs
+    '\b[A-Z][A-Z_]+s\b',
+    # Intra-doc link followed by a suffix: [`Align`]ment
+    '`\]ment',
 ]
 check-filename = true
+
+[default.extend-words]
+# OpenType width axis tag
+wdth = "wdth"
+# Level of detail (mipmaps)
+lod = "lod"
+LOD = "LOD"
+# MP4 track atom
+trak = "trak"
+# Media element state; also in a test name CI requires by exact name
+seeked = "seeked"
+# App Store Connect error code prefix (ITMS-90869)
+ITMS = "ITMS"
+# The `mis-` prefix: mis-route, mis-resolve
+mis = "mis"
+# Deliberate misspellings that exercise the "did you mean" diagnostics
+Buton = "Buton"
+raduis = "raduis"
+# Expected slug of "Café" once the accent is dropped
+caf = "caf"
+# Local names: ancestor, parent node, bounds or alpha of b, incoming y
+anc = "anc"
+pn = "pn"
+ba = "ba"
+iy = "iy"
+# Accepted variant spelling in an inherited Zed comment
+writeable = "writeable"
+
+[default.extend-identifiers]
+# Possessives in test names: "child's", "box's"
+unclipped_ancestor_does_not_cull_an_offscreen_childs_visible_shadow = "unclipped_ancestor_does_not_cull_an_offscreen_childs_visible_shadow"
+a_rotated_group_keeps_its_size_and_reports_its_boxs_world_corner = "a_rotated_group_keeps_its_size_and_reports_its_boxs_world_corner"

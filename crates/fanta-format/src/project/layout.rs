@@ -387,12 +387,13 @@ project files directly, and before you tell the user a file edit is done.
 When it reports findings, repair the files instead of working around them.
 Change only the files a finding names, then run the check again. Fanta keeps
 a snapshot of the project from before and after every save in
-`.fanta/history.git`; read the last good version of a file with
-`git --git-dir=.fanta/history.git for-each-ref --sort=-refname refs/snapshots`
-and `git --git-dir=.fanta/history.git show <ref>:<path>`, and never run
-`checkout`, `reset` or `commit` with that `--git-dir`. Never invent a node
-id or write a `nodes.json` record by hand: restore them from a snapshot, or
-make the change in the app. The `fanta-repair` skill has the repair for each
+`.fanta/history.git`, and the user restores one in the app with File >
+Restore Snapshot. Never run `git` against `.fanta/history.git` yourself, not
+even to read: that directory comes with the project folder, and its settings
+can make git run programs. Read the last good version of a file from the
+user's own git repository when there is one. Never invent a node id or write
+a `nodes.json` record by hand: take them from the last good version, or make
+the change in the app. The `fanta-repair` skill has the repair for each
 finding code.
 
 **`batch_get`** — `{ ids?, page?, depth?, include_geometry?, detail? }`. With
@@ -860,6 +861,7 @@ fn seed_agents_md(dir: &Path) -> Result<()> {
         "43f0a9f47c7fdc11a6cb38db65958a57cb38a4f4f7a04387a8132abe42dd867d",
         "e5892602bc4798dcb3858af3ad520b8674aa3b1c1d49bdf64479638b34d757ff",
         "43353800872700d6036aaca86de4fe187726e5f2c310e6bfc4850e6d9dc706ea",
+        "e2776a06cc244df4497fe647fe67a2bf1fa7e8847fad1ca03deb9215b732feef",
     ];
     let should_write = match fs::read(&path) {
         Ok(contents) => {
@@ -1285,6 +1287,38 @@ mod tests {
             AGENTS_MD,
             "the previous seed's hash is missing from `previous_seeds`"
         );
+    }
+
+    #[test]
+    fn the_guide_that_sent_agents_to_the_snapshot_store_is_upgraded() {
+        let start = AGENTS_MD
+            .find("Change only the files a finding names")
+            .expect("the repair paragraph starts here");
+        let end = AGENTS_MD
+            .find("finding code.\n")
+            .expect("the repair paragraph ends here")
+            + "finding code.\n".len();
+        let previous = format!(
+            "{}{}{}",
+            &AGENTS_MD[..start],
+            "Change only the files a finding names, then run the check again. Fanta keeps\n\
+             a snapshot of the project from before and after every save in\n\
+             `.fanta/history.git`; read the last good version of a file with\n\
+             `git --git-dir=.fanta/history.git for-each-ref --sort=-refname refs/snapshots`\n\
+             and `git --git-dir=.fanta/history.git show <ref>:<path>`, and never run\n\
+             `checkout`, `reset` or `commit` with that `--git-dir`. Never invent a node\n\
+             id or write a `nodes.json` record by hand: restore them from a snapshot, or\n\
+             make the change in the app. The `fanta-repair` skill has the repair for each\n\
+             finding code.\n",
+            &AGENTS_MD[end..]
+        );
+
+        let project = tempdir().unwrap();
+        fs::write(project.path().join(AGENTS_MD_NAME), previous).unwrap();
+        scaffold_project_tree(project.path()).unwrap();
+        let upgraded = fs::read_to_string(project.path().join(AGENTS_MD_NAME)).unwrap();
+        assert_eq!(upgraded, AGENTS_MD, "the previous seed's hash is missing from `previous_seeds`");
+        assert!(!upgraded.contains("--git-dir"));
     }
 
     #[test]

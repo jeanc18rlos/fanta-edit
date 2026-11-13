@@ -1,6 +1,6 @@
 //! Fanta's design engine without the app: open a project directory, review or
 //! edit it with design ops, settle its layout, render its pages and save it
-//! back. The cloud engine worker (`fanta-engine`) drives it and the editor
+//! back. The cloud engine worker (`fanta-worker`) drives it and the editor
 //! shares its code, so nothing here may depend on GPUI.
 //!
 //! The facade is frozen by `docs/cloud-engine-contracts.md`.
