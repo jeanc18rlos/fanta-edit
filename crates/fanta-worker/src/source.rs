@@ -504,7 +504,16 @@ pub(crate) mod tests {
         assert!(!destination.path().join(".fanta").exists());
         assert!(!destination.path().join(".git").exists());
         // Skipped entries are still read, so they still count toward the limits.
-        for small in [Limits { bytes: 1024, files: 3 }, Limits { bytes: 11, files: 10 }] {
+        for small in [
+            Limits {
+                bytes: 1024,
+                files: 3,
+            },
+            Limits {
+                bytes: 11,
+                files: 10,
+            },
+        ] {
             assert_eq!(
                 code(extract(&skipped[..], "", destination.path(), small)),
                 Err(ErrorCode::PayloadTooLarge)
