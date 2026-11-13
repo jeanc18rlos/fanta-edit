@@ -11,43 +11,24 @@ yanked = "warn"
 # warns when an entry stops matching, which is the cue to delete it.
 # "Not called" means by a workspace crate.
 ignore = [
-    # Reachable from Fanta's own parsing of project files.
-    { id = "RUSTSEC-2026-0194", reason = "quick-xml: quadratic duplicate-attribute check. fanta-format iterates the attributes of project SVG, so a crafted start tag stalls the load (CPU only, no memory unsafety). Removed by quick-xml >= 0.41 (0.38.3 direct; 0.30, 0.37 and 0.39 through xcb, wayland-scanner and zbus_xml)." },
+    # quick-xml: no longer reachable from project files, still locked.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml: quadratic duplicate-attribute check. Not reachable from project files: fanta-format reads attributes through first_attributes, with the check off. Still locked: 0.38.3 for the workspace (agent only escapes text; the inherited mermaid_render iterates attributes of SVG its own renderer produced), and 0.30, 0.37 and 0.39 through xcb, wayland-scanner and zbus_xml. Removed by quick-xml >= 0.41 in all of them." },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml: NsReader allocation; NsReader is not used. Removed by quick-xml >= 0.41." },
-
-    # The TLS stack of every HTTP client. Semver-compatible updates.
-    { id = "RUSTSEC-2026-0285", reason = "rustls 0.23.40: handshake messages accepted across encryption levels. Removed by cargo update -p rustls (>= 0.23.46)." },
-    { id = "RUSTSEC-2026-0346", reason = "rustls 0.23.40: Debug output of client session values holds secrets; nothing logs them. Removed by rustls >= 0.23.46." },
-    { id = "RUSTSEC-2026-0348", reason = "rustls 0.23.40: up to 1 GiB allocated for a Brotli-compressed certificate. Removed by rustls >= 0.23.46." },
-    { id = "RUSTSEC-2026-0349", reason = "rustls 0.23.40: key-exchange downgrade on later connections. Removed by rustls >= 0.23.46." },
-    { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.103.13: accepts distrusted emSign intermediates. Removed by rustls-webpki >= 0.103.16." },
-    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.8 and 1.0.8: bundle the distrusted emSign roots. Removed by webpki-roots >= 1.0.10 (ureq; yawc pins 0.26)." },
-    { id = "RUSTSEC-2026-0383", reason = "webpki-root-certs 0.26.8: the same roots, through rustls-platform-verifier. Removed by webpki-root-certs >= 1.0.10." },
-    { id = "RUSTSEC-2026-0258", reason = "h2 0.4.12: unbounded empty DATA frames from a server the client connects to; low severity. Removed by cargo update -p h2 (>= 0.4.16)." },
 
     # The affected function is not called.
     { id = "RUSTSEC-2026-0367", reason = "zip 2.4.2: ZipArchive::extract keeps SUID bits. extract is not called; entries are read into memory. Removed by zip >= 9." },
     { id = "RUSTSEC-2026-0368", reason = "zip 2.4.2: extract creates symlinks that point outside the destination; extract is not called. Removed by zip >= 9." },
     { id = "RUSTSEC-2026-0369", reason = "zip 2.4.2: extract applies permissions through symlinks; extract is not called. Removed by zip >= 9." },
     { id = "RUSTSEC-2026-0429", reason = "zip 2.4.2: extract aborts on a symlink entry with a huge declared size; extract is not called. Removed by zip >= 9." },
-    { id = "RUSTSEC-2026-0391", reason = "zstd 0.13.3 (through zip): raw stream with_context reuse; not called. Removed by cargo update -p zstd@0.13.3 (>= 0.13.4)." },
-    { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7.2.4: Seekable::decompress; the seekable feature is off. Removed by zstd-safe >= 7.4." },
-    { id = "RUSTSEC-2026-0403", reason = "zstd-safe 5.0.2 and 7.2.4: write::Decoder exposes memory after a corrupt legacy frame. The .fig reader uses read::Decoder and the other callers decode_all or copy_decode, which are unaffected. Removed by zstd >= 0.13.4 in the workspace (now 0.11)." },
-    { id = "RUSTSEC-2026-0410", reason = "zstd-sys 2.0.16: wasm32 allocator shim; the wasm engine's zip is deflate-only and links no zstd. Removed by zstd-sys >= 2.1.2." },
-    { id = "RUSTSEC-2026-0414", reason = "pulldown-cmark 0.13.0: exponential events with ENABLE_WIKILINKS, which the markdown crate does not enable. Removed by cargo update -p pulldown-cmark (>= 0.13.6)." },
-    { id = "RUSTSEC-2026-0433", reason = "pulldown-cmark 0.13.0: quadratic wikilink parsing; ENABLE_WIKILINKS is off. Removed by pulldown-cmark >= 0.13.6." },
-    { id = "RUSTSEC-2026-0204", reason = "crossbeam-epoch 0.9.18: fmt::Pointer of a null Atomic or Shared; transitive and never formatted here. Removed by cargo update -p crossbeam-epoch (>= 0.9.20)." },
+    { id = "RUSTSEC-2026-0403", reason = "zstd-safe 5.0.2: write::Decoder exposes memory after a corrupt legacy frame. The .fig reader uses read::Decoder and the other callers decode_all or copy_decode, which are unaffected. Removed by moving the workspace zstd from 0.11 to >= 0.13.4 (agent, crashes, fanta-fig-interop, rpc); the 0.13 line through zip is already patched." },
 
     # Inherited from Zed; needs local files or a peer that Fanta does not have.
     { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10: Marvin timing attack. The inherited rpc crate uses it to decrypt a collaboration token, a service Fanta does not run. Removed by rsa >= 0.10 or by dropping rpc." },
     { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30.1 (bundled SQLite): stale memory from a crafted database and -wal pair; sqlez opens only databases the app wrote. Removed by libsqlite3-sys >= 0.39." },
-    { id = "RUSTSEC-2026-0274", reason = "rtrb 0.3.2 (through rodio): double free when an element's Drop panics; the elements are audio samples. Removed by rtrb >= 0.3.5." },
 
     # Unsound: memory unsafety needs a panic or a call pattern not found here.
-    { id = "RUSTSEC-2026-0190", reason = "anyhow 1.0.102: downcast_mut on an error after context. Removed by cargo update -p anyhow (>= 1.0.103)." },
     { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4: LruCache::pop when a key's Drop panics; the keys are integers and strings. Removed by lru >= 0.18.2." },
     { id = "RUSTSEC-2026-0256", reason = "circular-buffer 1.2.0: truncate and clear when an element's Drop panics; used by the inherited debugger session only. Removed by circular-buffer >= 2.0.1." },
-    { id = "RUSTSEC-2026-0386", reason = "tokio 1.52.1: AsyncFd constructors accept a descriptor the caller does not own; AsyncFd is not constructed. Removed by tokio >= 1.53.3." },
 ]
 
 [sources]

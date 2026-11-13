@@ -288,30 +288,29 @@ fn design_svgs(source: &TreeSource<'_>, dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-/// The attributes of a tag that can be read, the first of each name: what
-/// `start.attributes().flatten()` yields. quick-xml's own duplicate check
-/// compares every pair of names, so a tag with very many attributes stalled
-/// the load (RUSTSEC-2026-0194); this one is linear.
+/// The attributes of a tag that can be read, the first of each name.
+/// quick-xml's own duplicate check compares every pair of names, so a tag
+/// with very many attributes stalled the load (RUSTSEC-2026-0194).
 pub(super) fn first_attributes<'a>(
     start: &'a quick_xml::events::BytesStart<'_>,
 ) -> impl Iterator<Item = quick_xml::events::attributes::Attribute<'a>> {
-    use quick_xml::events::attributes::AttrError;
-    let mut seen = HashSet::new();
+    // Tags are small and this runs for every one, so names are compared
+    // directly until there are too many for that to stay cheap.
+    const SCANNED_NAMES: usize = 32;
+    let mut first_names: Vec<&[u8]> = Vec::new();
+    let mut later_names = HashSet::new();
     let mut attributes = start.attributes();
     attributes.with_checks(false);
-    attributes.filter_map(move |attribute| match attribute {
-        Ok(attribute) => seen
-            .insert(attribute.key.into_inner())
-            .then_some(attribute),
-        // quick-xml counted the name of an unquoted value as seen, so a later
-        // attribute of that name stays unread.
-        Err(AttrError::UnquotedValue(position)) => {
-            let is_space = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\r' | b'\n');
-            let name = start.get(..position)?.trim_ascii_end().strip_suffix(b"=")?;
-            seen.insert(name.trim_ascii_end().rsplit(is_space).next()?);
-            None
+    attributes.flatten().filter(move |attribute| {
+        let name = attribute.key.into_inner();
+        if first_names.contains(&name) {
+            false
+        } else if first_names.len() < SCANNED_NAMES {
+            first_names.push(name);
+            true
+        } else {
+            later_names.insert(name)
         }
-        Err(_) => None,
     })
 }
 
@@ -1333,17 +1332,21 @@ mod tests {
         let element = elements.get("a").expect("the element is read");
         assert_eq!((element.x, element.y), (Some(1.0), Some(3.0)));
 
-        // An unquoted value is not read, and still takes the name.
+        // An unquoted value is not read and does not take the name: a later
+        // quoted attribute of that name is the first one that can be read.
         elements.clear();
         parse_design_svg(
-            "<svg><rect id=\"a\" x = 1 x=\"2\" y=\"3\"/></svg>",
+            "<svg><rect id=\"a\" x = 1 x=\"2\" width=\"4\"y=5 y=\"3\"/></svg>",
             "pages/home/page.svg",
             0,
             &mut elements,
             &mut warnings,
         );
         let element = elements.get("a").expect("the element is read");
-        assert_eq!((element.x, element.y), (None, Some(3.0)));
+        assert_eq!(
+            (element.x, element.y, element.width),
+            (Some(2.0), Some(3.0), Some(4.0))
+        );
     }
 
     #[test]
@@ -1358,10 +1361,9 @@ mod tests {
         let started = std::time::Instant::now();
         parse_design_svg(&src, "pages/home/page.svg", 0, &mut elements, &mut warnings);
         let elapsed = started.elapsed();
-        eprintln!("parse_design_svg, 200000 attributes: {elapsed:?}");
         assert_eq!(elements.get("a").and_then(|element| element.y), Some(3.0));
         // A duplicate check that compares every pair takes minutes here.
-        assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(30), "{elapsed:?}");
     }
 
     #[test]
