@@ -68,9 +68,8 @@ pub fn overlay_path(path: &str) -> Result<PathBuf, EngineError> {
 }
 
 /// Whether `path` is, or is inside, a `.fanta` or `.git` folder. Git runs
-/// programs named by the files of both, and a project's source needs neither:
-/// the app's snapshot store ignores itself, so a commit holds one only when
-/// someone put it there.
+/// programs named by the files of both, and the engine reads neither: what a
+/// commit rightly holds there is the app's project settings.
 fn reserved(path: &Path) -> bool {
     path.components().any(|component| {
         let name = component.as_os_str();
@@ -155,7 +154,7 @@ impl Github {
 /// `destination`. GitHub wraps the tree in one top folder, which is dropped.
 /// Entries outside the project folder are skipped; inside it only plain files
 /// and folders are accepted, so a link can't point a later write outside
-/// `destination`, and nothing under `.fanta` or `.git` is.
+/// `destination`, and entries under `.fanta` or `.git` are left out.
 pub fn extract(
     reader: impl Read,
     project_path: &str,
@@ -192,20 +191,15 @@ pub fn extract(
         {
             return Err(unsafe_entry(&raw));
         }
-        if reserved(relative) {
-            return Err(EngineError::new(
-                ErrorCode::ProjectLoadFailed,
-                format!(
-                    "{} is inside .fanta or .git, which the engine does not read; remove it from the commit",
-                    raw.display()
-                ),
-            ));
-        }
-        if !kind.is_dir() && !kind.is_file() {
+        // A commit may hold project settings under `.fanta`. They are left
+        // out of the checkout, whatever kind of entry they are.
+        let skipped = reserved(relative);
+        if !skipped && !kind.is_dir() && !kind.is_file() {
             return Err(unsafe_entry(&raw));
         }
-        found = true;
-        // Folders count too: an archive of empty folders costs inodes.
+        found |= !skipped;
+        // Folders count too: an archive of empty folders costs inodes. So do
+        // skipped entries, which are still read to reach the next one.
         files += 1;
         if kind.is_file() {
             bytes = bytes.saturating_add(entry.header().size().map_err(corrupt)?);
@@ -218,6 +212,9 @@ pub fn extract(
                     limits.files, limits.bytes
                 ),
             ));
+        }
+        if skipped {
+            continue;
         }
         let target = destination.join(relative);
         if kind.is_dir() {
@@ -453,7 +450,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_snapshot_store_and_git_folders_are_refused() {
+    fn the_snapshot_store_and_git_folders_stay_out_of_the_checkout() {
         for path in [
             ".fanta/history.git/config",
             ".git/config",
@@ -465,6 +462,8 @@ pub(crate) mod tests {
                 Entry::File("design/fanta.json", b"{}"),
                 Entry::File(&format!("design/{path}"), b"planted"),
             ]);
+            // A commit may hold project settings under `.fanta`: the run goes
+            // on without them.
             assert_eq!(
                 code(extract(
                     &archive[..],
@@ -472,10 +471,12 @@ pub(crate) mod tests {
                     destination.path(),
                     Limits::SOURCE
                 )),
-                Err(ErrorCode::ProjectLoadFailed),
+                Ok(()),
                 "{path}"
             );
-            assert!(!destination.path().join(path).exists(), "{path}");
+            assert!(destination.path().join("fanta.json").exists(), "{path}");
+            let top = path.split('/').next().expect("first name");
+            assert!(!destination.path().join(top).exists(), "{path}");
 
             for file in [
                 serde_json::json!({"path": path, "content_b64": "eA=="}),
@@ -493,14 +494,22 @@ pub(crate) mod tests {
         }
 
         let destination = tempfile::tempdir().expect("destination");
-        let folder = tarball(&[
+        let skipped = tarball(&[
             Entry::File("fanta.json", b"{}"),
             Entry::Folder(".fanta/history.git/hooks"),
+            Entry::Link(".git/hooks", "/etc"),
+            Entry::File(".fanta/settings.json", b"0123456789"),
         ]);
-        assert_eq!(
-            code(extract(&folder[..], "", destination.path(), Limits::SOURCE)),
-            Err(ErrorCode::ProjectLoadFailed)
-        );
+        extract(&skipped[..], "", destination.path(), Limits::SOURCE).expect("skipped entries");
+        assert!(!destination.path().join(".fanta").exists());
+        assert!(!destination.path().join(".git").exists());
+        // Skipped entries are still read, so they still count toward the limits.
+        for small in [Limits { bytes: 1024, files: 3 }, Limits { bytes: 11, files: 10 }] {
+            assert_eq!(
+                code(extract(&skipped[..], "", destination.path(), small)),
+                Err(ErrorCode::PayloadTooLarge)
+            );
+        }
         // A name that only resembles them is an ordinary file.
         let ordinary = tarball(&[
             Entry::File("fanta.json", b"{}"),
