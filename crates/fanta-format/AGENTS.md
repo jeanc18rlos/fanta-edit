@@ -25,7 +25,7 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 ## Diagnostics
 
 - `SourceDiagnostic` and its codes live in `src/project/diagnostic.rs`, not under `session`: `session` is gated on `native` and the wasm engine reads projects without it. A new code needs a row in `docs/fanta/project-schema.md`; a test compares the two. (#207)
-- `fanta-engine`'s response and `fanta-wasm-engine`'s `inspect` state forward findings as strings on purpose. Sending records there changes the cloud contract and the web canvas. (#207)
+- `fanta-worker`'s response and `fanta-wasm-engine`'s `inspect` state forward findings as strings on purpose. Sending records there changes the cloud contract and the web canvas. (#207)
 
 - `check_project` compares disk with a projection made without a renderer, which draws fewer nodes than the editor's save. Only report what the projection has and disk lacks; the reverse flags every node the renderer drew. (#208)
 - The writer never puts `style` on a node's own element (only on `data-virtual` and mask elements), which is how the loader tells a hand-added one. If the writer starts to, the loader reports every such node. (#208)

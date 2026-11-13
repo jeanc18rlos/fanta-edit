@@ -180,7 +180,7 @@ impl Server {
     }
 
     /// One line in, at most one line out: a JSON-RPC 2.0 object per line, a
-    /// `-32700` framed error with `id: null` for an unparseable line, and no
+    /// `-32700` framed error with `id: null` for an unparsable line, and no
     /// answer at all for notifications (requests without an `id`).
     fn handle_line(&mut self, line: &str) -> Option<Value> {
         if line.trim().is_empty() {

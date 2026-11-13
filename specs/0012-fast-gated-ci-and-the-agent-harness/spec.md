@@ -1,5 +1,5 @@
 ---
-status: draft
+status: in-progress
 date: 2026-11-12
 owner: Jean Rojas
 decisions: [0013, 0030]
@@ -183,9 +183,14 @@ Agent harness:
   `tier1_golden_scene_matches` fails on Linux by text glyph edges (FreeType
   against CoreText), so the render stage stays on macOS. A per-platform
   baseline is the founder's decision and is not needed for this spec.
-- **Q3.** How many advisories does the first `cargo deny` run report in the
-  inherited dependencies? T12 triages them; the count decides whether it is
-  one pull request.
+- **Q3.** ~~How many advisories does the first `cargo deny` run report in
+  the inherited dependencies?~~ **Answered by T12, 2026-11-13:** 43
+  advisories on 39 crate versions with cargo-deny 0.20.2: 24
+  vulnerabilities, 4 unsound and 15 unmaintained. One pull request was
+  enough: the 28 that fail are ignored in `deny.toml` with a reason each
+  and no dependency was bumped; the 15 unmaintained warn. One is reachable
+  from Fanta's own code, RUSTSEC-2026-0194 in `quick-xml`, a slow load on
+  a crafted project SVG. The bumps are follow-up work.
 
 ## Changes after acceptance
 

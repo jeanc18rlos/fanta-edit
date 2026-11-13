@@ -49,7 +49,7 @@ these rules or when the index below is stale.
 | [0010](0010-ship-through-the-mac-app-store.md) | Ship through the Mac App Store | superseded by [0012](0012-distribute-a-notarized-dmg-with-web-billing.md) | 2026-09-24 |
 | [0011](0011-consume-gpui-and-shared-ui-from-fanta-ui.md) | Consume GPUI and the shared UI from fanta-ui | accepted | 2026-09-27 |
 | [0012](0012-distribute-a-notarized-dmg-with-web-billing.md) | Distribute a notarized DMG with web billing | accepted | 2026-09-30 |
-| [0013](0013-gate-releases-on-named-verification-suites.md) | Gate releases on named verification suites | accepted | 2026-10-05 |
+| [0013](0013-gate-releases-on-named-verification-suites.md) | Gate releases on named verification suites | superseded by [0030](0030-gate-merges-on-one-fast-required-check-and.md) | 2026-10-05 |
 | [0014](0014-persist-ids-in-serde-form.md) | Persist ids in serde form and prefix them only at the edges | accepted | 2026-10-07 |
 | [0015](0015-render-the-metal-canvas-with-skia-graphite.md) | Render the Metal canvas with Skia Graphite | accepted | 2026-10-14 |
 | [0016](0016-keep-agent-instructions-in-the-repository.md) | Keep agent instructions in the repository | accepted | 2026-10-15 |
@@ -66,6 +66,6 @@ these rules or when the index below is stale.
 | [0027](0027-project-designs-onto-plain-web-files.md) | Store projects as plain web files | accepted | 2026-11-10 |
 | [0028](0028-choose-the-tools-that-run-the-business.md) | Choose the tools that run the business | proposed | 2026-11-04 |
 | [0029](0029-deliver-business-events-through-the-backend-outbox.md) | Deliver business events through the backend outbox | proposed | 2026-11-07 |
-| [0030](0030-gate-merges-on-one-fast-required-check-and.md) | Gate merges on one fast required check and run each suite on the cheapest platform that can witness it | proposed | 2026-11-12 |
+| [0030](0030-gate-merges-on-one-fast-required-check-and.md) | Gate merges on one fast required check and run each suite on the cheapest platform that can witness it | accepted | 2026-11-12 |
 | [0031](0031-split-the-desktop-layer-into-three-editor-layers.md) | Split the desktop layer into three editor layers | proposed | 2026-11-12 |
 <!-- decisions:end -->

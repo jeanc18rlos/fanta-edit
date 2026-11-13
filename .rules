@@ -11,7 +11,7 @@ Fanta is a macOS design editor built as a fork of Zed. The `fanta` package build
 | Viewport math, tools | `crates/fanta-canvas`, `crates/fanta-tools` |
 | `.fig` import, prototype playback | `crates/fanta-fig-interop`, `crates/fanta-present` |
 | Agent seam, design ops and built-in canvas tools | `crates/design_surface`, `crates/fanta-design-ops`, `crates/agent/src/tools/design_*` |
-| Headless engine, design API and cloud engine worker | `crates/fanta-headless`, `crates/fanta-api`, `crates/fanta-engine` |
+| Headless engine, design API and cloud engine worker | `crates/fanta-headless`, `crates/fanta-api`, `crates/fanta-worker` |
 | Shared Fanta UI | `crates/fanta_ui` |
 
 GPUI and the reusable UI crates are not in this repository. They come from `squidred-dev/fanta-ui`, pinned by git revision in `Cargo.toml`; read their source under `~/.cargo/git/checkouts/fanta-ui-*/<rev>/crates/`. `vendor/skia-bindings-0.153.3` carries Fanta's Graphite shim (see its `FANTA-PROVENANCE.txt`).
@@ -37,6 +37,7 @@ Crate rules record traps that earlier changes hit. Claude Code loads them when i
 - `./script/verify-fanta-release --list` prints the release suites (engine, render, import, source-order, editor, workspace, ui, shell, release-blockers, build, lint). Run the stages that cover your change before calling it verified; the `fanta-verify` skill maps changes to stages, probes and smoke tests.
 - CI (`.github/workflows/check.yml`) requires 51 editor and workspace regressions by exact test name. If you rename or delete one of those tests, update the list in `check.yml` in the same change.
 - Regenerate golden images (`FANTA_REGEN_GOLDEN`, `UPDATE_BASELINE`) only when the user asks: a regenerated baseline turns a visual regression into a pass.
+- Run `script/gate` before you stop: it needs no build and takes seconds. Claude Code has hooks; Codex does not, so run it yourself. `script/gate --full` adds scoped clippy and the test stages for the crates your branch changed.
 
 ## Specs and decisions
 
@@ -96,6 +97,8 @@ GPUI is the UI framework (entities, windows, async tasks, elements, actions). Th
 
 When an agent opens or updates a pull request, it must:
 
+- Open it as a draft. Mark it ready only after `script/gate --full` passes, or say in the description which part could not run and why.
+- Before marking it ready, run a code review of the diff (`/code-review` in Claude Code) and summarize what it found and what you fixed in the description. Add a security review (`/security-review`) when the diff touches a parser of outside files, IPC or MCP, update or signing code.
 - Use a clear, correctly capitalized, imperative PR title (for example, `Fix crash in project panel`).
 - Avoid conventional commit prefixes in PR titles (`fix:`, `feat:`, `docs:`, etc.).
 - Avoid trailing punctuation in PR titles.
