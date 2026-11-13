@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Tests for script/serve-project. Run: python3 script/test-serve-project"""
+
+import http.client
+import importlib.machinery
+import importlib.util
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+loader = importlib.machinery.SourceFileLoader('serve_project', str(ROOT / 'script/serve-project'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+serve_project = importlib.util.module_from_spec(spec)
+loader.exec_module(serve_project)
+
+JSON = {'Content-Type': 'application/json'}
+
+
+class ServeProjectTest(unittest.TestCase):
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.project = Path(scratch.name)
+        (self.project / 'fanta.json').write_text('{}')
+        # No app is running for these tests, whatever the machine has open.
+        serve_project.live_socket_path = lambda: None
+        self.server = serve_project.make_server(self.project, 0, None)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def request(self, method, path, headers=None, body=None, host=None):
+        connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=10)
+        self.addCleanup(connection.close)
+        connection.putrequest(method, path, skip_host=True)
+        if host is None:
+            host = f'127.0.0.1:{self.port}'
+        if host:
+            connection.putheader('Host', host)
+        for name, value in (headers or {}).items():
+            connection.putheader(name, value)
+        if body is not None:
+            connection.putheader('Content-Length', str(len(body)))
+        connection.endheaders(body)
+        response = connection.getresponse()
+        response.read()
+        return response.status
+
+    def origin(self, name='127.0.0.1'):
+        return {'Origin': f'http://{name}:{self.port}'}
+
+    def test_the_emitted_editor_still_reads_and_writes(self):
+        for host in (f'127.0.0.1:{self.port}', f'localhost:{self.port}', f'LOCALHOST:{self.port}'):
+            self.assertEqual(self.request('GET', '/fanta.json', host=host), 200, host)
+        self.assertEqual(self.request('GET', '/__fanta/capabilities'), 200)
+        self.assertEqual(self.request('GET', '/__fanta/files'), 200)
+        # What editor.js sends: a same-origin PUT of bytes, with and without Origin.
+        self.assertEqual(self.request('PUT', '/pages/home/page.svg', self.origin(), b'<svg/>'), 204)
+        self.assertEqual(self.request('PUT', '/pages/home/page.css', None, b''), 204)
+        self.assertEqual((self.project / 'pages/home/page.svg').read_bytes(), b'<svg/>')
+        self.assertEqual(
+            self.request('PUT', '/tokens.json', self.origin('localhost'), b'{}', f'localhost:{self.port}'),
+            204,
+        )
+        # No app is open, so a well-formed batch gets as far as "no live app".
+        batch = b'{"ops": []}'
+        self.assertEqual(self.request('POST', '/__fanta/ops', {**JSON, **self.origin()}, batch), 409)
+        self.assertEqual(
+            self.request('POST', '/__fanta/ops', {'Content-Type': 'application/json; charset=utf-8'}, batch),
+            409,
+        )
+
+    def test_a_host_that_is_not_this_server_is_refused_on_every_method(self):
+        for host in ('attacker.example', f'attacker.example:{self.port}', f'127.0.0.1:{self.port + 1}', '127.0.0.1', ''):
+            for method, path, headers, body in (
+                ('GET', '/fanta.json', None, None),
+                ('HEAD', '/fanta.json', None, None),
+                ('GET', '/__fanta/files', None, None),
+                ('GET', '/__fanta/capabilities', None, None),
+                ('PUT', '/AGENTS.md', None, b'planted'),
+                ('POST', '/__fanta/ops', JSON, b'{"ops": []}'),
+            ):
+                self.assertEqual(self.request(method, path, headers, body, host), 403, (host, method, path))
+        self.assertFalse((self.project / 'AGENTS.md').exists())
+
+    def test_a_write_from_another_site_is_refused(self):
+        for origin in ('https://attacker.example', f'http://attacker.example:{self.port}', 'null', f'https://127.0.0.1:{self.port}'):
+            cross = {'Origin': origin}
+            self.assertEqual(self.request('PUT', '/AGENTS.md', cross, b'planted'), 403, origin)
+            self.assertEqual(self.request('POST', '/__fanta/ops', {**JSON, **cross}, b'{"ops": []}'), 403, origin)
+        self.assertFalse((self.project / 'AGENTS.md').exists())
+
+    def test_ops_must_be_sent_as_json(self):
+        batch = b'{"ops": []}'
+        for content_type in (None, 'text/plain', 'application/x-www-form-urlencoded', 'multipart/form-data'):
+            headers = {'Content-Type': content_type} if content_type else {}
+            self.assertEqual(self.request('POST', '/__fanta/ops', headers, batch), 415, content_type)
+
+
+if __name__ == '__main__':
+    unittest.main()
