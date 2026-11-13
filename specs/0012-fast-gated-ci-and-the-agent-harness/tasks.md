@@ -37,10 +37,10 @@ Fast CI:
 
 Agent harness:
 
-- [ ] **T5.** (plan H1) `script/gate`, default and `--full`; shrink the
+- [x] **T5.** (#222) (plan H1) `script/gate`, default and `--full`; shrink the
   `fanta-verify` skill (R17). Verify: A9.
 - [ ] **T6.** (plan H2) The `PostToolUse` and `Stop` hooks (R18). Verify: A10.
-- [ ] **T7.** (plan H3) Fix `guard_bash.py` and add its self-tests (R18).
+- [x] **T7.** (#218) (plan H3) Fix `guard_bash.py` and add its self-tests (R18).
   Below the spec threshold on its own; it may land before the spec is
   accepted. Verify: A10.
 - [ ] **T8.** (plan H4) Agent pull request rules in `CLAUDE.md` and `AGENTS.md`
