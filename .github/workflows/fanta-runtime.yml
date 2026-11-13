@@ -6,7 +6,7 @@ name: Fanta runtime engine
 
 on:
   pull_request:
-    paths:
+    paths: &runtime-paths
       - 'crates/fanta-bundle/**'
       - 'crates/fanta-doc/**'
       - 'crates/fanta-fnx/**'
@@ -20,6 +20,10 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - '.github/workflows/fanta-runtime.yml'
+  # Pull requests read the cache that this run on main saves.
+  push:
+    branches: [main]
+    paths: *runtime-paths
   workflow_dispatch:
 
 permissions:
@@ -56,6 +60,7 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: fanta-runtime-rust-1.95
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Test the Rust design and playback engines
         run: |
