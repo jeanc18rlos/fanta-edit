@@ -29,4 +29,6 @@ request when it merges.
   seed-upgrade test with the replaced guide's hash.
 - [ ] **T8.** Publish the format's code list, the checker binary as a
   release artifact and the corpus under the licence ADR 0026 sets (R9,
-  R10). Blocked until the founder accepts ADR 0026.
+  R10). ADR 0026 was accepted on 2026-11-12 (Apache-2.0). Waits for spec
+  0002 T2, which sweeps `fanta-format` and `fanta-doc` and changes their
+  licence fields.

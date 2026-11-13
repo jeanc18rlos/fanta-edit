@@ -39,7 +39,7 @@ has no open tasks. `script/architecture index --check` enforces both in CI.
 | Spec | Title | Status | Date | Decisions |
 | --- | --- | --- | --- | --- |
 | [0001](0001-architecture-map-and-boundaries/spec.md) | Architecture map and boundaries | implemented | 2026-10-27 | 0001, 0023 |
-| [0002](0002-fanta-engine-repository/spec.md) | The fanta-engine repository | draft | 2026-10-27 | 0023, 0024, 0025, 0026 |
+| [0002](0002-fanta-engine-repository/spec.md) | The fanta-engine repository | accepted | 2026-10-27 | 0023, 0024, 0025, 0026 |
 | [0003](0003-github-organization/spec.md) | One GitHub organization | draft | 2026-10-27 | 0025 |
 | [0004](0004-pen-drawing-that-closes-snaps-and-previews/spec.md) | Pen drawing that closes, snaps and previews | draft | 2026-10-29 | — |
 | [0005](0005-view-a-project-as-plain-web-files/spec.md) | View a project as plain web files | accepted | 2026-11-09 | 0027 |
@@ -49,4 +49,5 @@ has no open tasks. `script/architecture index --check` enforces both in CI.
 | [0009](0009-check-repair-and-snapshot-project-files/spec.md) | Check, repair and snapshot project files | accepted | 2026-11-12 | 0026, 0027 |
 | [0010](0010-measure-generated-code-against-designs/spec.md) | Measure generated code against designs | accepted | 2026-11-12 | 0027 |
 | [0011](0011-internal-operations-platform/spec.md) | Internal operations platform | draft | 2026-11-04 | 0028, 0029 |
+| [0012](0012-fast-gated-ci-and-the-agent-harness/spec.md) | Fast, gated CI and the agent harness | draft | 2026-11-12 | 0013, 0030 |
 <!-- specs:end -->
