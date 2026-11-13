@@ -629,11 +629,13 @@ jobs:
           retention-days: 14
 
   # The only check the main ruleset requires: keep the job id and its name `gate`.
-  # A draft pull request passes with only `changes` and `hygiene` having run.
+  # It fails on a draft, whose compiling jobs skip: a pass would stay on the
+  # commit and let it merge once marked ready, before the new run reports.
   gate:
     if: ${{ always() }}
-    # Every job a pull request must pass. `native-video` is manual only.
-    needs: [changes, hygiene, linux-test, check, mac-app-store-runtime, release-blocker-regressions]
+    # Every job a pull request must pass. `native-video` is manual only, and
+    # `linux-test` joins when it loses `continue-on-error` (spec 0012, T2).
+    needs: [changes, hygiene, check, mac-app-store-runtime, release-blocker-regressions]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -643,11 +645,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Pass when every needed job succeeded or was skipped
+      - name: Pass when the needed jobs succeeded and the pull request is not a draft
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
-        # `--advisory` goes when `linux-test` loses `continue-on-error` (spec 0012, T2).
-        run: script/gate --needs-json "$NEEDS_JSON" --advisory linux-test
+          DRAFT: ${{ github.event.pull_request.draft == true }}
+        run: script/gate --needs-json "$NEEDS_JSON" --required changes --required hygiene --draft "$DRAFT"
 
   native-video:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_video_only }}
