@@ -35,11 +35,9 @@ let
           builtins.elem firstComp [
             "crates"
             "assets"
-            "extensions"
             "script"
             "tooling"
             "Cargo.toml"
-            ".config"
             ".cargo"
           ];
         name = "gpui-a11y-source";
