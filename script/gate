@@ -23,6 +23,8 @@ FAST_CHECKS = [
     ("architecture", ["script/architecture", "verify"]),
     ("bash-guard", ["python3", ".claude/hooks/guard_bash.py", "--self-test"]),
     ("gate", ["script/gate", "--self-test"]),
+    # Starts a server on a free loopback port; no network.
+    ("serve-project", ["python3", "script/test-serve-project"]),
     ("typos", ["typos", "--config", "typos.toml"]),
     # Offline: the online audits need a GitHub token. Ignores are in zizmor.yml.
     ("zizmor", ["zizmor", "--offline", ".github/workflows", ".github/actions"]),
@@ -34,6 +36,8 @@ FAST_CHECKS = [
         + ["advisories", "sources", "bans"],
     ),
 ]
+# Seconds a check may take. Only a check that could wait forever needs one.
+TIMEOUTS = {"serve-project": 60}
 
 
 def run(name, command, list_only):
@@ -48,7 +52,11 @@ def run(name, command, list_only):
             return False
         print(f"SKIP {name}: {tool} is not installed")
         return True
-    passed = subprocess.run(command, cwd=ROOT).returncode == 0
+    try:
+        passed = subprocess.run(command, cwd=ROOT, timeout=TIMEOUTS.get(name)).returncode == 0
+    except subprocess.TimeoutExpired:
+        print(f"{name} did not finish in {TIMEOUTS[name]} seconds")
+        passed = False
     print(f"{'PASS' if passed else 'FAIL'} {name}", flush=True)
     return passed
 
