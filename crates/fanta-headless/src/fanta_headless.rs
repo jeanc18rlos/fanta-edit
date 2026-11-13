@@ -144,6 +144,7 @@ pub struct HeadlessProject {
     created_pages: Vec<NodeId>,
     loaded_hashes: BTreeMap<String, [u8; 32]>,
     warnings: Vec<fanta_format::SourceDiagnostic>,
+    snapshots: bool,
 }
 
 #[cfg(feature = "native")]
@@ -201,7 +202,16 @@ impl HeadlessProject {
             created_pages: Vec::new(),
             loaded_hashes,
             warnings,
+            snapshots: true,
         })
+    }
+
+    /// Whether [`save`](Self::save) records snapshots in the project's
+    /// `.fanta/history.git`, as the editor's save does. On by default; a host
+    /// that works on a throwaway copy of someone else's project turns it off,
+    /// so that it never runs git on that copy.
+    pub fn set_snapshots(&mut self, enabled: bool) {
+        self.snapshots = enabled;
     }
 
     pub fn root(&self) -> &Path {
@@ -562,6 +572,7 @@ impl HeadlessProject {
             &self.document.raw_assets,
             Some(&render),
             &self.warnings,
+            self.snapshots,
         )?;
         self.baseline = self.document.doc.clone_for_persist();
         self.saved_scene = (
@@ -824,6 +835,10 @@ mod tests {
         let mut project = HeadlessProject::open(legacy.path()).expect("open the legacy project");
         let before = render_home(&mut project);
         project.save().expect("the converting save");
+        assert!(
+            legacy.path().join(".fanta/history.git").is_dir(),
+            "a save records snapshots unless its host turned them off"
+        );
         let converted = files_under(legacy.path());
         assert!(
             !converted.iter().any(|path| {
@@ -920,7 +935,12 @@ mod tests {
         );
         assert_eq!(project.journal().len(), 2, "one comment write per page");
 
+        project.set_snapshots(false);
         project.save().expect("save");
+        assert!(
+            !project.root().join(".fanta").exists(),
+            "a save with snapshots off must not create the snapshot store"
+        );
         let changed = changeset(project.loaded_hashes(), project.root()).expect("changeset");
         // Every edit stamps `modified_at`, as in the editor, so the metadata
         // file changes too whenever the clock ticked over a second.

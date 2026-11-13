@@ -26,9 +26,11 @@ class ServeProjectTest(unittest.TestCase):
         (self.project / 'fanta.json').write_text('{}')
         # No app is running for these tests, whatever the machine has open.
         serve_project.live_socket_path = lambda: None
+        serve_project.Handler.log_message = lambda *arguments: None
         self.server = serve_project.make_server(self.project, 0, None)
         self.port = self.server.server_address[1]
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        # shutdown() waits one poll, so the default half second is most of a run.
+        threading.Thread(target=self.server.serve_forever, args=(0.01,), daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
 
@@ -92,6 +94,66 @@ class ServeProjectTest(unittest.TestCase):
             self.assertEqual(self.request('PUT', '/AGENTS.md', cross, b'planted'), 403, origin)
             self.assertEqual(self.request('POST', '/__fanta/ops', {**JSON, **cross}, b'{"ops": []}'), 403, origin)
         self.assertFalse((self.project / 'AGENTS.md').exists())
+
+    def test_git_and_the_snapshot_store_are_not_served(self):
+        for path in ('.git/config', '.fanta/history.git/config', 'pages/.git/HEAD', 'pages/home/page.svg'):
+            file = self.project / path
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text('[core]')
+        (self.project / 'alias').symlink_to('.git')
+        # Names that only resemble them are ordinary files.
+        (self.project / '.gitignore').write_text('previews/')
+        self.assertEqual(self.request('GET', '/pages/home/page.svg'), 200)
+        self.assertEqual(self.request('GET', '/.gitignore'), 200)
+        for path in (
+            '/.git/config',
+            '/.git/',
+            '/.git',
+            '/.fanta/history.git/config',
+            '/.fanta/',
+            '/pages/.git/HEAD',
+            '/%2Egit/config',
+            '/.GIT/config',
+            '/pages/../.git/config',
+            '/alias/config',
+            '/.git/config?x=1',
+        ):
+            for method in ('GET', 'HEAD'):
+                self.assertEqual(self.request(method, path), 404, (method, path))
+        # A link that leaves the project is not followed, wherever it leads.
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        (Path(outside.name) / '.git').mkdir()
+        (Path(outside.name) / '.git/config').write_text('[core]')
+        (Path(outside.name) / 'notes.txt').write_text('notes')
+        (self.project / 'elsewhere').symlink_to(Path(outside.name) / '.git')
+        (self.project / 'notes.txt').symlink_to(Path(outside.name) / 'notes.txt')
+        # A folder address answers with its index file, which may be a link too.
+        (self.project / 'folder').mkdir()
+        (self.project / 'folder/index.html').symlink_to(Path(outside.name) / 'notes.txt')
+        (self.project / 'other').mkdir()
+        (self.project / 'other/index.htm').symlink_to(self.project / '.git/config')
+        for path in ('/elsewhere/config', '/elsewhere/', '/notes.txt', '/folder/', '/other/'):
+            for method in ('GET', 'HEAD'):
+                self.assertEqual(self.request(method, path), 404, (method, path))
+        # A missing file answers the same, so the answer does not say what exists.
+        self.assertEqual(self.request('GET', '/.git/missing'), 404)
+        self.assertEqual(self.request('GET', '/missing'), 404)
+
+    def test_folders_are_not_listed(self):
+        (self.project / '.git').mkdir()
+        (self.project / 'pages/home').mkdir(parents=True)
+        (self.project / 'pages/home/page.svg').write_text('<svg/>')
+        # Without an index.html a static server would list the folder, `.git` included.
+        for path in ('/', '/pages/', '/pages/home/'):
+            self.assertEqual(self.request('GET', path), 404, path)
+        (self.project / 'index.html').write_text('<!doctype html>')
+        self.assertEqual(self.request('GET', '/'), 200)
+
+    def test_a_write_into_git_or_the_snapshot_store_is_refused_in_any_letter_case(self):
+        for path in ('/.git/config', '/.GIT/config', '/.Fanta/history.git/config', '/pages/.Git/hooks/x', '/.fanta/x'):
+            self.assertEqual(self.request('PUT', path, None, b'planted'), 403, path)
+        self.assertEqual([entry.name for entry in self.project.iterdir()], ['fanta.json'])
 
     def test_ops_must_be_sent_as_json(self):
         batch = b'{"ops": []}'

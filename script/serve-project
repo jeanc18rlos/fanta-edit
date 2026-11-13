@@ -5,7 +5,9 @@ needs (spec 0008 T3).
     script/serve-project <project-dir> [--port 8080] [--engine <pkg-dir>]
 
 GET serves the project's own files, exactly as any static server would, so
-`index.html` works unchanged. On top of that:
+`index.html` works unchanged, except that `.git/`, `.fanta/`, links that
+leave the project and folder listings answer 404.
+On top of that:
 
 - `/__fanta/capabilities` answers `{"write": true, "engine": <bool>,
   "live": <bool>, "stamp": <latest change>}`; the emitted `editor.js`
@@ -42,6 +44,9 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 SKIPPED_DIRECTORIES = {".git", ".fanta", "exports", "previews", "node_modules"}
+# Never served: git's own data and the snapshot store hold every past version
+# of the project, and no page needs them.
+PRIVATE_DIRECTORIES = {".git", ".fanta"}
 MAX_PUT_BYTES = 64 * 1024 * 1024
 LIVE_CACHE_SECONDS = 5.0
 INITIALIZE_PARAMS = {
@@ -145,13 +150,15 @@ def project_files(root: Path):
     return files, stamp
 
 
-def contained(root: Path, relative: str):
-    """The absolute path for a request path, or None when it escapes."""
+def contained(root: Path, relative: str, refused=SKIPPED_DIRECTORIES):
+    """The absolute path for a request path, or None when it escapes the
+    project, through a link too, or enters a `refused` directory."""
     candidate = (root / relative.lstrip("/")).resolve()
     root = root.resolve()
     if candidate == root or root not in candidate.parents:
         return None
-    if any(part in SKIPPED_DIRECTORIES for part in candidate.relative_to(root).parts):
+    # Lower case: macOS and Windows open `.GIT` as `.git`.
+    if any(part.lower() in refused for part in candidate.relative_to(root).parts):
         return None
     return candidate
 
@@ -208,6 +215,21 @@ class Handler(SimpleHTTPRequestHandler):
         if origin is None:
             return False
         return origin.lower() not in {f"http://{name}" for name in self.local_names()}
+
+    def send_head(self):
+        """The static file for GET and HEAD, unless it is private."""
+        relative = os.path.relpath(self.translate_path(self.path), self.directory)
+        # A folder address is answered with its index file, which may be a link.
+        for opened in (relative, f"{relative}/index.html", f"{relative}/index.htm"):
+            if opened != "." and contained(self.project, opened, PRIVATE_DIRECTORIES) is None:
+                self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+                return None
+        return super().send_head()
+
+    def list_directory(self, path):
+        # A listing would name `.git` and `.fanta`, and no page asks for one.
+        self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+        return None
 
     def send_json(self, value):
         body = json.dumps(value).encode()
