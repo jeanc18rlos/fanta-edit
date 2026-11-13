@@ -29,8 +29,9 @@ The provenance sweep of 2026-11-13 (recorded in
 own licence.
 
 - `vendor/skia-bindings-0.153.3` is rust-skia's `skia-bindings`, MIT,
-  Copyright (c) 2019 LongYinan & Armin Sander, with Fanta's changes to three
-  files listed in its `FANTA-PROVENANCE.txt`. Its `LICENSE` is upstream's.
+  Copyright (c) 2019 LongYinan & Armin Sander, Copyright (c) 2019 rust-skia
+  Contributors, with Fanta's changes to three files listed in its
+  `FANTA-PROVENANCE.txt`. Its `LICENSE` is upstream's.
 - `crates/fanta-text/assets` bundles Inter (Copyright (c) 2016 The Inter
   Project Authors) and Source Sans 3, Source Serif 4 and Source Code Pro
   (Adobe), all under the SIL Open Font License 1.1. Each folder carries its
@@ -38,12 +39,18 @@ own licence.
 - `crates/fanta-fig-interop/src/kiwi` is a Rust port of the Kiwi wire format,
   https://github.com/evanw/kiwi, MIT, Copyright (c) 2016-2023 Evan Wallace.
 - The `.fig` mapping in `crates/fanta-fig-interop/src/mapping` and
-  drag-to-reparent in `crates/fanta-tools/src/select/reparent.rs` port or
-  mirror logic from two MIT projects named OpenPencil, and the layout and
-  instance resolution in `crates/fanta-doc` follow their behaviour:
+  drag-to-reparent in `crates/fanta-tools/src/select/reparent.rs`, called
+  from `select/mv.rs`, port or mirror logic from two MIT projects named
+  OpenPencil, and the layout and instance resolution in `crates/fanta-doc`
+  follow their behaviour:
   https://github.com/open-pencil/open-pencil, Copyright (c) 2026 Danila
   Poyarkov and OpenPencil contributors, and
   https://github.com/ZSeven-W/openpencil, Copyright (c) 2026 ZSeven—W.
+  The code's comments call them "op1" and "op2" and give no URL. The
+  comment in `mv.rs` gives the source of the drag-to-reparent port as "op1:
+  vue/src/shared/input/drop-target.ts, core/src/editor/structure/reorder.ts";
+  which of the two repositories "op1" is cannot be determined from this
+  repository, so both notices are kept.
 - `crates/fanta-tools/src/ink.rs` reimplements the algorithm of
   `perfect-freehand`, https://github.com/steveruizok/perfect-freehand, MIT,
   Copyright (c) 2021 Stephen Ruiz Ltd. The fixtures in `fixtures/ink` are that

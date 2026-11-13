@@ -231,10 +231,10 @@ fix cites [ADR 0023](../decisions/0023-enforce-layered-crate-boundaries.md).
   `component_actions`, `prototype_player` and `draw_wand`.
 - `fanta-present` depends on `fanta-render`, which ties playback to one
   renderer, and `fanta-text` mixes the rich-text model with Skia layout.
-- Seventeen engine crates are `Apache-2.0`
-  ([0026](../decisions/0026-choose-the-engine-and-sdk-licence.md));
-  `fanta-fig-interop` still inherits the workspace's `GPL-3.0` until the
-  origin of its golden fixtures is settled (spec 0002, T2).
+- `fanta-fig-interop` is still GPL (it inherits the workspace's `GPL-3.0`)
+  while the rest of the engine group is `Apache-2.0`
+  ([0026](../decisions/0026-choose-the-engine-and-sdk-licence.md)): the
+  founder's decision on its golden fixtures is pending (spec 0002, T2).
 - The engine can only be reached through this repository
   ([0024](../decisions/0024-move-the-engine-into-its-own-repository.md)).
 
