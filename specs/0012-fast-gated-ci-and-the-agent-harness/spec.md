@@ -1,5 +1,5 @@
 ---
-status: draft
+status: in-progress
 date: 2026-11-12
 owner: Jean Rojas
 decisions: [0013, 0030]
