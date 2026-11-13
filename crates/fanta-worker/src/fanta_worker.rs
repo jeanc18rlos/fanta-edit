@@ -1288,6 +1288,8 @@ mod tests {
         );
     }
 
+    // The worker runs on Linux only, and the stripping reads Unix paths.
+    #[cfg(unix)]
     #[test]
     fn errors_do_not_name_the_private_checkout() {
         let directory = tempfile::tempdir().expect("project directory");
@@ -1308,6 +1310,8 @@ mod tests {
         );
     }
 
+    // The worker runs on Linux only, and the stripping reads Unix paths.
+    #[cfg(unix)]
     #[test]
     fn caller_messages_drop_the_checkout_root_and_nothing_else() {
         let message =
@@ -1362,6 +1366,8 @@ mod tests {
         }
     }
 
+    // The worker runs on Linux only, and the stripping reads Unix paths.
+    #[cfg(unix)]
     #[test]
     fn row_errors_do_not_name_the_private_checkout() {
         use fanta_api::{NodeKind, Placeholder};
