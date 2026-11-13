@@ -84,6 +84,14 @@ jobs:
         with:
           persist-credentials: false
 
+      # cargo-deny has cargo download every locked crate to read its manifest:
+      # three minutes without this cache. No target directory: nothing compiles.
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: hygiene
+          cache-targets: 'false'
+          save-if: 'true'
+
       - name: Install typos, zizmor and cargo-deny
         run: script/install-gate-tools "${RUNNER_TEMP}/gate-tools"
 
