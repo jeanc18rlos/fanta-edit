@@ -64,8 +64,12 @@ Gates:
   Verify: A6.
 - [ ] **T13.** (plan G4) `script/verify-required-tests --names` in
   `script/gate` (R9). Needs T2. Verify: A6.
-- [x] **T14.** (#238) (plan G5) Fuzz targets for the four parsers and their nightly
+- [ ] **T14.** (#238) (plan G5) Fuzz targets for the four parsers and their nightly
   job (R13, R14). Needs T3. Verify: A8.
+  Done in #238: the five targets, `script/fuzz` and `.github/workflows/fuzz.yml`;
+  60-second local runs; A8 for the kiwi definition-count input. Remaining: the
+  `fuzz` job in `nightly.yml` after #230 and #235 merge, five-minute runs of
+  every target, and A8 for the FNX and kiwi nesting inputs.
 - [ ] **T15.** (plan G6) Measure `clippy::unwrap_used` and
   `let_underscore_must_use` in the four parser crates; enable per crate
   where small; record the counts here (R15). Verify: `./script/clippy -p`

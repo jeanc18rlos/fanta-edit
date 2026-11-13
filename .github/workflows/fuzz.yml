@@ -1,7 +1,13 @@
 name: Fuzz
 
 # Five minutes on each fuzz target of the parsers that read files from outside (spec 0012 R13, R14).
-# Called by the Nightly workflow; a crash fails the job and leaves the input as an artifact.
+# Called by the Nightly workflow; a crash fails the job. The repository is public and both
+# libFuzzer and cargo-fuzz print a crashing input, so the run's output goes to a file and a
+# crash shows only the target, libFuzzer's seed and the input's SHA-256; nothing is uploaded.
+# To reproduce, run `script/fuzz <crate> <target> 300` locally on the same commit (the seeds
+# are committed), with `-seed=<n>` added to the libFuzzer arguments in script/fuzz, and compare
+# the SHA-256 of the file in fuzz/artifacts/<target>. Output is shown when there is no input,
+# which is a build failure.
 on:
   workflow_call:
   workflow_dispatch:
@@ -46,13 +52,20 @@ jobs:
         env:
           CRATE: ${{ matrix.crate }}
           TARGET: ${{ matrix.target }}
-        run: script/fuzz "$CRATE" "$TARGET" 300
-
-      - name: Keep the crashing input
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: fuzz-${{ matrix.crate }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: crates/${{ matrix.crate }}/fuzz/artifacts
-          if-no-files-found: ignore
-          retention-days: 14
+        run: |
+          log="$RUNNER_TEMP/fuzz.log"
+          if script/fuzz "$CRATE" "$TARGET" 300 >"$log" 2>&1; then
+            tail -n 3 "$log"
+            exit 0
+          fi
+          shopt -s nullglob
+          inputs=("crates/$CRATE/fuzz/artifacts/$TARGET"/*)
+          if (( ${#inputs[@]} == 0 )); then
+            cat "$log"
+            exit 1
+          fi
+          grep -a -m 1 '^INFO: Seed:' "$log" || true
+          for input in "${inputs[@]}"; do
+            echo "$CRATE $TARGET: input with SHA-256 $(sha256sum "$input" | cut -d' ' -f1)"
+          done
+          exit 1
