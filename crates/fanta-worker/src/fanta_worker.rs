@@ -391,9 +391,7 @@ pub fn validate(request: &RunRequest) -> Result<(), EngineError> {
         }
         source::relative_path(path)?;
         for file in overlay.iter().flat_map(|overlay| &overlay.files) {
-            if source::relative_path(&file.path)?.as_os_str().is_empty() {
-                return bad_request("an overlay file needs a path".into());
-            }
+            source::overlay_path(&file.path)?;
         }
     }
     for (index, step) in request.steps.iter().enumerate() {
@@ -450,13 +448,13 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
     validate(request)?;
     let started = Instant::now();
     let deadline = Duration::from_millis(request.deadline_ms);
-    let project = HeadlessProject::open(work_dir).map_err(|error| {
+    let mut project = HeadlessProject::open(work_dir).map_err(|error| {
         let code = if fanta_headless::saved_by_newer_fanta(&error) {
             ErrorCode::SchemaTooNew
         } else {
             ErrorCode::ProjectLoadFailed
         };
-        EngineError::new(code, format!("{error:#}"))
+        EngineError::new(code, caller_message(&error, work_dir))
     })?;
     if started.elapsed() >= deadline {
         return Err(EngineError::new(
@@ -464,13 +462,15 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
             "the deadline passed before the project loaded",
         ));
     }
+    // The checkout is someone else's files and is thrown away after the run:
+    // a snapshot would only run git on them.
+    project.set_snapshots(false);
     let mut session = DesignSession::from_project(project);
     // Template images come from data: URIs or this checkout's own files,
     // never from the network.
-    session.set_image_fetcher(
-        DirectoryFetcher::new(work_dir)
-            .map_err(|error| EngineError::new(ErrorCode::Internal, format!("{error:#}")))?,
-    );
+    session.set_image_fetcher(DirectoryFetcher::new(work_dir).map_err(|error| {
+        EngineError::new(ErrorCode::Internal, caller_message(&error, work_dir))
+    })?);
     let mut results = Vec::with_capacity(request.steps.len());
     for step in &request.steps {
         if started.elapsed() >= deadline {
@@ -499,7 +499,7 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
                     result: None,
                     error: Some(ErrorBody {
                         code: ErrorCode::StepFailed,
-                        message: format!("{error:#}"),
+                        message: caller_message(&error, work_dir),
                     }),
                 });
                 break;
@@ -521,6 +521,22 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
         },
         results,
     })
+}
+
+/// An error's text with the checkout's location taken out, so that a file is
+/// named by its path in the project and the answer says nothing about the
+/// engine's own disk.
+fn caller_message(error: &anyhow::Error, work_dir: &Path) -> String {
+    let mut message = format!("{error:#}");
+    // The project is opened by its resolved path, so errors can carry either.
+    for root in [work_dir.canonicalize().ok(), Some(work_dir.to_owned())] {
+        let Some(root) = root else { continue };
+        let root = root.to_string_lossy();
+        message = message
+            .replace(&format!("{root}/"), "")
+            .replace(root.as_ref(), "the project folder");
+    }
+    message
 }
 
 fn font_report(project: &HeadlessProject) -> FontReport {
@@ -1170,5 +1186,119 @@ mod tests {
         };
         assert_eq!(substitution.family, "Adobe Clean");
         assert!(substitution.used.starts_with("Source"), "{substitution:?}");
+    }
+
+    #[test]
+    fn validation_refuses_an_overlay_inside_the_snapshot_store() {
+        for path in [".fanta/history.git/config", "pages/.git/config"] {
+            let error = validate(&request(json!({
+                "request_id": "r",
+                "deadline_ms": 1000,
+                "source": {
+                    "kind": "github",
+                    "repo": "acme/site",
+                    "sha": "0123456789abcdef0123456789abcdef01234567",
+                    "token": "t",
+                    "overlay": {"files": [{"path": path, "content_b64": "eA=="}]}
+                },
+                "steps": [{"step": "inspect"}]
+            })))
+            .expect_err("refused");
+            assert_eq!(error.error.code, ErrorCode::BadRequest, "{path}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_run_that_saves_takes_no_snapshot() {
+        let directory = text_project("Inter");
+        let response = run_in(
+            &request(json!({
+                "request_id": "r",
+                "deadline_ms": 60000,
+                "source": {"kind": "dir", "dir": directory.path()},
+                "steps": [
+                    {"step": "create_page", "name": "Landing"},
+                    {"step": "changeset"}
+                ]
+            })),
+            directory.path(),
+        )
+        .expect("the run answers");
+        assert!(
+            response.results.iter().all(|result| result.ok),
+            "{:?}",
+            response.results
+        );
+        assert!(
+            !directory.path().join(".fanta").exists(),
+            "the engine is stateless: a save must not create a snapshot store"
+        );
+    }
+
+    #[test]
+    fn errors_do_not_name_the_private_checkout() {
+        let directory = tempfile::tempdir().expect("project directory");
+        let location = directory.path().to_string_lossy().into_owned();
+        let resolved = directory
+            .path()
+            .canonicalize()
+            .expect("resolve")
+            .to_string_lossy()
+            .into_owned();
+
+        let error = inspect(directory.path()).expect_err("an empty folder is no project");
+        assert_eq!(error.error.code, ErrorCode::ProjectLoadFailed, "{error}");
+        let message = &error.error.message;
+        assert!(
+            !message.contains(&location) && !message.contains(&resolved),
+            "{message}"
+        );
+
+        // A step fails the same way: a checkout that cannot be written to
+        // loads, and its save does not go through.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let project = text_project("Inter");
+            let location = project.path().to_string_lossy().into_owned();
+            let resolved = project
+                .path()
+                .canonicalize()
+                .expect("resolve")
+                .to_string_lossy()
+                .into_owned();
+            let set_mode = |mode| {
+                std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(mode))
+                    .expect("set permissions")
+            };
+            set_mode(0o555);
+            let response = run_in(
+                &request(json!({
+                    "request_id": "r",
+                    "deadline_ms": 60000,
+                    "source": {"kind": "dir", "dir": project.path()},
+                    "steps": [
+                        {"step": "create_page", "name": "Landing"},
+                        {"step": "changeset"}
+                    ]
+                })),
+                project.path(),
+            );
+            set_mode(0o755);
+            let failure = response
+                .expect("the project loads")
+                .results
+                .into_iter()
+                .find_map(|result| result.error);
+            // Root writes to a read-only folder, so there the save succeeds.
+            if let Some(failure) = failure {
+                let message = &failure.message;
+                assert!(
+                    !message.contains(&location) && !message.contains(&resolved),
+                    "{message}"
+                );
+                assert!(message.contains("the project folder"), "{message}");
+            }
+        }
     }
 }

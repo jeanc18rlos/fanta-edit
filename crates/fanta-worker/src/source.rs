@@ -16,6 +16,7 @@ use crate::{EngineError, ErrorCode, Overlay, Token};
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     pub bytes: u64,
+    /// Files and folders together.
     pub files: usize,
 }
 
@@ -43,6 +44,38 @@ pub fn relative_path(path: &str) -> Result<PathBuf, EngineError> {
         }
     }
     Ok(relative)
+}
+
+/// An overlay file's path: a [`relative_path`] that names a file outside
+/// the folders the engine never reads.
+pub fn overlay_path(path: &str) -> Result<PathBuf, EngineError> {
+    let relative = relative_path(path)?;
+    if relative.as_os_str().is_empty() {
+        return Err(EngineError::new(
+            ErrorCode::BadRequest,
+            "an overlay file needs a path",
+        ));
+    }
+    if reserved(&relative) {
+        return Err(EngineError::new(
+            ErrorCode::BadRequest,
+            format!(
+                "overlay file {path:?} is inside .fanta or .git, which the engine does not read"
+            ),
+        ));
+    }
+    Ok(relative)
+}
+
+/// Whether `path` is, or is inside, a `.fanta` or `.git` folder. Git runs
+/// programs named by the files of both, and a project's source needs neither:
+/// the app's snapshot store ignores itself, so a commit holds one only when
+/// someone put it there.
+fn reserved(path: &Path) -> bool {
+    path.components().any(|component| {
+        let name = component.as_os_str();
+        name.eq_ignore_ascii_case(".fanta") || name.eq_ignore_ascii_case(".git")
+    })
 }
 
 pub struct Github {
@@ -122,7 +155,7 @@ impl Github {
 /// `destination`. GitHub wraps the tree in one top folder, which is dropped.
 /// Entries outside the project folder are skipped; inside it only plain files
 /// and folders are accepted, so a link can't point a later write outside
-/// `destination`.
+/// `destination`, and nothing under `.fanta` or `.git` is.
 pub fn extract(
     reader: impl Read,
     project_path: &str,
@@ -159,29 +192,42 @@ pub fn extract(
         {
             return Err(unsafe_entry(&raw));
         }
+        if reserved(relative) {
+            return Err(EngineError::new(
+                ErrorCode::ProjectLoadFailed,
+                format!(
+                    "{} is inside .fanta or .git, which the engine does not read; remove it from the commit",
+                    raw.display()
+                ),
+            ));
+        }
+        if !kind.is_dir() && !kind.is_file() {
+            return Err(unsafe_entry(&raw));
+        }
         found = true;
+        // Folders count too: an archive of empty folders costs inodes.
+        files += 1;
+        if kind.is_file() {
+            bytes = bytes.saturating_add(entry.header().size().map_err(corrupt)?);
+        }
+        if files > limits.files || bytes > limits.bytes {
+            return Err(EngineError::new(
+                ErrorCode::PayloadTooLarge,
+                format!(
+                    "the project folder is over {} files and folders or {} bytes",
+                    limits.files, limits.bytes
+                ),
+            ));
+        }
         let target = destination.join(relative);
         if kind.is_dir() {
             std::fs::create_dir_all(&target).map_err(write_error)?;
-        } else if kind.is_file() {
-            files += 1;
-            bytes = bytes.saturating_add(entry.header().size().map_err(corrupt)?);
-            if files > limits.files || bytes > limits.bytes {
-                return Err(EngineError::new(
-                    ErrorCode::PayloadTooLarge,
-                    format!(
-                        "the project folder is over {} files or {} bytes",
-                        limits.files, limits.bytes
-                    ),
-                ));
-            }
+        } else {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(write_error)?;
             }
             let mut file = std::fs::File::create(&target).map_err(write_error)?;
             io::copy(&mut entry, &mut file).map_err(corrupt)?;
-        } else {
-            return Err(unsafe_entry(&raw));
         }
     }
     if !found {
@@ -196,13 +242,7 @@ pub fn extract(
 /// Lays the overlay's files over the extracted project folder.
 pub fn apply_overlay(overlay: &Overlay, destination: &Path) -> Result<(), EngineError> {
     for file in &overlay.files {
-        let relative = relative_path(&file.path)?;
-        if relative.as_os_str().is_empty() {
-            return Err(EngineError::new(
-                ErrorCode::BadRequest,
-                "an overlay file needs a path",
-            ));
-        }
+        let relative = overlay_path(&file.path)?;
         let target = destination.join(&relative);
         match &file.content_b64 {
             Some(content) if !file.deleted => {
@@ -253,6 +293,7 @@ pub(crate) mod tests {
     pub(crate) enum Entry<'a> {
         File(&'a str, &'a [u8]),
         Link(&'a str, &'a str),
+        Folder(&'a str),
     }
 
     /// A gzipped tarball shaped like GitHub's: a pax global header, then the
@@ -281,6 +322,15 @@ pub(crate) mod tests {
                         .append_data(&mut header, format!("acme-site-0123456/{path}"), *bytes)
                         .expect("file entry");
                 }
+                Entry::Folder(path) => {
+                    header.set_entry_type(tar::EntryType::Directory);
+                    header.set_size(0);
+                    header.set_mode(0o755);
+                    header.set_cksum();
+                    builder
+                        .append_data(&mut header, format!("acme-site-0123456/{path}/"), &[][..])
+                        .expect("folder entry");
+                }
                 Entry::Link(path, target) => {
                     header.set_entry_type(tar::EntryType::Symlink);
                     header.set_size(0);
@@ -290,11 +340,7 @@ pub(crate) mod tests {
                 }
             }
         }
-        builder
-            .into_inner()
-            .expect("tar")
-            .finish()
-            .expect("gzip")
+        builder.into_inner().expect("tar").finish().expect("gzip")
     }
 
     fn code(result: Result<(), EngineError>) -> Result<(), ErrorCode> {
@@ -327,7 +373,12 @@ pub(crate) mod tests {
             Entry::Link("design/assets", "/etc"),
         ]);
         assert_eq!(
-            code(extract(&linked[..], "design", destination.path(), Limits::SOURCE)),
+            code(extract(
+                &linked[..],
+                "design",
+                destination.path(),
+                Limits::SOURCE
+            )),
             Err(ErrorCode::ProjectLoadFailed)
         );
         let many = tarball(&[
@@ -335,22 +386,38 @@ pub(crate) mod tests {
             Entry::File("a.txt", b"a"),
             Entry::File("b.txt", b"b"),
         ]);
-        let small = Limits { bytes: 1024, files: 2 };
+        let small = Limits {
+            bytes: 1024,
+            files: 2,
+        };
         assert_eq!(
             code(extract(&many[..], "", destination.path(), small)),
             Err(ErrorCode::PayloadTooLarge)
         );
-        let large = Limits { bytes: 3, files: 10 };
+        let large = Limits {
+            bytes: 3,
+            files: 10,
+        };
         assert_eq!(
             code(extract(&many[..], "", destination.path(), large)),
             Err(ErrorCode::PayloadTooLarge)
         );
         assert_eq!(
-            code(extract(&many[..], "elsewhere", destination.path(), Limits::SOURCE)),
+            code(extract(
+                &many[..],
+                "elsewhere",
+                destination.path(),
+                Limits::SOURCE
+            )),
             Err(ErrorCode::NotFound)
         );
         assert_eq!(
-            code(extract(&many[..], "../design", destination.path(), Limits::SOURCE)),
+            code(extract(
+                &many[..],
+                "../design",
+                destination.path(),
+                Limits::SOURCE
+            )),
             Err(ErrorCode::BadRequest)
         );
     }
@@ -383,5 +450,87 @@ pub(crate) mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn the_snapshot_store_and_git_folders_are_refused() {
+        for path in [
+            ".fanta/history.git/config",
+            ".git/config",
+            "pages/.fanta/history.git/HEAD",
+            ".FANTA/history.git/config",
+        ] {
+            let destination = tempfile::tempdir().expect("destination");
+            let archive = tarball(&[
+                Entry::File("design/fanta.json", b"{}"),
+                Entry::File(&format!("design/{path}"), b"planted"),
+            ]);
+            assert_eq!(
+                code(extract(
+                    &archive[..],
+                    "design",
+                    destination.path(),
+                    Limits::SOURCE
+                )),
+                Err(ErrorCode::ProjectLoadFailed),
+                "{path}"
+            );
+            assert!(!destination.path().join(path).exists(), "{path}");
+
+            for file in [
+                serde_json::json!({"path": path, "content_b64": "eA=="}),
+                serde_json::json!({"path": path, "deleted": true}),
+            ] {
+                let overlay: Overlay =
+                    serde_json::from_value(serde_json::json!({"files": [file]})).expect("overlay");
+                assert_eq!(
+                    code(apply_overlay(&overlay, destination.path())),
+                    Err(ErrorCode::BadRequest),
+                    "{path}"
+                );
+            }
+            assert!(!destination.path().join(path).exists(), "{path}");
+        }
+
+        let destination = tempfile::tempdir().expect("destination");
+        let folder = tarball(&[
+            Entry::File("fanta.json", b"{}"),
+            Entry::Folder(".fanta/history.git/hooks"),
+        ]);
+        assert_eq!(
+            code(extract(&folder[..], "", destination.path(), Limits::SOURCE)),
+            Err(ErrorCode::ProjectLoadFailed)
+        );
+        // A name that only resembles them is an ordinary file.
+        let ordinary = tarball(&[
+            Entry::File("fanta.json", b"{}"),
+            Entry::File(".fanta-notes/readme.txt", b"x"),
+            Entry::File(".gitignore", b"previews/\n"),
+        ]);
+        extract(&ordinary[..], "", destination.path(), Limits::SOURCE).expect("ordinary names");
+    }
+
+    #[test]
+    fn folders_count_toward_the_entry_limit() {
+        let destination = tempfile::tempdir().expect("destination");
+        let folders = tarball(&[
+            Entry::File("fanta.json", b"{}"),
+            Entry::Folder("a"),
+            Entry::Folder("a/b"),
+            Entry::Folder("a/b/c"),
+        ]);
+        let small = Limits {
+            bytes: 1024,
+            files: 3,
+        };
+        assert_eq!(
+            code(extract(&folders[..], "", destination.path(), small)),
+            Err(ErrorCode::PayloadTooLarge)
+        );
+        let enough = Limits {
+            bytes: 1024,
+            files: 4,
+        };
+        extract(&folders[..], "", destination.path(), enough).expect("within the limit");
     }
 }
