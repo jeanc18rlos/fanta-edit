@@ -8,7 +8,7 @@
 //! Only differences change the document: a pristine projection loads with no
 //! record touched and no warning, so load-then-save stays byte-identical.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use fanta_doc::{
@@ -288,6 +288,33 @@ fn design_svgs(source: &TreeSource<'_>, dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
+/// The attributes of a tag that can be read, the first of each name: what
+/// `start.attributes().flatten()` yields. quick-xml's own duplicate check
+/// compares every pair of names, so a tag with very many attributes stalled
+/// the load (RUSTSEC-2026-0194); this one is linear.
+pub(super) fn first_attributes<'a>(
+    start: &'a quick_xml::events::BytesStart<'_>,
+) -> impl Iterator<Item = quick_xml::events::attributes::Attribute<'a>> {
+    use quick_xml::events::attributes::AttrError;
+    let mut seen = HashSet::new();
+    let mut attributes = start.attributes();
+    attributes.with_checks(false);
+    attributes.filter_map(move |attribute| match attribute {
+        Ok(attribute) => seen
+            .insert(attribute.key.into_inner())
+            .then_some(attribute),
+        // quick-xml counted the name of an unquoted value as seen, so a later
+        // attribute of that name stays unread.
+        Err(AttrError::UnquotedValue(position)) => {
+            let is_space = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\r' | b'\n');
+            let name = start.get(..position)?.trim_ascii_end().strip_suffix(b"=")?;
+            seen.insert(name.trim_ascii_end().rsplit(is_space).next()?);
+            None
+        }
+        Err(_) => None,
+    })
+}
+
 fn parse_design_svg(
     src: &str,
     context: &str,
@@ -318,7 +345,7 @@ fn parse_design_svg(
                 };
                 let mut id = None;
                 let mut styled = false;
-                for attribute in start.attributes().flatten() {
+                for attribute in first_attributes(&start) {
                     let value = match attribute.unescape_value() {
                         Ok(value) => value.into_owned(),
                         Err(_) => continue,
@@ -1288,6 +1315,53 @@ mod tests {
         assert_eq!(warnings[0].file.as_deref(), Some("pages/home/page.svg"));
         assert_eq!(warnings[0].line, Some(3), "{warnings:?}");
         assert!(elements.contains_key("a"), "elements before the error are kept");
+    }
+
+    #[test]
+    fn a_repeated_attribute_keeps_its_first_value() {
+        let mut elements = BTreeMap::new();
+        let mut warnings = Vec::new();
+        parse_design_svg(
+            "<svg><rect id=\"a\" x=\"1\" x=\"2\" id=\"b\" y=\"3\"/></svg>",
+            "pages/home/page.svg",
+            0,
+            &mut elements,
+            &mut warnings,
+        );
+        assert_eq!(warnings.len(), 0, "{warnings:?}");
+        assert_eq!(elements.keys().collect::<Vec<_>>(), ["a"]);
+        let element = elements.get("a").expect("the element is read");
+        assert_eq!((element.x, element.y), (Some(1.0), Some(3.0)));
+
+        // An unquoted value is not read, and still takes the name.
+        elements.clear();
+        parse_design_svg(
+            "<svg><rect id=\"a\" x = 1 x=\"2\" y=\"3\"/></svg>",
+            "pages/home/page.svg",
+            0,
+            &mut elements,
+            &mut warnings,
+        );
+        let element = elements.get("a").expect("the element is read");
+        assert_eq!((element.x, element.y), (None, Some(3.0)));
+    }
+
+    #[test]
+    fn a_tag_with_very_many_attributes_is_read_in_linear_time() {
+        let mut src = String::from("<svg><rect id=\"a\"");
+        for index in 0..200_000 {
+            src.push_str(&format!(" a{index}=\"\""));
+        }
+        src.push_str(" y=\"3\"/></svg>");
+        let mut elements = BTreeMap::new();
+        let mut warnings = Vec::new();
+        let started = std::time::Instant::now();
+        parse_design_svg(&src, "pages/home/page.svg", 0, &mut elements, &mut warnings);
+        let elapsed = started.elapsed();
+        eprintln!("parse_design_svg, 200000 attributes: {elapsed:?}");
+        assert_eq!(elements.get("a").and_then(|element| element.y), Some(3.0));
+        // A duplicate check that compares every pair takes minutes here.
+        assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
     }
 
     #[test]
