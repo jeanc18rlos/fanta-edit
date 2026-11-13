@@ -13,7 +13,7 @@ affiliated with or endorsed by Zed Industries, Inc.
   is the engine group of `docs/architecture/layers.toml`: `fanta-doc`,
   `fanta-design-ops`, `fanta-canvas`, `fanta-tools`, `fanta-fnx`,
   `fanta-format`, `fanta-bundle`, `fanta-text`, `fanta-render`,
-  `fanta-present`, `fanta-headless`, `fanta-api`, `fanta-engine`, `fanta-mcp`,
+  `fanta-present`, `fanta-headless`, `fanta-api`, `fanta-worker`, `fanta-mcp`,
   `fanta-runtime`, `fanta-site` and `fanta-wasm-engine`. Their `LICENSE-APACHE`
   links point at the licence text only: the Zed Industries copyright line at
   the top of that file covers the code inherited from Zed, not the engine.
