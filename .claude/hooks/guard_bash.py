@@ -24,7 +24,7 @@ import sys
 FULL_CLIPPY_OVERRIDE = "FANTA_FULL_CLIPPY=1"
 SHELLS = {"bash", "sh", "zsh"}
 COMMAND_PREFIXES = {"env", "time", "nohup", "exec", "command"}
-SEGMENT_SEPARATOR = re.compile(r"&&|\|\||[;|&\n()`]|\$\(")
+SEGMENT_SEPARATORS = "();<>|&\n`"
 ENVIRONMENT_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 TARGET_DIRECTORY_SETTING = re.compile(
     r"(?:^|[\s;&|(])(?:export\s+)?CARGO_TARGET_DIR=(\"[^\"]*\"|'[^']*'|[^\s;&|)]+)"
@@ -45,18 +45,33 @@ def deny(reason):
     )
 
 
-def split_words(segment):
+def split_segments(command):
+    """Splits a command line into the word lists of its simple commands.
+
+    Shell operators only separate commands outside quotes, so the line is tokenized first:
+    `grep 'a\\|script/clippy' file` is one command whose pattern happens to name the script.
+    """
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=SEGMENT_SEPARATORS)
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
     try:
-        return shlex.split(segment)
+        tokens = list(lexer)
     except ValueError:
-        return segment.split()
+        tokens = command.split()
+    segments = [[]]
+    for token in tokens:
+        if token and all(character in SEGMENT_SEPARATORS for character in token):
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    return segments
 
 
 def runs_unscoped_clippy(command):
     if FULL_CLIPPY_OVERRIDE in command:
         return False
-    for segment in SEGMENT_SEPARATOR.split(command):
-        words = split_words(segment)
+    for words in split_segments(command):
         while words and (ENVIRONMENT_ASSIGNMENT.match(words[0]) or words[0] in COMMAND_PREFIXES):
             words = words[1:]
         if words and os.path.basename(words[0]) in SHELLS:
@@ -66,6 +81,10 @@ def runs_unscoped_clippy(command):
                 options.append(words.pop(0))
             # `bash -n script/clippy` only checks syntax.
             if "-n" in options:
+                continue
+            if any(option.endswith("c") for option in options):
+                if words and runs_unscoped_clippy(words[0]):
+                    return True
                 continue
         if not words or not words[0].endswith("script/clippy"):
             continue
@@ -150,7 +169,42 @@ def main():
         )
 
 
+def self_test():
+    denied = [
+        "./script/clippy",
+        "script/clippy --fix",
+        "cd crates && ../script/clippy",
+        "FOO=1 time ./script/clippy",
+        "ls\n./script/clippy",
+        "echo $(./script/clippy)",
+        "bash -c './script/clippy && ls'",
+    ]
+    allowed = [
+        "./script/clippy -p fanta-doc",
+        "./script/clippy --package fanta-doc",
+        "FANTA_FULL_CLIPPY=1 ./script/clippy",
+        "bash -n script/clippy",
+        "bash -c './script/clippy -p fanta-doc'",
+        "grep -rn 'runs_unscoped\\|script/clippy' .claude",
+        'grep -E "cargo clippy|script/clippy" docs',
+        "grep -rn 'cargo clippy\\|script/clippy\\|cargo fmt' docs",
+        "grep -rnE '(script/clippy)( |$)' docs",
+        "grep -rn '`./script/clippy`' CLAUDE.md",
+        'grep -rn "cargo clippy\\|script/clippy " docs',
+        "cat script/clippy",
+        "git log -- script/clippy",
+    ]
+    for command in denied:
+        assert runs_unscoped_clippy(command), f"should deny: {command}"
+    for command in allowed:
+        assert not runs_unscoped_clippy(command), f"should allow: {command}"
+    print(f"guard_bash.py: {len(denied) + len(allowed)} cases pass")
+
+
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        self_test()
+        sys.exit(0)
     try:
         main()
     except Exception as error:

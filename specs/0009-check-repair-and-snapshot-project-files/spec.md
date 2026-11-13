@@ -171,4 +171,6 @@ validator that runs without the editor.
 
 ## Changes after acceptance
 
-- None.
+- 2026-11-12: the founder accepted ADR 0026 with Apache-2.0 for the engine,
+  which confirms the reading of Q6: the licence covers `fanta-format` and
+  `fanta-doc`.

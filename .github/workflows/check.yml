@@ -1,9 +1,11 @@
 name: Check
 
 on:
+  # A branch push without a pull request starts nothing: the pull request run covers it.
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       native_video_only:
@@ -25,7 +27,7 @@ env:
 
 jobs:
   check:
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.native_video_only }}
+    if: ${{ (github.event_name != 'workflow_dispatch' || !inputs.native_video_only) && !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
     runs-on: macos-26
     timeout-minutes: 120
     steps:
@@ -39,6 +41,7 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: macos-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: ./.github/actions/prepare-skia-source
         with:
@@ -226,7 +229,7 @@ jobs:
         run: cargo test --locked -p sidebar --lib
 
   mac-app-store-runtime:
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.native_video_only }}
+    if: ${{ (github.event_name != 'workflow_dispatch' || !inputs.native_video_only) && !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
     runs-on: macos-26
     timeout-minutes: 90
     steps:
@@ -240,6 +243,8 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: macos-check
+          # The check job's build is the superset, and three saved copies would not fit the 10 GB cache limit.
+          save-if: 'false'
 
       - uses: ./.github/actions/prepare-skia-source
         with:
@@ -282,7 +287,7 @@ jobs:
         run: cargo test --locked -p project --test integration --features mac_app_store,test-support test_mac_app_store_
 
   release-blocker-regressions:
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.native_video_only }}
+    if: ${{ (github.event_name != 'workflow_dispatch' || !inputs.native_video_only) && !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
     runs-on: macos-26
     timeout-minutes: 120
     steps:
@@ -328,6 +333,8 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: macos-check
+          # The check job's build is the superset, and three saved copies would not fit the 10 GB cache limit.
+          save-if: 'false'
 
       - uses: ./.github/actions/prepare-skia-source
         with:
