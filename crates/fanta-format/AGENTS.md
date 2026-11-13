@@ -36,6 +36,7 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 ## Snapshots
 
 - `project/history.rs` runs git against `.fanta/history.git` only. Build every command through `History::git`, which sets `GIT_DIR` and `GIT_WORK_TREE` and shuts out the user's configuration; a bare `Command::new("git")` in the project directory acts on the user's repository. (#210)
+- `.fanta/history.git` arrives with the project folder, so it is input from whoever supplied the project: its config, attributes, hooks, links and redirect files can make git run programs. `History::git` rewrites or refuses them before every command (`secure_store`); never add a git call that skips it, read a setting back from that config, or tell an agent to run git against that directory. (#234)
 - New code that walks a whole project directory must skip `.fanta`, or it reads git objects as project files. Code that reads the named directories (`doc`, `pages`, `components`, `assets`) never reaches it. (#210)
 
 - After changing the save path or the snapshot store, run all of `cargo test --locked -p fig_viewer --lib`, not a filter: the store's binary files land in every project a test saves, and a serialization test far from the save code was the one that broke. (#215)

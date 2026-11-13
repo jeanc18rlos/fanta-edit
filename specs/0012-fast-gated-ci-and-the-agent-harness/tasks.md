@@ -13,7 +13,7 @@ before T1 in its own pull request.
 
 Fast CI:
 
-- [ ] **T1.** (plan A1) Add stages `render`, `shell` and `release-blockers` to
+- [x] **T1.** (#225) (plan A1) Add stages `render`, `shell` and `release-blockers` to
   `script/verify-fanta-release` and take `fanta-render` out of `engine`.
   Add the `changes` and `linux-test` jobs to `check.yml` as advisory
   (R3, R4, R5). Verify: `--list` shows the stages; the Linux job is green

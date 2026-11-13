@@ -24,7 +24,10 @@ GET serves the project's own files, exactly as any static server would, so
       RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build \
           crates/fanta-wasm-engine --target web --no-typescript --release
 
-Local development only: binds 127.0.0.1 and holds no authentication.
+Local development only: binds 127.0.0.1 and holds no authentication. A web
+page in the same browser can still send requests here, so every request must
+name this server in `Host` (a page that re-points its own domain at 127.0.0.1
+does not), and a write must come from a page this server served.
 """
 
 import argparse
@@ -180,6 +183,32 @@ class Handler(SimpleHTTPRequestHandler):
         cls.live_cache = (now + LIVE_CACHE_SECONDS, matched)
         return matched
 
+    def local_names(self):
+        port = self.server.server_address[1]
+        names = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        if port == 80:
+            names |= {"127.0.0.1", "localhost"}
+        return names
+
+    def parse_request(self):
+        if not super().parse_request():
+            return False
+        if self.headers.get("Host", "").lower() not in self.local_names():
+            self.send_error(HTTPStatus.FORBIDDEN, "this server answers on loopback only")
+            return False
+        return True
+
+    def cross_site(self):
+        """Whether a write comes from a page this server did not serve.
+
+        Browsers send `Origin` with every POST and PUT a page makes; other
+        clients (curl, scripts) send none.
+        """
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return False
+        return origin.lower() not in {f"http://{name}" for name in self.local_names()}
+
     def send_json(self, value):
         body = json.dumps(value).encode()
         self.send_response(HTTPStatus.OK)
@@ -231,6 +260,14 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path.split("?", 1)[0] != "/__fanta/ops":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
+        if self.cross_site():
+            self.send_error(HTTPStatus.FORBIDDEN, "cross-site request")
+            return
+        # A page on another site can send a form or plain text without the
+        # browser asking this server first, but not this content type.
+        if self.headers.get_content_type() != "application/json":
+            self.send_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "expected application/json")
+            return
         length = int(self.headers.get("Content-Length", -1))
         if length < 0 or length > MAX_PUT_BYTES:
             self.send_error(HTTPStatus.BAD_REQUEST, "missing or oversized body")
@@ -258,6 +295,9 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json(result)
 
     def do_PUT(self):
+        if self.cross_site():
+            self.send_error(HTTPStatus.FORBIDDEN, "cross-site request")
+            return
         target = contained(self.project, self.path.split("?", 1)[0])
         if target is None:
             self.send_error(HTTPStatus.FORBIDDEN, "outside the project")
@@ -285,11 +325,11 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, format, *args):  # noqa: A002 - stdlib signature
-        if "__fanta/capabilities" not in (args[0] if args else ""):
+        if "__fanta/capabilities" not in str(args[0] if args else ""):
             super().log_message(format, *args)
 
 
-def serve(project: Path, port: int, engine: Path | None):
+def make_server(project: Path, port: int, engine: Path | None):
     handler = type(
         "ProjectHandler",
         (Handler,),
@@ -300,7 +340,11 @@ def serve(project: Path, port: int, engine: Path | None):
     def factory(*arguments, **keywords):
         return handler(*arguments, directory=str(project), **keywords)
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), factory)
+    return ThreadingHTTPServer(("127.0.0.1", port), factory)
+
+
+def serve(project: Path, port: int, engine: Path | None):
+    server = make_server(project, port, engine)
     print(f"serving {project} at http://127.0.0.1:{server.server_address[1]}/")
     if engine is not None:
         print(f"engine: {engine} at /__fanta/engine/")
