@@ -69,7 +69,7 @@ Gates:
 - [x] **T15.** (plan G6) Measure `clippy::unwrap_used` and
   `let_underscore_must_use` in the four parser crates; enable per crate
   where small; record the counts here (R15). Verify: `./script/clippy -p`
-  for each crate. (#PRNUM)
+  for each crate. (#236)
 
   Counts on 2026-11-13, non-test code / test code (unit tests, `tests/`,
   examples and benches). `expect_used` is counted for information only.
