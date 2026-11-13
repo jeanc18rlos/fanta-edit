@@ -10,6 +10,8 @@ touches their file.
   (R4, R5, R6). Verify: A4, A5.
 - [ ] **T2.** `view.rs`: move `mod tests` to `view/tests.rs` and split it
   into `view/tests/*.rs` (R1, R2, R3). Verify: A2, A3.
+  First step, the move to `view/tests.rs`: #231. The split into
+  `view/tests/*.rs` is still open.
 - [ ] **T3.** `view.rs`: split the `impl FigView` blocks by method cluster
   into `view/*.rs` (R1, R2, R3). Verify: A2, A3.
 - [ ] **T4.** `gpui_adapters/design.rs` (17,674 lines): tests, then
