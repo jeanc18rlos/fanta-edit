@@ -26,6 +26,8 @@ Changes made while vendoring, and nothing else:
   `[workspace.package]` instead, so the headers still inherit.
 - Each crate directory gained a `LICENSE-GPL` symlink, as `script/check-licenses`
   requires.
+  Since spec 0002 T2 the engine crates are Apache-2.0 and link
+  `LICENSE-APACHE` instead, except `fanta-fig-interop` (see `NOTICE.md`).
 
 Divergences from upstream made *after* vendoring, to be re-applied on a resync:
 

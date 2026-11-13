@@ -147,6 +147,64 @@ ADR 0024 compares vendoring, sibling paths, a one-way mirror and crates.io.
   comes before the field change, and counsel confirms before the repository
   is public.
 
+## Provenance sweep (2026-11-13, T2)
+
+Result: nothing in the engine traces to Zed or to other GPL code. Seventeen
+crates are now `Apache-2.0`. `fanta-fig-interop` stays GPL-3.0 because of one
+open item, its golden fixtures. This is an engineering check, not legal
+advice; counsel confirms before the repository is public (ADR 0026).
+
+Method, on `main` at `3e4d7b5e`:
+
+- **History.** 867 tracked files: the 18 crates (780), the vendored Skia
+  binding (60) and the 27 files that move with them or that T4 decides on.
+  65 commits added them. Each was diffed against its whole parent tree with
+  `git show -M50% -C50% --find-copies-harder`: 83 copies or renames came from
+  outside the engine paths (43 Skia binding files renamed from 0.84.0, 18
+  `LICENSE-GPL` links, 8 `OFL.txt`, 9 files from `fig_viewer`, 5 from
+  `design_surface`). The 14 files from `fig_viewer` and
+  `design_surface` were first added between 2026-07-10 and 2026-10-15, after
+  the Zed baseline `8b08b060`, with no copy source of their own except
+  `design_surface/Cargo.toml`, a manifest modelled on `web_search`'s. Every commit
+  in the repository has one author.
+- **Content.** The 807 non-vendored files were searched for licence headers,
+  SPDX identifiers, copyright lines, attribution phrases, project names and
+  URLs. No file carries a licence header or names Zed.
+- **Similarity.** Windows of 8 normalised lines from the 399 engine Rust
+  files (167,437 windows) were looked up in 1,004 non-engine Rust files of
+  this checkout, the 1,806 of the Zed baseline and the 1,046 of the pinned
+  `fanta-ui`. 16 file pairs matched, 15 in `fig_viewer` and one in
+  `agent/src/tools/design_screenshot_tool.rs`, all Fanta's files from after
+  the baseline. None matched the baseline or `fanta-ui`.
+- **Dependencies.** `cargo metadata --locked`: no engine crate reaches a
+  workspace crate outside the group, dev-dependencies included. The 329
+  third-party packages in the normal and build closure, and 14 more through
+  dev-dependencies, are MIT, Apache-2.0, BSD, ISC, Zlib, Unicode or CC0 style,
+  except `option-ext` 0.2.0 (MPL-2.0), which `fanta-text` reaches through
+  `dirs`.
+
+| Path | Origin | Licence | Verdict |
+| --- | --- | --- | --- |
+| `crates/fanta-fig-interop/tests/golden/op_ref_*.json` (4 files) | Layer names, bounds, colours and text of Adobe's Spectrum Figma community file, distilled with OpenPencil | Not recorded | Open. The founder confirms the file's licence and adds its attribution, or removes the fixtures (only the opt-in legacy report reads them). The crate stays GPL-3.0 until then |
+| `crates/fanta-fig-interop/src/kiwi` | Rust port of the Kiwi wire format (evanw/kiwi) | MIT | Compatible; notice added to `NOTICE.md` |
+| `crates/fanta-fig-interop/src/mapping`, `crates/fanta-tools/src/select/reparent.rs`, comments in `fanta-doc` and `fanta-render` | Ported from or mirroring open-pencil/open-pencil ("op1") and ZSeven-W/openpencil ("op2") | MIT, both | Compatible; notices added |
+| `crates/fanta-tools/src/ink.rs`, `fixtures/ink` | Reimplementation of perfect-freehand's algorithm; the fixtures are its output. The generator `oracle/gen-ink.mjs` the header names is not in the tree | MIT | Compatible; notice added |
+| `crates/fanta-text/assets` (14 fonts) | Inter, Source Sans 3, Source Serif 4, Source Code Pro | OFL-1.1 | Compatible to bundle; the fonts keep OFL-1.1 and their `OFL.txt` |
+| `vendor/skia-bindings-0.153.3` | crates.io `skia-bindings` 0.153.3; the archive's SHA-256 and the 55 unchanged files match `FANTA-PROVENANCE.txt`, and `LICENSE` matches upstream's | MIT | Stays MIT, as `script/check-licenses` enforces |
+| `option-ext` 0.2.0 | crates.io dependency of `fanta-text` | MPL-2.0 | Unmodified dependency; for counsel's list |
+| `fanta-tools` (`select.rs`, `event.rs`, `tool.rs`), `fanta-canvas/src/snap.rs`, `fanta-doc/src/index.rs` | Comments say the design mirrors or is inspired by tldraw, Figma and Sketch | tldraw's licence is not open source | No port is claimed and none was found, but the code was not compared with tldraw's source; for counsel's list |
+| Files moved from `fig_viewer` and `design_surface` into `fanta-headless` and `fanta-design-ops` | Fanta's editor code | Was GPL-3.0-or-later, Fanta's own | Relicensed by its owner |
+
+Not checked: the engine's history before 2026-07-07, which lives in
+`squidred-dev/fantaisa-engine` (private, one contributor, no licence file);
+similarity against sources outside this repository (current Zed, OpenPencil,
+tldraw, Skia); JavaScript, CSS and C++ similarity; whether the fonts are
+byte-identical to their upstream releases.
+
+The root `LICENSE-APACHE` opens with Zed Industries' copyright line, so the
+crates' links to it are for the licence text only; T4 gives the engine
+repository its own `LICENSE`.
+
 ## Verification
 
 Each acceptance criterion maps to a task's check in `tasks.md`.
