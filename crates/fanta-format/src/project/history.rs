@@ -21,6 +21,17 @@ use super::diagnostic::{SNAPSHOT_UNAVAILABLE, SourceDiagnostic};
 /// walker of a project directory skips it.
 pub const HISTORY_DIR: &str = ".fanta";
 const GIT_DIR: &str = ".fanta/history.git";
+const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+/// What `git init --bare` writes, less what it probes from the file system.
+const STORE_CONFIG: &str = if cfg!(windows) {
+    "[core]\n\trepositoryformatversion = 0\n\tbare = true\n\tfilemode = false\n\tsymlinks = false\n"
+} else {
+    "[core]\n\trepositoryformatversion = 0\n\tbare = true\n\tfilemode = true\n"
+};
+/// Outranks any `.gitattributes` in the project: snapshots hold the bytes on
+/// disk, with no line-ending, encoding or filter conversion.
+const STORE_ATTRIBUTES: &str = "* -text -filter -ident -working-tree-encoding\n";
+const STORE_HEAD: &str = "ref: refs/heads/main\n";
 const SNAPSHOT_REFS: &str = "refs/snapshots/";
 const KEEP_EVERYTHING_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const MILLIS_PER_DAY: u128 = 24 * 60 * 60 * 1000;
@@ -107,7 +118,7 @@ impl History {
         if let Some(newest) = self.list()?.first() {
             let tree = self.stage()?;
             let name = format!("{SNAPSHOT_REFS}{}^{{tree}}", newest.id);
-            if self.run(self.git().args(["rev-parse", &name]))?.trim() == tree {
+            if self.run(self.git()?.args(["rev-parse", &name]))?.trim() == tree {
                 return Ok(None);
             }
         }
@@ -116,11 +127,10 @@ impl History {
 
     /// Bring the private index up to the files on disk; returns its tree.
     fn stage(&self) -> Result<String> {
-        self.ensure_repository()?;
         // `-f`: the project's own `.gitignore` must not thin the snapshot, or
         // a restore would not give back what the save changed.
-        self.run(self.git().args(["add", "-A", "-f", "--", ".", ":(exclude).fanta"]))?;
-        Ok(self.run(self.git().arg("write-tree"))?.trim().to_owned())
+        self.run(self.git()?.args(["add", "-A", "-f", "--", ".", ":(exclude).fanta"]))?;
+        Ok(self.run(self.git()?.arg("write-tree"))?.trim().to_owned())
     }
 
     fn record_at(&self, reason: SnapshotReason, time: SystemTime) -> Result<Snapshot> {
@@ -128,7 +138,7 @@ impl History {
         let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
         let date = format!("@{} +0000", since_epoch.as_secs());
         let commit = self.run(
-            self.git()
+            self.git()?
                 .env("GIT_AUTHOR_DATE", &date)
                 .env("GIT_COMMITTER_DATE", &date)
                 .args(["commit-tree", "--no-gpg-sign", "-m", reason.as_str()])
@@ -140,7 +150,7 @@ impl History {
         for millis in taken..taken + 1000 {
             let id = format!("{millis:013}");
             let name = format!("{SNAPSHOT_REFS}{id}");
-            if self.succeeds(self.git().args(["update-ref", &name, commit.trim(), ""]))? {
+            if self.succeeds(self.git()?.args(["update-ref", &name, commit.trim(), ""]))? {
                 return Ok(Snapshot {
                     id,
                     taken_at: UNIX_EPOCH + Duration::from_millis(millis as u64),
@@ -159,7 +169,7 @@ impl History {
         if !self.dir.join(GIT_DIR).is_dir() {
             return Ok(Vec::new());
         }
-        let refs = self.run(self.git().args([
+        let refs = self.run(self.git()?.args([
             "for-each-ref",
             "--format=%(refname:lstrip=2) %(contents:subject)",
             SNAPSHOT_REFS,
@@ -188,12 +198,12 @@ impl History {
         let target = format!("{SNAPSHOT_REFS}{id}");
         let tree = format!("{target}^{{tree}}");
         if !self.dir.join(GIT_DIR).is_dir()
-            || !self.succeeds(self.git().args(["rev-parse", "--verify", "--quiet", &tree]))?
+            || !self.succeeds(self.git()?.args(["rev-parse", "--verify", "--quiet", &tree]))?
         {
             return Err(FormatError::Snapshot(format!("no snapshot {id}")));
         }
         let before = self.record(SnapshotReason::BeforeRestore)?;
-        let gone = self.run(self.git().args([
+        let gone = self.run(self.git()?.args([
             "diff-tree",
             "-r",
             "-z",
@@ -218,8 +228,8 @@ impl History {
                 parent = folder.parent();
             }
         }
-        self.run(self.git().args(["read-tree", &target]))?;
-        self.run(self.git().args(["checkout-index", "-a", "-f"]))?;
+        self.run(self.git()?.args(["read-tree", &target]))?;
+        self.run(self.git()?.args(["checkout-index", "-a", "-f"]))?;
         Ok(before)
     }
 
@@ -244,73 +254,140 @@ impl History {
                 continue;
             }
             self.run(
-                self.git()
+                self.git()?
                     .args(["update-ref", "-d", &format!("{SNAPSHOT_REFS}{}", snapshot.id)]),
             )?;
             dropped = true;
         }
         if dropped {
-            self.run(self.git().args(["gc", "--auto", "--quiet"]))?;
+            self.run(self.git()?.args(["gc", "--auto", "--quiet"]))?;
         }
         Ok(())
     }
 
-    fn ensure_repository(&self) -> Result<()> {
-        let git_dir = self.dir.join(GIT_DIR);
-        if git_dir.join("HEAD").is_file() {
-            return Ok(());
-        }
+    /// Make the store directory safe to hand to git, creating it when it is
+    /// missing. The directory travels with the project folder, so everything
+    /// in it is input from whoever supplied the project, and is checked
+    /// before every command, not only at creation:
+    ///
+    /// - A link (on Windows also a junction) at `.fanta`, at the store, or at
+    ///   any entry git reads by a fixed name is refused: following one lets
+    ///   the project choose which files git reads and which Fanta overwrites.
+    ///   A store that is a file is refused too: git follows a `gitdir:` file.
+    /// - `HEAD`, `config` and `info/attributes` hold nothing a user sets, so
+    ///   they are overwritten with fixed content instead of being parsed.
+    ///   That drops every setting that names a command (filters,
+    ///   `diff.external`, `core.fsmonitor`, `core.hooksPath`, includes,
+    ///   extensions), and a `.gitattributes` in the project then names
+    ///   drivers that do not exist.
+    /// - `commondir` (moves config, objects and refs elsewhere),
+    ///   `objects/info/alternates` (borrows objects from any path) and
+    ///   `info/grafts` are deleted: the store never writes them.
+    /// - `hooks/` is left in place and never run: `git` points
+    ///   `core.hooksPath` at the null device on the command line, which
+    ///   outranks every file.
+    /// - `index`, `packed-refs`, `refs/`, `objects/` and `worktrees/` are
+    ///   data. A crafted one gives wrong or unreadable snapshots, which a
+    ///   project could ship anyway, and runs nothing.
+    fn secure_store(&self) -> Result<()> {
         let private = self.dir.join(HISTORY_DIR);
-        fs::create_dir_all(&private)?;
-        // The directory ignores itself, so the user's git never sees it and
-        // their own `.gitignore` is not edited.
-        fs::write(private.join(".gitignore"), "*\n")?;
-        self.run(
-            Command::new(&self.git)
-                .args(["init", "--quiet", "--bare", "--template="])
-                .arg(&git_dir),
-        )?;
-        fs::create_dir_all(git_dir.join("info"))?;
-        // Outranks any `.gitattributes` in the project: snapshots hold the
-        // bytes on disk, with no line-ending or filter conversion.
-        fs::write(git_dir.join("info/attributes"), "* -text -filter -ident\n")?;
+        let git_dir = self.dir.join(GIT_DIR);
+        refuse_link(&private)?;
+        refuse_link(&git_dir)?;
+        if fs::symlink_metadata(&git_dir).is_err() {
+            fs::create_dir_all(&private)?;
+            // The directory ignores itself, so the user's git never sees it
+            // and their own `.gitignore` is not edited.
+            fs::write(private.join(".gitignore"), "*\n")?;
+            fs::create_dir(&git_dir)?;
+        }
+        if !fs::symlink_metadata(&git_dir)?.is_dir() {
+            return Err(refused(&git_dir));
+        }
+        for name in [
+            "HEAD",
+            "config",
+            "hooks",
+            "info",
+            "info/attributes",
+            "info/grafts",
+            "objects",
+            "objects/info",
+            "objects/info/alternates",
+            "objects/info/http-alternates",
+            "refs",
+            "packed-refs",
+            "index",
+            "commondir",
+            "worktrees",
+        ] {
+            refuse_link(&git_dir.join(name))?;
+        }
+        for name in [
+            "commondir",
+            "info/grafts",
+            "objects/info/alternates",
+            "objects/info/http-alternates",
+        ] {
+            match fs::remove_file(git_dir.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        for folder in ["objects", "refs", "info"] {
+            fs::create_dir_all(git_dir.join(folder))?;
+        }
+        for (name, content) in [
+            ("HEAD", STORE_HEAD),
+            ("config", STORE_CONFIG),
+            ("info/attributes", STORE_ATTRIBUTES),
+        ] {
+            let path = git_dir.join(name);
+            // Rewritten only when it differs: a save runs a dozen git
+            // commands, and none should find the file half written.
+            if fs::read(&path).ok().as_deref() != Some(content.as_bytes()) {
+                fs::write(&path, content)?;
+            }
+        }
         Ok(())
     }
 
-    /// A git command against the private repository only. The user's and the
+    /// A git command against the private repository only, once
+    /// `secure_store` has made that repository inert. The user's and the
     /// system's configuration are shut out: signing, hooks, filters and
     /// line-ending settings must not shape or block a snapshot.
-    fn git(&self) -> Command {
+    fn git(&self) -> Result<Command> {
+        self.secure_store()?;
         let mut command = Command::new(&self.git);
+        // Set when Fanta is started from inside a git hook or alias, or by a
+        // shell profile: they redirect git or name programs for it to start.
+        for (name, _) in std::env::vars_os() {
+            if is_inherited_git_setting(&name.to_string_lossy()) {
+                command.env_remove(name);
+            }
+        }
         command
             .current_dir(&self.dir)
             .env("GIT_DIR", self.dir.join(GIT_DIR))
             .env("GIT_WORK_TREE", &self.dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
+            .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
+            .env("GIT_ATTR_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_AUTHOR_NAME", "Fanta")
             .env("GIT_AUTHOR_EMAIL", "snapshots@fanta.invalid")
             .env("GIT_COMMITTER_NAME", "Fanta")
             .env("GIT_COMMITTER_EMAIL", "snapshots@fanta.invalid")
-            .args(["-c", "core.autocrlf=false", "-c", "core.fsmonitor=false"]);
-        // Set when Fanta is started from inside a git hook or alias.
-        for inherited in [
-            "GIT_INDEX_FILE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_COMMON_DIR",
-            "GIT_NAMESPACE",
-            "GIT_PREFIX",
-        ] {
-            command.env_remove(inherited);
-        }
+            .args(["-c", "core.autocrlf=false", "-c", "core.fsmonitor=false"])
+            .args(["-c", &format!("core.hooksPath={NULL_DEVICE}")]);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt as _;
             // CREATE_NO_WINDOW: no console flashes up under the editor.
             command.creation_flags(0x0800_0000);
         }
-        command
+        Ok(command)
     }
 
     fn succeeds(&self, command: &mut Command) -> Result<bool> {
@@ -338,6 +415,29 @@ impl History {
         String::from_utf8(output.stdout)
             .map_err(|_| FormatError::Snapshot("git printed a path that is not UTF-8".to_owned()))
     }
+}
+
+/// Environment the store must not pass on: every `GIT_*` variable except
+/// the one that says where git's own programs are, and the variables naming
+/// an editor, pager or password prompt for git to start.
+fn is_inherited_git_setting(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    (name.starts_with("GIT_") && name != "GIT_EXEC_PATH")
+        || ["EDITOR", "VISUAL", "PAGER", "SSH_ASKPASS"].contains(&name.as_str())
+}
+
+fn refuse_link(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(refused(path)),
+        _ => Ok(()),
+    }
+}
+
+fn refused(path: &Path) -> FormatError {
+    FormatError::Snapshot(format!(
+        "{} is a link or not a folder, so the snapshot store is not used",
+        path.display()
+    ))
 }
 
 fn unavailable(error: FormatError) -> SourceDiagnostic {
@@ -544,6 +644,254 @@ mod tests {
         let second = history.record_at(SnapshotReason::AfterSave, time).unwrap();
         assert_ne!(first.id, second.id);
         assert_eq!(history.list().unwrap(), [second, first]);
+    }
+
+    /// A store as a hostile project would ship it. Every command it names
+    /// only creates a file in `markers`, so an empty `markers` proves that
+    /// none ran.
+    #[cfg(unix)]
+    fn plant_hostile_store(store: &Path, markers: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::create_dir_all(markers).unwrap();
+        let touch = |name: &str| format!("touch '{}/{name}'", markers.display());
+        for folder in ["objects", "refs", "info"] {
+            fs::create_dir_all(store.join(folder)).unwrap();
+        }
+        fs::write(store.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            store.join("config"),
+            format!(
+                "[core]\n\trepositoryformatversion = 0\n\tbare = true\n\
+                 \tfsmonitor = \"{}\"\n\thooksPath = {}\n\
+                 [filter \"planted\"]\n\tclean = \"{}; cat\"\n\tsmudge = \"{}; cat\"\n\
+                 [diff]\n\texternal = \"{}\"\n\
+                 [diff \"planted\"]\n\tcommand = \"{}\"\n\ttextconv = \"{}\"\n\
+                 [merge \"planted\"]\n\tdriver = \"{}\"\n",
+                touch("fsmonitor"),
+                store.join("planted-hooks").display(),
+                touch("filter-clean"),
+                touch("filter-smudge"),
+                touch("diff-external"),
+                touch("diff-command"),
+                touch("diff-textconv"),
+                touch("merge-driver"),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            store.join("info/attributes"),
+            "* filter=planted diff=planted merge=planted\n",
+        )
+        .unwrap();
+        for folder in ["hooks", "planted-hooks"] {
+            for hook in [
+                "post-index-change",
+                "reference-transaction",
+                "pre-auto-gc",
+                "post-checkout",
+            ] {
+                let path = store.join(folder).join(hook);
+                write(store, &format!("{folder}/{hook}"), &format!("#!/bin/sh\n{}\n", touch(hook)));
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn ran(markers: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(markers)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The store directory arrives with the project. One that names
+    /// commands in its config, attributes and hooks must run none of them,
+    /// and snapshots must still work.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_shipped_with_the_project_runs_nothing() {
+        let scratch = tempfile::tempdir().unwrap();
+        let project = scratch.path().join("design");
+        let markers = scratch.path().join("markers");
+        write(&project, "fanta.json", "{}");
+        write(&project, "pages/home/page.svg", "<svg/>\r\n");
+        plant_hostile_store(&project.join(GIT_DIR), &markers);
+        let before = files(&project);
+        let history = History::new(&project);
+
+        assert_eq!(history.before_save(), None);
+        write(&project, "pages/home/page.svg", "<svg data-save=\"1\"/>");
+        assert_eq!(history.after_save(), None);
+        let snapshots = history.list().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        history.restore(&snapshots[1].id).unwrap();
+        assert_eq!(files(&project), before);
+        // Far enough ahead that everything but one snapshot a day is
+        // dropped, which is what runs `gc`.
+        history.prune(SystemTime::now() + KEEP_EVERYTHING_FOR * 2).unwrap();
+        assert_eq!(history.list().unwrap().len(), 1);
+
+        assert_eq!(ran(&markers), Vec::<String>::new());
+        let store = project.join(GIT_DIR);
+        assert_eq!(fs::read_to_string(store.join("config")).unwrap(), STORE_CONFIG);
+        assert_eq!(fs::read_to_string(store.join("info/attributes")).unwrap(), STORE_ATTRIBUTES);
+    }
+
+    /// A `.gitattributes` in the project may name any driver: the store's
+    /// config defines none, even when the store came without its own
+    /// attributes file.
+    #[cfg(unix)]
+    #[test]
+    fn drivers_named_by_the_projects_gitattributes_do_not_exist() {
+        let scratch = tempfile::tempdir().unwrap();
+        let project = scratch.path().join("design");
+        let markers = scratch.path().join("markers");
+        write(&project, "fanta.json", "{}");
+        write(&project, "pages/home/page.svg", "<svg/>\r\n");
+        write(&project, ".gitattributes", "* filter=planted diff=planted merge=planted\n");
+        plant_hostile_store(&project.join(GIT_DIR), &markers);
+        fs::remove_file(project.join(GIT_DIR).join("info/attributes")).unwrap();
+        let before = files(&project);
+        let history = History::new(&project);
+
+        let taken = history.record(SnapshotReason::BeforeSave).unwrap();
+        write(&project, "pages/home/page.svg", "<svg/>");
+        history.restore(&taken.id).unwrap();
+        assert_eq!(files(&project), before);
+        assert_eq!(ran(&markers), Vec::<String>::new());
+    }
+
+    /// A link in place of the store, or of a file git reads from it, would
+    /// make git read (and Fanta overwrite) files the project chose. Such a
+    /// store is not used at all; the save goes on without a snapshot.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_that_is_or_holds_a_link_is_refused() {
+        use std::os::unix::fs::symlink;
+        for case in ["private folder", "store", "config", "hooks", "attributes", "gitdir file"] {
+            let scratch = tempfile::tempdir().unwrap();
+            let project = scratch.path().join("design");
+            let markers = scratch.path().join("markers");
+            let elsewhere = scratch.path().join("elsewhere");
+            write(&project, "fanta.json", "{}");
+            plant_hostile_store(&elsewhere.join("history.git"), &markers);
+            let planted = files(&elsewhere);
+            let store = project.join(GIT_DIR);
+            let outside = elsewhere.join("history.git");
+            if case == "private folder" {
+                symlink(&elsewhere, project.join(HISTORY_DIR)).unwrap();
+            } else if case == "store" {
+                fs::create_dir_all(project.join(HISTORY_DIR)).unwrap();
+                symlink(&outside, &store).unwrap();
+            } else if case == "gitdir file" {
+                write(&project, GIT_DIR, &format!("gitdir: {}\n", outside.display()));
+            } else {
+                for folder in ["objects", "refs", "info"] {
+                    fs::create_dir_all(store.join(folder)).unwrap();
+                }
+                fs::write(store.join("HEAD"), STORE_HEAD).unwrap();
+                let name = if case == "attributes" { "info/attributes" } else { case };
+                symlink(outside.join(name), store.join(name)).unwrap();
+            }
+            let history = History::new(&project);
+
+            assert!(history.record(SnapshotReason::AfterSave).is_err(), "{case}");
+            let finding = history.before_save().expect(case);
+            assert_eq!(finding.code, SNAPSHOT_UNAVAILABLE, "{case}");
+            assert!(history.after_save().is_some(), "{case}");
+            assert_eq!(ran(&markers), Vec::<String>::new(), "{case}");
+            assert_eq!(files(&elsewhere), planted, "{case}: the link's target was written");
+        }
+    }
+
+    /// Files inside a git directory that send git to another directory
+    /// without any config are removed before git runs.
+    #[cfg(unix)]
+    #[test]
+    fn redirections_inside_the_store_are_removed() {
+        let scratch = tempfile::tempdir().unwrap();
+        let project = scratch.path().join("design");
+        let markers = scratch.path().join("markers");
+        let elsewhere = scratch.path().join("elsewhere.git");
+        write(&project, "fanta.json", "{}");
+        plant_hostile_store(&elsewhere, &markers);
+        let planted = files(&elsewhere);
+        let store = project.join(GIT_DIR);
+        let redirections = [
+            ("commondir", format!("{}\n", elsewhere.display())),
+            ("objects/info/alternates", format!("{}/objects\n", elsewhere.display())),
+            ("info/grafts", String::new()),
+        ];
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("HEAD"), STORE_HEAD).unwrap();
+        for (name, content) in &redirections {
+            write(&store, name, content);
+        }
+        let history = History::new(&project);
+
+        let taken = history.record(SnapshotReason::AfterSave).unwrap();
+        assert_eq!(history.list().unwrap(), [taken]);
+        for (name, _) in &redirections {
+            assert!(!store.join(name).exists(), "{name}");
+        }
+        assert_eq!(ran(&markers), Vec::<String>::new());
+        assert_eq!(files(&elsewhere), planted);
+    }
+
+    /// Git runs with the store's own settings only: nothing inherited may
+    /// redirect it or name a program, and it never asks at a terminal.
+    #[test]
+    fn git_runs_in_a_controlled_environment() {
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_CONFIG",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GIT_ASKPASS",
+            "GIT_EDITOR",
+            "GIT_PAGER",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "git_proxy_command",
+            "SSH_ASKPASS",
+            "EDITOR",
+            "VISUAL",
+            "PAGER",
+        ] {
+            assert!(is_inherited_git_setting(name), "{name}");
+        }
+        for name in ["PATH", "HOME", "GIT_EXEC_PATH", "LANG", "TMPDIR", "DIGIT_X"] {
+            assert!(!is_inherited_git_setting(name), "{name}");
+        }
+
+        let scratch = tempfile::tempdir().unwrap();
+        let command = History::new(scratch.path()).git().unwrap();
+        let set = |name: &str| {
+            command
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        assert_eq!(set("GIT_CONFIG_NOSYSTEM").as_deref(), Some("1"));
+        assert_eq!(set("GIT_CONFIG_GLOBAL").as_deref(), Some(NULL_DEVICE));
+        assert_eq!(set("GIT_ATTR_NOSYSTEM").as_deref(), Some("1"));
+        assert_eq!(set("GIT_TERMINAL_PROMPT").as_deref(), Some("0"));
+        let store = scratch.path().join(GIT_DIR);
+        assert_eq!(set("GIT_DIR").as_deref(), Some(store.to_string_lossy().as_ref()));
+        let arguments: Vec<_> = command.get_args().map(|argument| argument.to_string_lossy()).collect();
+        assert!(arguments.contains(&format!("core.hooksPath={NULL_DEVICE}").into()));
+        assert!(arguments.contains(&"core.fsmonitor=false".into()));
     }
 
     #[test]
