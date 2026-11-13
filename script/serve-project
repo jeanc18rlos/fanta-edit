@@ -5,7 +5,8 @@ needs (spec 0008 T3).
     script/serve-project <project-dir> [--port 8080] [--engine <pkg-dir>]
 
 GET serves the project's own files, exactly as any static server would, so
-`index.html` works unchanged. On top of that:
+`index.html` works unchanged, except `.git/` and `.fanta/`, which answer 404.
+On top of that:
 
 - `/__fanta/capabilities` answers `{"write": true, "engine": <bool>,
   "live": <bool>, "stamp": <latest change>}`; the emitted `editor.js`
@@ -42,6 +43,9 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 SKIPPED_DIRECTORIES = {".git", ".fanta", "exports", "previews", "node_modules"}
+# Never served: git's own data and the snapshot store hold every past version
+# of the project, and no page needs them.
+PRIVATE_DIRECTORIES = {".git", ".fanta"}
 MAX_PUT_BYTES = 64 * 1024 * 1024
 LIVE_CACHE_SECONDS = 5.0
 INITIALIZE_PARAMS = {
@@ -208,6 +212,17 @@ class Handler(SimpleHTTPRequestHandler):
         if origin is None:
             return False
         return origin.lower() not in {f"http://{name}" for name in self.local_names()}
+
+    def send_head(self):
+        """The static file for GET and HEAD, unless it is private."""
+        target = Path(self.translate_path(self.path)).resolve()
+        root = self.project.resolve()
+        inside = target.relative_to(root).parts if root in target.parents else ()
+        # Lower case: macOS and Windows open `.GIT` as `.git`.
+        if PRIVATE_DIRECTORIES & {part.lower() for part in inside}:
+            self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+            return None
+        return super().send_head()
 
     def send_json(self, value):
         body = json.dumps(value).encode()
