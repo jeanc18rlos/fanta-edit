@@ -1366,9 +1366,9 @@ reuse a running app. Set `FANTA_USER_DATA_DIR` to the candidate profile and use
 `--screenshot-path` to retain its PNG. Retain its assertions and screenshot alongside native UI
 evidence. It is intentionally outside the default runner.
 
-The `Check` workflow runs the runner's engine, import, source-order, editor,
+The `Check` workflow runs the runner's engine, render, import, source-order, editor,
 workspace and UI stages and uploads their logs/results, including after a failed test stage.
-The default runner also includes build and lint. Workspace coverage exercises
+The default runner also includes shell, release-blockers, build and lint. Workspace coverage exercises
 serialization ordering, immediate Quit, Hot Exit and tab restoration alongside
 the canvas-specific journeys in the editor suite.
 It also covers account/provider, sidebar, Git and Mac App Store execution
