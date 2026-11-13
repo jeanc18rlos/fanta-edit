@@ -66,10 +66,28 @@ Gates:
   `script/gate` (R9). Needs T2. Verify: A6.
 - [ ] **T14.** (plan G5) Fuzz targets for the four parsers and their nightly
   job (R13, R14). Needs T3. Verify: A8.
-- [ ] **T15.** (plan G6) Measure `clippy::unwrap_used` and
+- [x] **T15.** (plan G6) Measure `clippy::unwrap_used` and
   `let_underscore_must_use` in the four parser crates; enable per crate
   where small; record the counts here (R15). Verify: `./script/clippy -p`
-  for each crate.
+  for each crate. (#PRNUM)
+
+  Counts on 2026-11-13, non-test code / test code (unit tests, `tests/`,
+  examples and benches). `expect_used` is counted for information only.
+
+  | Crate | `unwrap_used` | `let_underscore_must_use` | `expect_used` | Enabled |
+  | --- | --- | --- | --- | --- |
+  | `fanta-fig-interop` | 0 / 437 | 0 / 0 | 0 / 185 | both |
+  | `fanta-fnx` | 0 / 109 | 0 / 0 | 0 / 193 | both |
+  | `fanta-format` | 1 / 1328 | 35 / 1 | 3 / 1368 | `unwrap_used` |
+  | `fanta-bundle` | 0 / 0 | 0 / 0 | 0 / 16 | both |
+
+  The lints are a crate-root `#![cfg_attr(not(test), deny(...))]`, so they
+  cover the library and leave tests free to unwrap. The one `unwrap` in
+  `fanta-format` (`project/session/artifact.rs`, a session-state invariant
+  that no file content reaches) now returns a `SessionError`. Its 35
+  `let_underscore_must_use` sites are all `let _ = write!(...)` into a
+  `String` in the web writer `project/web.rs`, which cannot fail, so that
+  lint stays off there.
 - [ ] **T16.** (plan G7) Security review of the November agent surfaces;
   findings filed as issues and linked here (R16). Verify: A11.
 - [ ] **T17.** (plan G8) `SECURITY.md` (R12). Verify: A11.

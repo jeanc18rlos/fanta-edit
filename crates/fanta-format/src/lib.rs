@@ -41,6 +41,9 @@
 //! ```
 
 #![forbid(unsafe_code)]
+// Reads untrusted files, so it must not panic on them; tests may unwrap.
+// `clippy::let_underscore_must_use` stays off: see spec 0012 T15.
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 // The wasm build compiles out the disk writers; their std-only helpers go
 // dead there while the default build keeps full dead-code analysis.
 #![cfg_attr(not(feature = "native"), allow(dead_code))]
