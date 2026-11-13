@@ -1,6 +1,6 @@
 # fanta-headless rules
 
-The editor's document code that runs without the app: opening a project, settling layout, the comment model, the agent scene and style projections, screenshots and the source-preserving save. `fig_viewer` re-exports it, and the cloud engine (`crates/fanta-engine`) runs it on Linux.
+The editor's document code that runs without the app: opening a project, settling layout, the comment model, the agent scene and style projections, screenshots and the source-preserving save. `fig_viewer` re-exports it, and the cloud engine (`crates/fanta-worker`) runs it on Linux.
 
 PR numbers point at the change that found each trap (`gh pr view <n>`).
 

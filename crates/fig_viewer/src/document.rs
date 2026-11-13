@@ -9171,6 +9171,8 @@ mod tests {
     /// Spec 0009 A3: for each hostile-edit case, open it, save it, and restore
     /// the snapshot taken before the save. The files are byte-identical to
     /// the hostile state.
+    // The App Store build runs no git, so it takes no snapshots to restore.
+    #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
     #[gpui::test]
     async fn every_corpus_case_is_restored_byte_identical_after_a_save(cx: &mut TestAppContext) {
         fn copy(from: &Path, to: &Path) {
