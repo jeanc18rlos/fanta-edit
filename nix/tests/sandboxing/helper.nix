@@ -23,11 +23,9 @@ let
       builtins.elem firstComp [
         "crates"
         "assets"
-        "extensions"
         "script"
         "tooling"
         "Cargo.toml"
-        ".config"
         ".cargo"
       ];
     name = "bwrap-test-helper-source";

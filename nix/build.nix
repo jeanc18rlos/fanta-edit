@@ -68,11 +68,9 @@ let
       topLevelIncludes = [
         "crates"
         "assets"
-        "extensions"
         "script"
         "tooling"
         "Cargo.toml"
-        ".config" # nextest?
         ".cargo"
       ];
       firstComp = builtins.head (lib.path.subpath.components relPath);

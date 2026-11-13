@@ -117,7 +117,7 @@ jobs:
           (evidence / "upstream-source.json").write_text(json.dumps(records, indent=2) + "\n")
           PY
 
-      - uses: ./.github/actions/prepare-skia-source
+      - uses: $/.github/actions/prepare-skia-source
 
       - name: Compile default renderer from Skia source
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}

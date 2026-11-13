@@ -3,16 +3,6 @@ name: Build macOS release
 on:
   push:
     tags: ['v*']
-    branches: ['codex-release-backend-gateway']
-    paths:
-      - '.github/workflows/release-macos.yml'
-      - '.cargo/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'crates/**'
-      - 'assets/**'
-      - 'script/**'
   workflow_dispatch:
     inputs:
       distribution:
@@ -62,6 +52,10 @@ jobs:
     name: Build Apple Silicon installer
     runs-on: macos-26
     timeout-minutes: 180
+    # Signed and Mac App Store builds read the signing secrets, which live only in the release
+    # environment, and it admits main and release tags. Unsigned test builds run anywhere, in
+    # an environment that holds no secrets.
+    environment: ${{ (startsWith(github.ref, 'refs/tags/') || inputs.signed || inputs.distribution == 'app-store') && 'release' || 'unsigned-build' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -93,7 +87,7 @@ jobs:
         run: |
           for name in MACOS_CERTIFICATE MACOS_CERTIFICATE_PASSWORD APPLE_NOTARIZATION_KEY APPLE_NOTARIZATION_KEY_ID APPLE_NOTARIZATION_ISSUER_ID; do
             if [[ -z "${!name}" ]]; then
-              echo "::error::Configure the ${name} repository secret before building for distribution."
+              echo "::error::Configure the ${name} secret in the release environment before building for distribution."
               exit 1
             fi
           done
@@ -109,7 +103,7 @@ jobs:
         run: |
           for name in MACOS_APP_STORE_CERTIFICATE MACOS_APP_STORE_CERTIFICATE_PASSWORD MACOS_APP_STORE_INSTALLER_CERTIFICATE MACOS_APP_STORE_INSTALLER_CERTIFICATE_PASSWORD MACOS_APP_STORE_PROFILE; do
             if [[ -z "${!name}" ]]; then
-              echo "::error::Configure the ${name} repository secret before building a Mac App Store package."
+              echo "::error::Configure the ${name} secret in the release environment before building a Mac App Store package."
               exit 1
             fi
           done
@@ -194,28 +188,6 @@ jobs:
           cd target/aarch64-apple-darwin/release
           shasum -a 256 Fanta-aarch64.dmg > SHA256SUMS.txt
 
-      # The signer installs in its own step, so no package's install code sees
-      # the key, and its packages are pinned, so a new release of one cannot.
-      - name: Install the update signer
-        if: env.FANTA_APP_STORE != 'true' && env.FANTA_REQUIRE_NOTARIZATION == 'true'
-        run: |
-          python3 -m venv "$RUNNER_TEMP/update-signing"
-          "$RUNNER_TEMP/update-signing/bin/pip" install --quiet cryptography==50.0.2 cffi==2.1.1 pycparser==3.12
-
-      # Installed copies update themselves only with installers this key signed
-      # (crates/auto_update/src/verify.rs). The signature ships next to the DMG.
-      - name: Sign the installer for in-place updates
-        if: env.FANTA_APP_STORE != 'true' && env.FANTA_REQUIRE_NOTARIZATION == 'true'
-        env:
-          FANTA_UPDATE_SIGNING_KEY: ${{ secrets.FANTA_UPDATE_SIGNING_KEY }}
-        run: |
-          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
-          "$RUNNER_TEMP/update-signing/bin/python" script/update_signing.py sign \
-            --asset Fanta-aarch64.dmg --version "$version" \
-            --file target/aarch64-apple-darwin/release/Fanta-aarch64.dmg \
-            --public-key-file crates/auto_update/release-signing-key.pub \
-            > target/aarch64-apple-darwin/release/Fanta-aarch64.dmg.sig
-
       - name: Verify Mac App Store package and record checksums
         if: env.FANTA_APP_STORE == 'true'
         env:
@@ -255,7 +227,6 @@ jobs:
           name: fanta-macos-aarch64-${{ env.FANTA_REQUIRE_NOTARIZATION == 'true' && 'notarized' || 'test-only' }}
           path: |
             target/aarch64-apple-darwin/release/Fanta-aarch64.dmg
-            target/aarch64-apple-darwin/release/Fanta-aarch64.dmg.sig
             target/aarch64-apple-darwin/release/SHA256SUMS.txt
           if-no-files-found: error
           compression-level: 0
@@ -293,10 +264,57 @@ jobs:
         run: |
           printf '### Fanta for the Mac App Store\n\nSigned package and checksum are in this run’s installer artifact. It has not been uploaded to App Store Connect.\n\nCommit: `%s`\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
 
+  # Installed copies update themselves only with installers this key signed
+  # (crates/auto_update/src/verify.rs). Signing runs in its own small job, so the update key
+  # is never present while the build runs dependency build scripts, and only the release
+  # environment holds it.
+  sign-update:
+    name: Sign the DMG for in-place updates
+    if: inputs.distribution != 'app-store' && (startsWith(github.ref, 'refs/tags/') || inputs.signed)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fanta-macos-aarch64-notarized
+          path: target
+
+      # Its own step, so no package's install code runs with the key in its environment.
+      - name: Install the update signer
+        run: |
+          python3 -m venv "$RUNNER_TEMP/update-signing"
+          "$RUNNER_TEMP/update-signing/bin/pip" install --quiet --require-hashes --only-binary :all: \
+            -r script/update-signing-requirements.txt
+
+      - name: Sign the DMG
+        env:
+          FANTA_UPDATE_SIGNING_KEY: ${{ secrets.FANTA_UPDATE_SIGNING_KEY }}
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
+          "$RUNNER_TEMP/update-signing/bin/python" script/update_signing.py sign \
+            --asset Fanta-aarch64.dmg --version "$version" \
+            --file target/Fanta-aarch64.dmg \
+            --public-key-file crates/auto_update/release-signing-key.pub \
+            > target/Fanta-aarch64.dmg.sig
+
+      - name: Upload the update signature
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fanta-macos-aarch64-update-signature
+          path: target/Fanta-aarch64.dmg.sig
+          if-no-files-found: error
+          retention-days: 30
+
   draft-release:
     name: Prepare draft release
     if: startsWith(github.ref, 'refs/tags/') && inputs.distribution != 'app-store'
-    needs: build
+    needs: [build, sign-update]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -312,6 +330,11 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: fanta-macos-aarch64-notarized
+          path: release
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fanta-macos-aarch64-update-signature
           path: release
 
       - name: Add the verified installer to the draft release
