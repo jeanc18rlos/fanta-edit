@@ -1,5 +1,5 @@
 ---
-status: draft
+status: accepted
 date: 2026-10-27
 owner: Jean Rojas
 decisions: [0023, 0024, 0025, 0026]
@@ -30,9 +30,9 @@ proposes a third attempt; this spec says what it must achieve.
 - Publishing to crates.io.
 - Moving `fig_viewer` or any other editor crate.
 - Changing the engine's public API or its crate names, except the cloud
-  worker rename if Q2 says so.
+  worker rename (Q2).
 - Choosing the licence. ADR 0026 decides it; this spec only blocks going
-  public until it is decided.
+  public until its conditions are met.
 
 ## Requirements
 
@@ -80,17 +80,24 @@ proposes a third attempt; this spec says what it must achieve.
 
 ## Open questions
 
-- **Q1.** Which licence (ADR 0026)?
-- **Q2.** Rename the cloud worker crate from `fanta-engine` to free the name?
-  Recommended: `fanta-worker`.
-- **Q3.** Tag versions (`v0.x.y`) from the first day, or pin revisions until
-  an outside consumer exists? Recommended: tags from the first day, so
-  consumers and the changelog speak the same language.
-- **Q4.** Should the cloud contract (`docs/cloud-engine-contracts.md`) move to
-  the engine repository, with the backend keeping its copy? Recommended: yes,
-  since the engine owns the wire types.
-- **Q5.** Keep the vendored `skia-bindings` in the engine repository, or give
-  it its own? Recommended: keep it; it changes only with Skia upgrades.
+All resolved by the founder on 2026-11-12.
+
+- **Q1.** ~~Which licence (ADR 0026)?~~ **Resolved:** Apache-2.0 for the
+  engine and the SDK; the editor stays GPL.
+- **Q2.** ~~Rename the cloud worker crate from `fanta-engine` to free the
+  name?~~ **Resolved:** yes, to `fanta-worker`.
+- **Q3.** ~~Tag versions (`v0.x.y`) from the first day, or pin revisions
+  until an outside consumer exists?~~ **Resolved:** tags from the first
+  day, starting at `v0.1.0`. The editor still pins an exact revision (R3).
+- **Q4.** ~~Should the cloud contract (`docs/cloud-engine-contracts.md`)
+  move to the engine repository, with the backend keeping its copy?~~
+  **Resolved:** yes, it moves.
+- **Q5.** ~~Keep the vendored `skia-bindings` in the engine repository, or
+  give it its own?~~ **Resolved:** it stays with the engine.
+
+The founder also set the order: preparation (T2 to T5) starts now, and the
+editor switch (T6) waits until no open pull request touches an engine crate.
+The earlier hold for spec 0007 is released, since its tasks have merged.
 
 ## Changes after acceptance
 
