@@ -1,5 +1,6 @@
 ---
-status: accepted
+status: superseded
+superseded-by: 0030
 date: 2026-10-05
 recorded: 2026-10-27
 decision-makers: Jean Rojas
