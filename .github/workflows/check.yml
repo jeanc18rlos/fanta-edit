@@ -90,7 +90,7 @@ jobs:
         with:
           shared-key: hygiene
           cache-targets: 'false'
-          save-if: 'true'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install typos, zizmor and cargo-deny
         run: script/install-gate-tools "${RUNNER_TEMP}/gate-tools"
