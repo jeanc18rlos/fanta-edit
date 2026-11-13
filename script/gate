@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""The checks a change must pass, the same locally and in CI.
+
+Without options it runs the checks that need no compile and take seconds.
+`--full` then lints the crates the branch changed and runs the
+script/verify-fanta-release stages that test them.
+"""
+
+import argparse
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+BASE = "origin/main"
+
+# (name, command). The first word is the tool that must be installed.
+FAST_CHECKS = [
+    ("architecture", ["script/architecture", "verify"]),
+    ("bash-guard", ["python3", ".claude/hooks/guard_bash.py", "--self-test"]),
+    ("gate", ["script/gate", "--self-test"]),
+]
+
+
+def run(name, command, list_only):
+    print(f"{name}: {shlex.join(command)}", flush=True)
+    if list_only:
+        return True
+    tool = command[0]
+    if not (ROOT / tool).exists() and shutil.which(tool) is None:
+        # CI must not pass because a tool was missing from the image.
+        if os.environ.get("CI"):
+            print(f"FAIL {name}: {tool} is not installed")
+            return False
+        print(f"SKIP {name}: {tool} is not installed")
+        return True
+    passed = subprocess.run(command, cwd=ROOT).returncode == 0
+    print(f"{'PASS' if passed else 'FAIL'} {name}", flush=True)
+    return passed
+
+
+def git_lines(*arguments):
+    result = subprocess.run(
+        ["git", *arguments], cwd=ROOT, check=True, stdout=subprocess.PIPE, text=True
+    )
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def changed_files():
+    merge_base = git_lines("merge-base", BASE, "HEAD")[0]
+    return sorted(
+        set(git_lines("diff", "--name-only", merge_base))
+        | set(git_lines("ls-files", "--others", "--exclude-standard"))
+    )
+
+
+def crate_directories():
+    metadata = json.loads(
+        subprocess.run(
+            ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
+            cwd=ROOT,
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        ).stdout
+    )
+    return {
+        Path(package["manifest_path"]).parent.relative_to(ROOT).as_posix(): package["name"]
+        for package in metadata["packages"]
+    }
+
+
+def changed_crates(files, directories):
+    crates = set()
+    for file in files:
+        owners = [directory for directory in directories if file.startswith(directory + "/")]
+        if owners:
+            crates.add(directories[max(owners, key=len)])
+    return sorted(crates)
+
+
+def stages_for(crates, stage_listing):
+    """Picks the test stages whose command names a changed crate.
+
+    Returns the stages and the changed crates that no stage tests.
+
+    `stage_listing` is the output of `script/verify-fanta-release --list`:
+    one `stage: command` line per stage. The lint stages are left out
+    because `--full` lints the changed crates itself.
+    """
+    stages = []
+    untested = set(crates)
+    for line in stage_listing.splitlines():
+        stage, _, command = line.partition(": ")
+        words = shlex.split(command)
+        packages = {words[index + 1] for index, word in enumerate(words[:-1]) if word == "-p"}
+        if stage.startswith("lint") or not packages & set(crates):
+            continue
+        stages.append(stage)
+        untested -= packages
+    return stages, sorted(untested)
+
+
+def full_checks(list_only):
+    crates = changed_crates(changed_files(), crate_directories())
+    if not crates:
+        print(f"No crate changed since {BASE}: nothing to lint or test.")
+        return True
+    listing = subprocess.run(
+        ["script/verify-fanta-release", "--list"],
+        cwd=ROOT,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout
+    package_arguments = [argument for crate in crates for argument in ("-p", crate)]
+    passed = run("clippy", ["script/clippy", "--locked", *package_arguments], list_only)
+    stages, untested = stages_for(crates, listing)
+    if stages:
+        stage_arguments = [argument for stage in stages for argument in ("--stage", stage)]
+        passed &= run("stages", ["script/verify-fanta-release", *stage_arguments], list_only)
+    if untested:
+        untested_arguments = [argument for crate in untested for argument in ("-p", crate)]
+        passed &= run("tests", ["cargo", "test", "--locked", *untested_arguments], list_only)
+    return passed
+
+
+def self_test():
+    directories = {"crates/fanta-doc": "fanta-doc", "crates/fanta-doc/fuzz": "fanta-doc-fuzz"}
+    files = ["crates/fanta-doc/src/scene.rs", "crates/fanta-doc/fuzz/a.rs", "docs/x.md"]
+    assert changed_crates(files, directories) == ["fanta-doc", "fanta-doc-fuzz"]
+    listing = (
+        "engine: cargo test --locked -p fanta-doc -p fanta-fnx\n"
+        "workspace: cargo test --locked -p workspace --lib\n"
+        "lint: ./script/clippy --locked -p fanta-doc\n"
+    )
+    assert stages_for(["agent", "fanta-doc"], listing) == (["engine"], ["agent"])
+    print("script/gate: self-test passes")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    parser.add_argument(
+        "--full", action="store_true", help=f"also lint and test the crates changed since {BASE}"
+    )
+    parser.add_argument("--list", action="store_true", help="print the commands without running")
+    parser.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
+    arguments = parser.parse_args()
+    if arguments.self_test:
+        self_test()
+        return 0
+    passed = True
+    for name, command in FAST_CHECKS:
+        passed &= run(name, command, arguments.list)
+    if arguments.full and (passed or arguments.list):
+        passed &= full_checks(arguments.list)
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
