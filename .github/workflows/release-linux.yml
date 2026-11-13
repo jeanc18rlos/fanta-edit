@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       signed:
-        description: Sign the tarball for in-place updates (requires FANTA_UPDATE_SIGNING_KEY)
+        description: Sign the tarball for in-place updates (runs only from main; needs FANTA_UPDATE_SIGNING_KEY in the release environment)
         required: true
         default: false
         type: boolean
@@ -31,7 +31,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: '0'
   FANTA_RELEASE_CHANNEL: stable
-  FANTA_SIGN_UPDATE: ${{ startsWith(github.ref, 'refs/tags/') || inputs.signed || false }}
 
 jobs:
   build:
@@ -77,26 +76,6 @@ jobs:
       - name: Record checksum
         working-directory: target/release
         run: sha256sum fanta-linux-x86_64.tar.gz > SHA256SUMS-linux-x86_64.txt
-
-      # Installed copies update themselves only with tarballs this key signed
-      # (crates/auto_update/src/verify.rs). The signature ships next to the tarball.
-      - name: Sign the tarball for in-place updates
-        if: env.FANTA_SIGN_UPDATE == 'true'
-        env:
-          FANTA_UPDATE_SIGNING_KEY: ${{ secrets.FANTA_UPDATE_SIGNING_KEY }}
-        run: |
-          if [[ -z "$FANTA_UPDATE_SIGNING_KEY" ]]; then
-            echo "::warning::FANTA_UPDATE_SIGNING_KEY is not set, so this tarball is unsigned and installed copies will not update to it."
-            exit 0
-          fi
-          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
-          python3 -m venv "$RUNNER_TEMP/update-signing"
-          "$RUNNER_TEMP/update-signing/bin/pip" install --quiet 'cryptography>=42'
-          "$RUNNER_TEMP/update-signing/bin/python" script/update_signing.py sign \
-            --asset fanta-linux-x86_64.tar.gz --version "$version" \
-            --file target/release/fanta-linux-x86_64.tar.gz \
-            --public-key-file crates/auto_update/release-signing-key.pub \
-            > target/release/fanta-linux-x86_64.tar.gz.sig
 
       # Installs the tarball the way users do, then opens the sample project under Xvfb with
       # Mesa's software Vulkan, so a startup panic or a broken bundle fails the build.
@@ -202,7 +181,6 @@ jobs:
           name: fanta-linux-x86_64
           path: |
             target/release/fanta-linux-x86_64.tar.gz
-            target/release/fanta-linux-x86_64.tar.gz.sig
             target/release/SHA256SUMS-linux-x86_64.txt
           if-no-files-found: error
           compression-level: 0
@@ -218,17 +196,63 @@ jobs:
 
       - name: Summarize build
         run: |
-          if [[ -s target/release/fanta-linux-x86_64.tar.gz.sig ]]; then
-            signing='Signed for in-place updates.'
-          else
-            signing='Unsigned: installed copies will not update to this tarball.'
+          printf '### Fanta for Linux (x86_64)\n\nCommit: `%s`\n\nThe tarball and its checksum are in this run’s `fanta-linux-x86_64` artifact, and its update signature, if any, comes from the sign-update job. Crash symbols are stored separately.\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  # Installed copies update themselves only with tarballs this key signed
+  # (crates/auto_update/src/verify.rs). The key lives only in the release environment, which
+  # admits main and release tags, so a branch that edits this workflow still can't reach it.
+  sign-update:
+    name: Sign the tarball for in-place updates
+    if: startsWith(github.ref, 'refs/tags/') || inputs.signed
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fanta-linux-x86_64
+          path: target
+
+      # Its own step, so no package's install code runs with the key in its environment.
+      - name: Install the update signer
+        run: |
+          python3 -m venv "$RUNNER_TEMP/update-signing"
+          "$RUNNER_TEMP/update-signing/bin/pip" install --quiet --require-hashes --only-binary :all: \
+            -r script/update-signing-requirements.txt
+
+      - name: Sign the tarball
+        env:
+          FANTA_UPDATE_SIGNING_KEY: ${{ secrets.FANTA_UPDATE_SIGNING_KEY }}
+        run: |
+          if [[ -z "$FANTA_UPDATE_SIGNING_KEY" ]]; then
+            echo "::warning::FANTA_UPDATE_SIGNING_KEY is not set in the release environment, so this tarball is unsigned and installed copies will not update to it."
+            exit 0
           fi
-          printf '### Fanta for Linux (x86_64)\n\n%s\n\nCommit: `%s`\n\nThe tarball, its signature and checksum are in this run’s `fanta-linux-x86_64` artifact. Crash symbols are stored separately.\n' "$signing" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
+          "$RUNNER_TEMP/update-signing/bin/python" script/update_signing.py sign \
+            --asset fanta-linux-x86_64.tar.gz --version "$version" \
+            --file target/fanta-linux-x86_64.tar.gz \
+            --public-key-file crates/auto_update/release-signing-key.pub \
+            > target/fanta-linux-x86_64.tar.gz.sig
+          echo 'The tarball is signed for in-place updates.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the update signature
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fanta-linux-x86_64-update-signature
+          path: target/fanta-linux-x86_64.tar.gz.sig
+          if-no-files-found: ignore
+          retention-days: 30
 
   draft-release:
     name: Add to the draft release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    needs: [build, sign-update]
     runs-on: ubuntu-latest
     # Each platform's release workflow uses this group, so they add to one draft in turn.
     concurrency:
@@ -241,9 +265,11 @@ jobs:
         with:
           persist-credentials: false
 
+      # The tarball, plus its update signature when sign-update produced one.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: fanta-linux-x86_64
+          pattern: fanta-linux-x86_64*
+          merge-multiple: true
           path: release
 
       - name: Upload the tarball to the draft
