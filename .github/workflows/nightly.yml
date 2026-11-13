@@ -42,7 +42,7 @@ jobs:
           # Restore only: the check job on main owns this key, and a second copy would not fit the 10 GB cache limit.
           save-if: 'false'
 
-      - uses: ./.github/actions/prepare-skia-source
+      - uses: $/.github/actions/prepare-skia-source
         with:
           offline: 'true'
 
