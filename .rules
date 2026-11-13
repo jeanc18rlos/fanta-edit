@@ -11,7 +11,7 @@ Fanta is a macOS design editor built as a fork of Zed. The `fanta` package build
 | Viewport math, tools | `crates/fanta-canvas`, `crates/fanta-tools` |
 | `.fig` import, prototype playback | `crates/fanta-fig-interop`, `crates/fanta-present` |
 | Agent seam, design ops and built-in canvas tools | `crates/design_surface`, `crates/fanta-design-ops`, `crates/agent/src/tools/design_*` |
-| Headless engine, design API and cloud engine worker | `crates/fanta-headless`, `crates/fanta-api`, `crates/fanta-engine` |
+| Headless engine, design API and cloud engine worker | `crates/fanta-headless`, `crates/fanta-api`, `crates/fanta-worker` |
 | Shared Fanta UI | `crates/fanta_ui` |
 
 GPUI and the reusable UI crates are not in this repository. They come from `squidred-dev/fanta-ui`, pinned by git revision in `Cargo.toml`; read their source under `~/.cargo/git/checkouts/fanta-ui-*/<rev>/crates/`. `vendor/skia-bindings-0.153.3` carries Fanta's Graphite shim (see its `FANTA-PROVENANCE.txt`).
