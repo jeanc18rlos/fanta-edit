@@ -1,7 +1,7 @@
 # Cloud engine contracts
 
 The interfaces between the Fanta app, the v2 API (fanta-backend) and the cloud
-engine worker (`crates/fanta-engine`), frozen on 2026-10-21 for cloud AI Review,
+engine worker (`crates/fanta-worker`), frozen on 2026-10-21 for cloud AI Review,
 Ultra review and cloud generation. Both repositories keep a copy of this page.
 Change a contract only together with the code on both sides, and update both
 copies in the same pair of pull requests.

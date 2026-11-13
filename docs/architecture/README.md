@@ -64,7 +64,7 @@ proposes giving the engine its own repository.
 | --- | --- | --- | --- |
 | Desktop app | `jeanc18rlos/fanta-edit` (this one) | Rust, GPUI, Skia Graphite on Metal | macOS; Windows and Linux in progress ([0019](../decisions/0019-build-and-release-for-windows-and-linux.md)) |
 | Engine crates | this repository, `crates/fanta-*` | Rust, Skia | Everywhere the app, the worker or the runtime runs |
-| Engine worker | this repository, `crates/fanta-engine` | Rust | Google Cloud Run, Linux |
+| Engine worker | this repository, `crates/fanta-worker` | Rust | Google Cloud Run, Linux |
 | GPUI and shared UI | `squidred-dev/fanta-ui` | Rust, published as `fanta-gpui-*` 0.5.0 and pinned by git revision ([0011](../decisions/0011-consume-gpui-and-shared-ui-from-fanta-ui.md)) | Inside the app |
 | Runtime and SDK packages | `jeanc18rlos/Fanta-JS` | TypeScript and WebAssembly, built from a pinned fanta-edit commit ([0018](../decisions/0018-build-the-portable-runtime-here-and-package-it-in-fanta-js.md)) | npm: browsers and Node |
 | v2 API, accounts, billing, cloud jobs | `jeanc18rlos/fanta-backend` (private) | Next.js and TypeScript | Vercel, with Cloud Run for the worker |
@@ -93,7 +93,7 @@ In short, from the inside out:
   document.
 - **Application** (`fanta-headless`, `fanta-api`): open, edit, settle,
   render and save a project without the app, and the programmatic design API.
-- **Engine hosts** (`fanta-engine`, `fanta-runtime`, `fanta-site`): the cloud
+- **Engine hosts** (`fanta-worker`, `fanta-runtime`, `fanta-site`): the cloud
   worker, the portable player and the website exporter.
 - **Desktop editor** (`fig_viewer`, `design_surface`, `fanta_ui`,
   `fanta_languages`): the GPUI host.
@@ -116,7 +116,7 @@ shell reaches the canvas only through `design_surface`.
 | Driving ports, which hosts call | `HeadlessProject` (`fanta-headless`), `DesignSession` (`fanta-api`), the `DesignOp` vocabulary, `DesignSurface` |
 | Driven ports, which the engine calls | `AssetResolver` and `DecodeListener` (images for the renderer), `ImageStore`, `ImageFetcher` (template data), `FormatHandler` (file formats), `LayoutTree` |
 | Driven adapters | Skia (`fanta-render`, `fanta-text`), files (`fanta-fnx`, `fanta-format`), `.fig` (`fanta-fig-interop`) |
-| Driving adapters | `fig_viewer` (desktop), `fanta-engine` (HTTP worker), `fanta-runtime` (WebAssembly and C bridge), `fanta-site` (command line) |
+| Driving adapters | `fig_viewer` (desktop), `fanta-worker` (HTTP worker), `fanta-runtime` (WebAssembly and C bridge), `fanta-site` (command line) |
 
 ## How changes flow
 
@@ -178,7 +178,7 @@ GPUI global. The edit reaches the files through the canvas's normal save.
 sequenceDiagram
   participant App as Desktop app
   participant API as v2 API (fanta-backend)
-  participant Worker as Engine worker (fanta-engine)
+  participant Worker as Engine worker (fanta-worker)
   participant GitHub
   App->>API: request a review of a commit and unpushed files
   API->>Worker: POST /v1/run with steps

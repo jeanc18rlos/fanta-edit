@@ -1,5 +1,5 @@
 [package]
-name = "fanta-engine"
+name = "fanta-worker"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,10 +8,11 @@ license = "Apache-2.0"
 description = "The cloud engine worker: runs design steps (inspect, edit, comment, render, changeset) on a Fanta project without the app."
 
 [lib]
-path = "src/fanta_engine.rs"
+path = "src/fanta_worker.rs"
 doctest = false
 
 [[bin]]
+# The binary keeps the name the cloud contract and the image entrypoint use.
 name = "fanta-engine"
 path = "src/main.rs"
 

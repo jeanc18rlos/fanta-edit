@@ -201,12 +201,11 @@ Fanta branch and intentionally select the Fanta release branch as the default
 before relying on the repository home page or manual release workflow.
 
 `Check` runs on pushes and pull requests. `Build macOS release` produces an
-Apple Silicon DMG and checksum as run artifacts. Manual unsigned builds are
-for testing. A narrow branch trigger also requests an unsigned packaging
-build when app code, assets, Cargo/build scripts, or packaging files change on
-`codex-release-backend-gateway`; docs-only changes do not rebuild. These branch
-builds create test artifacts, not customer releases or draft releases. Signed builds and version tags require these
-repository secrets:
+Apple Silicon DMG and checksum as run artifacts. Manual unsigned builds, on any
+branch, are for testing. Signed builds and version tags need these secrets in
+the `release` environment, never as repository secrets. The environment admits
+only `main` and release tags, and each job that uses it waits for the founder's
+approval, so a branch that edits a workflow cannot reach them:
 
 - `MACOS_CERTIFICATE`: base64 Developer ID Application `.p12` certificate.
 - `MACOS_CERTIFICATE_PASSWORD`: certificate password.
@@ -254,11 +253,12 @@ Silicon workflow has no verified SSH remote-server artifact.
 **One-time setup:**
 1. Run `script/update-signing-key` on your Mac, then commit
    `crates/auto_update/release-signing-key.pub`.
-2. Store the private key as the `FANTA_UPDATE_SIGNING_KEY` Actions secret (the
-   script prints the `gh secret set` command).
-3. Add the notarization secrets (`MACOS_SIGNING_IDENTITY`,
-   `APPLE_NOTARIZATION_KEY`, `APPLE_NOTARIZATION_KEY_ID`,
-   `APPLE_NOTARIZATION_ISSUER_ID`).
+2. Store the private key as the `FANTA_UPDATE_SIGNING_KEY` secret of the
+   `release` environment (the script prints the `gh secret set --env release`
+   command).
+3. Add the notarization secrets to the same environment
+   (`MACOS_SIGNING_IDENTITY`, `APPLE_NOTARIZATION_KEY`,
+   `APPLE_NOTARIZATION_KEY_ID`, `APPLE_NOTARIZATION_ISSUER_ID`).
 
 Tag builds fail until the key is in place.
 

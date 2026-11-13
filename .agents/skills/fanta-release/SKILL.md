@@ -11,10 +11,16 @@ Fanta ships as a notarized Developer ID DMG for Apple Silicon, built in GitHub A
 
 Workflow "Build macOS release" (`.github/workflows/release-macos.yml`):
 
-- `workflow_dispatch` inputs: `distribution` (`developer-id` or `app-store`), `signed` (sign and notarize; needs the Apple secrets), `build_diagnostics`.
+- `workflow_dispatch` inputs: `distribution` (`developer-id` or `app-store`), `signed` (sign and notarize; needs the Apple secrets), `channel`, `build_diagnostics`.
 - Notarization is required whenever the workflow runs on a tag, even with `signed=false`. Dispatch unsigned test builds on a branch.
+- Signing secrets live only in the `release` environment, never as repository secrets. It admits `main` and the release tags, and every job that uses it waits for the founder to approve it under "Review deployments". Signed and Mac App Store builds therefore run only from `main` or a release tag. Unsigned builds use the `unsigned-build` environment, which holds no secrets.
 - A pushed tag must equal `v<version>` from `crates/fanta/Cargo.toml`, and creates a draft GitHub release.
-- Artifacts: `fanta-macos-aarch64-notarized` (or `fanta-macos-aarch64-test-only`) with `Fanta-aarch64.dmg` and `SHA256SUMS.txt`; crash symbols `fanta-symbols-aarch64-<commit>` (`fanta.dwarf`, kept 90 days); DMG verification evidence.
+- The `sign-update` job signs the DMG for in-place updates on Linux, after the build, so the update key never sits on the build machine.
+- Artifacts:
+  - `fanta-macos-aarch64-notarized` (or `fanta-macos-aarch64-test-only`), with `Fanta-aarch64.dmg` and `SHA256SUMS.txt`;
+  - `fanta-macos-aarch64-update-signature` (`Fanta-aarch64.dmg.sig`);
+  - crash symbols `fanta-symbols-aarch64-<commit>` (`fanta.dwarf`, kept 90 days);
+  - the DMG verification evidence.
 
 Locally, `./script/bundle-mac aarch64-apple-darwin` builds the DMG and `fanta.dwarf` (`-i` installs it into `/Applications`; `-s` builds the Mac App Store variant instead). Local notarization needs `FANTA_REQUIRE_NOTARIZATION=true` and either a notarytool keychain profile (`APPLE_NOTARIZATION_KEYCHAIN_PROFILE`) or the API key variables. A local bundle does not establish that the public installer works.
 
@@ -26,7 +32,7 @@ Locally, `./script/bundle-mac aarch64-apple-darwin` builds the DMG and `fanta.dw
 
 ## Publish a public alpha
 
-Public alphas are GitHub prereleases tagged `alpha-<version>-<YYYYMMDD>`. The first, `alpha-1.0.0-20261012`, targets the commit built by a `workflow_dispatch` run on a branch. Create the prerelease from the verified notarized artifact with `Fanta-aarch64.dmg` and `SHA256SUMS.txt`, targeting the built commit.
+Public alphas are GitHub prereleases tagged `alpha-<version>-<YYYYMMDD>`. The first, `alpha-1.0.0-20261012`, targets the commit built by a `workflow_dispatch` run on a branch. Signed builds now come only from `main` or a release tag (see Build). Create the prerelease from the verified notarized artifact with `Fanta-aarch64.dmg` and `SHA256SUMS.txt`, targeting the built commit.
 
 Then update every place that pins the release tag, and check that each download link resolves:
 
@@ -41,7 +47,11 @@ Keep the release's `fanta-symbols-aarch64-<commit>` artifact reachable for crash
 Workflow "Build Windows release" (`.github/workflows/release-windows.yml`) runs `script/bundle-windows.ps1` on `windows-2025` for `v*` tags, `workflow_dispatch`, and pull requests that change the packaging.
 
 - The installer, `Fanta-x86_64.exe`, is not Authenticode-signed (`FANTA_WINDOWS_SIGN=1` turns signing on once Azure Trusted Signing is set up), so SmartScreen warns on first run.
-- Tag and dispatch builds sign `Fanta-x86_64.exe.sig` for in-app updates. Without the `FANTA_UPDATE_SIGNING_KEY` secret the step only warns, and installed copies will not update to that build.
-- Artifacts: `fanta-windows-x86_64` (installer, `.sig`, `SHA256SUMS-windows-x86_64.txt`) and `fanta-windows-symbols-x86_64-<commit>` (PDBs, kept 90 days).
+- Tag builds and dispatches on `main` sign `Fanta-x86_64.exe.sig` for in-app updates, in a `sign-update` job that uses the `release` environment and waits for approval. Pull requests never reach the key.
+  - Without the `FANTA_UPDATE_SIGNING_KEY` secret in that environment, the job only warns, and installed copies will not update to that build.
+- Artifacts:
+  - `fanta-windows-x86_64` (installer and `SHA256SUMS-windows-x86_64.txt`);
+  - `fanta-windows-x86_64-update-signature` (`.sig`);
+  - `fanta-windows-symbols-x86_64-<commit>` (PDBs, kept 90 days).
 - The `smoke-test` job installs, updates in place and uninstalls an installer built from the real update helper and stand-in app binaries, in about 20 minutes. When the bundle script, `fanta.iss` or the helper change, read it first: the full build takes hours.
 - Every platform adds its assets to the tag's one draft through `script/upload-draft-release`, in the concurrency group `draft-release-<tag>`. Don't call `gh release create` for a tag directly: GitHub allows several drafts with the same tag.

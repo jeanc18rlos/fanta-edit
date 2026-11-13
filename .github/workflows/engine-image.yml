@@ -2,7 +2,9 @@ name: Engine image
 
 # Builds the container image that fanta-backend's v2/deploy/gcp-engine-deploy.sh
 # deploys as the private fanta-engine Cloud Run service
-# (docs/cloud-engine-contracts.md). Pull requests build and smoke-test it.
+# (docs/cloud-engine-contracts.md). The crate is fanta-worker; its binary, the
+# image and the service keep the name fanta-engine, which the deploy script
+# reads. Pull requests build and smoke-test it.
 # Pushes to main also push it to Artifact Registry as
 # <GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/fanta/fanta-engine:<commit sha>;
 # that sha is the deploy script's ENGINE_TAG.
@@ -23,7 +25,7 @@ on:
       - 'crates/fanta-canvas/**'
       - 'crates/fanta-design-ops/**'
       - 'crates/fanta-doc/**'
-      - 'crates/fanta-engine/**'
+      - 'crates/fanta-worker/**'
       - 'crates/fanta-fnx/**'
       - 'crates/fanta-format/**'
       - 'crates/fanta-headless/**'
@@ -77,7 +79,7 @@ jobs:
           shared-key: engine-image-rust-1.95
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - uses: ./.github/actions/prepare-skia-source
+      - uses: $/.github/actions/prepare-skia-source
         with:
           offline: 'true'
 
@@ -85,12 +87,12 @@ jobs:
         env:
           FANTA_ENGINE_GIT_SHA: ${{ github.sha }}
         run: |
-          cargo build --locked --release -p fanta-engine
+          cargo build --locked --release -p fanta-worker
           mkdir -p "$RUNNER_TEMP/context"
           cp target/release/fanta-engine "$RUNNER_TEMP/context/"
 
       - name: Build the image
-        run: docker build --file crates/fanta-engine/Dockerfile --tag "$IMAGE" "$RUNNER_TEMP/context"
+        run: docker build --file crates/fanta-worker/Dockerfile --tag "$IMAGE" "$RUNNER_TEMP/context"
 
       - name: Run a render inside the image
         run: |

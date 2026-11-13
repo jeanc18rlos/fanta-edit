@@ -17,9 +17,14 @@
   Partly done 2026-11-13: the sweep is recorded in `design.md` and 17 crates
   are Apache-2.0. `fanta-fig-interop` waits for the founder's decision on its
   golden fixtures.
-- [ ] **T3.** Rename the cloud worker crate from `fanta-engine` to
+- [x] **T3.** Rename the cloud worker crate from `fanta-engine` to
   `fanta-worker` (Q2), paired with its deployment change in `fanta-backend`.
-  Verify: both repositories' CI.
+  Verify: both repositories' CI. Done in #229: the package, its directory
+  and its library are `fanta-worker`. The binary, the container image, the
+  Cloud Run service and the environment variables keep the name
+  `fanta-engine`, because the backend's `gcp-engine-deploy.sh` reads the
+  image and the service by that name; so the backend's deployment needed no
+  change. Renaming those is a separate, paired change if it is ever wanted.
 - [ ] **T4.** Create `fantaisa-ai/fanta-engine` (private) from the
   extraction, with its root manifest, toolchain, README, rules and layer
   map, and tag `v0.1.0` (R1, R8, Q3). Verify: A1.

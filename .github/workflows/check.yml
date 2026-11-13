@@ -26,6 +26,106 @@ env:
   CARGO_PROFILE_DEV_DEBUG: '0'
 
 jobs:
+  # Classifies the diff so that jobs skip instead of the workflow not starting.
+  changes:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.native_video_only }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      docs: ${{ steps.classify.outputs.docs }}
+      rust: ${{ steps.classify.outputs.rust }}
+      workflows: ${{ steps.classify.outputs.workflows }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          # A pull request checks out its merge commit, whose first parent is the base.
+          fetch-depth: 2
+
+      - name: Classify the changed files
+        id: classify
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          docs=false
+          rust=false
+          workflows=false
+          if [[ "$EVENT_NAME" != pull_request ]]; then
+            # shortcut: pushes to main and manual runs test everything; classify them when main runs become the bottleneck.
+            rust=true
+          else
+            while IFS= read -r path; do
+              case "$path" in
+                # crates/fanta-format includes this file with include_str!.
+                docs/fanta/project-schema.md) rust=true ;;
+                .github/*) workflows=true ;;
+                docs/*|specs/*|.agents/*|.claude/*|.rules) docs=true ;;
+                */*) rust=true ;;
+                *.md) docs=true ;;
+                *) rust=true ;;
+              esac
+            done < <(git diff --name-only HEAD^1 HEAD)
+          fi
+          printf 'docs=%s\nrust=%s\nworkflows=%s\n' "$docs" "$rust" "$workflows" | tee -a "$GITHUB_OUTPUT"
+
+  # Advisory until five consecutive green runs on main (spec 0012, T2).
+  linux-test:
+    needs: changes
+    if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true') }}
+    continue-on-error: true
+    # Skia's PDF backend needs C++20 ranges that Ubuntu 22.04's libstdc++ 12 lacks under
+    # clang; the runtime and engine image workflows build Skia on 24.04 for the same reason.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # Debug test binaries plus one release lint build outgrow the runner's free disk.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install Linux dependencies
+        run: ./script/linux
+
+      - name: Install Rust 1.95
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy --component rustfmt
+          rustup override set 1.95.0
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: linux-test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: $/.github/actions/prepare-skia-source
+        with:
+          offline: 'true'
+
+      # The render stage (golden image) and the editor stage stay on macOS.
+      - name: Test the platform-independent stages
+        run: |
+          ./script/verify-fanta-release \
+            --stage engine --stage import --stage source-order --stage workspace --stage ui \
+            --stage shell --stage release-blockers \
+            --output-dir "${RUNNER_TEMP}/fanta-release-verification"
+
+      - name: Preserve release verification evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-release-verification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fanta-release-verification
+          if-no-files-found: ignore
+          retention-days: 14
+
   check:
     if: ${{ (github.event_name != 'workflow_dispatch' || !inputs.native_video_only) && !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
     runs-on: macos-26
@@ -43,7 +143,7 @@ jobs:
           shared-key: macos-check
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - uses: ./.github/actions/prepare-skia-source
+      - uses: $/.github/actions/prepare-skia-source
         with:
           offline: 'true'
 
@@ -72,7 +172,7 @@ jobs:
       - name: Test design engines, import, editor interactions and UI components
         run: |
           ./script/verify-fanta-release \
-            --stage engine --stage import --stage source-order --stage editor --stage workspace --stage ui \
+            --stage engine --stage render --stage import --stage source-order --stage editor --stage workspace --stage ui \
             --output-dir "${RUNNER_TEMP}/fanta-release-verification"
 
       - name: Verify every required editor and workspace regression actually passed
@@ -141,7 +241,7 @@ jobs:
                   "test_save_all_reports_failure_preserves_remaining_drafts_and_retries"
               ]
           }
-          required_stages = ("engine", "import", "source-order", "editor", "workspace", "ui")
+          required_stages = ("engine", "render", "import", "source-order", "editor", "workspace", "ui")
           stage_path = output / "results.tsv"
           stages = []
           if stage_path.exists():
@@ -246,7 +346,7 @@ jobs:
           # The check job's build is the superset, and three saved copies would not fit the 10 GB cache limit.
           save-if: 'false'
 
-      - uses: ./.github/actions/prepare-skia-source
+      - uses: $/.github/actions/prepare-skia-source
         with:
           offline: 'true'
 
@@ -336,7 +436,7 @@ jobs:
           # The check job's build is the superset, and three saved copies would not fit the 10 GB cache limit.
           save-if: 'false'
 
-      - uses: ./.github/actions/prepare-skia-source
+      - uses: $/.github/actions/prepare-skia-source
         with:
           offline: 'true'
 
@@ -509,7 +609,7 @@ jobs:
           persist-credentials: false
       - name: Install the repository Rust toolchain
         run: rustup show active-toolchain
-      - uses: ./.github/actions/prepare-skia-source
+      - uses: $/.github/actions/prepare-skia-source
         with:
           offline: 'true'
       - name: Test canvas video rendering
