@@ -485,7 +485,7 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
             });
             break;
         }
-        match run_step(&mut session, step) {
+        match run_step(&mut session, step, work_dir) {
             Ok(result) => results.push(StepResult {
                 step: step.name().into(),
                 ok: true,
@@ -515,7 +515,13 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
             project_id: project.map(|project| project.doc().id.to_string()),
             warnings: project
                 // The cloud contract is frozen (ADR 0021): one sentence per finding.
-                .map(|project| project.warnings().iter().map(ToString::to_string).collect())
+                .map(|project| {
+                    project
+                        .warnings()
+                        .iter()
+                        .map(|warning| project_relative(&warning.to_string(), work_dir))
+                        .collect()
+                })
                 .unwrap_or_default(),
             fonts: project.map(font_report).unwrap_or_default(),
         },
@@ -527,16 +533,55 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
 /// named by its path in the project and the answer says nothing about the
 /// engine's own disk.
 fn caller_message(error: &anyhow::Error, work_dir: &Path) -> String {
-    let mut message = format!("{error:#}");
-    // The project is opened by its resolved path, so errors can carry either.
-    for root in [work_dir.canonicalize().ok(), Some(work_dir.to_owned())] {
-        let Some(root) = root else { continue };
-        let root = root.to_string_lossy();
-        message = message
-            .replace(&format!("{root}/"), "")
-            .replace(root.as_ref(), "the project folder");
+    project_relative(&format!("{error:#}"), work_dir)
+}
+
+fn project_relative(message: &str, work_dir: &Path) -> String {
+    // The project is opened by its resolved path, so text can carry either.
+    let message = match work_dir.canonicalize() {
+        Ok(resolved) => without_root(message, &resolved),
+        Err(_) => message.to_owned(),
+    };
+    without_root(&message, work_dir)
+}
+
+/// `message` with `root/` removed from the front of every path under it, and
+/// `root` on its own replaced by "the project folder". A longer name that
+/// merely contains `root` (`/data<root>`, `<root>-old`) is left alone.
+fn without_root(message: &str, root: &Path) -> String {
+    let root = root.to_string_lossy();
+    let root = root.trim_end_matches('/');
+    // Replacing a relative root, such as `.`, would eat ordinary text.
+    if !root.starts_with('/') {
+        return message.to_owned();
     }
-    message
+    let in_name = |character: char| character.is_alphanumeric() || "-_~+@%".contains(character);
+    let mut cleaned = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(start) = rest.find(root) {
+        let before = rest[..start].chars().next_back();
+        let mut after = rest[start + root.len()..].chars();
+        let next = after.next();
+        let then = after.next();
+        let part_of_longer_path = before.is_some_and(|character| in_name(character) || "/.".contains(character))
+            || next.is_some_and(in_name)
+            // A dot continues a name (`project.bak`) unless it ends a sentence.
+            || (next == Some('.') && then.is_some_and(|character| in_name(character) || character == '.'));
+        cleaned.push_str(&rest[..start]);
+        rest = &rest[start + root.len()..];
+        if part_of_longer_path {
+            cleaned.push_str(root);
+        } else if next == Some('/')
+            && then.is_some_and(|character| in_name(character) || character == '.')
+        {
+            rest = &rest[1..];
+        } else {
+            cleaned.push_str("the project folder");
+            rest = rest.strip_prefix('/').unwrap_or(rest);
+        }
+    }
+    cleaned.push_str(rest);
+    cleaned
 }
 
 fn font_report(project: &HeadlessProject) -> FontReport {
@@ -555,7 +600,11 @@ fn font_report(project: &HeadlessProject) -> FontReport {
     }
 }
 
-fn run_step(session: &mut DesignSession, step: &Step) -> anyhow::Result<serde_json::Value> {
+fn run_step(
+    session: &mut DesignSession,
+    step: &Step,
+    work_dir: &Path,
+) -> anyhow::Result<serde_json::Value> {
     match step {
         Step::Inspect {} => session_project(session)?.inspect(),
         Step::CreatePage { name } => {
@@ -639,7 +688,11 @@ fn run_step(session: &mut DesignSession, step: &Step) -> anyhow::Result<serde_js
                             image.bounds.height(),
                         ],
                     }),
-                    Err(error) => json!({ "row": row, "ok": false, "error": format!("{error:#}") }),
+                    Err(error) => json!({
+                        "row": row,
+                        "ok": false,
+                        "error": project_relative(&format!("{error:#}"), work_dir),
+                    }),
                 })
                 .collect();
             Ok(json!({ "images": images }))
@@ -1253,52 +1306,111 @@ mod tests {
             !message.contains(&location) && !message.contains(&resolved),
             "{message}"
         );
+    }
 
-        // A step fails the same way: a checkout that cannot be written to
-        // loads, and its save does not go through.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let project = text_project("Inter");
-            let location = project.path().to_string_lossy().into_owned();
-            let resolved = project
-                .path()
-                .canonicalize()
-                .expect("resolve")
-                .to_string_lossy()
-                .into_owned();
-            let set_mode = |mode| {
-                std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(mode))
-                    .expect("set permissions")
-            };
-            set_mode(0o555);
-            let response = run_in(
-                &request(json!({
-                    "request_id": "r",
-                    "deadline_ms": 60000,
-                    "source": {"kind": "dir", "dir": project.path()},
-                    "steps": [
-                        {"step": "create_page", "name": "Landing"},
-                        {"step": "changeset"}
-                    ]
-                })),
-                project.path(),
-            );
-            set_mode(0o755);
-            let failure = response
-                .expect("the project loads")
-                .results
-                .into_iter()
-                .find_map(|result| result.error);
-            // Root writes to a read-only folder, so there the save succeeds.
-            if let Some(failure) = failure {
-                let message = &failure.message;
-                assert!(
-                    !message.contains(&location) && !message.contains(&resolved),
-                    "{message}"
-                );
-                assert!(message.contains("the project folder"), "{message}");
-            }
+    #[test]
+    fn caller_messages_drop_the_checkout_root_and_nothing_else() {
+        let message =
+            |text: &str, root: &str| caller_message(&anyhow::anyhow!("{text}"), Path::new(root));
+        let root = "/tmp/x/project";
+        for (text, expected) in [
+            (
+                "reading /tmp/x/project/pages/a.svg: denied",
+                "reading pages/a.svg: denied",
+            ),
+            (
+                "at path \"/tmp/x/project/.fanta-transaction\"",
+                "at path \".fanta-transaction\"",
+            ),
+            (
+                "project at /tmp/x/project: not found",
+                "project at the project folder: not found",
+            ),
+            (
+                "in /tmp/x/project/: not found",
+                "in the project folder: not found",
+            ),
+            (
+                "`a` is outside /tmp/x/project",
+                "`a` is outside the project folder",
+            ),
+            (
+                "not a project: /tmp/x/project.",
+                "not a project: the project folder.",
+            ),
+            // Another folder whose name starts or ends the same way is not the checkout.
+            ("reading /tmp/x/project-x/a", "reading /tmp/x/project-x/a"),
+            (
+                "reading /tmp/x/project.bak/a",
+                "reading /tmp/x/project.bak/a",
+            ),
+            (
+                "reading /data/tmp/x/project/a",
+                "reading /data/tmp/x/project/a",
+            ),
+        ] {
+            assert_eq!(message(text, root), expected);
+            assert_eq!(message(text, "/tmp/x/project/"), expected, "trailing slash");
         }
+        // A root that is not absolute names nothing worth hiding, and
+        // replacing it would eat ordinary text.
+        for root in [".", "", "project", "/"] {
+            assert_eq!(
+                message("reading ./a.b/project: no", root),
+                "reading ./a.b/project: no"
+            );
+        }
+    }
+
+    #[test]
+    fn row_errors_do_not_name_the_private_checkout() {
+        use fanta_api::{NodeKind, Placeholder};
+        let directory = text_project("Inter");
+        let pixel = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+            .expect("a one-pixel png");
+        {
+            let mut session = DesignSession::open_project(directory.path()).expect("open");
+            let page = session.active_page().expect("page");
+            let photo = session
+                .create_node(page, NodeKind::Image(pixel.clone()))
+                .expect("photo");
+            session.set_name(photo, "photo").expect("name");
+            session
+                .set_placeholder(photo, Some(Placeholder::default()))
+                .expect("placeholder");
+            session.add_undo_step("Template").expect("commit");
+            session.save().expect("save");
+        }
+        // An image that exists, but outside the checkout.
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("photo.png"), &pixel).expect("outside image");
+        let escaping = pathdiff(outside.path(), directory.path()).join("photo.png");
+
+        let response = run_in(
+            &request(json!({
+                "request_id": "r",
+                "deadline_ms": 60000,
+                "source": {"kind": "dir", "dir": directory.path()},
+                "steps": [{"step": "export_batch", "page": {"index": 0}, "max_dimension": 64,
+                           "rows": [{"photo": escaping}]}]
+            })),
+            directory.path(),
+        )
+        .expect("the run answers");
+        let text = serde_json::to_string(&response).expect("serialize");
+        assert!(text.contains("is outside the project folder"), "{text}");
+        let location = directory.path().canonicalize().expect("resolve");
+        assert!(!text.contains(&*location.to_string_lossy()), "{text}");
+        assert!(
+            !text.contains(&*directory.path().to_string_lossy()),
+            "{text}"
+        );
+    }
+
+    /// `../<name>` from one temporary directory to its sibling.
+    fn pathdiff(target: &Path, from: &Path) -> PathBuf {
+        assert_eq!(target.parent(), from.parent(), "siblings");
+        Path::new("..").join(target.file_name().expect("name"))
     }
 }

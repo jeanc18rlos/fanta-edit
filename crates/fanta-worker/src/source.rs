@@ -16,7 +16,6 @@ use crate::{EngineError, ErrorCode, Overlay, Token};
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     pub bytes: u64,
-    /// Files and folders together.
     pub files: usize,
 }
 
@@ -198,20 +197,19 @@ pub fn extract(
             return Err(unsafe_entry(&raw));
         }
         found |= !skipped;
-        // Folders count too: an archive of empty folders costs inodes. So do
-        // skipped entries, which are still read to reach the next one.
-        files += 1;
         if kind.is_file() {
+            // A skipped file counts too: the archive is still read through it.
+            files += 1;
             bytes = bytes.saturating_add(entry.header().size().map_err(corrupt)?);
-        }
-        if files > limits.files || bytes > limits.bytes {
-            return Err(EngineError::new(
-                ErrorCode::PayloadTooLarge,
-                format!(
-                    "the project folder is over {} files and folders or {} bytes",
-                    limits.files, limits.bytes
-                ),
-            ));
+            if files > limits.files || bytes > limits.bytes {
+                return Err(EngineError::new(
+                    ErrorCode::PayloadTooLarge,
+                    format!(
+                        "the project folder is over {} files or {} bytes",
+                        limits.files, limits.bytes
+                    ),
+                ));
+            }
         }
         if skipped {
             continue;
@@ -337,7 +335,11 @@ pub(crate) mod tests {
                 }
             }
         }
-        builder.into_inner().expect("tar").finish().expect("gzip")
+        builder
+            .into_inner()
+            .expect("tar")
+            .finish()
+            .expect("gzip")
     }
 
     fn code(result: Result<(), EngineError>) -> Result<(), ErrorCode> {
@@ -370,12 +372,7 @@ pub(crate) mod tests {
             Entry::Link("design/assets", "/etc"),
         ]);
         assert_eq!(
-            code(extract(
-                &linked[..],
-                "design",
-                destination.path(),
-                Limits::SOURCE
-            )),
+            code(extract(&linked[..], "design", destination.path(), Limits::SOURCE)),
             Err(ErrorCode::ProjectLoadFailed)
         );
         let many = tarball(&[
@@ -383,38 +380,22 @@ pub(crate) mod tests {
             Entry::File("a.txt", b"a"),
             Entry::File("b.txt", b"b"),
         ]);
-        let small = Limits {
-            bytes: 1024,
-            files: 2,
-        };
+        let small = Limits { bytes: 1024, files: 2 };
         assert_eq!(
             code(extract(&many[..], "", destination.path(), small)),
             Err(ErrorCode::PayloadTooLarge)
         );
-        let large = Limits {
-            bytes: 3,
-            files: 10,
-        };
+        let large = Limits { bytes: 3, files: 10 };
         assert_eq!(
             code(extract(&many[..], "", destination.path(), large)),
             Err(ErrorCode::PayloadTooLarge)
         );
         assert_eq!(
-            code(extract(
-                &many[..],
-                "elsewhere",
-                destination.path(),
-                Limits::SOURCE
-            )),
+            code(extract(&many[..], "elsewhere", destination.path(), Limits::SOURCE)),
             Err(ErrorCode::NotFound)
         );
         assert_eq!(
-            code(extract(
-                &many[..],
-                "../design",
-                destination.path(),
-                Limits::SOURCE
-            )),
+            code(extract(&many[..], "../design", destination.path(), Limits::SOURCE)),
             Err(ErrorCode::BadRequest)
         );
     }
@@ -464,16 +445,7 @@ pub(crate) mod tests {
             ]);
             // A commit may hold project settings under `.fanta`: the run goes
             // on without them.
-            assert_eq!(
-                code(extract(
-                    &archive[..],
-                    "design",
-                    destination.path(),
-                    Limits::SOURCE
-                )),
-                Ok(()),
-                "{path}"
-            );
+            extract(&archive[..], "design", destination.path(), Limits::SOURCE).expect(path);
             assert!(destination.path().join("fanta.json").exists(), "{path}");
             let top = path.split('/').next().expect("first name");
             assert!(!destination.path().join(top).exists(), "{path}");
@@ -503,17 +475,11 @@ pub(crate) mod tests {
         extract(&skipped[..], "", destination.path(), Limits::SOURCE).expect("skipped entries");
         assert!(!destination.path().join(".fanta").exists());
         assert!(!destination.path().join(".git").exists());
-        // Skipped entries are still read, so they still count toward the limits.
-        for small in [
-            Limits {
-                bytes: 1024,
-                files: 3,
-            },
-            Limits {
-                bytes: 11,
-                files: 10,
-            },
-        ] {
+        // Skipped files are still read, so they count toward the limits as
+        // files always did.
+        let one_file = Limits { bytes: 1024, files: 1 };
+        let eleven_bytes = Limits { bytes: 11, files: 10 };
+        for small in [one_file, eleven_bytes] {
             assert_eq!(
                 code(extract(&skipped[..], "", destination.path(), small)),
                 Err(ErrorCode::PayloadTooLarge)
@@ -526,29 +492,5 @@ pub(crate) mod tests {
             Entry::File(".gitignore", b"previews/\n"),
         ]);
         extract(&ordinary[..], "", destination.path(), Limits::SOURCE).expect("ordinary names");
-    }
-
-    #[test]
-    fn folders_count_toward_the_entry_limit() {
-        let destination = tempfile::tempdir().expect("destination");
-        let folders = tarball(&[
-            Entry::File("fanta.json", b"{}"),
-            Entry::Folder("a"),
-            Entry::Folder("a/b"),
-            Entry::Folder("a/b/c"),
-        ]);
-        let small = Limits {
-            bytes: 1024,
-            files: 3,
-        };
-        assert_eq!(
-            code(extract(&folders[..], "", destination.path(), small)),
-            Err(ErrorCode::PayloadTooLarge)
-        );
-        let enough = Limits {
-            bytes: 1024,
-            files: 4,
-        };
-        extract(&folders[..], "", destination.path(), enough).expect("within the limit");
     }
 }
