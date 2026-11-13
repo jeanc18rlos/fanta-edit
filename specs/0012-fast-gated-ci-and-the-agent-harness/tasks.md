@@ -43,7 +43,7 @@ Agent harness:
 - [x] **T7.** (#218) (plan H3) Fix `guard_bash.py` and add its self-tests (R18).
   Below the spec threshold on its own; it may land before the spec is
   accepted. Verify: A10.
-- [ ] **T8.** (plan H4) Agent pull request rules in `CLAUDE.md` and `AGENTS.md`
+- [x] **T8.** (#228) (plan H4) Agent pull request rules in `CLAUDE.md` and `AGENTS.md`
   (R20). Verify: A11.
 - [ ] **T9.** (plan H5) Run the six lints nightly, advisory; evaluate the id
   lint with the `lint-creator` skill and record the result here (R19).
