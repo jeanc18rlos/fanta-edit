@@ -59,7 +59,7 @@ Gates:
   (R11). Lands when no open pull request would conflict. Verify: A6.
 - [x] **T11.** (#233) (plan G2) `typos` and `zizmor` in `script/gate`, with the
   findings fixed (R8). Verify: A6.
-- [ ] **T12.** (plan G3) `deny.toml` and `cargo deny check advisories sources
+- [x] **T12.** (#233) (plan G3) `deny.toml` and `cargo deny check advisories sources
   bans` in `script/gate`, with the first run triaged (R10, Q3).
   Verify: A6.
 - [ ] **T13.** (plan G4) `script/verify-required-tests --names` in

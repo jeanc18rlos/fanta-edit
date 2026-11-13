@@ -26,6 +26,13 @@ FAST_CHECKS = [
     ("typos", ["typos", "--config", "typos.toml"]),
     # Offline: the online audits need a GitHub token. Ignores are in zizmor.yml.
     ("zizmor", ["zizmor", "--offline", ".github/workflows", ".github/actions"]),
+    # Named as the binary so that a missing cargo-deny skips. Licences are
+    # script/check-licenses' job. Fetches the advisory database.
+    (
+        "cargo-deny",
+        ["cargo-deny", "--locked", "check", "--hide-inclusion-graph", "-W", "unmaintained"]
+        + ["advisories", "sources", "bans"],
+    ),
 ]
 
 
