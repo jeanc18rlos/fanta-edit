@@ -20,6 +20,7 @@ Locally, `./script/bundle-mac aarch64-apple-darwin` builds the DMG and `fanta.dw
 
 ## Verify
 
+- Nightly must be green on the release commit: `gh run list --workflow nightly.yml --commit <sha> --json conclusion,url` must show a run with conclusion `success`. If the commit has no run, start one with `gh workflow run nightly.yml --ref <branch or tag at that commit>` and wait for it. Do not release from a commit whose latest Nightly run failed, or while the issue "Nightly is failing" (label `nightly-failure`) is open for it.
 - `python3 script/verify-macos-dmg <dmg> <app>` (the workflow runs it), `python3 script/test-macos-release`, and stage `build` of `script/verify-fanta-release`.
 - Run signature checks (`codesign`, `pkgutil --check-signature`, `stapler`) with access to the login keychain. Inside a sandbox they can falsely report a missing signing certificate.
 - Check the downloaded asset with `shasum -a 256 -c SHA256SUMS.txt`.
