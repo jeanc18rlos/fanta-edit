@@ -34,12 +34,18 @@ mechanical:
   5.9 MB history against the editor's 46 MB, in under a second.
 - The extracted crates resolve as their own 15-crate workspace with 320
   packages (the app links about 1,400), with no GPUI-family or Zed crate.
+  The group has since grown to 18 crates (`fanta-bundle`, `fanta-mcp`,
+  `fanta-wasm-engine`).
 - The seven crates without Skia passed `cargo check` there in 10.8 seconds,
   with no warnings.
 
 ## Decision
 
-Proposed:
+The founder approved this decision on 2026-11-12, with spec 0002. The status
+stays `proposed` until the editor switches to the pin (spec 0002 T9): the
+record index requires an accepted record's predecessor to be `superseded`,
+and [0008](0008-vendor-the-engine-into-this-repository.md) describes the
+tree until the in-tree crates are deleted.
 
 1. Create `fanta-engine` in the organization
    ([0025](0025-organize-the-repositories-under-one-github-organization.md))
@@ -95,9 +101,10 @@ Proposed:
   The CE.SDK work (#160 to #166) would have needed about six of them. Build
   settings (lints, profiles, the Skia opt-level) must be kept in step by
   hand in two workspaces.
-- Follow-up: rename the cloud worker crate (today `fanta-engine`) so the name
-  can belong to the repository and an optional facade crate; recommended
-  `fanta-worker`. Its deployment in `fanta-backend` changes with it.
+- Follow-up: rename the cloud worker crate (today `fanta-engine`) to
+  `fanta-worker` (founder, 2026-11-12), so the name can belong to the
+  repository and an optional facade crate. Its deployment in `fanta-backend`
+  changes with it.
 
 ## Confirmation
 

@@ -263,7 +263,8 @@ impl History {
 - **Stray `.fanta/` readers.** Any directory walker that does not skip it
   will index git objects. T4 greps for walkers and adds a test per one.
 - **Licence.** `fanta-format` is GPL today. Publishing the checker under a
-  permissive licence waits for ADR 0026; T8 is blocked on it.
+  permissive licence waits for the field change in spec 0002 T2 (ADR 0026
+  chose Apache-2.0 on 2026-11-12); T8 comes after it.
 
 ## Verification
 
