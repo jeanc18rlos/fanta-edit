@@ -30,7 +30,7 @@ Fast CI:
   narrow `skia-source-compatibility.yml`'s pull request paths; delete
   `fanta-lint.yml`; add the nightly rule to the `fanta-release` skill
   (R6). Verify: A7.
-- [ ] **T4.** (plan A4) The `gate` and `hygiene` jobs; fold `architecture.yml`
+- [x] **T4.** (#239) (plan A4) The `gate` and `hygiene` jobs; fold `architecture.yml`
   into `hygiene`. The description carries the `gh api` command with which
   the founder adds the required check and the bypass to the ruleset
   (R7, R8). Verify: A1, A3, A4.
