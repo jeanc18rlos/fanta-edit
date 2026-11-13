@@ -70,6 +70,27 @@ jobs:
           fi
           printf 'docs=%s\nrust=%s\nworkflows=%s\n' "$docs" "$rust" "$workflows" | tee -a "$GITHUB_OUTPUT"
 
+  # Everything that needs no compile. Runs on every pull request, drafts and docs-only included.
+  hygiene:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.native_video_only }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # `cargo metadata` and cargo-deny read manifests and Cargo.lock only, so the
+      # runner's stable toolchain is enough and the pinned one need not install.
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install typos, zizmor and cargo-deny
+        run: script/install-gate-tools "${RUNNER_TEMP}/gate-tools"
+
+      # CI is set, so a missing tool fails instead of skipping.
+      - name: Run the checks that need no compile
+        run: PATH="${RUNNER_TEMP}/gate-tools:${PATH}" script/gate
+
   # Advisory until five consecutive green runs on main (spec 0012, T2).
   linux-test:
     needs: changes
@@ -598,6 +619,27 @@ jobs:
           path: ${{ runner.temp }}/release-blocker-regressions
           if-no-files-found: error
           retention-days: 14
+
+  # The only check the main ruleset requires: keep the job id and its name `gate`.
+  # A draft pull request passes with only `changes` and `hygiene` having run.
+  gate:
+    if: ${{ always() }}
+    # Every job a pull request must pass. `native-video` is manual only.
+    needs: [changes, hygiene, linux-test, check, mac-app-store-runtime, release-blocker-regressions]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Pass when every needed job succeeded or was skipped
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        # `--advisory` goes when `linux-test` loses `continue-on-error` (spec 0012, T2).
+        run: script/gate --needs-json "$NEEDS_JSON" --advisory linux-test
 
   native-video:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_video_only }}

@@ -3,7 +3,8 @@
 
 Without options it runs the checks that need no compile and take seconds.
 `--full` then lints the crates the branch changed and runs the
-script/verify-fanta-release stages that test them.
+script/verify-fanta-release stages that test them. `--needs-json` is the
+`gate` job of check.yml: it decides from the results of the other jobs.
 """
 
 import argparse
@@ -21,6 +22,7 @@ BASE = "origin/main"
 # (name, command). The first word is the tool that must be installed.
 FAST_CHECKS = [
     ("architecture", ["script/architecture", "verify"]),
+    ("architecture-tests", ["python3", "script/test-architecture"]),
     ("bash-guard", ["python3", ".claude/hooks/guard_bash.py", "--self-test"]),
     ("gate", ["script/gate", "--self-test"]),
     ("typos", ["typos", "--config", "typos.toml"]),
@@ -139,7 +141,53 @@ def full_checks(list_only):
     return passed
 
 
+def needs_verdict(needs, advisory):
+    """Reads the `needs` context of the `gate` job.
+
+    Returns one (job, result, verdict) row per job and whether a pull request
+    may merge: every job succeeded or was skipped. A job named in `advisory`
+    never fails the verdict.
+    """
+    rows = []
+    passed = bool(needs)
+    for job in sorted(needs):
+        result = needs[job].get("result")
+        if result in ("success", "skipped"):
+            verdict = "ok"
+        elif job in advisory:
+            verdict = "advisory"
+        else:
+            verdict = "FAIL"
+            passed = False
+        rows.append((job, str(result), verdict))
+    return rows, passed
+
+
+def needs_gate(needs_json, advisory):
+    rows, passed = needs_verdict(json.loads(needs_json), set(advisory))
+    width = max([len(job) for job, _, _ in rows] + [len("job")])
+    print(f"{'job':<{width}}  {'result':<9}  verdict")
+    for job, result, verdict in rows:
+        print(f"{job:<{width}}  {result:<9}  {verdict}")
+    print("gate: " + ("pass" if passed else "FAIL: a job failed, was cancelled or none reported"))
+    return passed
+
+
 def self_test():
+    def verdict(advisory=(), **results):
+        needs = {job.replace("_", "-"): {"result": result} for job, result in results.items()}
+        return needs_verdict(needs, set(advisory))[1]
+
+    assert verdict(changes="success", hygiene="success", check="success", linux_test="success")
+    # A draft pull request: the compiling jobs skip.
+    assert verdict(changes="success", hygiene="success", check="skipped", linux_test="skipped")
+    assert not verdict(changes="success", hygiene="failure", check="skipped")
+    assert not verdict(changes="success", hygiene="success", check="cancelled")
+    assert verdict(["linux-test"], hygiene="success", check="success", linux_test="failure")
+    assert not verdict(["linux-test"], hygiene="success", check="failure", linux_test="failure")
+    assert not verdict(hygiene="success", linux_test="failure")
+    assert not verdict(hygiene=None)
+    assert not verdict()
     directories = {"crates/fanta-doc": "fanta-doc", "crates/fanta-doc/fuzz": "fanta-doc-fuzz"}
     files = ["crates/fanta-doc/src/scene.rs", "crates/fanta-doc/fuzz/a.rs", "docs/x.md"]
     assert changed_crates(files, directories) == ["fanta-doc", "fanta-doc-fuzz"]
@@ -158,8 +206,22 @@ def main():
         "--full", action="store_true", help=f"also lint and test the crates changed since {BASE}"
     )
     parser.add_argument("--list", action="store_true", help="print the commands without running")
+    parser.add_argument(
+        "--needs-json",
+        metavar="JSON",
+        help="decide from a workflow's `needs` context instead of running checks",
+    )
+    parser.add_argument(
+        "--advisory",
+        action="append",
+        default=[],
+        metavar="JOB",
+        help="with --needs-json: a job whose failure does not fail the gate",
+    )
     parser.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args()
+    if arguments.needs_json is not None:
+        return 0 if needs_gate(arguments.needs_json, arguments.advisory) else 1
     if arguments.self_test:
         self_test()
         return 0
