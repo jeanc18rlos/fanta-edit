@@ -128,7 +128,12 @@ class ServeProjectTest(unittest.TestCase):
         (Path(outside.name) / 'notes.txt').write_text('notes')
         (self.project / 'elsewhere').symlink_to(Path(outside.name) / '.git')
         (self.project / 'notes.txt').symlink_to(Path(outside.name) / 'notes.txt')
-        for path in ('/elsewhere/config', '/elsewhere/', '/notes.txt'):
+        # A folder address answers with its index file, which may be a link too.
+        (self.project / 'folder').mkdir()
+        (self.project / 'folder/index.html').symlink_to(Path(outside.name) / 'notes.txt')
+        (self.project / 'other').mkdir()
+        (self.project / 'other/index.htm').symlink_to(self.project / '.git/config')
+        for path in ('/elsewhere/config', '/elsewhere/', '/notes.txt', '/folder/', '/other/'):
             for method in ('GET', 'HEAD'):
                 self.assertEqual(self.request(method, path), 404, (method, path))
         # A missing file answers the same, so the answer does not say what exists.

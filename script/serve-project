@@ -219,9 +219,11 @@ class Handler(SimpleHTTPRequestHandler):
     def send_head(self):
         """The static file for GET and HEAD, unless it is private."""
         relative = os.path.relpath(self.translate_path(self.path), self.directory)
-        if relative != "." and contained(self.project, relative, PRIVATE_DIRECTORIES) is None:
-            self.send_error(HTTPStatus.NOT_FOUND, "File not found")
-            return None
+        # A folder address is answered with its index file, which may be a link.
+        for opened in (relative, f"{relative}/index.html", f"{relative}/index.htm"):
+            if opened != "." and contained(self.project, opened, PRIVATE_DIRECTORIES) is None:
+                self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+                return None
         return super().send_head()
 
     def list_directory(self, path):
