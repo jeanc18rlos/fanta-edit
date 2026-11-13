@@ -120,9 +120,35 @@ class ServeProjectTest(unittest.TestCase):
         ):
             for method in ('GET', 'HEAD'):
                 self.assertEqual(self.request(method, path), 404, (method, path))
+        # A link that leaves the project is not followed, wherever it leads.
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        (Path(outside.name) / '.git').mkdir()
+        (Path(outside.name) / '.git/config').write_text('[core]')
+        (Path(outside.name) / 'notes.txt').write_text('notes')
+        (self.project / 'elsewhere').symlink_to(Path(outside.name) / '.git')
+        (self.project / 'notes.txt').symlink_to(Path(outside.name) / 'notes.txt')
+        for path in ('/elsewhere/config', '/elsewhere/', '/notes.txt'):
+            for method in ('GET', 'HEAD'):
+                self.assertEqual(self.request(method, path), 404, (method, path))
         # A missing file answers the same, so the answer does not say what exists.
         self.assertEqual(self.request('GET', '/.git/missing'), 404)
         self.assertEqual(self.request('GET', '/missing'), 404)
+
+    def test_folders_are_not_listed(self):
+        (self.project / '.git').mkdir()
+        (self.project / 'pages/home').mkdir(parents=True)
+        (self.project / 'pages/home/page.svg').write_text('<svg/>')
+        # Without an index.html a static server would list the folder, `.git` included.
+        for path in ('/', '/pages/', '/pages/home/'):
+            self.assertEqual(self.request('GET', path), 404, path)
+        (self.project / 'index.html').write_text('<!doctype html>')
+        self.assertEqual(self.request('GET', '/'), 200)
+
+    def test_a_write_into_git_or_the_snapshot_store_is_refused_in_any_letter_case(self):
+        for path in ('/.git/config', '/.GIT/config', '/.Fanta/history.git/config', '/pages/.Git/hooks/x', '/.fanta/x'):
+            self.assertEqual(self.request('PUT', path, None, b'planted'), 403, path)
+        self.assertEqual([entry.name for entry in self.project.iterdir()], ['fanta.json'])
 
     def test_ops_must_be_sent_as_json(self):
         batch = b'{"ops": []}'
