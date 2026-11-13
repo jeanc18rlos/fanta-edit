@@ -43,7 +43,7 @@ both sides, in a pair of pull requests.
 
 ## Confirmation
 
-The wire types in `crates/fanta-engine/src/fanta_engine.rs` and their tests,
+The wire types in `crates/fanta-worker/src/fanta_worker.rs` and their tests,
 and review of both copies of the contract in each paired pull request.
 
 ## References

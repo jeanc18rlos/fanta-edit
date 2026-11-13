@@ -4425,35 +4425,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fanta-engine"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bytes",
- "clap",
- "fanta-api",
- "fanta-design-ops",
- "fanta-doc",
- "fanta-format",
- "fanta-headless",
- "flate2",
- "hex",
- "hmac",
- "http-body-util",
- "hyper",
- "hyper-util",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "tiny_http",
- "tokio",
- "ureq",
-]
-
-[[package]]
 name = "fanta-fig-interop"
 version = "0.1.0"
 dependencies = [
@@ -5431,6 +5402,35 @@ dependencies = [
  "fanta-headless",
  "serde_json",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "fanta-worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "clap",
+ "fanta-api",
+ "fanta-design-ops",
+ "fanta-doc",
+ "fanta-format",
+ "fanta-headless",
+ "flate2",
+ "hex",
+ "hmac",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "tiny_http",
+ "tokio",
+ "ureq",
 ]
 
 [[package]]
