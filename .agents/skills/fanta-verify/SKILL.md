@@ -7,6 +7,8 @@ description: Choose and run the right checks for a Fanta change - crate tests, s
 
 Run the narrowest check that exercises the change, then the release stage that covers its area. Report what you ran and what you did not.
 
+`script/gate` runs the checks that need no compile, in seconds. `script/gate --full` then runs `./script/clippy -p` for the crates the branch changed since `origin/main`, the release stages that name them, and `cargo test -p` for changed crates no stage covers; `--list` prints the commands. It does not choose the single-test gates, probes, smoke tests or platform checks in the table below.
+
 ## Pick the checks
 
 | Changed | Run |
