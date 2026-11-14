@@ -309,7 +309,7 @@ mod tests {
     async fn test_managed_provider_uses_live_enabled_catalog(cx: &mut TestAppContext) {
         let (client, credentials_provider) = cx.update(init_test);
         client.http_client().as_fake().replace_handler(|_, request| async move {
-            assert_eq!(request.uri().to_string(), "https://api.fantaisa.net/v1/models");
+            assert_eq!(request.uri().to_string(), "https://api-v2.fantaisa.net/v1/models");
             assert_eq!(
                 request
                     .headers()
@@ -390,7 +390,7 @@ mod tests {
         assert!(cx.update(|cx| provider.is_authenticated(cx)));
 
         client.http_client().as_fake().replace_handler(|_, mut request| async move {
-            assert_eq!(request.uri().to_string(), "https://api.fantaisa.net/v1/messages");
+            assert_eq!(request.uri().to_string(), "https://api-v2.fantaisa.net/v1/messages");
             assert_eq!(request.headers().get("x-api-key").and_then(|value| value.to_str().ok()), Some("fnt_live_account_token"));
             let mut body = String::new();
             request.body_mut().read_to_string(&mut body).await?;
@@ -519,9 +519,9 @@ mod tests {
                 "Fanta".into(),
                 client.clone(),
                 Arc::new(FakeCredentialsProvider {
-                    expected_storage_url: Some("https://api.fantaisa.net/ai-api-key"),
+                    expected_storage_url: Some("https://api-v2.fantaisa.net/ai-api-key"),
                     stored_credentials: Some((
-                        "https://api.fantaisa.net".into(),
+                        "https://api-v2.fantaisa.net".into(),
                         "1".into(),
                         b"fnt_live_stored_account_token".to_vec(),
                     )),

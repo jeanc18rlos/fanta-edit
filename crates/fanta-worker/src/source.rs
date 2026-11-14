@@ -45,6 +45,37 @@ pub fn relative_path(path: &str) -> Result<PathBuf, EngineError> {
     Ok(relative)
 }
 
+/// An overlay file's path: a [`relative_path`] that names a file outside
+/// the folders the engine never reads.
+pub fn overlay_path(path: &str) -> Result<PathBuf, EngineError> {
+    let relative = relative_path(path)?;
+    if relative.as_os_str().is_empty() {
+        return Err(EngineError::new(
+            ErrorCode::BadRequest,
+            "an overlay file needs a path",
+        ));
+    }
+    if reserved(&relative) {
+        return Err(EngineError::new(
+            ErrorCode::BadRequest,
+            format!(
+                "overlay file {path:?} is inside .fanta or .git, which the engine does not read"
+            ),
+        ));
+    }
+    Ok(relative)
+}
+
+/// Whether `path` is, or is inside, a `.fanta` or `.git` folder. Git runs
+/// programs named by the files of both, and the engine reads neither: what a
+/// commit rightly holds there is the app's project settings.
+fn reserved(path: &Path) -> bool {
+    path.components().any(|component| {
+        let name = component.as_os_str();
+        name.eq_ignore_ascii_case(".fanta") || name.eq_ignore_ascii_case(".git")
+    })
+}
+
 pub struct Github {
     api: String,
     agent: ureq::Agent,
@@ -122,7 +153,7 @@ impl Github {
 /// `destination`. GitHub wraps the tree in one top folder, which is dropped.
 /// Entries outside the project folder are skipped; inside it only plain files
 /// and folders are accepted, so a link can't point a later write outside
-/// `destination`.
+/// `destination`, and entries under `.fanta` or `.git` are left out.
 pub fn extract(
     reader: impl Read,
     project_path: &str,
@@ -159,11 +190,15 @@ pub fn extract(
         {
             return Err(unsafe_entry(&raw));
         }
-        found = true;
-        let target = destination.join(relative);
-        if kind.is_dir() {
-            std::fs::create_dir_all(&target).map_err(write_error)?;
-        } else if kind.is_file() {
+        // A commit may hold project settings under `.fanta`. They are left
+        // out of the checkout, whatever kind of entry they are.
+        let skipped = reserved(relative);
+        if !skipped && !kind.is_dir() && !kind.is_file() {
+            return Err(unsafe_entry(&raw));
+        }
+        found |= !skipped;
+        if kind.is_file() {
+            // A skipped file counts too: the archive is still read through it.
             files += 1;
             bytes = bytes.saturating_add(entry.header().size().map_err(corrupt)?);
             if files > limits.files || bytes > limits.bytes {
@@ -175,13 +210,19 @@ pub fn extract(
                     ),
                 ));
             }
+        }
+        if skipped {
+            continue;
+        }
+        let target = destination.join(relative);
+        if kind.is_dir() {
+            std::fs::create_dir_all(&target).map_err(write_error)?;
+        } else {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(write_error)?;
             }
             let mut file = std::fs::File::create(&target).map_err(write_error)?;
             io::copy(&mut entry, &mut file).map_err(corrupt)?;
-        } else {
-            return Err(unsafe_entry(&raw));
         }
     }
     if !found {
@@ -196,13 +237,7 @@ pub fn extract(
 /// Lays the overlay's files over the extracted project folder.
 pub fn apply_overlay(overlay: &Overlay, destination: &Path) -> Result<(), EngineError> {
     for file in &overlay.files {
-        let relative = relative_path(&file.path)?;
-        if relative.as_os_str().is_empty() {
-            return Err(EngineError::new(
-                ErrorCode::BadRequest,
-                "an overlay file needs a path",
-            ));
-        }
+        let relative = overlay_path(&file.path)?;
         let target = destination.join(&relative);
         match &file.content_b64 {
             Some(content) if !file.deleted => {
@@ -253,6 +288,7 @@ pub(crate) mod tests {
     pub(crate) enum Entry<'a> {
         File(&'a str, &'a [u8]),
         Link(&'a str, &'a str),
+        Folder(&'a str),
     }
 
     /// A gzipped tarball shaped like GitHub's: a pax global header, then the
@@ -280,6 +316,15 @@ pub(crate) mod tests {
                     builder
                         .append_data(&mut header, format!("acme-site-0123456/{path}"), *bytes)
                         .expect("file entry");
+                }
+                Entry::Folder(path) => {
+                    header.set_entry_type(tar::EntryType::Directory);
+                    header.set_size(0);
+                    header.set_mode(0o755);
+                    header.set_cksum();
+                    builder
+                        .append_data(&mut header, format!("acme-site-0123456/{path}/"), &[][..])
+                        .expect("folder entry");
                 }
                 Entry::Link(path, target) => {
                     header.set_entry_type(tar::EntryType::Symlink);
@@ -383,5 +428,69 @@ pub(crate) mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn the_snapshot_store_and_git_folders_stay_out_of_the_checkout() {
+        for path in [
+            ".fanta/history.git/config",
+            ".git/config",
+            "pages/.fanta/history.git/HEAD",
+            ".FANTA/history.git/config",
+        ] {
+            let destination = tempfile::tempdir().expect("destination");
+            let archive = tarball(&[
+                Entry::File("design/fanta.json", b"{}"),
+                Entry::File(&format!("design/{path}"), b"planted"),
+            ]);
+            // A commit may hold project settings under `.fanta`: the run goes
+            // on without them.
+            extract(&archive[..], "design", destination.path(), Limits::SOURCE).expect(path);
+            assert!(destination.path().join("fanta.json").exists(), "{path}");
+            let top = path.split('/').next().expect("first name");
+            assert!(!destination.path().join(top).exists(), "{path}");
+
+            for file in [
+                serde_json::json!({"path": path, "content_b64": "eA=="}),
+                serde_json::json!({"path": path, "deleted": true}),
+            ] {
+                let overlay: Overlay =
+                    serde_json::from_value(serde_json::json!({"files": [file]})).expect("overlay");
+                assert_eq!(
+                    code(apply_overlay(&overlay, destination.path())),
+                    Err(ErrorCode::BadRequest),
+                    "{path}"
+                );
+            }
+            assert!(!destination.path().join(path).exists(), "{path}");
+        }
+
+        let destination = tempfile::tempdir().expect("destination");
+        let skipped = tarball(&[
+            Entry::File("fanta.json", b"{}"),
+            Entry::Folder(".fanta/history.git/hooks"),
+            Entry::Link(".git/hooks", "/etc"),
+            Entry::File(".fanta/settings.json", b"0123456789"),
+        ]);
+        extract(&skipped[..], "", destination.path(), Limits::SOURCE).expect("skipped entries");
+        assert!(!destination.path().join(".fanta").exists());
+        assert!(!destination.path().join(".git").exists());
+        // Skipped files are still read, so they count toward the limits as
+        // files always did.
+        let one_file = Limits { bytes: 1024, files: 1 };
+        let eleven_bytes = Limits { bytes: 11, files: 10 };
+        for small in [one_file, eleven_bytes] {
+            assert_eq!(
+                code(extract(&skipped[..], "", destination.path(), small)),
+                Err(ErrorCode::PayloadTooLarge)
+            );
+        }
+        // A name that only resembles them is an ordinary file.
+        let ordinary = tarball(&[
+            Entry::File("fanta.json", b"{}"),
+            Entry::File(".fanta-notes/readme.txt", b"x"),
+            Entry::File(".gitignore", b"previews/\n"),
+        ]);
+        extract(&ordinary[..], "", destination.path(), Limits::SOURCE).expect("ordinary names");
     }
 }

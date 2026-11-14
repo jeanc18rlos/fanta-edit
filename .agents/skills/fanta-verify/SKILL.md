@@ -7,13 +7,14 @@ description: Choose and run the right checks for a Fanta change - crate tests, s
 
 Run the narrowest check that exercises the change, then the release stage that covers its area. Report what you ran and what you did not.
 
-`script/gate` runs the checks that need no compile, in seconds. `script/gate --full` then runs `./script/clippy -p` for the crates the branch changed since `origin/main`, the release stages that name them, and `cargo test -p` for changed crates no stage covers; `--list` prints the commands. It does not choose the single-test gates, probes, smoke tests or platform checks in the table below.
+`script/gate` runs the checks that need no compile, in seconds. `script/gate --full` then runs `./script/clippy -p` for the crates the branch changed since `origin/main`, the release stages that name them, and `cargo test -p` for changed crates no stage covers; `--list` prints the commands. It does not choose the single-test gates, probes, smoke tests or platform checks in the table below. A check whose tool is missing prints `SKIP` locally and fails in CI; on Linux x86_64 `script/install-gate-tools <directory on PATH>` installs the pinned `typos`, `zizmor` and `cargo-deny` that CI's `hygiene` job uses.
 
 ## Pick the checks
 
 | Changed | Run |
 | --- | --- |
-| `fanta-doc`, `fanta-canvas`, `fanta-tools`, `fanta-render`, `fanta-text`, `fanta-present` | `cargo test --locked -p <crate>`, then stage `engine` |
+| `fanta-doc`, `fanta-canvas`, `fanta-tools`, `fanta-text`, `fanta-present` | `cargo test --locked -p <crate>`, then stage `engine` |
+| `fanta-render` | `cargo test --locked -p fanta-render`, then stage `render`. Its golden image was rendered on macOS, so `tier1_golden_scene_matches` fails on Linux; do not regenerate it |
 | `fanta-fnx`, `fanta-format` | `cargo test --locked -p fanta-fnx -p fanta-format --lib`, then stages `engine` and `source-order` |
 | `fanta-fig-interop` | stage `import`; with a private fixture, `FANTA_FIG_FIXTURE=<file.fig>` and stage `import-preservation` |
 | `fig_viewer` | `cargo test --locked -p fig_viewer --lib <filter>`, then stage `editor`; add `workspace` for pane, save and close flows |
@@ -25,12 +26,14 @@ Run the narrowest check that exercises the change, then the release stage that c
 | Lints | `./script/clippy -p <crate>` (off macOS it enables every feature except the renderer's Metal ones); stage `lint` covers the release crates and lints the wasm engine for the browser target |
 | Platform-specific code (`cfg(target_os)`, `std::os::unix`, per-OS keymaps) | the `Windows` workflow (`.github/workflows/windows.yml`). On Windows, run `.\script\clippy.ps1` and the `cargo` commands directly; the other scripts are Bash ([guide](../../../docs/fanta/windows-development.md)) |
 | Packaging scripts | `bash -n <script>`, `python3 script/test-macos-release`, `./script/check-licenses` |
-| Crate dependencies, a new crate, `docs/architecture`, `docs/decisions`, `specs`, `script/architecture` | `script/architecture verify` (no build); `python3 script/test-architecture` when the script changed |
+| Crate dependencies, a new crate, `docs/architecture`, `docs/decisions`, `specs`, `script/architecture` | `script/gate` runs both `script/architecture verify` (no build) and `python3 script/test-architecture` |
 | `mac_app_store` code paths | `cargo check --locked -p fanta --features mac_app_store`, plus the matching tests in the `mac-app-store-runtime` job of `check.yml` |
 
 `./script/verify-fanta-release --list` prints each stage's exact command. `--stage <name>` (repeatable) runs stages and writes logs plus `results.tsv` under `target/release-verification`. The script does not validate an installer, drive the full app, contact production services or run ignored benchmarks, and it refuses to run while golden-regeneration variables are set.
 
-A green stage is not the whole CI gate. `.github/workflows/check.yml` also runs single-test gates (bundled git, languages, AI provider auth, browser sign-in, Save As prompts, agent panel toggle, sidebar) and requires 51 named editor and workspace tests. Renaming one of those tests means updating that list.
+Stage `shell` runs the single-test gates on the inherited crates (bundled git, languages, AI provider auth, browser sign-in, Save As prompts, update verification, agent panel toggle, sidebar) and stage `release-blockers` the agent request-limit, output-limit, compaction and Settings regressions with their default-feature lint. Off macOS both skip, with a printed note, the steps whose tests are macOS-only (bundled git, the Settings window).
+
+A green stage is not the whole CI gate. `.github/workflows/check.yml` also requires 51 named editor and workspace tests. Renaming one of those tests means updating that list.
 
 ## Probe and render examples
 

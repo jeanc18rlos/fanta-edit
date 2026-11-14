@@ -1,0 +1,157 @@
+name: Nightly
+
+# The suites spec 0012 (R6) keeps off the pull request path. A release is built only from a
+# commit with a green run of this workflow: see the `fanta-release` skill.
+on:
+  schedule:
+    # 03:17 UTC: off the top of the hour, when scheduled runs queue longest.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Must differ from the groups of the workflows called below, or the run would wait on itself.
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  # The same steps as the `mac-app-store-runtime` job of check.yml, which spec 0012 T2 deletes.
+  mac-app-store:
+    name: Mac App Store suite
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install the repository Rust toolchain
+        run: rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: macos-check
+          # Restore only: the check job on main owns this key, and a second copy would not fit the 10 GB cache limit.
+          save-if: 'false'
+
+      - uses: $/.github/actions/prepare-skia-source
+        with:
+          offline: 'true'
+
+      - name: Check the Mac App Store feature build
+        run: cargo check --locked -p fanta --features mac_app_store
+
+      - name: Test Store App Access settings guide
+        run: cargo test --locked -p fanta --bin fanta --features mac_app_store store_app_access_guide_has_one_system_action_and_three_explanations
+
+      - name: Test account billing date windows
+        run: cargo test --locked -p fanta --bin fanta --features mac_app_store usage_
+
+      - name: Test Store Welcome App Access entry
+        run: cargo test --locked -p workspace --lib --features mac_app_store store_welcome_links_to_app_access_guide
+
+      - name: Test blocked local MCP process spawn
+        run: cargo test --locked -p context_server --lib --features mac_app_store rejects_stdio_before_process_spawn
+
+      - name: Test blocked native agent terminal commands
+        run: cargo test --locked -p agent --lib --features mac_app_store test_mac_app_store_terminal_tool
+
+      - name: Test terminal action is hidden in Store builds
+        run: cargo test --locked -p agent_ui --lib --features mac_app_store test_agent_command_palette_visibility
+
+      - name: Test blocked direct ACP process spawn
+        run: cargo test --locked -p agent_servers --lib --features mac_app_store test_mac_app_store_blocks_direct_acp_stdio_spawn
+
+      - name: Test blocked Prettier JavaScript server
+        run: cargo test --locked -p prettier --lib --features mac_app_store test_mac_app_store_rejects_prettier_launch
+
+      - name: Test blocked remote connections
+        run: cargo test --locked -p remote --lib --features mac_app_store test_mac_app_store_rejects_remote_connection
+
+      - name: Test bundled Git requirement
+        run: cargo test --locked -p fs --test integration --features mac_app_store,test-support test_mac_app_store_requires_bundled_git
+
+      - name: Test blocked project execution paths
+        run: cargo test --locked -p project --test integration --features mac_app_store,test-support test_mac_app_store_
+
+  lint:
+    name: macOS all-features lint
+    uses: ./.github/workflows/fanta-lint.yml
+
+  skia-source:
+    name: Skia source compatibility
+    uses: ./.github/workflows/skia-source-compatibility.yml
+
+  # Advisory until the tree is clean (spec 0012 R19, T9): it never fails the run or opens the issue.
+  custom-lints:
+    name: Custom lints (advisory)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        run: ./script/linux
+
+      - name: Install Rust, the lints' pinned nightly and Dylint
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          lint_toolchain="$(awk -F'"' '/^channel/ {print $2}' tooling/lints/rust-toolchain.toml)"
+          rustup toolchain install "$lint_toolchain" --profile minimal \
+            --component llvm-tools-preview --component rustc-dev --component rust-src
+          cargo install --locked cargo-dylint@6.4.0 dylint-link@6.4.0
+
+      - name: Run the lints of tooling/lints on Fanta's GPUI crates
+        run: cargo dylint --all -- --locked -p fig_viewer -p fanta_ui -p design_surface -p fanta
+
+  # Fuzzing (spec 0012 T14) adds its job here and its name to `needs` below.
+
+  tracking-issue:
+    name: Update the tracking issue
+    needs: [mac-app-store, lint, skia-source]
+    # Skipped when the run is cancelled by hand; a job that timed out still counts as failed.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open, update or close "Nightly is failing"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NEEDS: ${{ toJSON(needs) }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          failed="$(jq -r '[to_entries[] | select(.value.result != "success") | .key] | join(", ")' <<<"$NEEDS")"
+          # Found by label, not by title: anyone can open an issue with this title, only maintainers can label one.
+          issue="$(gh issue list --state open --label nightly-failure --json number --jq '.[0].number // empty')"
+          if [[ -n "$failed" ]]; then
+            body="Nightly failed on \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA}. Failed jobs: ${failed}. Run: ${run_url}"
+            if [[ -n "$issue" ]]; then
+              gh issue comment "$issue" --body "$body"
+            else
+              gh label create nightly-failure --force --color B60205 \
+                --description 'The Nightly workflow is failing'
+              gh issue create --title 'Nightly is failing' --label nightly-failure --body "$body"
+            fi
+            exit 1
+          fi
+          # A green run of another branch says nothing about main, so it leaves the issue open.
+          if [[ -n "$issue" && "$GITHUB_REF" == "refs/heads/${DEFAULT_BRANCH}" ]]; then
+            gh issue comment "$issue" --body "Nightly is green again at ${GITHUB_SHA}. Run: ${run_url}"
+            gh issue close "$issue"
+          fi
