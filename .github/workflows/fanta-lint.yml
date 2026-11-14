@@ -24,17 +24,20 @@ on:
       - 'crates/fanta-design-ops/**'
       - 'crates/fanta-headless/**'
       - 'crates/fanta-api/**'
-      - 'crates/fanta-engine/**'
+      - 'crates/fanta-worker/**'
       - 'crates/fig_viewer/**'
       - 'crates/workspace/**'
       - 'crates/fanta_ui/**'
   workflow_dispatch:
+  # nightly.yml runs this job every night.
+  workflow_call:
 
 permissions:
   contents: read
 
+# `github.workflow` is the caller's name in a called run, so a pull request or manual run cannot cancel the nightly one.
 concurrency:
-  group: release-lint-${{ github.ref }}
+  group: release-lint-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -87,7 +90,7 @@ jobs:
             xcrun -sdk macosx --find metallib
           } 2>&1 | tee "${RUNNER_TEMP}/fanta-lint/toolchain.log"
 
-      - uses: ./.github/actions/prepare-skia-source
+      - uses: $/.github/actions/prepare-skia-source
         with:
           offline: 'true'
 

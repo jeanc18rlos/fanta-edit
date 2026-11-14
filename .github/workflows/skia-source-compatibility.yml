@@ -1,28 +1,33 @@
 name: Skia source compatibility
 
 on:
+  # Only the files that decide what this workflow compiles. `Cargo.toml` and `Cargo.lock` are left
+  # out because nearly every dependency change touches them: an edit there to the skia-safe features,
+  # the skia-bindings patch or its build dependencies (bindgen, cc) is first built from source by
+  # nightly.yml. Run this workflow by hand on such a pull request.
   pull_request:
     paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
       - 'vendor/skia-bindings-0.153.3/**'
-      - 'crates/fanta-render/**'
-      - 'crates/fanta-text/**'
-      - 'crates/fig_viewer/Cargo.toml'
+      - 'crates/fanta-render/Cargo.toml'
+      - 'crates/fanta-text/Cargo.toml'
       - 'script/clippy'
       - 'script/check-licenses'
       - 'script/generate-licenses'
       - 'script/licenses/**'
+      - 'script/prepare-skia-source'
+      - '.github/actions/prepare-skia-source/**'
       - '.github/workflows/skia-source-compatibility.yml'
       - 'rust-toolchain.toml'
       - '.cargo/**'
   workflow_dispatch:
+  # nightly.yml runs this job every night.
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: skia-source-${{ github.ref }}
+  group: skia-source-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -112,7 +117,7 @@ jobs:
           (evidence / "upstream-source.json").write_text(json.dumps(records, indent=2) + "\n")
           PY
 
-      - uses: ./.github/actions/prepare-skia-source
+      - uses: $/.github/actions/prepare-skia-source
 
       - name: Compile default renderer from Skia source
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}

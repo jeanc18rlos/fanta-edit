@@ -1,0 +1,21 @@
+# Findings `script/gate` tolerates. Each ignore says why and what removes it.
+rules:
+  github-env:
+    ignore:
+      # The value is a constant path under GITHUB_WORKSPACE; no input, event
+      # field or file content reaches the line. The step exists to hand the
+      # path to later steps, which only GITHUB_ENV can do.
+      - action.yml
+  cache-poisoning:
+    ignore:
+      # Deferred: pull request #174 rewrites the release workflows. Decide
+      # there whether a release build may restore a cache, then drop these.
+      - release-macos.yml
+      - release-windows.yml
+  self-repository:
+    ignore:
+      # Deferred with the same pull request, which owns this file for now.
+      - release-macos.yml
+      # The two reusable-workflow calls keep `./`: the `$/` form is proven here
+      # for actions only. Switch them after a nightly run has shown it works.
+      - nightly.yml

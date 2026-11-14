@@ -391,9 +391,7 @@ pub fn validate(request: &RunRequest) -> Result<(), EngineError> {
         }
         source::relative_path(path)?;
         for file in overlay.iter().flat_map(|overlay| &overlay.files) {
-            if source::relative_path(&file.path)?.as_os_str().is_empty() {
-                return bad_request("an overlay file needs a path".into());
-            }
+            source::overlay_path(&file.path)?;
         }
     }
     for (index, step) in request.steps.iter().enumerate() {
@@ -450,13 +448,13 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
     validate(request)?;
     let started = Instant::now();
     let deadline = Duration::from_millis(request.deadline_ms);
-    let project = HeadlessProject::open(work_dir).map_err(|error| {
+    let mut project = HeadlessProject::open(work_dir).map_err(|error| {
         let code = if fanta_headless::saved_by_newer_fanta(&error) {
             ErrorCode::SchemaTooNew
         } else {
             ErrorCode::ProjectLoadFailed
         };
-        EngineError::new(code, format!("{error:#}"))
+        EngineError::new(code, caller_message(&error, work_dir))
     })?;
     if started.elapsed() >= deadline {
         return Err(EngineError::new(
@@ -464,13 +462,15 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
             "the deadline passed before the project loaded",
         ));
     }
+    // The checkout is someone else's files and is thrown away after the run:
+    // a snapshot would only run git on them.
+    project.set_snapshots(false);
     let mut session = DesignSession::from_project(project);
     // Template images come from data: URIs or this checkout's own files,
     // never from the network.
-    session.set_image_fetcher(
-        DirectoryFetcher::new(work_dir)
-            .map_err(|error| EngineError::new(ErrorCode::Internal, format!("{error:#}")))?,
-    );
+    session.set_image_fetcher(DirectoryFetcher::new(work_dir).map_err(|error| {
+        EngineError::new(ErrorCode::Internal, caller_message(&error, work_dir))
+    })?);
     let mut results = Vec::with_capacity(request.steps.len());
     for step in &request.steps {
         if started.elapsed() >= deadline {
@@ -485,7 +485,7 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
             });
             break;
         }
-        match run_step(&mut session, step) {
+        match run_step(&mut session, step, work_dir) {
             Ok(result) => results.push(StepResult {
                 step: step.name().into(),
                 ok: true,
@@ -499,7 +499,7 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
                     result: None,
                     error: Some(ErrorBody {
                         code: ErrorCode::StepFailed,
-                        message: format!("{error:#}"),
+                        message: caller_message(&error, work_dir),
                     }),
                 });
                 break;
@@ -515,12 +515,73 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
             project_id: project.map(|project| project.doc().id.to_string()),
             warnings: project
                 // The cloud contract is frozen (ADR 0021): one sentence per finding.
-                .map(|project| project.warnings().iter().map(ToString::to_string).collect())
+                .map(|project| {
+                    project
+                        .warnings()
+                        .iter()
+                        .map(|warning| project_relative(&warning.to_string(), work_dir))
+                        .collect()
+                })
                 .unwrap_or_default(),
             fonts: project.map(font_report).unwrap_or_default(),
         },
         results,
     })
+}
+
+/// An error's text with the checkout's location taken out, so that a file is
+/// named by its path in the project and the answer says nothing about the
+/// engine's own disk.
+fn caller_message(error: &anyhow::Error, work_dir: &Path) -> String {
+    project_relative(&format!("{error:#}"), work_dir)
+}
+
+fn project_relative(message: &str, work_dir: &Path) -> String {
+    // The project is opened by its resolved path, so text can carry either.
+    let message = match work_dir.canonicalize() {
+        Ok(resolved) => without_root(message, &resolved),
+        Err(_) => message.to_owned(),
+    };
+    without_root(&message, work_dir)
+}
+
+/// `message` with `root/` removed from the front of every path under it, and
+/// `root` on its own replaced by "the project folder". A longer name that
+/// merely contains `root` (`/data<root>`, `<root>-old`) is left alone.
+fn without_root(message: &str, root: &Path) -> String {
+    let root = root.to_string_lossy();
+    let root = root.trim_end_matches('/');
+    // Replacing a relative root, such as `.`, would eat ordinary text.
+    if !root.starts_with('/') {
+        return message.to_owned();
+    }
+    let in_name = |character: char| character.is_alphanumeric() || "-_~+@%".contains(character);
+    let mut cleaned = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(start) = rest.find(root) {
+        let before = rest[..start].chars().next_back();
+        let mut after = rest[start + root.len()..].chars();
+        let next = after.next();
+        let then = after.next();
+        let part_of_longer_path = before.is_some_and(|character| in_name(character) || "/.".contains(character))
+            || next.is_some_and(in_name)
+            // A dot continues a name (`project.bak`) unless it ends a sentence.
+            || (next == Some('.') && then.is_some_and(|character| in_name(character) || character == '.'));
+        cleaned.push_str(&rest[..start]);
+        rest = &rest[start + root.len()..];
+        if part_of_longer_path {
+            cleaned.push_str(root);
+        } else if next == Some('/')
+            && then.is_some_and(|character| in_name(character) || character == '.')
+        {
+            rest = &rest[1..];
+        } else {
+            cleaned.push_str("the project folder");
+            rest = rest.strip_prefix('/').unwrap_or(rest);
+        }
+    }
+    cleaned.push_str(rest);
+    cleaned
 }
 
 fn font_report(project: &HeadlessProject) -> FontReport {
@@ -539,7 +600,11 @@ fn font_report(project: &HeadlessProject) -> FontReport {
     }
 }
 
-fn run_step(session: &mut DesignSession, step: &Step) -> anyhow::Result<serde_json::Value> {
+fn run_step(
+    session: &mut DesignSession,
+    step: &Step,
+    work_dir: &Path,
+) -> anyhow::Result<serde_json::Value> {
     match step {
         Step::Inspect {} => session_project(session)?.inspect(),
         Step::CreatePage { name } => {
@@ -623,7 +688,11 @@ fn run_step(session: &mut DesignSession, step: &Step) -> anyhow::Result<serde_js
                             image.bounds.height(),
                         ],
                     }),
-                    Err(error) => json!({ "row": row, "ok": false, "error": format!("{error:#}") }),
+                    Err(error) => json!({
+                        "row": row,
+                        "ok": false,
+                        "error": project_relative(&format!("{error:#}"), work_dir),
+                    }),
                 })
                 .collect();
             Ok(json!({ "images": images }))
@@ -1170,5 +1239,184 @@ mod tests {
         };
         assert_eq!(substitution.family, "Adobe Clean");
         assert!(substitution.used.starts_with("Source"), "{substitution:?}");
+    }
+
+    #[test]
+    fn validation_refuses_an_overlay_inside_the_snapshot_store() {
+        for path in [".fanta/history.git/config", "pages/.git/config"] {
+            let error = validate(&request(json!({
+                "request_id": "r",
+                "deadline_ms": 1000,
+                "source": {
+                    "kind": "github",
+                    "repo": "acme/site",
+                    "sha": "0123456789abcdef0123456789abcdef01234567",
+                    "token": "t",
+                    "overlay": {"files": [{"path": path, "content_b64": "eA=="}]}
+                },
+                "steps": [{"step": "inspect"}]
+            })))
+            .expect_err("refused");
+            assert_eq!(error.error.code, ErrorCode::BadRequest, "{path}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_run_that_saves_takes_no_snapshot() {
+        let directory = text_project("Inter");
+        let response = run_in(
+            &request(json!({
+                "request_id": "r",
+                "deadline_ms": 60000,
+                "source": {"kind": "dir", "dir": directory.path()},
+                "steps": [
+                    {"step": "create_page", "name": "Landing"},
+                    {"step": "changeset"}
+                ]
+            })),
+            directory.path(),
+        )
+        .expect("the run answers");
+        assert!(
+            response.results.iter().all(|result| result.ok),
+            "{:?}",
+            response.results
+        );
+        assert!(
+            !directory.path().join(".fanta").exists(),
+            "the engine is stateless: a save must not create a snapshot store"
+        );
+    }
+
+    // The worker runs on Linux only, and the stripping reads Unix paths.
+    #[cfg(unix)]
+    #[test]
+    fn errors_do_not_name_the_private_checkout() {
+        let directory = tempfile::tempdir().expect("project directory");
+        let location = directory.path().to_string_lossy().into_owned();
+        let resolved = directory
+            .path()
+            .canonicalize()
+            .expect("resolve")
+            .to_string_lossy()
+            .into_owned();
+
+        let error = inspect(directory.path()).expect_err("an empty folder is no project");
+        assert_eq!(error.error.code, ErrorCode::ProjectLoadFailed, "{error}");
+        let message = &error.error.message;
+        assert!(
+            !message.contains(&location) && !message.contains(&resolved),
+            "{message}"
+        );
+    }
+
+    // The worker runs on Linux only, and the stripping reads Unix paths.
+    #[cfg(unix)]
+    #[test]
+    fn caller_messages_drop_the_checkout_root_and_nothing_else() {
+        let message =
+            |text: &str, root: &str| caller_message(&anyhow::anyhow!("{text}"), Path::new(root));
+        let root = "/tmp/x/project";
+        for (text, expected) in [
+            (
+                "reading /tmp/x/project/pages/a.svg: denied",
+                "reading pages/a.svg: denied",
+            ),
+            (
+                "at path \"/tmp/x/project/.fanta-transaction\"",
+                "at path \".fanta-transaction\"",
+            ),
+            (
+                "project at /tmp/x/project: not found",
+                "project at the project folder: not found",
+            ),
+            (
+                "in /tmp/x/project/: not found",
+                "in the project folder: not found",
+            ),
+            (
+                "`a` is outside /tmp/x/project",
+                "`a` is outside the project folder",
+            ),
+            (
+                "not a project: /tmp/x/project.",
+                "not a project: the project folder.",
+            ),
+            // Another folder whose name starts or ends the same way is not the checkout.
+            ("reading /tmp/x/project-x/a", "reading /tmp/x/project-x/a"),
+            (
+                "reading /tmp/x/project.bak/a",
+                "reading /tmp/x/project.bak/a",
+            ),
+            (
+                "reading /data/tmp/x/project/a",
+                "reading /data/tmp/x/project/a",
+            ),
+        ] {
+            assert_eq!(message(text, root), expected);
+            assert_eq!(message(text, "/tmp/x/project/"), expected, "trailing slash");
+        }
+        // A root that is not absolute names nothing worth hiding, and
+        // replacing it would eat ordinary text.
+        for root in [".", "", "project", "/"] {
+            assert_eq!(
+                message("reading ./a.b/project: no", root),
+                "reading ./a.b/project: no"
+            );
+        }
+    }
+
+    // The worker runs on Linux only, and the stripping reads Unix paths.
+    #[cfg(unix)]
+    #[test]
+    fn row_errors_do_not_name_the_private_checkout() {
+        use fanta_api::{NodeKind, Placeholder};
+        let directory = text_project("Inter");
+        let pixel = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+            .expect("a one-pixel png");
+        {
+            let mut session = DesignSession::open_project(directory.path()).expect("open");
+            let page = session.active_page().expect("page");
+            let photo = session
+                .create_node(page, NodeKind::Image(pixel.clone()))
+                .expect("photo");
+            session.set_name(photo, "photo").expect("name");
+            session
+                .set_placeholder(photo, Some(Placeholder::default()))
+                .expect("placeholder");
+            session.add_undo_step("Template").expect("commit");
+            session.save().expect("save");
+        }
+        // An image that exists, but outside the checkout.
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("photo.png"), &pixel).expect("outside image");
+        let escaping = pathdiff(outside.path(), directory.path()).join("photo.png");
+
+        let response = run_in(
+            &request(json!({
+                "request_id": "r",
+                "deadline_ms": 60000,
+                "source": {"kind": "dir", "dir": directory.path()},
+                "steps": [{"step": "export_batch", "page": {"index": 0}, "max_dimension": 64,
+                           "rows": [{"photo": escaping}]}]
+            })),
+            directory.path(),
+        )
+        .expect("the run answers");
+        let text = serde_json::to_string(&response).expect("serialize");
+        assert!(text.contains("is outside the project folder"), "{text}");
+        let location = directory.path().canonicalize().expect("resolve");
+        assert!(!text.contains(&*location.to_string_lossy()), "{text}");
+        assert!(
+            !text.contains(&*directory.path().to_string_lossy()),
+            "{text}"
+        );
+    }
+
+    /// `../<name>` from one temporary directory to its sibling.
+    fn pathdiff(target: &Path, from: &Path) -> PathBuf {
+        assert_eq!(target.parent(), from.parent(), "siblings");
+        Path::new("..").join(target.file_name().expect("name"))
     }
 }

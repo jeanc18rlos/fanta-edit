@@ -13,7 +13,7 @@ before T1 in its own pull request.
 
 Fast CI:
 
-- [ ] **T1.** (plan A1) Add stages `render`, `shell` and `release-blockers` to
+- [x] **T1.** (#225) (plan A1) Add stages `render`, `shell` and `release-blockers` to
   `script/verify-fanta-release` and take `fanta-render` out of `engine`.
   Add the `changes` and `linux-test` jobs to `check.yml` as advisory
   (R3, R4, R5). Verify: `--list` shows the stages; the Linux job is green
@@ -25,11 +25,14 @@ Fast CI:
   required names into `ci/required-tests.json` with
   `script/verify-required-tests`. Update the rule in `CLAUDE.md` that
   points at `check.yml` (R4, R9). Verify: A2, A5.
-- [ ] **T3.** (plan A3) `nightly.yml` with the Mac App Store suite, the macOS
+- [x] **T3.** (#230) (plan A3) `nightly.yml` with the Mac App Store suite, the macOS
   all-features lint, Skia source compatibility and the tracking issue;
   narrow `skia-source-compatibility.yml`'s pull request paths; delete
   `fanta-lint.yml`; add the nightly rule to the `fanta-release` skill
-  (R6). Verify: A7.
+  (R6). Verify: A7. As merged: `fanta-lint.yml` stays, because nightly
+  calls it, and keeps its pull request trigger until T2 removes it; the
+  advisory custom-lints job of T9 is already in; A7 is proven by the first
+  dispatches after the merge.
 - [ ] **T4.** (plan A4) The `gate` and `hygiene` jobs; fold `architecture.yml`
   into `hygiene`. The description carries the `gh api` command with which
   the founder adds the required check and the bypass to the ruleset
@@ -43,7 +46,7 @@ Agent harness:
 - [x] **T7.** (#218) (plan H3) Fix `guard_bash.py` and add its self-tests (R18).
   Below the spec threshold on its own; it may land before the spec is
   accepted. Verify: A10.
-- [ ] **T8.** (plan H4) Agent pull request rules in `CLAUDE.md` and `AGENTS.md`
+- [x] **T8.** (#228) (plan H4) Agent pull request rules in `CLAUDE.md` and `AGENTS.md`
   (R20). Verify: A11.
 - [ ] **T9.** (plan H5) Run the six lints nightly, advisory; evaluate the id
   lint with the `lint-creator` skill and record the result here (R19).
@@ -57,9 +60,9 @@ Gates:
 - [ ] **T10.** (plan G1) One `cargo fmt --all` commit, listed in
   `.git-blame-ignore-revs`, then the formatting check in `script/gate`
   (R11). Lands when no open pull request would conflict. Verify: A6.
-- [ ] **T11.** (plan G2) `typos` and `zizmor` in `script/gate`, with the
+- [x] **T11.** (#233) (plan G2) `typos` and `zizmor` in `script/gate`, with the
   findings fixed (R8). Verify: A6.
-- [ ] **T12.** (plan G3) `deny.toml` and `cargo deny check advisories sources
+- [x] **T12.** (#233) (plan G3) `deny.toml` and `cargo deny check advisories sources
   bans` in `script/gate`, with the first run triaged (R10, Q3).
   Verify: A6.
 - [ ] **T13.** (plan G4) `script/verify-required-tests --names` in
