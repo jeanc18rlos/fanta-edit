@@ -29,12 +29,15 @@ on:
       - 'crates/workspace/**'
       - 'crates/fanta_ui/**'
   workflow_dispatch:
+  # nightly.yml runs this job every night.
+  workflow_call:
 
 permissions:
   contents: read
 
+# `github.workflow` is the caller's name in a called run, so a pull request or manual run cannot cancel the nightly one.
 concurrency:
-  group: release-lint-${{ github.ref }}
+  group: release-lint-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:

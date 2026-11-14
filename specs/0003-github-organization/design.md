@@ -44,7 +44,7 @@ Each move is one task with the same three phases.
 ### Rules for public repositories
 
 A repository ruleset on `main`: require a pull request with one approving
-review from the founder; require the `Check` and `Architecture` workflows;
+review from the founder; require the `gate` check of the `Check` workflow;
 block deletion and force pushes; allow merge commits (the history uses them).
 Keep the existing tag ruleset for `alpha-*`. Required review only works once
 agents open pull requests under their own identity (Q3).
