@@ -25,12 +25,15 @@ Fast CI:
   required names into `ci/required-tests.json` with
   `script/verify-required-tests`. Update the rule in `CLAUDE.md` that
   points at `check.yml` (R4, R9). Verify: A2, A5.
-- [ ] **T3.** (plan A3) `nightly.yml` with the Mac App Store suite, the macOS
+- [x] **T3.** (#230) (plan A3) `nightly.yml` with the Mac App Store suite, the macOS
   all-features lint, Skia source compatibility and the tracking issue;
   narrow `skia-source-compatibility.yml`'s pull request paths; delete
   `fanta-lint.yml`; add the nightly rule to the `fanta-release` skill
-  (R6). Verify: A7.
-- [ ] **T4.** (plan A4) The `gate` and `hygiene` jobs; fold `architecture.yml`
+  (R6). Verify: A7. As merged: `fanta-lint.yml` stays, because nightly
+  calls it, and keeps its pull request trigger until T2 removes it; the
+  advisory custom-lints job of T9 is already in; A7 is proven by the first
+  dispatches after the merge.
+- [x] **T4.** (#239) (plan A4) The `gate` and `hygiene` jobs; fold `architecture.yml`
   into `hygiene`. The description carries the `gh api` command with which
   the founder adds the required check and the bypass to the ruleset
   (R7, R8). Verify: A1, A3, A4.
