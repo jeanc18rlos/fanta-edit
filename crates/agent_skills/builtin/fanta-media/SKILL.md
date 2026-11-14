@@ -2,7 +2,7 @@
 name: fanta-media
 description: >-
   Generate and use AI media (images, edits, upscales, animations) via the
-  Fanta backend MCP server at api.fantaisa.net. Use when the user wants to
+  Fanta backend MCP server at api-v2.fantaisa.net. Use when the user wants to
   generate an image, edit or upscale an existing one, animate a still, or
   bring generated media into a design. Covers the generate → poll → deliver
   loop and current canvas-placement limitations.
@@ -10,7 +10,7 @@ description: >-
 
 # Generating media with the Fanta backend
 
-Media generation runs on the `fanta` MCP server (`https://api.fantaisa.net/mcp`,
+Media generation runs on the `fanta` MCP server (`https://api-v2.fantaisa.net/mcp`,
 authenticated automatically with the user's signed-in Fanta account). If its tools
 (`generate_image`, `edit_image`, `upscale_image`, `vectorize`,
 `animate_image`, `plan_compose`, `get_generation`, `list_models`,
