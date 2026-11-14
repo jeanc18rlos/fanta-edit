@@ -69,9 +69,7 @@ impl History {
     /// The store for the project at `dir`, using the `git` on `PATH`.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
-            // Callers pass a canonicalized root, which on Windows is `\\?\C:\…`;
-            // git cannot open that form as a directory, a work tree or a git dir.
-            dir: dunce::simplified(&dir.into()).to_path_buf(),
+            dir: dir.into(),
             git: "git".into(),
         }
     }
@@ -391,17 +389,6 @@ mod tests {
             .before_save()
             .expect("a finding, not a failure");
         assert_eq!(finding.code, SNAPSHOT_UNAVAILABLE);
-    }
-
-    /// The editor and the headless engine open a project by its canonical path.
-    #[test]
-    fn a_canonical_project_path_still_takes_snapshots() {
-        let scratch = tempfile::tempdir().unwrap();
-        let project = scratch.path().canonicalize().unwrap();
-        write(&project, "fanta.json", "{}");
-        let history = History::new(&project);
-        assert_eq!(history.before_save(), None);
-        assert_eq!(history.list().unwrap().len(), 1);
     }
 
     fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {

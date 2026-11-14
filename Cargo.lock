@@ -4483,7 +4483,6 @@ name = "fanta-format"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "dunce",
  "fanta-bundle",
  "fanta-doc",
  "fanta-fnx",
