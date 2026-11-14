@@ -1,0 +1,31 @@
+[package]
+name = "fanta-fig-interop-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "GPL-3.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace: libfuzzer-sys and the nightly toolchain stay out of the
+# root workspace and its Cargo.lock.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fanta-fig-interop = { path = ".." }
+
+[[bin]]
+name = "read_fig"
+path = "fuzz_targets/read_fig.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kiwi"
+path = "fuzz_targets/kiwi.rs"
+test = false
+doc = false
+bench = false

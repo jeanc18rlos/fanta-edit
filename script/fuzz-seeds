@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Rebuilds the read_project fuzz seeds: each project of crates/fanta-format/tests/corpus
+# flattened into one file, `=== <path>` before each of its files (the target's input format).
+set -euo pipefail
+
+cd "$(dirname "$0")/../crates/fanta-format"
+seeds=fuzz/seeds/read_project
+rm -rf "$seeds"
+mkdir -p "$seeds"
+for project in tests/corpus/*/; do
+    (
+        cd "$project"
+        find . -type f | LC_ALL=C sort | while IFS= read -r file; do
+            printf '=== %s\n' "${file#./}"
+            cat "$file"
+            printf '\n'
+        done
+    ) >"$seeds/$(basename "$project")"
+done

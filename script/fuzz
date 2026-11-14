@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Runs one fuzz target of a parser crate with the limits the nightly job uses:
+#   script/fuzz <crate> <target> [seconds, default 60]
+# New inputs land in the ignored fuzz/corpus; the committed seeds are only read.
+set -euo pipefail
+
+# The one place the fuzzing nightly is pinned; fuzz.yml installs what this prints.
+toolchain=nightly-2026-11-12
+if [[ "${1:-}" == --toolchain ]]; then
+    echo "$toolchain"
+    exit
+fi
+
+usage='usage: script/fuzz <crate> <target> [seconds, default 60] | script/fuzz --toolchain'
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+    echo "$usage" >&2
+    exit 2
+fi
+crate=$1
+target=$2
+seconds=${3:-60}
+fuzz_dir="$(cd "$(dirname "$0")/.." && pwd)/crates/$crate/fuzz"
+if [[ ! -f "$fuzz_dir/Cargo.toml" || ! -f "$fuzz_dir/fuzz_targets/$target.rs" ]]; then
+    echo "script/fuzz: no fuzz target '$target' in crates/$crate/fuzz" >&2
+    echo "$usage" >&2
+    exit 2
+fi
+if [[ ! "$seconds" =~ ^[0-9]+$ ]]; then
+    echo "$usage" >&2
+    exit 2
+fi
+mkdir -p "$fuzz_dir/corpus/$target"
+cd "$fuzz_dir/.."
+# cargo-fuzz has no --locked, so check the committed lock is current before it builds.
+cargo "+$toolchain" metadata --locked --format-version 1 --manifest-path "$fuzz_dir/Cargo.toml" >/dev/null
+exec cargo "+$toolchain" fuzz run "$target" "$fuzz_dir/corpus/$target" "$fuzz_dir/seeds/$target" -- \
+    -max_total_time="$seconds" -max_len=65536 -timeout=10 -rss_limit_mb=2048
