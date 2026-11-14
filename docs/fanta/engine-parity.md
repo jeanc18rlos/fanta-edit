@@ -64,7 +64,7 @@ compatibility adapter is a separate, optional layer.
 | Assets | asset sources, queries, URI resolver, buffers | 🟡 project assets addressed by content hash; `fanta-api` fetches template images from `data:` URIs, a directory or https, as the caller allows; no asset sources or queries | 2 |
 | Automation | data merge, auto-resize, batch generation | 🟡 `fanta-api` fills a template from a data row, batch-exports one image per row, and resizes a frame by its constraints or by fitting its content; the cloud engine fills and batch-exports through its `fill_template` and `export_batch` steps | 2 |
 | Color and print | CMYK, spot colors, ICC, mm and inches, DPI, bleed, underlayer, cutouts, crop marks | ❌ 8-bit sRGB and pixels only | 5 |
-| Distribution | native Node package, engine plugins | ❌ engine bindings (the web runtime only plays prototypes); the engine is GPL-3.0 | 6 |
+| Distribution | native Node package, engine plugins | ❌ engine bindings (the web runtime only plays prototypes); the engine is Apache-2.0 (ADR 0026) | 6 |
 | Importers and extras | PSD, IDML, PDF, PPTX, Lottie; background removal, QR codes, dominant colors, validation | ❌ (✅ `.fig`, limited SVG; cloud segmentation) | 7 |
 
 Fanta has what CE.SDK does not: designs as FNX source in git, components and
@@ -96,8 +96,8 @@ over MCP and cloud review. The plan keeps all of them.
    with separations, overprint, page boxes, marks and PDF/X; cutouts,
    underlayers and exclusion areas.
 6. **Distribution.** A napi-rs package over `fanta-api` with prebuilt binaries,
-   an engine plugin trait and a WASM editing build. This needs a licence
-   decision first: the engine crates are GPL-3.0.
+   an engine plugin trait and a WASM editing build. The licence
+   decision it needed is made: the engine is Apache-2.0 (ADR 0026).
 7. **Importers and extras.** PSD, IDML, PPTX, PDF and Lottie importers through
    `fanta-format`'s format registry; QR codes, dominant colors, validation and
    brand rules; background removal through Apple Vision on device or a
