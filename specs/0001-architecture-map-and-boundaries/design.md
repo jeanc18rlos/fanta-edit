@@ -24,7 +24,8 @@
   between the `<!-- decisions:start -->` and `<!-- specs:start -->` markers.
   `new` copies the templates.
 - `verify` runs `check`, `map --check` and `index --check`, which is what
-  `.github/workflows/architecture.yml` calls.
+  `script/gate` calls, locally and in the `hygiene` job of
+  `.github/workflows/check.yml`.
 
 ## Interfaces and data
 

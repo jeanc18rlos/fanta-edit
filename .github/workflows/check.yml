@@ -70,6 +70,35 @@ jobs:
           fi
           printf 'docs=%s\nrust=%s\nworkflows=%s\n' "$docs" "$rust" "$workflows" | tee -a "$GITHUB_OUTPUT"
 
+  # Everything that needs no compile. Runs on every pull request, drafts and docs-only included.
+  hygiene:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.native_video_only }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # `cargo metadata` and cargo-deny read manifests and Cargo.lock only, so the
+      # runner's stable toolchain is enough and the pinned one need not install.
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # cargo-deny has cargo download every locked crate to read its manifest:
+      # three minutes without this cache. No target directory: nothing compiles.
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: hygiene
+          cache-targets: 'false'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install typos, zizmor and cargo-deny
+        run: script/install-gate-tools "${RUNNER_TEMP}/gate-tools"
+
+      # CI is set, so a missing tool fails instead of skipping.
+      - name: Run the checks that need no compile
+        run: PATH="${RUNNER_TEMP}/gate-tools:${PATH}" script/gate
+
   # Advisory until five consecutive green runs on main (spec 0012, T2).
   linux-test:
     needs: changes
@@ -598,6 +627,29 @@ jobs:
           path: ${{ runner.temp }}/release-blocker-regressions
           if-no-files-found: error
           retention-days: 14
+
+  # The only check the main ruleset requires: keep the job id and its name `gate`.
+  # It fails on a draft, whose compiling jobs skip: a pass would stay on the
+  # commit and let it merge once marked ready, before the new run reports.
+  gate:
+    if: ${{ always() }}
+    # Every job a pull request must pass. `native-video` is manual only, and
+    # `linux-test` joins when it loses `continue-on-error` (spec 0012, T2).
+    needs: [changes, hygiene, check, mac-app-store-runtime, release-blocker-regressions]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Pass when the needed jobs succeeded and the pull request is not a draft
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          DRAFT: ${{ github.event.pull_request.draft == true }}
+        run: script/gate --needs-json "$NEEDS_JSON" --required changes --required hygiene --draft "$DRAFT"
 
   native-video:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_video_only }}
