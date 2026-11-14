@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Installs the pinned typos, zizmor and cargo-deny that script/gate runs into
+# a directory, for CI's hygiene job and for a local machine without them.
+#
+#   script/install-gate-tools ~/.local/bin
+#
+# To bump a tool, change its version and the SHA-256 of its release asset
+# (`gh api repos/<owner>/<repo>/releases/tags/<tag> --jq '.assets[] | .name, .digest'`).
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: script/install-gate-tools <destination directory>" >&2
+  exit 2
+fi
+if [[ "$(uname -sm)" != "Linux x86_64" ]]; then
+  # shortcut: only the CI platform is pinned; add assets here when another one needs them.
+  echo "script/install-gate-tools: only Linux x86_64 is pinned; install typos, zizmor and cargo-deny with cargo or brew" >&2
+  exit 1
+fi
+
+destination="$1"
+mkdir -p "$destination"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+install_tool() {
+  local tool="$1" version="$2" url="$3" sha256="$4"
+  if [[ -x "$destination/$tool" ]] && "$destination/$tool" --version 2>/dev/null | grep -qF "$version"; then
+    echo "$tool $version: already installed"
+    return
+  fi
+  mkdir "$work/$tool"
+  curl --fail --silent --show-error --location --retry 3 --output "$work/$tool.tar.gz" "$url"
+  echo "$sha256  $work/$tool.tar.gz" | sha256sum --check --quiet -
+  tar -xzf "$work/$tool.tar.gz" -C "$work/$tool"
+  install -m 755 "$(find "$work/$tool" -type f -name "$tool" | head -n 1)" "$destination/$tool"
+  echo "$tool $version: installed"
+}
+
+install_tool typos 1.52.2 \
+  https://github.com/crate-ci/typos/releases/download/v1.52.2/typos-v1.52.2-x86_64-unknown-linux-musl.tar.gz \
+  3b13d1291281d39d01822e54035636487a7a0f228e70097899b1e33aeb0e7e93
+install_tool zizmor 1.32.0 \
+  https://github.com/zizmorcore/zizmor/releases/download/v1.32.0/zizmor-x86_64-unknown-linux-gnu.tar.gz \
+  bb110cc765eca9cd7efb2e284a956be5974c60027b0970f16397d86208a9957b
+install_tool cargo-deny 0.20.2 \
+  https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz \
+  9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f

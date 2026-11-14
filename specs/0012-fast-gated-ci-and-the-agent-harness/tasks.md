@@ -33,7 +33,7 @@ Fast CI:
   calls it, and keeps its pull request trigger until T2 removes it; the
   advisory custom-lints job of T9 is already in; A7 is proven by the first
   dispatches after the merge.
-- [ ] **T4.** (plan A4) The `gate` and `hygiene` jobs; fold `architecture.yml`
+- [x] **T4.** (#239) (plan A4) The `gate` and `hygiene` jobs; fold `architecture.yml`
   into `hygiene`. The description carries the `gh api` command with which
   the founder adds the required check and the bypass to the ruleset
   (R7, R8). Verify: A1, A3, A4.

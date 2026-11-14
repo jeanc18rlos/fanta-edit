@@ -80,7 +80,8 @@ impl History {
     /// The store for the project at `dir`, using the `git` on `PATH`.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
-            dir: dir.into(),
+            // Git for Windows cannot open the `\\?\` form that `canonicalize` returns there.
+            dir: dunce::simplified(&dir.into()).to_path_buf(),
             git: "git".into(),
         }
     }
@@ -455,6 +456,14 @@ mod tests {
     /// Spec 0009 R6: a snapshot before a save only when the files changed
     /// outside Fanta, one after every save that changed something, and a
     /// missing git never stops a save.
+    #[test]
+    fn a_resolved_project_path_takes_snapshots() {
+        let scratch = tempfile::tempdir().unwrap();
+        let project = scratch.path().canonicalize().unwrap();
+        write(&project, "fanta.json", "{}");
+        assert_eq!(History::new(&project).before_save(), None);
+    }
+
     #[test]
     fn saves_are_bracketed_by_snapshots_only_when_something_changed() {
         let scratch = tempfile::tempdir().unwrap();
