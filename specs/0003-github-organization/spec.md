@@ -41,7 +41,7 @@ reviewer of their pull requests.
   docs links, the SDK's engine pin, Vercel's Git connections, Cloud Build or
   Cloud Run triggers, the GitHub App that cloud review uses, and webhooks.
 - **R4.** Public repositories must have rules on `main`: a pull request is
-  required, the Check and Architecture workflows must pass, and deletion and
+  required, the `gate` check of the Check workflow must pass, and deletion and
   force pushes are blocked. Release tags stay protected.
 - **R5.** Agents must open pull requests under their own identity, and the
   founder's approval must be required on public repositories.

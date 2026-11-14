@@ -92,7 +92,7 @@ impl CloudApiClient {
             .build_zed_cloud_url("/")
             .ok()
             .and_then(|url| url.host_str().map(String::from))
-            .unwrap_or_else(|| "api.fantaisa.net".into())
+            .unwrap_or_else(|| "api-v2.fantaisa.net".into())
     }
 
     fn build_request(

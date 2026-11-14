@@ -1822,11 +1822,11 @@ mod tests {
         );
     }
 
-    /// Dev and Preview builds talk to the Fanta v2 backend; Stable stays on v1. Account auth is
-    /// only attached when a URL matches `server_url`, so every Fanta endpoint must move together,
-    /// and the repeated Fanta model list must not drift from the base one.
+    /// Every release channel talks to the Fanta v2 backend. Account auth is only attached when a
+    /// URL matches `server_url`, so every Fanta endpoint must sit on that host and no channel may
+    /// move one of them alone.
     #[test]
-    fn test_default_settings_fanta_v2_channel_overrides() {
+    fn test_default_settings_fanta_endpoints_share_server_url() {
         let (parsed, status) = UserSettingsContent::parse_json(&default_settings());
         assert!(
             parsed.is_some() && matches!(status, ParseStatus::Success),
@@ -1835,39 +1835,33 @@ mod tests {
 
         let defaults: serde_json::Value =
             crate::parse_json_with_comments(&default_settings()).unwrap();
-        let base_models =
-            &defaults["language_models"]["anthropic_compatible"]["Fanta"]["available_models"];
-        assert_eq!(defaults["server_url"], "https://api.fantaisa.net");
+        let server = defaults["server_url"].as_str().unwrap();
+        assert_eq!(server, "https://api-v2.fantaisa.net");
         assert_eq!(
-            defaults["context_servers"]["fanta-design"]["enabled"],
-            false
+            defaults["language_models"]["anthropic_compatible"]["Fanta"]["api_url"],
+            server
         );
-        assert!(defaults["stable"].get("server_url").is_none());
+        assert_eq!(
+            defaults["edit_predictions"]["open_ai_compatible_api"]["api_url"],
+            format!("{server}/v1/completions")
+        );
+        let servers = &defaults["context_servers"];
+        assert_eq!(servers["fanta"]["url"], format!("{server}/mcp"));
+        assert_eq!(servers["fanta-design"]["url"], format!("{server}/v2/mcp"));
+        assert_eq!(servers["fanta-design"]["enabled"], true);
 
-        for channel in ["dev", "preview"] {
-            let overrides = &defaults[channel];
-            let server = overrides["server_url"].as_str().unwrap();
-            assert_eq!(server, "https://api-v2.fantaisa.net", "{channel}");
-            let fanta = &overrides["language_models"]["anthropic_compatible"]["Fanta"];
-            assert_eq!(fanta["api_url"], server, "{channel}");
-            assert_eq!(&fanta["available_models"], base_models, "{channel}");
-            assert_eq!(
-                overrides["edit_predictions"]["open_ai_compatible_api"]["api_url"],
-                format!("{server}/v1/completions"),
-                "{channel}"
-            );
-            let servers = &overrides["context_servers"];
-            assert_eq!(
-                servers["fanta"]["url"],
-                format!("{server}/mcp"),
-                "{channel}"
-            );
-            assert_eq!(
-                servers["fanta-design"]["url"],
-                format!("{server}/v2/mcp"),
-                "{channel}"
-            );
-            assert_eq!(servers["fanta-design"]["enabled"], true, "{channel}");
+        for channel in ["dev", "nightly", "preview", "stable"] {
+            for key in [
+                "server_url",
+                "language_models",
+                "edit_predictions",
+                "context_servers",
+            ] {
+                assert!(
+                    defaults[channel].get(key).is_none(),
+                    "{channel} overrides {key}"
+                );
+            }
         }
     }
 

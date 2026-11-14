@@ -3,7 +3,8 @@
 
 Without options it runs the checks that need no compile and take seconds.
 `--full` then lints the crates the branch changed and runs the
-script/verify-fanta-release stages that test them.
+script/verify-fanta-release stages that test them. `--needs-json` is the
+`gate` job of check.yml: it decides from the results of the other jobs.
 """
 
 import argparse
@@ -21,8 +22,11 @@ BASE = "origin/main"
 # (name, command). The first word is the tool that must be installed.
 FAST_CHECKS = [
     ("architecture", ["script/architecture", "verify"]),
+    ("architecture-tests", ["python3", "script/test-architecture"]),
     ("bash-guard", ["python3", ".claude/hooks/guard_bash.py", "--self-test"]),
     ("gate", ["script/gate", "--self-test"]),
+    # Starts a server on a free loopback port; no network.
+    ("serve-project", ["python3", "script/test-serve-project"]),
     ("typos", ["typos", "--config", "typos.toml"]),
     # Offline: the online audits need a GitHub token. Ignores are in zizmor.yml.
     ("zizmor", ["zizmor", "--offline", ".github/workflows", ".github/actions"]),
@@ -34,6 +38,8 @@ FAST_CHECKS = [
         + ["advisories", "sources", "bans"],
     ),
 ]
+# Seconds a check may take. Only a check that could wait forever needs one.
+TIMEOUTS = {"serve-project": 60}
 
 
 def run(name, command, list_only):
@@ -48,7 +54,11 @@ def run(name, command, list_only):
             return False
         print(f"SKIP {name}: {tool} is not installed")
         return True
-    passed = subprocess.run(command, cwd=ROOT).returncode == 0
+    try:
+        passed = subprocess.run(command, cwd=ROOT, timeout=TIMEOUTS.get(name)).returncode == 0
+    except subprocess.TimeoutExpired:
+        print(f"{name} did not finish in {TIMEOUTS[name]} seconds")
+        passed = False
     print(f"{'PASS' if passed else 'FAIL'} {name}", flush=True)
     return passed
 
@@ -139,7 +149,56 @@ def full_checks(list_only):
     return passed
 
 
+def needs_verdict(needs, required, draft):
+    """Reads the `needs` context of the `gate` job.
+
+    Returns one (job, result, verdict) row per job and whether a pull request
+    may merge: every `required` job succeeded and every other job succeeded
+    or was skipped. A draft never passes, because its compiling jobs skip
+    and a pass would stay on the commit after the draft is marked ready.
+    """
+    rows = []
+    passed = bool(needs) and not draft and required <= set(needs)
+    for job in sorted(needs):
+        result = needs[job].get("result")
+        if result == "success" or (result == "skipped" and job not in required):
+            verdict = "ok"
+        else:
+            verdict = "FAIL"
+            passed = False
+        rows.append((job, str(result), verdict))
+    return rows, passed
+
+
+def needs_gate(needs_json, required, draft):
+    rows, passed = needs_verdict(json.loads(needs_json), set(required), draft)
+    width = max([len(job) for job, _, _ in rows] + [len("job")])
+    print(f"{'job':<{width}}  {'result':<9}  verdict")
+    for job, result, verdict in rows:
+        print(f"{job:<{width}}  {result:<9}  {verdict}")
+    if draft:
+        print("gate: FAIL: a draft skips the compiling jobs; mark it ready to run them")
+    else:
+        print("gate: " + ("pass" if passed else "FAIL: a job failed, was cancelled or did not run"))
+    return passed
+
+
 def self_test():
+    def verdict(draft=False, **results):
+        needs = {job.replace("_", "-"): {"result": result} for job, result in results.items()}
+        return needs_verdict(needs, {"changes", "hygiene"}, draft)[1]
+
+    assert verdict(changes="success", hygiene="success", check="success")
+    # A change no compiling job covers: they skip.
+    assert verdict(changes="success", hygiene="success", check="skipped")
+    assert not verdict(True, changes="success", hygiene="success", check="skipped")
+    # A manual native-video run skips everything.
+    assert not verdict(changes="skipped", hygiene="skipped", check="skipped")
+    assert not verdict(changes="success", check="success")
+    assert not verdict(changes="success", hygiene="failure", check="skipped")
+    assert not verdict(changes="success", hygiene="success", check="cancelled")
+    assert not verdict(changes="success", hygiene=None)
+    assert not verdict()
     directories = {"crates/fanta-doc": "fanta-doc", "crates/fanta-doc/fuzz": "fanta-doc-fuzz"}
     files = ["crates/fanta-doc/src/scene.rs", "crates/fanta-doc/fuzz/a.rs", "docs/x.md"]
     assert changed_crates(files, directories) == ["fanta-doc", "fanta-doc-fuzz"]
@@ -158,8 +217,25 @@ def main():
         "--full", action="store_true", help=f"also lint and test the crates changed since {BASE}"
     )
     parser.add_argument("--list", action="store_true", help="print the commands without running")
+    parser.add_argument(
+        "--needs-json",
+        metavar="JSON",
+        help="decide from a workflow's `needs` context instead of running checks",
+    )
+    parser.add_argument(
+        "--required",
+        action="append",
+        default=[],
+        metavar="JOB",
+        help="with --needs-json: a job that must succeed, not skip",
+    )
+    parser.add_argument(
+        "--draft", default="false", help="with --needs-json: `true` for a draft pull request"
+    )
     parser.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args()
+    if arguments.needs_json is not None:
+        return 0 if needs_gate(arguments.needs_json, arguments.required, arguments.draft == "true") else 1
     if arguments.self_test:
         self_test()
         return 0
