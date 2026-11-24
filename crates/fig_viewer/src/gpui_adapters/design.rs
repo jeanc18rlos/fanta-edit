@@ -4646,6 +4646,18 @@ impl FigView {
                     panel.set_active_surface(requested, cx);
                 });
             }
+            DesignPanelAction::GridTrackAddRequested { .. }
+            | DesignPanelAction::GridTrackDeleteRequested { .. }
+            | DesignPanelAction::GridTracksReorderRequested { .. }
+            | DesignPanelAction::EffectReorderRequested { .. } => {
+                crate::view::notify_unavailable(UNWIRED_CONTROL, window, cx);
+            }
+            // Only the commit end speaks: Preview fires on every drag frame.
+            DesignPanelAction::GridDimensionsEditRequested { phase, .. } => {
+                if *phase == DesignPanelEditPhase::Commit {
+                    crate::view::notify_unavailable(UNWIRED_CONTROL, window, cx);
+                }
+            }
             _ => {
                 log::debug!("fig design adapter: unhandled action {action:?}");
             }

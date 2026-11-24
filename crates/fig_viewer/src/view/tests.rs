@@ -8979,6 +8979,92 @@ async fn mounted_bound_instance_text_double_click_explains_refusal_without_editi
     });
 }
 
+#[cfg(feature = "fanta-gpui-ui")]
+#[gpui::test]
+async fn unwired_grid_track_and_effect_reorder_controls_explain_themselves(
+    cx: &mut TestAppContext,
+) {
+    use fanta_gpui::design::{
+        DesignGridDimensions, DesignGridTrackAxis, DesignPanelAction, DesignPanelEditPhase,
+    };
+    init_visual_test(cx);
+    let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+    let (mut doc, text, _) = text_selection_doc(false);
+    doc.selection.select_only(text);
+    let item = crate::document::ready_item_for_test(
+        &project,
+        std::path::PathBuf::from("/tmp/Unwired.fig"),
+        doc,
+        cx,
+    );
+    let (multi_workspace, visual) = cx.add_window_view(|window, cx| {
+        workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+    });
+    let workspace = multi_workspace.read_with(visual, |multi_workspace, _| {
+        multi_workspace.workspace().clone()
+    });
+    let view = visual.update(|window, cx| {
+        let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx)
+        });
+        view
+    });
+    visual.run_until_parked();
+    let notice = NotificationId::named(CANVAS_NOTICE_ID.into());
+    let mut emit_and_check = |action: DesignPanelAction, expect_notice: bool| {
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.refresh_gpui_design(cx);
+                let panel = view.gpui_design.as_ref().expect("Design").panel.clone();
+                view.handle_design_action(&panel, &action, window, cx);
+            })
+        });
+        visual.run_until_parked();
+        workspace.update(visual, |workspace, cx| {
+            assert_eq!(
+                workspace.notification_ids().contains(&notice),
+                expect_notice,
+                "{action:?}"
+            );
+            workspace.dismiss_toast(&notice, cx);
+        });
+    };
+    let node_id: SharedString = text.to_string().into();
+    let dimensions = DesignGridDimensions::new(3, 2).expect("dimensions");
+    for (phase, expect_notice) in [
+        (DesignPanelEditPhase::Begin, false),
+        (DesignPanelEditPhase::Preview, false),
+        (DesignPanelEditPhase::Commit, true),
+    ] {
+        emit_and_check(
+            DesignPanelAction::GridDimensionsEditRequested {
+                node_id: node_id.clone(),
+                dimensions,
+                phase,
+            },
+            expect_notice,
+        );
+    }
+    emit_and_check(
+        DesignPanelAction::GridTrackAddRequested {
+            node_id: node_id.clone(),
+            axis: DesignGridTrackAxis::Column,
+            insertion_index: 0,
+        },
+        true,
+    );
+    emit_and_check(
+        DesignPanelAction::EffectReorderRequested {
+            node_id: node_id.clone(),
+            effect_id: "effect-0".into(),
+            from_index: 0,
+            to_index: 1,
+        },
+        true,
+    );
+}
+
 #[gpui::test]
 async fn canvas_double_click_instance_text_commits_override_without_changing_master(
     cx: &mut TestAppContext,
