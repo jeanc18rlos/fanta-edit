@@ -5378,9 +5378,10 @@ async fn fetch_catalog(
     )
     .await?;
     // One malformed or newly shaped entry must not hide every other model.
-    let mut models: Vec<GenerationModel> = value["models"]
+    let entries = value["models"]
         .as_array()
-        .context("The model catalog could not be read.")?
+        .context("The model catalog could not be read.")?;
+    let mut models: Vec<GenerationModel> = entries
         .iter()
         .filter_map(|entry| {
             serde_json::from_value(entry.clone())
@@ -5394,6 +5395,10 @@ async fn fetch_catalog(
             model.capabilities["hosted"] != true,
             model.label().to_lowercase(),
         )
+    ensure!(
+        !models.is_empty() || entries.is_empty(),
+        "The model catalog could not be read."
+    );
     });
     Ok(models)
 }
@@ -7557,6 +7562,25 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         const SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="24"><path d="M2 2L30 2L16 22Z" fill="#22c55e"/></svg>"##;
+
+        let http = http_client::FakeHttpClient::create(|_| async move {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(r#"{"models":[{"id":null,"kind":"image"}]}"#.into())?)
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let unreadable = fetch_catalog(
+            &client,
+            "https://api.fantaisa.net",
+            client.account_access_token().as_deref(),
+            &cx.executor(),
+        )
+        .await;
+        assert!(
+            unreadable.is_err(),
+            "a catalog with no readable model is reported, not shown as empty"
+        );
         let messages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let http = http_client::FakeHttpClient::create({
             let messages = messages.clone();
