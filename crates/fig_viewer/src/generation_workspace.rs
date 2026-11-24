@@ -3160,15 +3160,6 @@ impl GenerationWorkspace {
             source: None,
             mode: GenerationMode::Vector.label().into(),
         };
-        self.pending = false;
-        self.outputs.clear();
-        self.preview = None;
-        self.preview_task = None;
-        self.prepared_video = None;
-        self.clear_playback(cx);
-        self.preview_request = None;
-        self.active_run = None;
-        self.active_title = None;
         self.error = None;
         self.status = "Creating vector artwork…".into();
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -3194,6 +3185,7 @@ impl GenerationWorkspace {
                         };
                         this.active_run = Some(run.clone());
                         this.active_title = None;
+                        this.pending = false;
                         this.history.insert(0, run);
                         let mut vectors = 0;
                         this.history.retain(|run| match run.result {
@@ -7558,6 +7550,70 @@ mod tests {
             Some("wav")
         );
         assert!(write_playback_file(b"not audio", "audio/mpeg").is_err());
+    }
+
+    #[gpui::test]
+    async fn generation_failed_vector_request_keeps_the_previous_artwork(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="24"><path d="M2 2L30 2L16 22Z" fill="#22c55e"/></svg>"##;
+        let messages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let http = http_client::FakeHttpClient::create({
+            let messages = messages.clone();
+            move |request| {
+                let messages = messages.clone();
+                async move {
+                    let (status, response) = match (request.method(), request.uri().path()) {
+                        (&Method::GET, "/v1/models") => (
+                            200,
+                            json!({"models": [{
+                                "id": "claude-sonnet-5", "kind": "chat", "max_output_tokens": 4096
+                            }]}),
+                        ),
+                        (&Method::GET, "/v1/me") => (200, recovery_account_fixture()),
+                        (&Method::POST, "/v1/messages") => {
+                            if messages.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                                (
+                                    200,
+                                    json!({
+                                        "id": "msg_first",
+                                        "stop_reason": "end_turn",
+                                        "content": [{"type": "text", "text": SVG}]
+                                    }),
+                                )
+                            } else {
+                                (503, json!({"error": "Temporarily unavailable"}))
+                            }
+                        }
+                        route => panic!("Unexpected vector request: {route:?}"),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(status)
+                        .body(response.to_string().into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Vector, client, cx);
+        for prompt_text in ["a green triangle", "a blue square"] {
+            view.update_in(cx, |view, window, cx| {
+                let prompt = view.prompt.clone();
+                prompt.update(cx, |prompt, cx| prompt.set_text(prompt_text, window, cx));
+                view.generate(window, cx);
+            });
+            cx.run_until_parked();
+        }
+        view.read_with(cx, |view, _| {
+            assert!(view.task.is_none());
+            assert!(view.error.is_some(), "the failed request is reported");
+            assert_eq!(view.outputs.len(), 1, "the earlier artwork stays shown");
+            assert!(matches!(
+                view.active_run.as_ref().map(|run| &run.result),
+                Some(RunResult::VectorMessage { message_id, .. })
+                    if message_id.as_deref() == Some("msg_first")
+            ));
+        });
     }
 
     struct PendingBody;
