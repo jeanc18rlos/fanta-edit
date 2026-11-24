@@ -9056,7 +9056,7 @@ async fn unwired_grid_track_and_effect_reorder_controls_explain_themselves(
     );
     emit_and_check(
         DesignPanelAction::EffectReorderRequested {
-            node_id: node_id.clone(),
+            node_id,
             effect_id: "effect-0".into(),
             from_index: 0,
             to_index: 1,
