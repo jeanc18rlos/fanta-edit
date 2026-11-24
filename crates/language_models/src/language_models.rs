@@ -438,11 +438,14 @@ mod tests {
             Err(language_model::LanguageModelCompletionError::PaymentRequired)
         ));
 
-        client.http_client().as_fake().replace_handler(|_, _| async move {
-            Ok(http_client::Response::builder()
-                .status(402)
-                .body("insufficient_credits".into())?)
-        });
+        client
+            .http_client()
+            .as_fake()
+            .replace_handler(|_, _| async move {
+                Ok(http_client::Response::builder()
+                    .status(402)
+                    .body("insufficient_credits".into())?)
+            });
         assert!(matches!(
             model
                 .stream_completion(LanguageModelRequest::default(), &cx.to_async())

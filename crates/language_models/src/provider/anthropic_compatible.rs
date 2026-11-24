@@ -723,7 +723,10 @@ impl LanguageModelProvider for AnthropicCompatibleLanguageModelProvider {
 
     fn authentication_error_message(&self) -> SharedString {
         if self.managed_account {
-            return "Your Fanta sign-in expired. Sign out and sign in again to continue.".into();
+            // An API key stored for this provider is sent instead of the sign-in token.
+            return "Fanta did not accept your sign-in. Sign out and sign in again, \
+                or update your Fanta API key in Settings > AI & models."
+                .into();
         }
         format!(
             "The API key for {} is invalid or has expired. \
@@ -858,7 +861,8 @@ impl Render for AccountConfigurationView {
             .child(
                 Button::new("fanta-manage-account", "Manage account and billing").on_click(
                     |_, window, cx| {
-                        window.dispatch_action(fanta_actions::OpenAccountSettings.boxed_clone(), cx);
+                        window
+                            .dispatch_action(fanta_actions::OpenAccountSettings.boxed_clone(), cx);
                     },
                 ),
             )
