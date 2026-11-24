@@ -2390,6 +2390,14 @@ impl GenerationWorkspace {
                 }
                 return true;
             }
+            // A running card whose polling stopped (failed check or timeout) resumes when clicked.
+            if self.pending
+                && self.task.is_none()
+                && let Some(run) = self.active_run.clone()
+            {
+                self.check_status(run, cx);
+                return true;
+            }
             return false;
         }
         if let Some(record) = self
@@ -3422,7 +3430,7 @@ impl GenerationWorkspace {
                         }
                         this.error = Some(
                             format!(
-                                "Status check failed: {error}. Use Check status to resume this job."
+                                "Status check failed: {error}. Select the running card to check again."
                             )
                             .into(),
                         );
@@ -3439,6 +3447,8 @@ impl GenerationWorkspace {
                 return;
             }
             this.status = "This job is still running. Check its status again in a moment.".into();
+            this.error =
+                Some("This job is still running. Select the running card to check again.".into());
             cx.notify();
         })
         .log_err();
@@ -7256,6 +7266,96 @@ mod tests {
     #[gpui::test]
     async fn generation_poll_accepts_backend_string_seed(cx: &mut gpui::TestAppContext) {
         assert_string_seed_generation_completes(true, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_running_card_resumes_after_a_failed_status_check(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("generated image");
+        let completed = json!({
+            "id":"resumed-job", "status":"succeeded", "model":"fanta-image-1",
+            "output":[{"data_url":format!("data:image/png;base64,{}", STANDARD.encode(png.into_inner()))}],
+        });
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let http = http_client::FakeHttpClient::create({
+            let polls = polls.clone();
+            move |request| {
+                let completed = completed.clone();
+                let polls = polls.clone();
+                async move {
+                    let (status, response) = match (request.method(), request.uri().path()) {
+                        (&Method::GET, "/v1/models") => (200, json!({"models":[]})),
+                        (&Method::GET, "/v1/me") => (200, recovery_account_fixture()),
+                        (&Method::POST, "/v1/generations") => {
+                            (200, json!({"id":"resumed-job", "status":"processing"}))
+                        }
+                        (&Method::GET, "/v1/generations/resumed-job") => {
+                            if polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                                (503, json!({"error":"Temporarily unavailable"}))
+                            } else {
+                                (200, completed)
+                            }
+                        }
+                        route => panic!("Unexpected generation request: {route:?}"),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(status)
+                        .body(response.to_string().into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Image, client, cx);
+        view.update(cx, |view, cx| {
+            view.submit(
+                Submission {
+                    key: "resumed-job".into(),
+                    request: json!({"model":"fanta-image-1", "prompt":"A sunrise"}),
+                    model: "fanta-image-1".into(),
+                    prompt: "A sunrise".into(),
+                    source: None,
+                    account,
+                    mode: GenerationMode::Image,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.task.is_none() && view.pending && view.outputs.is_empty());
+            assert!(view.error.is_some(), "the failed status check is reported");
+            let running = view
+                .generation_view_data(cx)
+                .outputs
+                .into_iter()
+                .find(|output| output.status == GenerationOutputStatus::Running)
+                .expect("the job stays visible as running");
+            assert_eq!(running.id.as_ref(), "gen:resumed-job:0");
+        });
+        view.update_in(cx, |view, window, cx| {
+            view.handle_generation_action(
+                GenerationAction::OutputSelected {
+                    id: "gen:resumed-job:0".into(),
+                },
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.task.is_none());
+            assert!(view.error.is_none());
+            assert!(!view.pending);
+            assert_eq!(view.outputs.len(), 1, "selecting the running card checks again");
+        });
     }
 
     struct PendingBody;
