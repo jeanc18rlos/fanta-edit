@@ -98,6 +98,21 @@ pub(super) fn property_name(property: MotionProperty) -> &'static str {
     }
 }
 
+fn keyframe_value_label(value: &ResolvedVarValue) -> SharedString {
+    match value {
+        ResolvedVarValue::Float { value } => format!("{value:.2}").into(),
+        ResolvedVarValue::Color { value } => value.to_hex().into(),
+        ResolvedVarValue::String { value } | ResolvedVarValue::Enum { value } => {
+            value.clone().into()
+        }
+        ResolvedVarValue::Boolean { value } => if *value { "On" } else { "Off" }.into(),
+        ResolvedVarValue::TextStyle { .. } => "Text style".into(),
+        ResolvedVarValue::Image { value } => {
+            if value.is_some() { "Image" } else { "No image" }.into()
+        }
+    }
+}
+
 impl FigView {
     pub(super) fn refresh_shared_timeline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.gpui_design.is_none() {
@@ -193,10 +208,7 @@ impl FigView {
                     .map(|key| shared::TimelineKeyframe {
                         id: key.id.to_string().into(),
                         time_ms: key.time_ms,
-                        value: match &key.value {
-                            ResolvedVarValue::Float { value } => format!("{value:.2}").into(),
-                            _ => format!("{:?}", key.value).into(),
-                        },
+                        value: keyframe_value_label(&key.value),
                         easing: shared_easing(key.easing, key.interpolation),
                     })
                     .collect::<Vec<_>>();
@@ -663,6 +675,32 @@ mod tests {
                 .get(&track_id)
                 .cloned()
         })
+    }
+
+    #[test]
+    fn keyframe_values_read_as_the_inspector_shows_them() {
+        let label = |value| keyframe_value_label(&value).to_string();
+        assert_eq!(label(ResolvedVarValue::Float { value: 0.5 }), "0.50");
+        assert_eq!(
+            label(ResolvedVarValue::Color {
+                value: fanta_doc::Color::from_hex("#FF0000").expect("color"),
+            }),
+            "#FF0000"
+        );
+        assert_eq!(label(ResolvedVarValue::Boolean { value: true }), "On");
+        assert_eq!(
+            label(ResolvedVarValue::String {
+                value: "Hello".into()
+            }),
+            "Hello"
+        );
+        assert_eq!(
+            label(ResolvedVarValue::Enum {
+                value: "Open".into()
+            }),
+            "Open"
+        );
+        assert_eq!(label(ResolvedVarValue::Image { value: None }), "No image");
     }
 
     #[gpui::test]
