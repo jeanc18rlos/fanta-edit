@@ -1157,6 +1157,12 @@ pub(crate) fn format_number(value: f64) -> String {
         return "0".to_string();
     }
     let rounded = (value * 100.0).round() / 100.0;
+    if !rounded.is_finite() {
+        // Scaling by 100 overflowed; a value this large has no hundredths to round.
+        return format!("{value}");
+    }
+    // Adding zero turns -0.0 into 0.0, so a tiny negative never prints "-0".
+    let rounded = rounded + 0.0;
     if rounded.fract() == 0.0 {
         format!("{rounded:.0}")
     } else {
@@ -1165,7 +1171,18 @@ pub(crate) fn format_number(value: f64) -> String {
 }
 
 pub(crate) fn parse_number(text: &str) -> Option<f64> {
-    let cleaned = text.trim().trim_end_matches("px").trim();
+    let cleaned = text
+        .trim()
+        .trim_end_matches("px")
+        .trim()
+        .replace('\u{2212}', "-");
+    // A single comma is a decimal comma; several look like thousands
+    // separators, which stay rejected rather than guessed.
+    let cleaned = if cleaned.matches(',').count() == 1 && !cleaned.contains('.') {
+        cleaned.replace(',', ".")
+    } else {
+        cleaned
+    };
     cleaned
         .parse::<f64>()
         .ok()
@@ -1210,6 +1227,27 @@ mod tests {
         HiddenPaintAlpha, opaque_paint_alpha, paint_alpha, paint_is_visible, set_paint_alpha,
         zeroed_paint_alpha,
     };
+
+    #[test]
+    fn format_number_round_trips_through_parse_number() {
+        assert_eq!(format_number(-0.001), "0");
+        assert_eq!(format_number(-1.25), "-1.25");
+        for value in [-0.001, 1e307, -1e307, 12.5] {
+            let text = format_number(value);
+            assert!(
+                parse_number(&text).is_some(),
+                "{value} formats as {text:?}, which parses back"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_number_accepts_a_decimal_comma_and_a_unicode_minus() {
+        assert_eq!(parse_number("1,5"), Some(1.5));
+        assert_eq!(parse_number("\u{2212}5px"), Some(-5.0));
+        assert_eq!(parse_number("1,000,000"), None);
+        assert_eq!(parse_number("1.5"), Some(1.5));
+    }
 
     #[test]
     fn font_weight_dropdown_labels_the_ladder_and_keeps_custom_weights() {
