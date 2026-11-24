@@ -1105,6 +1105,8 @@ impl FantaPrototypePanel {
                         TransitionStyle::SlideIn { .. } => TransitionStyle::SlideIn { direction },
                         TransitionStyle::Push { .. } => TransitionStyle::Push { direction },
                         TransitionStyle::MoveIn { .. } => TransitionStyle::MoveIn { direction },
+                        TransitionStyle::SlideOut { .. } => TransitionStyle::SlideOut { direction },
+                        TransitionStyle::MoveOut { .. } => TransitionStyle::MoveOut { direction },
                         style => style,
                     };
                 })
@@ -3953,6 +3955,70 @@ mod tests {
             assert_eq!(
                 reaction_by_id(doc, first_id, reaction_id).map(|reaction| &reaction.action),
                 Some(&Action::Navigate { to: second_id })
+            );
+        });
+    }
+
+    async fn panel_with_reaction(
+        reaction: Reaction,
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::WindowHandle<FantaPrototypePanel>,
+        Entity<FigItem>,
+        NodeId,
+    ) {
+        init_test(cx);
+        let (mut doc, first, _) = document_with_two_frames();
+        doc.apply(Operation::AddReaction {
+            node: first,
+            reaction,
+        })
+        .expect("add interaction");
+        doc.selection.select_only(first);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/PrototypeChoices.fanta"),
+            doc,
+            cx,
+        );
+        let panel_item = item.clone();
+        let panel = cx.add_window(move |_, cx| FantaPrototypePanel::new(panel_item, cx));
+        (panel, item, first)
+    }
+
+    #[gpui::test]
+    async fn direction_applies_to_out_transitions(cx: &mut TestAppContext) {
+        let reaction = Reaction {
+            id: ReactionId::new(),
+            trigger: Trigger::Click,
+            action: Action::Back,
+            extra_actions: Vec::new(),
+            transition: Some(Transition {
+                style: TransitionStyle::SlideOut {
+                    direction: Direction::Left,
+                },
+                duration_ms: 300,
+                easing: Easing::EaseInOut,
+            }),
+            animation: None,
+        };
+        let reaction_id = reaction.id;
+        let (panel, item, first) = panel_with_reaction(reaction, cx).await;
+        panel
+            .update(cx, |panel, _, cx| {
+                panel.set_transition_direction(first, reaction_id, DirectionChoice::Up, cx);
+            })
+            .expect("pick a direction");
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            assert_eq!(
+                reaction_by_id(doc, first, reaction_id)
+                    .and_then(|reaction| reaction.transition.as_ref())
+                    .map(|transition| transition.style),
+                Some(TransitionStyle::SlideOut {
+                    direction: Direction::Up
+                })
             );
         });
     }
