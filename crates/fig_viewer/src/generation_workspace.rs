@@ -4460,16 +4460,8 @@ impl GenerationWorkspace {
                     client.account_access_token() == account,
                     "Your Fanta account changed. Choose the result again before playing it."
                 );
-                cx.background_spawn(async move {
-                    generation_media::mp4_metadata(&bytes)?;
-                    let file = tempfile::Builder::new()
-                        .prefix("fanta-generation-")
-                        .suffix(".mp4")
-                        .tempfile()?;
-                    std::fs::write(file.path(), &bytes)?;
-                    Ok::<_, anyhow::Error>(file.into_temp_path())
-                })
-                .await
+                cx.background_spawn(async move { write_playback_file(&bytes, &output.mime) })
+                    .await
             }
             .await;
             this.update(cx, |this, cx| {
@@ -4483,7 +4475,7 @@ impl GenerationWorkspace {
                         this.error = None;
                         cx.open_with_system(&file);
                         this.playback_file = Some(file);
-                        this.status = "Opened in your video player.".into();
+                        this.status = "Opened in your media player.".into();
                     }
                     Err(error) => this.fail(error, cx),
                 }
@@ -5352,6 +5344,26 @@ fn vector_output(svg: Arc<[u8]>) -> MediaOutput {
         location: MediaLocation::Inline(svg),
         mask: false,
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_playback_file(bytes: &[u8], mime: &str) -> Result<tempfile::TempPath> {
+    let suffix = if mime.starts_with("audio/") {
+        let format = fanta_format::MediaRegistry::with_builtins()
+            .sniff(bytes)
+            .filter(|format| format.family == "audio")
+            .context("The generated file is not a supported audio file.")?;
+        format!(".{}", format.extension)
+    } else {
+        generation_media::mp4_metadata(bytes)?;
+        ".mp4".to_owned()
+    };
+    let file = tempfile::Builder::new()
+        .prefix("fanta-generation-")
+        .suffix(&suffix)
+        .tempfile()?;
+    std::fs::write(file.path(), bytes)?;
+    Ok(file.into_temp_path())
 }
 
 async fn fetch_catalog(
@@ -7527,6 +7539,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["fanta-image-1"]
         );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn generation_play_writes_a_generated_audio_file_with_its_own_extension() {
+        let mut wav = b"RIFF\x24\x00\x00\x00WAVEfmt ".to_vec();
+        wav.resize(44, 0);
+        let file = write_playback_file(&wav, "audio/wav").expect("audio written for playback");
+        assert_eq!(
+            file.extension().and_then(|extension| extension.to_str()),
+            Some("wav")
+        );
+        assert!(write_playback_file(b"not audio", "audio/mpeg").is_err());
     }
 
     struct PendingBody;
