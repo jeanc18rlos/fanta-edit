@@ -3517,6 +3517,11 @@ impl GenerationWorkspace {
         let client = self.client.clone();
         let base_url = self.base_url.clone();
         let account = self.client.account_access_token();
+        // A failed check of the job that is still running must leave its card to click again.
+        let still_running = self.pending
+            && run
+                .generation_id()
+                .is_some_and(|id| response_targets_active_run(self.active_run.as_ref(), id));
         self.outputs.clear();
         self.preview = None;
         self.preview_task = None;
@@ -3601,6 +3606,7 @@ impl GenerationWorkspace {
                             return;
                         }
                         this.fail(error, cx);
+                        this.pending = still_running;
                     }).log_err();
                 }
             }
@@ -5389,16 +5395,16 @@ async fn fetch_catalog(
                 .ok()
         })
         .collect();
+    ensure!(
+        !models.is_empty() || entries.is_empty(),
+        "The model catalog could not be read."
+    );
     models.sort_by_key(|model| {
         (
             !model.gateway(),
             model.capabilities["hosted"] != true,
             model.label().to_lowercase(),
         )
-    ensure!(
-        !models.is_empty() || entries.is_empty(),
-        "The model catalog could not be read."
-    );
     });
     Ok(models)
 }
@@ -7368,7 +7374,7 @@ mod tests {
                             (200, json!({"id":"resumed-job", "status":"processing"}))
                         }
                         (&Method::GET, "/v1/generations/resumed-job") => {
-                            if polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                            if polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
                                 (503, json!({"error":"Temporarily unavailable"}))
                             } else {
                                 (200, completed)
@@ -7414,16 +7420,30 @@ mod tests {
                 .expect("the job stays visible as running");
             assert_eq!(running.id.as_ref(), "gen:resumed-job:0");
         });
-        view.update_in(cx, |view, window, cx| {
-            view.handle_generation_action(
-                GenerationAction::OutputSelected {
-                    id: "gen:resumed-job:0".into(),
-                },
-                window,
-                cx,
-            )
+        let select_running_card = |cx: &mut gpui::VisualTestContext| {
+            view.update_in(cx, |view, window, cx| {
+                view.handle_generation_action(
+                    GenerationAction::OutputSelected {
+                        id: "gen:resumed-job:0".into(),
+                    },
+                    window,
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+        };
+        select_running_card(cx);
+        view.read_with(cx, |view, cx| {
+            assert!(view.task.is_none() && view.error.is_some());
+            assert!(
+                view.generation_view_data(cx)
+                    .outputs
+                    .iter()
+                    .any(|output| output.status == GenerationOutputStatus::Running),
+                "a check that fails again keeps the running card"
+            );
         });
-        cx.run_until_parked();
+        select_running_card(cx);
         view.read_with(cx, |view, _| {
             assert!(view.task.is_none());
             assert!(view.error.is_none());
@@ -7542,6 +7562,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["fanta-image-1"]
         );
+
+        let http = http_client::FakeHttpClient::create(|_| async move {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(r#"{"models":[{"id":null,"kind":"image"}]}"#.into())?)
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let unreadable = fetch_catalog(
+            &client,
+            "https://api.fantaisa.net",
+            client.account_access_token().as_deref(),
+            &cx.executor(),
+        )
+        .await;
+        assert!(
+            unreadable.is_err(),
+            "a catalog with no readable model is reported, not shown as empty"
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -7562,25 +7601,6 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         const SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="24"><path d="M2 2L30 2L16 22Z" fill="#22c55e"/></svg>"##;
-
-        let http = http_client::FakeHttpClient::create(|_| async move {
-            Ok(http_client::Response::builder()
-                .status(200)
-                .body(r#"{"models":[{"id":null,"kind":"image"}]}"#.into())?)
-        });
-        let client = catalog_client(cx, http);
-        sign_in_catalog_client(&client, cx).await;
-        let unreadable = fetch_catalog(
-            &client,
-            "https://api.fantaisa.net",
-            client.account_access_token().as_deref(),
-            &cx.executor(),
-        )
-        .await;
-        assert!(
-            unreadable.is_err(),
-            "a catalog with no readable model is reported, not shown as empty"
-        );
         let messages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let http = http_client::FakeHttpClient::create({
             let messages = messages.clone();
