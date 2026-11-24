@@ -10036,6 +10036,65 @@ async fn mounted_lost_primary_release_ends_draw_stroke_where_it_was_drawn(
 }
 
 #[gpui::test]
+async fn mounted_deactivation_mid_erase_keeps_the_eraser_active(cx: &mut TestAppContext) {
+    init_visual_test(cx);
+    let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+    let (doc, _, images) = bitmap_canvas_doc();
+    let (item, view, mut visual) =
+        mounted_canvas_interaction_fixture(&project, doc, images, cx);
+    view.update(&mut visual, |view, cx| {
+        view.set_editor_mode(EditorMode::Draw, cx);
+        view.activate_tool(ToolKind::Pencil, cx);
+    });
+    let start = view.read_with(&visual, |view, _| {
+        view.container_bounds.expect("canvas").center() + point(px(0.0), px(200.0))
+    });
+    visual.simulate_event(MouseDownEvent {
+        position: start,
+        button: MouseButton::Left,
+        modifiers: gpui::Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    visual.simulate_event(MouseMoveEvent {
+        position: start + point(px(80.0), px(0.0)),
+        pressed_button: Some(MouseButton::Left),
+        modifiers: gpui::Modifiers::none(),
+    });
+    visual.simulate_event(MouseUpEvent {
+        position: start + point(px(80.0), px(0.0)),
+        button: MouseButton::Left,
+        modifiers: gpui::Modifiers::none(),
+        click_count: 1,
+    });
+    view.update(&mut visual, |view, cx| {
+        view.activate_tool(ToolKind::Eraser, cx)
+    });
+    visual.simulate_event(MouseDownEvent {
+        position: start + point(px(40.0), px(-30.0)),
+        button: MouseButton::Left,
+        modifiers: gpui::Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    visual.simulate_event(MouseMoveEvent {
+        position: start + point(px(40.0), px(30.0)),
+        pressed_button: Some(MouseButton::Left),
+        modifiers: gpui::Modifiers::none(),
+    });
+    item.read_with(&visual, |item, _| assert!(item.content_preview_active()));
+    view.update_in(&mut visual, |view, window, cx| {
+        Item::workspace_deactivated(view, window, cx)
+    });
+    view.read_with(&visual, |view, cx| {
+        assert!(!item.read(cx).content_preview_active());
+        assert!(!view.primary_pressed);
+        assert_eq!(view.editor_mode(cx), EditorMode::Draw);
+        assert_eq!(view.active_tool(), ToolKind::Eraser);
+    });
+}
+
+#[gpui::test]
 async fn mounted_pen_anchors_survive_pending_press_deactivation(cx: &mut TestAppContext) {
     init_visual_test(cx);
     let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;

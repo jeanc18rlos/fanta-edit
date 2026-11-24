@@ -1502,7 +1502,8 @@ impl FigView {
     fn cancel_tool_gesture_if_active(&mut self, cx: &mut Context<Self>) {
         // Select can be interrupted before its first preview. Reset that
         // press too, so the next hover cannot promote it into a drag.
-        let pending_selection = self.primary_pressed && self.tools.kind() == ToolKind::Select;
+        let kind = self.tools.kind();
+        let pending_selection = self.primary_pressed && kind == ToolKind::Select;
         if !pending_selection && !self.item.read(cx).content_preview_active() {
             return;
         }
@@ -1522,10 +1523,12 @@ impl FigView {
                             &mut document.doc,
                             viewport,
                             screen_size,
-                            ToolKind::Select,
+                            kind,
                         );
-                        tools.cancel_and_activate(ToolKind::Select, &mut tool_context);
+                        tools.cancel_and_activate(kind, &mut tool_context);
                     } else {
+                        // Without a context the tool cannot be rebuilt in
+                        // place, so fall back to a fresh Select tool.
                         tools.activate_without_context(ToolKind::Select);
                     }
                     let change = if document.doc.scene.revision() != revision_before {
@@ -1546,7 +1549,7 @@ impl FigView {
             self.end_gesture_perf("pointer_state_reset");
             self.primary_pressed = false;
             self.canvas_pointer_down = false;
-            self.remember_tool_face(ToolKind::Select);
+            self.remember_tool_face(self.tools.kind());
             self.invalidate_canvas_cache();
             cx.notify();
         }
