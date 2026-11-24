@@ -5351,8 +5351,17 @@ async fn fetch_catalog(
         executor,
     )
     .await?;
-    let mut models: Vec<GenerationModel> = serde_json::from_value(value["models"].clone())
-        .context("The model catalog could not be read")?;
+    // One malformed or newly shaped entry must not hide every other model.
+    let mut models: Vec<GenerationModel> = value["models"]
+        .as_array()
+        .context("The model catalog could not be read.")?
+        .iter()
+        .filter_map(|entry| {
+            serde_json::from_value(entry.clone())
+                .map_err(|error| log::warn!("Skipping unreadable model catalog entry: {error}"))
+                .ok()
+        })
+        .collect();
     models.sort_by_key(|model| {
         (
             !model.gateway(),
@@ -7439,6 +7448,32 @@ mod tests {
             assert_eq!(view.outputs.len(), 1, "the in-flight result is shown");
             assert!(!view.pending);
         });
+    }
+
+    #[gpui::test]
+    async fn catalog_skips_an_unreadable_model_entry(cx: &mut gpui::TestAppContext) {
+        let http = http_client::FakeHttpClient::create(|_| async move {
+            Ok(http_client::Response::builder().status(200).body(
+                r#"{"models":[{"id":"fanta-image-1","kind":"image"},{"id":null,"kind":"image"},{"id":"future-model","kind":"image","max_output_tokens":1.5}]}"#.into(),
+            )?)
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let models = fetch_catalog(
+            &client,
+            "https://api.fantaisa.net",
+            client.account_access_token().as_deref(),
+            &cx.executor(),
+        )
+        .await
+        .expect("the readable models stay available");
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["fanta-image-1"]
+        );
     }
 
     struct PendingBody;
