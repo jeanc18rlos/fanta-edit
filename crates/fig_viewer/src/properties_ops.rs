@@ -881,6 +881,20 @@ pub(crate) fn restore_snapshot(doc: &mut Doc, snapshot: &NodeSnapshot) {
         doc.components
             .bump_preview_for_node(&doc.scene, snapshot.id);
     }
+    for (child_id, transform) in &snapshot.children {
+        if let Some(child) = doc.scene.get_mut(*child_id) {
+            child.transform = *transform;
+        }
+    }
+}
+
+/// The transforms of `id`'s direct children, for [`NodeSnapshot::children`].
+pub(crate) fn child_transforms(scene: &fanta_doc::Scene, id: NodeId) -> Vec<(NodeId, Transform2D)> {
+    scene
+        .children_of(Some(id))
+        .iter()
+        .filter_map(|child_id| Some((*child_id, scene.get(*child_id)?.transform)))
+        .collect()
 }
 
 /// Write an operation's `new` value straight into the scene WITHOUT history —
@@ -1852,6 +1866,7 @@ mod tests {
             data: Box::new(node.data.clone()),
             effects: node.effects.clone(),
             blurs: node.blurs.clone(),
+            children: Vec::new(),
         };
 
         let before = preview_rev(&doc);
@@ -1887,6 +1902,7 @@ mod tests {
             data: Box::new(node.data.clone()),
             effects: node.effects.clone(),
             blurs: node.blurs.clone(),
+            children: Vec::new(),
         };
 
         for operation in field_operations(&doc, &InspectorField::Width(id), "72") {
@@ -1994,6 +2010,7 @@ mod tests {
                 data: Box::new(node.data.clone()),
                 effects: node.effects.clone(),
                 blurs: node.blurs.clone(),
+                children: Vec::new(),
             }
         };
         for operation in

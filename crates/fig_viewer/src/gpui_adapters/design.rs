@@ -67,7 +67,7 @@ use crate::export::{
     ExportFormat, ExportRequest, ExportSizing, prepare_export_requests, run_export_jobs,
 };
 use crate::properties_ops::{
-    apply_preview_operation, blurs_operations, default_blur, default_shadow,
+    apply_preview_operation, blurs_operations, child_transforms, default_blur, default_shadow,
     detach_instance_operations, effects_operations, field_operations, finite_transform_operations,
     format_number, instance_prop_operations, layout_gap_operations, layout_limit_operations,
     layout_padding_operations, parse_color, parse_number, position_operations, read_field_text,
@@ -3265,6 +3265,7 @@ impl FigView {
                             data: Box::new(node.data.clone()),
                             effects: node.effects.clone(),
                             blurs: node.blurs.clone(),
+                            children: child_transforms(&document.doc.scene, id),
                         },
                     )
                 };
@@ -5129,6 +5130,7 @@ impl FigView {
                             data: Box::new(node.data.clone()),
                             effects: node.effects.clone(),
                             blurs: node.blurs.clone(),
+                            children: child_transforms(&document.doc.scene, id),
                         },
                     )
                 };
@@ -11016,6 +11018,7 @@ mod tests {
                     data: Box::new(node.data.clone()),
                     effects: node.effects.clone(),
                     blurs: node.blurs.clone(),
+                    children: Vec::new(),
                 },
             )
         };
@@ -17139,6 +17142,72 @@ mod tests {
                 "a cancelled preview must not create an undo step"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn frame_width_scrub_restores_constrained_children_each_frame(cx: &mut TestAppContext) {
+        let (mut doc, page, _rect) = doc_with_rect();
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([200.0, 100.0]),
+            ..Default::default()
+        }));
+        frame.parent = Some(page);
+        let frame_id = frame.id;
+        doc.scene.insert(frame).expect("insert frame");
+        let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+            FantaColor::BLACK,
+        )));
+        child.parent = Some(frame_id);
+        child.transform = Transform2D::translation(170.0, 10.0);
+        child.constraints = Some(fanta_doc::Constraints {
+            horizontal: fanta_doc::ConstraintH::Right,
+            vertical: fanta_doc::ConstraintV::Top,
+        });
+        let child_id = child.id;
+        doc.scene.insert(child).expect("insert child");
+        doc.selection.replace_with([frame_id]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        let emit = |cx: &mut VisualTestContext, value: f32, phase: DesignPanelEditPhase| {
+            panel.update_in(cx, |_, _, cx| {
+                cx.emit(DesignPanelAction::PropertyEditRequested {
+                    node_id: SharedString::from(frame_id.to_string()),
+                    property: DesignPanelProperty::Width,
+                    value: DesignPanelValue::Number(value),
+                    phase,
+                });
+            });
+            cx.run_until_parked();
+        };
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let child_x = |cx: &mut VisualTestContext| {
+            item.read_with(cx, |item, _| {
+                let doc = &item.document().expect("document ready").doc;
+                doc.scene
+                    .get(child_id)
+                    .expect("child exists")
+                    .transform
+                    .to_components()[4]
+            })
+        };
+
+        emit(cx, 200.0, DesignPanelEditPhase::Begin);
+        emit(cx, 300.0, DesignPanelEditPhase::Preview);
+        emit(cx, 310.0, DesignPanelEditPhase::Preview);
+        assert_eq!(
+            child_x(cx),
+            280.0,
+            "each preview frame pins the child from its gesture-start position"
+        );
+        emit(cx, 310.0, DesignPanelEditPhase::Cancel);
+        assert_eq!(child_x(cx), 170.0, "cancel restores the child");
     }
 
     #[gpui::test]

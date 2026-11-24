@@ -827,6 +827,8 @@ pub(crate) struct NodeSnapshot {
     pub(crate) data: Box<NodeData>,
     pub(crate) effects: SmallVec<[Shadow; 0]>,
     pub(crate) blurs: SmallVec<[Blur; 0]>,
+    /// A frame resize also moves the frame's constrained children.
+    pub(crate) children: Vec<(NodeId, Transform2D)>,
 }
 
 // =============================================================================
