@@ -1176,14 +1176,17 @@ pub(crate) fn parse_number(text: &str) -> Option<f64> {
         .trim_end_matches("px")
         .trim()
         .replace('\u{2212}', "-");
-    // A single comma is a decimal comma; several look like thousands
-    // separators, which stay rejected rather than guessed.
-    let cleaned = if cleaned.matches(',').count() == 1 && !cleaned.contains('.') {
-        cleaned.replace(',', ".")
-    } else {
-        cleaned
-    };
-    cleaned
+    // A single comma is a decimal comma. Several commas, or exactly three
+    // digits after one ("1,000"), look like thousands separators and stay
+    // rejected rather than guessed.
+    let decimal_comma = cleaned
+        .split_once(',')
+        .filter(|(_, fraction)| {
+            !cleaned.contains('.') && !fraction.contains(',') && fraction.len() != 3
+        })
+        .map(|(whole, fraction)| format!("{whole}.{fraction}"));
+    decimal_comma
+        .unwrap_or(cleaned)
         .parse::<f64>()
         .ok()
         .filter(|value| value.is_finite())
@@ -1244,8 +1247,10 @@ mod tests {
     #[test]
     fn parse_number_accepts_a_decimal_comma_and_a_unicode_minus() {
         assert_eq!(parse_number("1,5"), Some(1.5));
+        assert_eq!(parse_number("0,25px"), Some(0.25));
         assert_eq!(parse_number("\u{2212}5px"), Some(-5.0));
         assert_eq!(parse_number("1,000,000"), None);
+        assert_eq!(parse_number("1,200"), None);
         assert_eq!(parse_number("1.5"), Some(1.5));
     }
 
