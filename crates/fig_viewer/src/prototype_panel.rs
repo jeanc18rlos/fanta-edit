@@ -838,8 +838,8 @@ impl FantaPrototypePanel {
         })
     }
 
-    fn add_interaction(&mut self, node: NodeId, cx: &mut Context<Self>) {
-        self.apply_operation(|doc| add_reaction_operation(doc, node), cx);
+    fn add_interaction(&mut self, node: NodeId, cx: &mut Context<Self>) -> bool {
+        self.apply_operation(|doc| add_reaction_operation(doc, node), cx)
     }
 
     fn remove_interaction(&mut self, node: NodeId, reaction: ReactionId, cx: &mut Context<Self>) {
@@ -2516,7 +2516,7 @@ impl FantaPrototypePanel {
                                 .icon_size(IconSize::Small)
                                 .tooltip(Tooltip::text("Add interaction"))
                                 .on_click(cx.listener(move |panel, _, _, cx| {
-                                    panel.add_interaction(node, cx)
+                                    panel.add_interaction(node, cx);
                                 })),
                         )
                         .into_any_element()
@@ -3894,6 +3894,28 @@ mod tests {
                 Trigger::AfterDelay { delay_ms: 900 }
             );
         });
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_prototype_failed_add_keeps_the_selected_interaction(cx: &mut TestAppContext) {
+        let (panel, visual, item, first, reactions) =
+            mounted_panel_with_delay_interactions(2, cx).await;
+        start_delay_edit(&panel, first, reactions[0].id, "invalid", visual);
+        let add = visual
+            .debug_bounds("editor-prototype-inspector-add")
+            .expect("Add interaction");
+        visual.simulate_click(add.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.scene.get(first).expect("frame").reactions.len(), 2);
+        });
+        assert_eq!(
+            panel.read_with(visual, |panel, _| panel.selected_reaction),
+            Some(reactions[0].id),
+            "a refused add must not open another interaction's details"
+        );
     }
 
     #[gpui::test]
@@ -5590,16 +5612,17 @@ impl FantaPrototypePanel {
         }
         match action {
             Intent::ConnectionAddRequested => {
-                self.add_interaction(node, cx);
-                self.selected_reaction = self.item.read(cx).document().and_then(|document| {
-                    document
-                        .doc
-                        .scene
-                        .get(node)?
-                        .reactions
-                        .last()
-                        .map(|reaction| reaction.id)
-                });
+                if self.add_interaction(node, cx) {
+                    self.selected_reaction = self.item.read(cx).document().and_then(|document| {
+                        document
+                            .doc
+                            .scene
+                            .get(node)?
+                            .reactions
+                            .last()
+                            .map(|reaction| reaction.id)
+                    });
+                }
             }
             Intent::ConnectionEditRequested { id } => {
                 self.finish_parameter_edit(cx);
