@@ -5050,7 +5050,7 @@ impl FigView {
                 });
                 if let Err(error) = result {
                     log::warn!("boolean selection failed: {error:#}");
-                    crate::view::notify_unavailable("Boolean selection", window, cx);
+                    crate::view::show_canvas_notice(format!("{error:#}."), window, cx);
                 }
             }
             DesignSelectionHeaderCommand::EditObject => {
