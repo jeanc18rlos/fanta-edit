@@ -809,6 +809,8 @@ pub(crate) struct GradientEditor {
     /// Index (into the position-sorted stop list) of the stop currently being
     /// edited by the embedded color picker, if the picker is open.
     editing_stop: Option<usize>,
+    /// The edited stop's colour before its picker opened, restored on Cancel.
+    stop_original_color: Option<FantaColor>,
     stop_picker: Option<Entity<ColorPicker>>,
     focus_handle: FocusHandle,
     preview_bounds: Option<Bounds<Pixels>>,
@@ -854,6 +856,7 @@ impl GradientEditor {
         Self {
             gradient: initial,
             editing_stop: None,
+            stop_original_color: None,
             stop_picker: None,
             focus_handle: cx.focus_handle(),
             preview_bounds: None,
@@ -962,12 +965,16 @@ impl GradientEditor {
                         }
                         this.defer_close_stop_picker(picker, cx);
                     }
-                    ColorPickerEvent::Cancel => this.defer_close_stop_picker(picker, cx),
+                    ColorPickerEvent::Cancel => {
+                        this.restore_stop_color(cx);
+                        this.defer_close_stop_picker(picker, cx);
+                    }
                 }
             },
         );
         picker.read(cx).focus_handle(cx).focus(window, cx);
         self.editing_stop = Some(index);
+        self.stop_original_color = Some(stop.color);
         self.stop_picker = Some(picker);
         self._subscriptions = vec![subscription];
         cx.notify();
@@ -989,8 +996,16 @@ impl GradientEditor {
         });
     }
 
+    fn restore_stop_color(&mut self, cx: &mut Context<Self>) {
+        if let (Some(index), Some(color)) = (self.editing_stop, self.stop_original_color) {
+            set_stop_color(&mut self.gradient, index, color);
+            self.emit_changed(cx);
+        }
+    }
+
     fn close_stop_picker(&mut self, cx: &mut Context<Self>) {
         self.editing_stop = None;
+        self.stop_original_color = None;
         self.stop_picker = None;
         self._subscriptions.clear();
         cx.notify();
@@ -1010,6 +1025,7 @@ impl GradientEditor {
             "escape" => {
                 cx.stop_propagation();
                 if self.stop_picker.is_some() {
+                    self.restore_stop_color(cx);
                     self.close_stop_picker(cx);
                 } else {
                     cx.emit(GradientEditorEvent::Cancel);
@@ -1580,6 +1596,69 @@ mod render_tests {
             .read_with(cx, |picker, _| picker.hsva.h)
             .expect("read the picker");
         assert!((hue - 240.0).abs() < 0.5, "hue was reset to {hue}");
+    }
+
+    #[gpui::test]
+    fn cancelling_a_stop_picker_restores_the_stop_color(cx: &mut TestAppContext) {
+        init_test(cx);
+        let gradient = Gradient::Linear {
+            start: [0.0, 0.0],
+            end: [1.0, 0.0],
+            stops: vec![
+                GradientStop {
+                    position: 0.0,
+                    color: FantaColor::BLACK,
+                },
+                GradientStop {
+                    position: 1.0,
+                    color: FantaColor::WHITE,
+                },
+            ],
+        };
+        let window = cx.add_window(|_, cx| GradientEditor::new(gradient, cx));
+        for escape_in_editor in [false, true] {
+            window
+                .update(cx, |editor, window, cx| {
+                    editor.open_stop_picker(0, window, cx);
+                    let picker = editor.stop_picker_for_test().expect("stop picker is open");
+                    picker.update(cx, |picker, cx| {
+                        let hsva = rgb_to_hsv(FantaColor::rgb(255, 0, 0));
+                        picker.set_hsva(hsva, window, cx);
+                        if !escape_in_editor {
+                            cx.emit(ColorPickerEvent::Cancel);
+                        }
+                    });
+                })
+                .expect("preview a stop color");
+            cx.run_until_parked();
+            if escape_in_editor {
+                window
+                    .update(cx, |editor, window, cx| {
+                        let escape = KeyDownEvent {
+                            keystroke: gpui::Keystroke::parse("escape").expect("escape keystroke"),
+                            is_held: false,
+                            prefer_character_input: false,
+                        };
+                        editor.handle_key_down(&escape, window, cx);
+                    })
+                    .expect("press Escape in the gradient editor");
+                cx.run_until_parked();
+            }
+            let (color, picker_open) = window
+                .read_with(cx, |editor, _| {
+                    let color = gradient_stops(&editor.gradient)
+                        .first()
+                        .map(|stop| stop.color);
+                    (color, editor.stop_picker_for_test().is_some())
+                })
+                .expect("read gradient editor");
+            assert_eq!(
+                color,
+                Some(FantaColor::BLACK),
+                "escape_in_editor: {escape_in_editor}"
+            );
+            assert!(!picker_open);
+        }
     }
 
     #[gpui::test]
