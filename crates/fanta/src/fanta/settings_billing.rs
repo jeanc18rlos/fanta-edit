@@ -12,7 +12,7 @@ use fanta_gpui::{
 };
 use futures::AsyncReadExt as _;
 use gpui::{AppContext as _, AsyncWindowContext, SharedString};
-use http_client::{AsyncBody, HttpClient as _, Method, Request};
+use http_client::{AsyncBody, HttpClient as _, Method, Request, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
@@ -171,20 +171,26 @@ async fn api_json(
         .read_to_end(&mut bytes)
         .await?;
     ensure_account(client, token)?;
-    let value: Value = serde_json::from_slice(&bytes)
-        .with_context(|| format!("Fanta returned an unreadable response for {path}"))?;
-    if !status.is_success() {
-        let message = value["error"]["message"]
-            .as_str()
-            .or_else(|| value["error"].as_str())
-            .or_else(|| value["message"].as_str())
-            .unwrap_or("Request failed");
-        if status.as_u16() == 401 {
-            bail!("Your Fanta sign-in expired. Sign in again and retry.");
-        }
-        bail!("{message} (HTTP {status})");
+    api_response(status, &bytes, path)
+}
+
+fn api_response(status: StatusCode, bytes: &[u8], path: &str) -> Result<Value> {
+    if status.is_success() {
+        return serde_json::from_slice(bytes)
+            .with_context(|| format!("Fanta returned an unreadable response for {path}"));
     }
-    Ok(value)
+    if status.as_u16() == 401 {
+        bail!("Your Fanta sign-in expired. Sign in again and retry.");
+    }
+    // An error body is not always JSON: a proxy answers 502 with an HTML page.
+    let value: Value = serde_json::from_slice(bytes).unwrap_or_default();
+    let message = value["error"]["message"]
+        .as_str()
+        .or_else(|| value["error"].as_str())
+        .or_else(|| value["message"].as_str())
+        .or_else(|| value["detail"].as_str())
+        .unwrap_or("Request failed");
+    bail!("{message} (HTTP {status})");
 }
 
 async fn get<T: for<'de> Deserialize<'de>>(
@@ -266,13 +272,13 @@ fn comma(value: i64) -> String {
     result
 }
 
+/// A backend id such as "pro", "past_due" or "owner", as a label.
 fn plan_name(id: &str) -> String {
-    match id {
-        "free" => "Free".into(),
-        "pro" => "Pro".into(),
-        "team" => "Team".into(),
-        _ => id.to_owned(),
+    let mut label = id.replace('_', " ");
+    if let Some(first) = label.get_mut(..1) {
+        first.make_ascii_uppercase();
     }
+    label
 }
 
 fn credit_title(reason: &str, delta: i64) -> &'static str {
@@ -777,6 +783,46 @@ pub(super) async fn perform_billing_action(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn backend_ids_are_shown_as_labels() {
+        assert_eq!(plan_name("pro"), "Pro");
+        assert_eq!(plan_name("past_due"), "Past due");
+        assert_eq!(plan_name("owner"), "Owner");
+        assert_eq!(plan_name(""), "");
+    }
+
+    #[test]
+    fn error_responses_keep_their_status_when_the_body_is_not_json() {
+        let message = |status: u16, body: &str| {
+            let status = StatusCode::from_u16(status).expect("valid status");
+            api_response(status, body.as_bytes(), "/v1/me")
+                .expect_err("error status")
+                .to_string()
+        };
+        assert_eq!(
+            message(401, ""),
+            "Your Fanta sign-in expired. Sign in again and retry."
+        );
+        assert_eq!(
+            message(502, "<html>Bad Gateway</html>"),
+            "Request failed (HTTP 502 Bad Gateway)"
+        );
+        assert_eq!(
+            message(402, r#"{"error":{"message":"Out of credits"}}"#),
+            "Out of credits (HTTP 402 Payment Required)"
+        );
+        assert_eq!(
+            message(404, r#"{"detail":"Not Found"}"#),
+            "Not Found (HTTP 404 Not Found)"
+        );
+        assert!(
+            api_response(StatusCode::OK, b"<html>", "/v1/me")
+                .expect_err("unreadable success body")
+                .to_string()
+                .contains("unreadable response for /v1/me")
+        );
+    }
 
     #[test]
     fn legacy_free_plan_never_offers_signup_credits_or_checkout() -> Result<()> {

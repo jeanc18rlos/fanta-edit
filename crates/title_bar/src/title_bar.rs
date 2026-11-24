@@ -23,8 +23,6 @@ use crate::application_menu::{
 };
 
 use auto_update::AutoUpdateStatus;
-#[cfg(not(feature = "mac_app_store"))]
-use client::fanta_urls;
 use client::{Client, UserStore};
 use command_palette_hooks::CommandPaletteFilter;
 
@@ -1316,14 +1314,11 @@ impl TitleBar {
                                     .child(Label::new(username))
                                     .into_any_element()
                             },
-                            move |_window, cx| {
-                                #[cfg(feature = "mac_app_store")]
-                                _window.dispatch_action(
+                            move |window, cx| {
+                                window.dispatch_action(
                                     fanta_actions::OpenAccountSettings.boxed_clone(),
                                     cx,
                                 );
-                                #[cfg(not(feature = "mac_app_store"))]
-                                cx.open_url(&fanta_urls::account_url(cx));
                             },
                         )
                         .separator()

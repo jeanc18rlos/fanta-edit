@@ -29,11 +29,6 @@ fn docs_url(cx: &App) -> String {
     }
 }
 
-/// Returns the URL to the account page on fantaisa.net.
-pub fn account_url(cx: &App) -> String {
-    format!("{server_url}/account", server_url = server_url(cx))
-}
-
 /// Returns the URL to the start trial page on fantaisa.net.
 pub fn start_trial_url(cx: &App) -> String {
     format!(

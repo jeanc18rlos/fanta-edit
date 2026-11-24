@@ -11,7 +11,6 @@ use fanta_gpui::generation::{
     GenerationSubmission, GenerationTemplate, GenerationViewData, GenerationVoiceReference,
 };
 use futures::{AsyncReadExt as _, StreamExt as _};
-#[cfg(feature = "mac_app_store")]
 use gpui::Action as _;
 use gpui::{
     App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Image,
@@ -5072,11 +5071,8 @@ impl Render for GenerationWorkspace {
                     .child(Label::new(if signed_in { "Fanta account connected" } else { "Connect your account to generate" }).color(Color::Muted))
                     .when(!signed_in || self.error.is_some(), |element| element.child(Button::new("generation-sign-in", "Sign in")
                         .disabled(self.task.is_some()).on_click(cx.listener(|this, _, _, cx| this.sign_in(cx)))))
-                    .child(Button::new("generation-billing", "Credits & billing").on_click(|_, _window, cx| {
-                        #[cfg(feature = "mac_app_store")]
-                        _window.dispatch_action(fanta_actions::OpenAccountSettings.boxed_clone(), cx);
-                        #[cfg(not(feature = "mac_app_store"))]
-                        cx.open_url(&client::fanta_urls::account_url(cx));
+                    .child(Button::new("generation-billing", "Credits & billing").on_click(|_, window, cx| {
+                        window.dispatch_action(fanta_actions::OpenAccountSettings.boxed_clone(), cx);
                     }))))
             .child(h_flex().flex_shrink_0().gap_1().flex_wrap().children(GenerationMode::CREATION_MODES.into_iter().map(|mode| {
                 Button::new(("generation-mode", mode as usize), mode.label()).toggle_state(self.mode == mode)
@@ -5413,9 +5409,9 @@ async fn api_json(
         client.account_access_token().as_deref() == expected_account,
         "Your Fanta account changed. Start a new experiment."
     );
-    let value: Value = serde_json::from_slice(&bytes)
-        .context("Fanta returned an unreadable response. Please try again.")?;
     if !status.is_success() {
+        // An error body is not always JSON: a proxy answers 502 with an HTML page.
+        let value: Value = serde_json::from_slice(&bytes).unwrap_or_default();
         let message = match status.as_u16() {
             401 => "Your Fanta session expired. Sign in again to continue.".into(),
             402 => "You need more Fanta credits. Open Credits & billing to top up.".into(),
@@ -5432,7 +5428,8 @@ async fn api_json(
         }
         .into());
     }
-    Ok(value)
+    serde_json::from_slice(&bytes)
+        .context("Fanta returned an unreadable response. Please try again.")
 }
 
 fn error_message(value: &Value) -> String {
@@ -5440,6 +5437,7 @@ fn error_message(value: &Value) -> String {
         .as_str()
         .or_else(|| value["message"].as_str())
         .or_else(|| value["error"].as_str())
+        .or_else(|| value["detail"].as_str())
         .or_else(|| value.as_str())
         .unwrap_or("The generation service could not complete this request.")
         .chars()
@@ -7095,6 +7093,31 @@ mod tests {
             .expect("sign-in required");
         assert!(error.to_string().contains("Sign in to Fanta"));
         assert!(!error.to_string().contains("expired"));
+    }
+
+    #[gpui::test]
+    async fn an_error_response_that_is_not_json_keeps_its_status(cx: &mut gpui::TestAppContext) {
+        let http = http_client::FakeHttpClient::create(|_| async move {
+            Ok(http_client::Response::builder()
+                .status(401)
+                .body("<html>Unauthorized</html>".into())?)
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let error = fetch_catalog(
+            &client,
+            "https://api.fantaisa.net",
+            client.account_access_token().as_deref(),
+            &cx.executor(),
+        )
+        .await
+        .err()
+        .expect("rejected catalog");
+        let rejected = error
+            .downcast_ref::<ApiRejected>()
+            .expect("the HTTP status is kept");
+        assert_eq!(rejected.status, 401);
+        assert!(rejected.message.contains("session expired"));
     }
 
     #[gpui::test]
