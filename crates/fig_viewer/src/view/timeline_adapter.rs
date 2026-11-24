@@ -284,7 +284,7 @@ impl FigView {
                 if *playback == TimelinePlayback::PingPong { self.timeline_shell.update(cx, |clock, cx| clock.set_ping_pong_playback(cx)); }
                 else { self.timeline_shell.update(cx, |clock, cx| clock.set_loop_playback(*playback == TimelinePlayback::Loop, cx)); }
             }
-            Action::SeekRequested { time_ms } => { self.timeline_shell.update(cx, |clock, cx| clock.set_playhead(i64::from(*time_ms) * 1000, cx)); }
+            Action::SeekRequested { time_ms } => { self.timeline_shell.update(cx, |clock, cx| clock.seek_to(i64::from(*time_ms) * 1000, cx)); }
             Action::DurationChangeRequested { duration_ms } => { if self.active_motion_clip.is_none() { self.create_motion_clip(cx); } self.set_motion_clip_duration(i64::from(*duration_ms) * 1000, cx); }
             Action::ZoomChangeRequested { zoom } => { if let Some(adapter) = &mut self.gpui_timeline { adapter.zoom = *zoom; } }
             Action::HeightChangeRequested { height } => { if let Some(adapter) = &mut self.gpui_timeline { adapter.height = *height; } }
@@ -331,7 +331,7 @@ impl FigView {
                 self.apply_inspector_operations(operation.into_iter().collect(), "Add keyframe", window, cx);
             }
             Action::AddKeyframeRequested { time_ms } => {
-                self.timeline_shell.update(cx, |clock, cx| clock.set_playhead(i64::from(*time_ms) * 1000, cx));
+                self.timeline_shell.update(cx, |clock, cx| clock.seek_to(i64::from(*time_ms) * 1000, cx));
                 let operations = self.active_motion_clip.and_then(|clip_id| {
                     let doc = &self.item.read(cx).document()?.doc;
                     let clip = doc.motion.clip(clip_id)?;
@@ -678,6 +678,27 @@ mod tests {
         assert!(
             active_clip_track(&view, track_id, cx).is_none(),
             "an empty track would leave a property row whose + adds nothing"
+        );
+    }
+
+    #[gpui::test]
+    async fn seeking_during_playback_keeps_the_requested_time(cx: &mut TestAppContext) {
+        let (view, timeline, _, mut cx) = setup(cx, true).await;
+        let cx = &mut cx;
+        timeline.update(cx, |_, cx| {
+            cx.emit(Action::PlayStateChangeRequested { playing: true })
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, cx| view.timeline_shell.read(cx).is_playing()));
+
+        timeline.update(cx, |_, cx| cx.emit(Action::SeekRequested { time_ms: 1_200 }));
+        cx.run_until_parked();
+        cx.executor().advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.timeline_shell.read(cx).playhead_us()),
+            1_200_000
         );
     }
 
