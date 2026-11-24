@@ -700,13 +700,15 @@ impl FigView {
                 }
             }
             DrawInspectorAction::ColorChangeRequested { hex } => {
-                if fanta_doc::Color::from_hex(&format!("#{}", hex.trim_start_matches('#')))
-                    .is_none()
-                {
-                    show_canvas_notice("Enter a six or eight digit hex color".into(), window, cx);
+                let Some(color) = crate::properties_ops::parse_color(hex) else {
+                    show_canvas_notice(
+                        "Enter a hex color such as F00 or FF0000".into(),
+                        window,
+                        cx,
+                    );
                     return;
-                }
-                draw.color_hex = hex.trim_start_matches('#').to_ascii_uppercase().into();
+                };
+                draw.color_hex = color.to_hex().trim_start_matches('#').to_owned().into();
             }
             DrawInspectorAction::BlendModeChangeRequested { id } => {
                 if !draw.blend_modes.iter().any(|choice| choice.id == *id) {

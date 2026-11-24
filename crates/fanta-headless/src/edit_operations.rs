@@ -333,12 +333,16 @@ pub fn default_shadow() -> Shadow {
     }
 }
 
+/// Parse a hex color with or without `#`, including the CSS shorthand
+/// `RGB` / `RGBA` forms.
 pub fn parse_color(text: &str) -> Option<Color> {
-    let trimmed = text.trim();
-    if let Some(color) = Color::from_hex(trimmed) {
-        return Some(color);
+    let digits = text.trim();
+    let digits = digits.strip_prefix('#').unwrap_or(digits);
+    if matches!(digits.len(), 3 | 4) && digits.chars().all(|digit| digit.is_ascii_hexdigit()) {
+        let expanded: String = digits.chars().flat_map(|digit| [digit, digit]).collect();
+        return Color::from_hex(&format!("#{expanded}"));
     }
-    Color::from_hex(&format!("#{trimmed}"))
+    Color::from_hex(&format!("#{digits}"))
 }
 
 pub fn authored_local_bounds(scene: &fanta_doc::Scene, id: NodeId) -> Option<fanta_doc::Bounds> {
@@ -619,4 +623,24 @@ pub fn detach_instance_operations(doc: &Doc, id: NodeId) -> anyhow::Result<Vec<O
         });
     }
     Ok(operations)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_color_expands_css_shorthand() {
+        assert_eq!(parse_color("f00"), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(parse_color(" #F00 "), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(parse_color("#f008"), Some(Color::rgba(255, 0, 0, 0x88)));
+        assert_eq!(parse_color("#112233"), Some(Color::rgb(0x11, 0x22, 0x33)));
+        assert_eq!(
+            parse_color("11223344"),
+            Some(Color::rgba(0x11, 0x22, 0x33, 0x44))
+        );
+        assert_eq!(parse_color("ff"), None);
+        assert_eq!(parse_color("xyz"), None);
+        assert_eq!(parse_color("aé"), None);
+    }
 }
