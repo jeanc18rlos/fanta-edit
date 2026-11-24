@@ -9977,6 +9977,65 @@ async fn mounted_deactivation_cancels_canvas_press_before_content_preview(
 }
 
 #[gpui::test]
+async fn mounted_lost_primary_release_ends_draw_stroke_where_it_was_drawn(
+    cx: &mut TestAppContext,
+) {
+    init_visual_test(cx);
+    let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+    let (doc, _, images) = bitmap_canvas_doc();
+    let (item, view, mut visual) =
+        mounted_canvas_interaction_fixture(&project, doc, images, cx);
+    view.update(&mut visual, |view, cx| {
+        view.activate_tool(ToolKind::Pencil, cx)
+    });
+    let (start, nodes_before) = view.read_with(&visual, |view, cx| {
+        (
+            view.container_bounds.expect("canvas").center(),
+            item.read(cx).doc().expect("document").scene.len(),
+        )
+    });
+    visual.simulate_event(MouseDownEvent {
+        position: start,
+        button: MouseButton::Left,
+        modifiers: gpui::Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    visual.simulate_event(MouseMoveEvent {
+        position: start + point(px(60.0), px(0.0)),
+        pressed_button: Some(MouseButton::Left),
+        modifiers: gpui::Modifiers::none(),
+    });
+    for position in [
+        start + point(px(200.0), px(150.0)),
+        start + point(px(-200.0), px(-150.0)),
+    ] {
+        visual.simulate_event(MouseMoveEvent {
+            position,
+            pressed_button: None,
+            modifiers: gpui::Modifiers::none(),
+        });
+    }
+    view.read_with(&visual, |view, cx| {
+        assert!(!view.primary_pressed && !view.canvas_pointer_down);
+        assert_eq!(view.active_tool(), ToolKind::Pencil);
+        let doc = item.read(cx).doc().expect("document");
+        assert_eq!(doc.scene.len(), nodes_before + 1, "the stroke is committed");
+        let stroke = doc
+            .scene
+            .children_of(doc.active_page())
+            .last()
+            .copied()
+            .expect("stroke");
+        let bounds = doc.scene.world_bounds(stroke).expect("stroke bounds");
+        assert!(
+            bounds.width() < 70.0 && bounds.height() < 10.0,
+            "hover moves after the lost release must not extend the stroke: {bounds:?}"
+        );
+    });
+}
+
+#[gpui::test]
 async fn mounted_pen_anchors_survive_pending_press_deactivation(cx: &mut TestAppContext) {
     init_visual_test(cx);
     let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;

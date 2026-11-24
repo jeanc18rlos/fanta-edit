@@ -474,6 +474,9 @@ pub struct FigView {
     pub(crate) viewport: Option<Viewport>,
     pan_last_position: Option<Point<Pixels>>,
     primary_pressed: bool,
+    /// Where the primary gesture last reached the tool, so a release the
+    /// window never saw can end it there instead of at a later hover.
+    primary_drag_screen: Option<DVec2>,
     click_diagnostics: Option<ClickDiagnostics>,
     pub(crate) gesture_perf: Option<crate::gesture_perf::SharedGesturePerf>,
     /// A pointer button is down on the canvas, from the press until the
@@ -907,6 +910,7 @@ impl FigView {
             viewport: None,
             pan_last_position: None,
             primary_pressed: false,
+            primary_drag_screen: None,
             click_diagnostics: ClickDiagnostics::from_setting(
                 std::env::var_os("FANTA_INPUT_DIAGNOSTICS").as_deref(),
             ),
@@ -4096,10 +4100,11 @@ impl FigView {
         let Some(button) = pointer_button(event.button) else {
             return "unsupported_button";
         };
+        let screen = screen_position_in_bounds(event.position, bounds);
         if button == ToolButton::Primary {
             self.primary_pressed = true;
+            self.primary_drag_screen = Some(screen);
         }
-        let screen = screen_position_in_bounds(event.position, bounds);
         self.dispatch_tool_event(
             press_event(screen, button, event.modifiers, event.click_count),
             cx,
@@ -4297,15 +4302,24 @@ impl FigView {
         let Some(bounds) = self.container_bounds else {
             return;
         };
-        if let Some(perf) = &self.gesture_perf {
-            let mut perf = perf.borrow_mut();
-            if event.pressed_button != Some(MouseButton::Left) {
-                perf.end("pointer_button_lost");
-            } else {
-                perf.pointer_move();
-            }
-        }
         let screen = screen_position_in_bounds(event.position, bounds);
+        if event.pressed_button != Some(MouseButton::Left) {
+            // Other tools finish where the drag last was: a brush or eraser
+            // following later hovers would paint or erase with no button down.
+            self.primary_pressed = false;
+            self.canvas_pointer_down = false;
+            let release_at = self.primary_drag_screen.take().unwrap_or(screen);
+            self.dispatch_tool_event(
+                release_event(release_at, ToolButton::Primary, event.modifiers),
+                cx,
+            );
+            self.end_gesture_perf("pointer_button_lost");
+            return;
+        }
+        if let Some(perf) = &self.gesture_perf {
+            perf.borrow_mut().pointer_move();
+        }
+        self.primary_drag_screen = Some(screen);
         self.dispatch_tool_event(move_event(screen, event.modifiers), cx);
     }
 
@@ -10273,6 +10287,7 @@ impl Item for FigView {
                 viewport,
                 pan_last_position: None,
                 primary_pressed: false,
+                primary_drag_screen: None,
                 click_diagnostics: ClickDiagnostics::from_setting(
                     std::env::var_os("FANTA_INPUT_DIAGNOSTICS").as_deref(),
                 ),
