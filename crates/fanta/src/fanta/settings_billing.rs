@@ -749,7 +749,7 @@ pub(super) async fn perform_billing_action(
         }
         BillingAction::PlanRequested { plan_id } => {
             ensure!(
-                matches!(plan_id.as_ref(), "pro" | "team"),
+                plan_id.as_ref() != "free",
                 "Select a paid plan in web billing. Free plans do not include AI credits."
             );
             let response = api_json(
