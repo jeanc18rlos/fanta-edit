@@ -461,10 +461,13 @@ mod tests {
                 tool.handle_event(&mut ctx, mv(*point));
             }
             tool.handle_event(&mut ctx, release(*points.last().expect("last point")));
-            doc.scene.roots().first().and_then(|id| match &doc.scene.get(*id)?.data {
-                NodeData::Vector(vector) => Some(vector.path.segments.len()),
-                _ => None,
-            })
+            doc.scene
+                .roots()
+                .first()
+                .and_then(|id| match &doc.scene.get(*id)?.data {
+                    NodeData::Vector(vector) => Some(vector.path.segments.len()),
+                    _ => None,
+                })
         };
         let at_100 = segment_count(1.0, &arc).expect("stroke at 100%");
         assert!(at_100 > 3, "the arc keeps its curve at 100%: {at_100}");
