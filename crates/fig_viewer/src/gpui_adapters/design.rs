@@ -3420,7 +3420,7 @@ impl FigView {
             Err(error) => {
                 log::error!("fig design adapter failed to apply operation: {error:#}");
                 crate::view::show_canvas_notice_deferred(
-                    format!("Could not apply that change: {error}"),
+                    format!("Could not apply that change: {}", error.root_cause()),
                     cx,
                 );
                 false
