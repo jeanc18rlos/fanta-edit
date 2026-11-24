@@ -21,6 +21,7 @@ use super::diagnostic::{
 use super::layout::{ASSETS_DIR, COMPONENTS_DIR, DOC_DIR, FANTA_JSON, PAGES_DIR, json_key};
 use super::read::read_project_tree_with_warnings;
 use super::web::{DESIGN_CSS, asset_hrefs, web_project_files};
+use super::web_read::first_attributes;
 
 const NODES_JSON: &str = "nodes.json";
 const ASSET_INDEX: &str = "assets/index.json";
@@ -258,7 +259,7 @@ fn check_svg(name: &str, text: &str, findings: &mut Vec<SourceDiagnostic>) {
     let mut depth = 0usize;
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     let mut note_id = |start: &quick_xml::events::BytesStart<'_>| {
-        for attribute in start.attributes().flatten() {
+        for attribute in first_attributes(start) {
             if attribute.key.as_ref() == b"id"
                 && let Ok(id) = attribute.unescape_value()
             {
@@ -603,6 +604,46 @@ mod tests {
             codes("a.json", "{\n  \"a\": 1,\n}\n"),
             vec![(PARSE_JSON, Some(3))]
         );
+    }
+
+    #[test]
+    fn a_repeated_attribute_counts_its_first_id_only() {
+        assert_eq!(
+            codes("a.svg", "<svg><g id=\"a\" id=\"b\"/><g id=\"b\"/></svg>"),
+            vec![]
+        );
+        assert_eq!(
+            codes("a.svg", "<svg>\n<g x=\"1\" x=\"2\" id=\"a\"/>\n<g id=\"a\"/></svg>"),
+            vec![(ID_DUPLICATE, Some(3))]
+        );
+    }
+
+    #[test]
+    fn attributes_after_a_repeated_one_with_spaces_in_its_value_are_read() {
+        // quick-xml's own check resumed inside the skipped value and lost the
+        // rest of the tag.
+        assert_eq!(
+            codes(
+                "a.svg",
+                "<svg><g class=\"a\" class=\"b c=\" id=\"x\"/><g id=\"x\"/></svg>"
+            ),
+            vec![(ID_DUPLICATE, Some(1))]
+        );
+    }
+
+    #[test]
+    fn a_tag_with_very_many_attributes_is_checked_in_linear_time() {
+        let mut text = String::from("<svg><g id=\"a\"");
+        for index in 0..200_000 {
+            text.push_str(&format!(" a{index}=\"\""));
+        }
+        text.push_str("/><g id=\"a\"/></svg>");
+        let started = std::time::Instant::now();
+        let found = codes("a.svg", &text);
+        let elapsed = started.elapsed();
+        assert_eq!(found, vec![(ID_DUPLICATE, Some(1))]);
+        // A duplicate check that compares every pair takes minutes here.
+        assert!(elapsed < std::time::Duration::from_secs(30), "{elapsed:?}");
     }
 
     #[test]
