@@ -7762,7 +7762,7 @@ fn crop_transform_for_state(
     {
         return None;
     }
-    let width = transform.m11 / state.zoom;
+    let mut width = transform.m11 / state.zoom;
     let mut height = transform.m22 / state.zoom;
     let ratio = match state.aspect_ratio {
         fanta_gpui::design::DesignMediaCropAspectRatio::Free => None,
@@ -7773,6 +7773,12 @@ fn crop_transform_for_state(
     };
     if let Some(ratio) = ratio {
         height = width * source_aspect / ratio;
+        // Shrink both sides together so the crop keeps its ratio inside the image.
+        let overflow = width.max(height);
+        if overflow > 1.0 {
+            width /= overflow;
+            height /= overflow;
+        }
     }
     if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
         return None;
@@ -10339,6 +10345,25 @@ mod tests {
         let crop = crop_transform_for_state(state, 2.0).expect("valid crop");
         assert!((crop.m11 - 0.5).abs() < 1e-6);
         assert!((crop.m22 - 1.0).abs() < 1e-6);
+        assert!(crop.tx >= 0.0 && crop.ty >= 0.0);
+        assert!(crop.tx + crop.m11 <= 1.0 && crop.ty + crop.m22 <= 1.0);
+    }
+
+    #[test]
+    fn square_crop_of_a_landscape_image_keeps_the_ratio_inside_the_image() {
+        let state = DesignMediaCropToolState {
+            active: true,
+            transform: DesignPaintTransform::IDENTITY,
+            zoom: 1.0,
+            aspect_ratio: fanta_gpui::design::DesignMediaCropAspectRatio::Square,
+        };
+        let source_aspect = 1.5;
+        let crop = crop_transform_for_state(state, source_aspect).expect("valid crop");
+        assert!(
+            (crop.m11 * source_aspect / crop.m22 - 1.0).abs() < 1e-6,
+            "the crop window is square in image pixels: {crop:?}"
+        );
+        assert!(crop.m11 <= 1.0 && crop.m22 <= 1.0);
         assert!(crop.tx >= 0.0 && crop.ty >= 0.0);
         assert!(crop.tx + crop.m11 <= 1.0 && crop.ty + crop.m22 <= 1.0);
     }
