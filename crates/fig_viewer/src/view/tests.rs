@@ -7863,6 +7863,69 @@ async fn rejected_cross_document_canvas_paste_shows_notice_and_preserves_documen
 }
 
 #[gpui::test]
+async fn refused_undo_and_redo_show_a_canvas_notice(cx: &mut TestAppContext) {
+    init_visual_test(cx);
+    let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+    let (doc, _, _) = text_selection_doc(false);
+    let item = crate::document::ready_item_for_test(
+        &project,
+        std::path::PathBuf::from("/tmp/RefusedUndo.fig"),
+        doc,
+        cx,
+    );
+    let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+        workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+    });
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let view = cx.update(|window, cx| {
+        let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+        });
+        window.activate_window();
+        view
+    });
+    cx.run_until_parked();
+    // Another view of the same design holds a live preview, so the item
+    // refuses history changes from this one.
+    let other_owner = workspace.entity_id();
+    item.update(cx, |item, cx| {
+        item.with_document_for_preview_owner(other_owner, cx, |_| ((), DocChange::ContentPreview))
+            .expect("start the other view's preview");
+        assert!(item.content_preview_active());
+    });
+    let undo_depth = item.read_with(cx, |item, _| {
+        item.document().expect("document").doc.history.undo_depth()
+    });
+    let notice = NotificationId::named(CANVAS_NOTICE_ID.into());
+    for redo in [false, true] {
+        workspace.update(cx, |workspace, cx| workspace.dismiss_notification(&notice, cx));
+        view.update_in(cx, |view, window, cx| {
+            if redo {
+                view.redo(&Redo, window, cx)
+            } else {
+                view.undo(&Undo, window, cx)
+            }
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.notification_ids().contains(&notice),
+                "a refused {} must tell the user why nothing happened",
+                if redo { "redo" } else { "undo" }
+            );
+        });
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.document().expect("document").doc.history.undo_depth(),
+                undo_depth
+            );
+        });
+    }
+}
+
+#[gpui::test]
 async fn right_click_menu_creates_an_instance_and_goes_back_to_its_main_component(
     cx: &mut TestAppContext,
 ) {
