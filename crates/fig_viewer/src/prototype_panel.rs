@@ -3832,6 +3832,41 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_prototype_parameter_enter_commits_and_escape_cancels(cx: &mut TestAppContext) {
+        let (panel, visual, item, first, reactions) =
+            mounted_panel_with_delay_interactions(1, cx).await;
+        let reaction = reactions[0].id;
+        start_delay_edit(&panel, first, reaction, "900", visual);
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        assert!(panel.read_with(visual, |panel, _| panel.editing_parameter.is_none()));
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                reaction_by_id(doc, first, reaction)
+                    .expect("interaction")
+                    .trigger,
+                Trigger::AfterDelay { delay_ms: 900 }
+            );
+        });
+
+        start_delay_edit(&panel, first, reaction, "1500", visual);
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        assert!(panel.read_with(visual, |panel, _| panel.editing_parameter.is_none()));
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                reaction_by_id(doc, first, reaction)
+                    .expect("interaction")
+                    .trigger,
+                Trigger::AfterDelay { delay_ms: 900 }
+            );
+        });
+    }
+
     #[gpui::test]
     async fn action_choices_require_their_targets_before_applying(cx: &mut TestAppContext) {
         init_test(cx);
@@ -5321,6 +5356,8 @@ impl FantaPrototypePanel {
             panel.update(cx, |panel, cx| panel.set_view_data(data, cx));
         }
         v_flex()
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::handle_key_down))
             .size_full()
             .min_h_0()
             .child(div().flex_1().min_h_0().children(self.shared.clone()))
