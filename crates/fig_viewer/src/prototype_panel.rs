@@ -3730,6 +3730,108 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "fanta-gpui-ui")]
+    async fn mounted_panel_with_delay_interactions(
+        reaction_count: usize,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<FantaPrototypePanel>,
+        &mut gpui::VisualTestContext,
+        Entity<FigItem>,
+        NodeId,
+        Vec<Reaction>,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
+            crate::theme_bridge::init(cx);
+        });
+        let (mut doc, first, _) = document_with_two_frames();
+        let reactions: Vec<Reaction> = (0..reaction_count)
+            .map(|_| Reaction {
+                id: ReactionId::new(),
+                trigger: Trigger::AfterDelay { delay_ms: 300 },
+                action: Action::Back,
+                extra_actions: Vec::new(),
+                transition: None,
+                animation: None,
+            })
+            .collect();
+        for reaction in &reactions {
+            doc.apply(Operation::AddReaction {
+                node: first,
+                reaction: reaction.clone(),
+            })
+            .expect("initial interaction");
+        }
+        doc.selection.select_only(first);
+        doc.history = Default::default();
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/PrototypeParameterKeys.fanta"),
+            doc,
+            cx,
+        );
+        let (panel, visual) = cx.add_window_view({
+            let item = item.clone();
+            move |_, cx| FantaPrototypePanel::new(item, cx)
+        });
+        visual.simulate_resize(gpui::size(px(400.0), px(1000.0)));
+        let selected = reactions.first().map(|reaction| reaction.id);
+        panel.update(visual, |panel, cx| {
+            panel.selected_reaction = selected;
+            cx.notify();
+        });
+        visual.run_until_parked();
+        (panel, visual, item, first, reactions)
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn start_delay_edit(
+        panel: &Entity<FantaPrototypePanel>,
+        node: NodeId,
+        reaction: ReactionId,
+        text: &str,
+        visual: &mut gpui::VisualTestContext,
+    ) {
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.start_parameter_edit(
+                    ReactionParameter {
+                        node,
+                        reaction,
+                        kind: ParameterKind::Delay,
+                    },
+                    "300".into(),
+                    window,
+                    cx,
+                );
+                panel
+                    .parameter_editor
+                    .clone()
+                    .expect("parameter editor")
+                    .update(cx, |editor, cx| editor.set_text(text, window, cx));
+            });
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_prototype_parameter_error_is_shown(cx: &mut TestAppContext) {
+        let (panel, visual, _, first, reactions) =
+            mounted_panel_with_delay_interactions(1, cx).await;
+        start_delay_edit(&panel, first, reactions[0].id, "invalid", visual);
+        assert!(panel.read_with(visual, |panel, _| panel.parameter_error.is_some()));
+        assert!(
+            visual.debug_bounds("prototype-parameter-error").is_some(),
+            "the invalid draft explains itself in the default inspector"
+        );
+    }
+
     #[gpui::test]
     async fn action_choices_require_their_targets_before_applying(cx: &mut TestAppContext) {
         init_test(cx);
@@ -5222,6 +5324,15 @@ impl FantaPrototypePanel {
             .size_full()
             .min_h_0()
             .child(div().flex_1().min_h_0().children(self.shared.clone()))
+            .children(self.parameter_error.clone().map(|error| {
+                h_flex()
+                    .debug_selector(|| "prototype-parameter-error".to_owned())
+                    .flex_none()
+                    .px_3()
+                    .py_1()
+                    .bg(cx.theme().status().error_background)
+                    .child(Label::new(error).size(LabelSize::Small))
+            }))
             .children(detail.map(|detail| {
                 div()
                     .id("prototype-interaction-detail")
