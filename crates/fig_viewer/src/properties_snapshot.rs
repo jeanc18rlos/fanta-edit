@@ -326,11 +326,12 @@ pub(crate) const DISTRIBUTE_BUTTONS: [(AlignGlyph, &str, AlignCommand); 2] = [
     ),
 ];
 
-pub(crate) const PRIMARY_ALIGNS: [(PrimaryAlign, &str); 4] = [
+pub(crate) const PRIMARY_ALIGNS: [(PrimaryAlign, &str); 5] = [
     (PrimaryAlign::Start, "Start"),
     (PrimaryAlign::Center, "Center"),
     (PrimaryAlign::End, "End"),
     (PrimaryAlign::SpaceBetween, "Space Between"),
+    (PrimaryAlign::SpaceEvenly, "Space Evenly"),
 ];
 
 pub(crate) const COUNTER_ALIGNS: [(CounterAlign, &str); 5] = [
@@ -1946,6 +1947,30 @@ pub(crate) mod tests {
     use fanta_doc::{GroupNode, PathData, Stroke, TextPathNode};
 
     use super::*;
+
+    #[test]
+    fn primary_align_dropdown_lists_every_alignment() {
+        for align in [
+            PrimaryAlign::Start,
+            PrimaryAlign::Center,
+            PrimaryAlign::End,
+            PrimaryAlign::SpaceBetween,
+            PrimaryAlign::SpaceEvenly,
+        ] {
+            // Exhaustive so a new variant fails to compile until it is listed above.
+            match align {
+                PrimaryAlign::Start
+                | PrimaryAlign::Center
+                | PrimaryAlign::End
+                | PrimaryAlign::SpaceBetween
+                | PrimaryAlign::SpaceEvenly => {}
+            }
+            assert!(
+                PRIMARY_ALIGNS.iter().any(|(listed, _)| *listed == align),
+                "{align:?} is missing from the dropdown"
+            );
+        }
+    }
 
     #[test]
     fn tab_pairs_hop_between_2up_partners() {
