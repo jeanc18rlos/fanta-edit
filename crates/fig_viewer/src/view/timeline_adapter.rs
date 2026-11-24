@@ -499,7 +499,8 @@ impl FigView {
                     clip: clip_id,
                     track: track.id,
                     old: Some(Box::new(track.clone())),
-                    new: Some(Box::new(changed)),
+                    // An empty track would leave a property row whose + adds nothing.
+                    new: (!changed.keyframes.is_empty()).then(|| Box::new(changed)),
                 });
             }
         }
@@ -511,7 +512,8 @@ impl FigView {
 mod tests {
     use super::*;
     use fanta_doc::{
-        AnimationClip, AnimationClipId, CanvasNode, Doc, GroupNode, NodeData, TextNode,
+        AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, CanvasNode, Doc,
+        GroupNode, MotionTarget, NodeData, TextNode,
     };
     use gpui::{TestAppContext, VisualTestContext};
     use project::{FakeFs, Project};
@@ -577,6 +579,106 @@ mod tests {
                 .clone()
         });
         (view, timeline, target_id, cx.clone())
+    }
+
+    fn insert_opacity_track(
+        view: &Entity<FigView>,
+        target_id: NodeId,
+        times: &[u32],
+        cx: &mut VisualTestContext,
+    ) -> (AnimationTrackId, Vec<KeyframeId>) {
+        let track_id = AnimationTrackId::new();
+        let mut track = AnimationTrack::new(
+            track_id,
+            MotionTarget::new(
+                target_id,
+                MotionProperty::Bound {
+                    prop: BoundProp::Opacity,
+                },
+            ),
+        );
+        let keyframe_ids = times
+            .iter()
+            .map(|time_ms| {
+                let keyframe = Keyframe::new(
+                    KeyframeId::new(),
+                    *time_ms,
+                    ResolvedVarValue::Float {
+                        value: f64::from(*time_ms) / 1_000.,
+                    },
+                );
+                let id = keyframe.id;
+                track.keyframes.insert(id, keyframe);
+                id
+            })
+            .collect();
+        view.update(cx, |view, cx| {
+            let clip_id = view.active_motion_clip.expect("active clip");
+            view.item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document
+                        .doc
+                        .motion
+                        .clips
+                        .get_mut(&clip_id)
+                        .expect("clip")
+                        .tracks
+                        .insert(track_id, track);
+                    ((), DocChange::Content)
+                });
+            });
+        });
+        cx.run_until_parked();
+        (track_id, keyframe_ids)
+    }
+
+    fn active_clip_track(
+        view: &Entity<FigView>,
+        track_id: AnimationTrackId,
+        cx: &mut VisualTestContext,
+    ) -> Option<AnimationTrack> {
+        view.read_with(cx, |view, cx| {
+            let clip_id = view.active_motion_clip.expect("active clip");
+            let document = view.item.read(cx).document().expect("document");
+            document
+                .doc
+                .motion
+                .clip(clip_id)
+                .expect("clip")
+                .tracks
+                .get(&track_id)
+                .cloned()
+        })
+    }
+
+    #[gpui::test]
+    async fn deleting_a_property_last_keyframe_removes_its_track(cx: &mut TestAppContext) {
+        let (view, timeline, target_id, mut cx) = setup(cx, true).await;
+        let cx = &mut cx;
+        let (track_id, keyframe_ids) = insert_opacity_track(&view, target_id, &[0, 500], cx);
+        let [first, second] = keyframe_ids.as_slice() else {
+            panic!("expected two keyframes");
+        };
+
+        timeline.update(cx, |_, cx| {
+            cx.emit(Action::KeyframesDeleteRequested {
+                keyframe_ids: vec![first.to_string().into()],
+            })
+        });
+        cx.run_until_parked();
+        let track = active_clip_track(&view, track_id, cx).expect("track keeps its other keyframe");
+        assert_eq!(track.keyframes.keys().collect::<Vec<_>>(), [second]);
+
+        timeline.update(cx, |_, cx| {
+            cx.emit(Action::KeyframesDeleteRequested {
+                keyframe_ids: vec![second.to_string().into()],
+            })
+        });
+        cx.run_until_parked();
+        assert!(
+            active_clip_track(&view, track_id, cx).is_none(),
+            "an empty track would leave a property row whose + adds nothing"
+        );
     }
 
     #[gpui::test]

@@ -558,6 +558,15 @@ pub(crate) fn delete_keyframe_operation(
     let keyframe_id = selection.keyframe_id.parse::<KeyframeId>().ok()?;
     let track = doc.motion.clip(clip)?.tracks.get(&track_id)?;
     let keyframe = track.keyframes.get(&keyframe_id)?.clone();
+    // An empty track would keep its property listed as animated with nothing to edit.
+    if track.keyframes.len() == 1 {
+        return Some(Operation::SetAnimationTrack {
+            clip,
+            track: track_id,
+            old: Some(Box::new(track.clone())),
+            new: None,
+        });
+    }
     Some(Operation::SetKeyframe {
         clip,
         track: track_id,
@@ -812,8 +821,38 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_track_last_keyframe_removes_the_track() {
+        let (mut doc, clip_id, track_id, _, selection) = motion_doc();
+        let operation =
+            delete_keyframe_operation(&doc, clip_id, &selection).expect("delete operation");
+        assert!(matches!(
+            &operation,
+            Operation::SetAnimationTrack {
+                track,
+                new: None,
+                ..
+            } if *track == track_id
+        ));
+        doc.apply(operation).expect("delete the last keyframe");
+        assert!(doc.motion.clips[&clip_id].tracks.is_empty());
+    }
+
+    #[test]
     fn delete_rename_and_duration_use_existing_motion_operations() {
         let (mut doc, clip_id, track_id, keyframe_id, selection) = motion_doc();
+        let other_keyframe = KeyframeId::from_u128(5);
+        doc.motion
+            .clips
+            .get_mut(&clip_id)
+            .expect("clip")
+            .tracks
+            .get_mut(&track_id)
+            .expect("track")
+            .keyframes
+            .insert(
+                other_keyframe,
+                Keyframe::new(other_keyframe, 750, ResolvedVarValue::Float { value: 20.0 }),
+            );
         assert!(matches!(
             delete_keyframe_operation(&doc, clip_id, &selection),
             Some(Operation::SetKeyframe {
