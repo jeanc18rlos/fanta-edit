@@ -16,6 +16,9 @@
 //! `nodes_from_tree(parse_doc(print_doc(tree.root)), tree.sidecar, tree.root_parent)`
 //! reproduces `n` exactly (modulo set ordering).
 
+// Parsers of untrusted files must not panic on them; tests may unwrap.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::let_underscore_must_use))]
+
 mod api;
 mod canonicalize;
 mod color;

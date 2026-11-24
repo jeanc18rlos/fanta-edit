@@ -1257,7 +1257,10 @@ impl ArtifactSession {
     pub fn projected_node_map(&self) -> Result<NodeMapEdition, SessionError> {
         match &self.state {
             ArtifactDirty::DirtyText => {
-                let source = self.text.as_ref().unwrap();
+                let source = self
+                    .text
+                    .as_ref()
+                    .ok_or_else(|| SessionError::other("DirtyText missing buffer"))?;
                 let reconciled = deterministic_reconcile(source, self.ir.sidecar())?;
                 let nodes = fanta_fnx::decode_subtree_with(source, &reconciled, &self.ref_table)?;
                 let mut map = Map::new();

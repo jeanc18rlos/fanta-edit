@@ -43,6 +43,8 @@
 //! [`Doc`]: fanta_doc::Doc
 
 #![forbid(unsafe_code)]
+// Parsers of untrusted files must not panic on them; tests may unwrap.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::let_underscore_must_use))]
 
 pub mod canvas;
 pub mod error;

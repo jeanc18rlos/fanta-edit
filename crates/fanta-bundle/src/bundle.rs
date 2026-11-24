@@ -8,6 +8,8 @@
 //! through the `fanta-compile` CLI.
 
 #![forbid(unsafe_code)]
+// Parsers of untrusted files must not panic on them; tests may unwrap.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::let_underscore_must_use))]
 
 use fanta_doc::motion::CompiledMotionLibrary;
 use fanta_doc::{AssetId, Doc, NodeId};
