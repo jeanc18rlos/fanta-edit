@@ -3604,6 +3604,37 @@ fn pr12_authored_initial_scroll_offset_seeds_on_frame_enter() {
 }
 
 #[test]
+fn restart_reseeds_the_authored_initial_scroll_offset() {
+    let mut doc = Doc::new();
+    let root = frame_sized(0.0, 0.0, 200.0, 200.0, Color::WHITE);
+    let root_id = root.id;
+    doc.apply(Operation::create_node(root)).unwrap();
+    let mut container = CanvasNode::new(NodeData::Group(GroupNode {
+        clip_size: Some([100.0, 100.0]),
+        scroll_direction: Some(ScrollDirection::Vertical),
+        scroll_offset: Some([0.0, 40.0]),
+        ..GroupNode::default()
+    }));
+    let container_id = container.id;
+    container.parent = Some(root_id);
+    container.transform = Transform2D::translation(50.0, 50.0);
+    doc.apply(Operation::create_node(container)).unwrap();
+    colored_child(
+        &mut doc,
+        container_id,
+        150.0,
+        40.0,
+        Color::rgb(0, 0, 255),
+        ScrollBehavior::Scrolls,
+    );
+
+    let mut session = PresentSession::new(&doc, Some(root_id), DVec2::splat(200.0)).unwrap();
+    session.set_scroll_offset(container_id, [0.0, 0.0]);
+    assert!(session.restart_at(root_id));
+    assert_eq!(session.scroll_offset(container_id), [0.0, 40.0]);
+}
+
+#[test]
 fn frame_without_authored_overflow_does_not_scroll() {
     // The legacy heuristic made every frame scrollable; authored axes say NO.
     let (mut doc, root, container) = scrolling_fixture(ScrollDirection::None);

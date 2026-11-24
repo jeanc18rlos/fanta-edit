@@ -792,6 +792,7 @@ impl PlaybackSession {
         self.hover_chain.clear();
         self.active_scroll_animation = None;
         self.pending_url = None;
+        self.seed_initial_scroll_offsets(start);
         self.schedule_timers(start);
         self.camera = frame_camera(
             &self.resolved_layer(start, false).scene,
