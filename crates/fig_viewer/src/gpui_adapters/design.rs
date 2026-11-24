@@ -4239,7 +4239,22 @@ impl FigView {
                     return;
                 }
                 self.finish_document_edits_for_external_change(cx);
-                self.forget_hidden_paint_alpha(id, is_stroke);
+                // Adding appends, so remembered alphas keep their index, except
+                // a group without a primary background, which takes the new
+                // fill as its first paint.
+                let shifts_paints = !is_stroke
+                    && self
+                        .item()
+                        .read(cx)
+                        .document()
+                        .and_then(|document| document.doc.scene.get(id))
+                        .is_some_and(|node| {
+                            matches!(&node.data, NodeData::Group(group)
+                                if group.background.is_none() && !group.background_fills.is_empty())
+                        });
+                if shifts_paints {
+                    self.forget_hidden_paint_alpha(id, is_stroke);
+                }
                 let ops = self.design_ops(cx, |doc| {
                     replace_data_operation(doc, id, |data| {
                         if is_stroke {
@@ -13540,6 +13555,54 @@ mod tests {
                 paint_alpha(&paint_at(doc, rect, false, 1)),
                 HiddenPaintAlpha::Solid(0),
                 "the previously hidden paint stays hidden after moving"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn adding_a_fill_keeps_a_hidden_paints_remembered_alpha(cx: &mut TestAppContext) {
+        let (mut doc, _, rect) = doc_with_rect();
+        let NodeData::Vector(vector) = &mut doc.scene.get_mut(rect).expect("rectangle").data else {
+            panic!("rectangle is a vector");
+        };
+        vector.fills = vec![Fill::Solid {
+            color: FantaColor::rgba(0xe0, 0x30, 0x30, 0x66),
+            blend: BlendMode::Normal,
+        }]
+        .into();
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        emit_inspector_paint(
+            &panel,
+            &mut cx,
+            rect,
+            DesignPaintProperty::Visible,
+            DesignPaintValue::Bool(false),
+            DesignPanelEditPhase::Commit,
+        );
+        panel.update_in(&mut cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::CollectionItemAddRequested {
+                node_id: rect.to_string().into(),
+                collection: DesignPanelCollection::Fill,
+                target: DesignPaintTarget::WholeLayer,
+            });
+        });
+        cx.run_until_parked();
+        emit_inspector_paint(
+            &panel,
+            &mut cx,
+            rect,
+            DesignPaintProperty::Visible,
+            DesignPaintValue::Bool(true),
+            DesignPanelEditPhase::Commit,
+        );
+        item.read_with(&cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            assert_eq!(
+                paint_alpha(&paint_at(doc, rect, false, 0)),
+                HiddenPaintAlpha::Solid(0x66),
+                "showing the paint again restores the alpha it had before hiding"
             );
         });
     }
