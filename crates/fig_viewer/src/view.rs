@@ -4683,7 +4683,7 @@ impl FigView {
             Ok(changed) => changed,
             Err(error) => {
                 log::error!("fig_viewer undo failed: {error:#}");
-                show_canvas_notice_deferred(format!("Couldn't undo: {error:#}"), cx);
+                show_canvas_notice_deferred(format!("Could not undo: {error:#}"), cx);
                 false
             }
         });
@@ -4721,7 +4721,7 @@ impl FigView {
             Ok(changed) => changed,
             Err(error) => {
                 log::error!("fig_viewer redo failed: {error:#}");
-                show_canvas_notice_deferred(format!("Couldn't redo: {error:#}"), cx);
+                show_canvas_notice_deferred(format!("Could not redo: {error:#}"), cx);
                 false
             }
         });
