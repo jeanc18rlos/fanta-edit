@@ -827,15 +827,20 @@ impl FantaPrototypePanel {
             return false;
         };
         let preview_owner = cx.entity_id();
-        self.item.update(cx, |item, cx| {
-            match item.apply_for_preview_owner(preview_owner, operation, cx) {
-                Ok(()) => true,
-                Err(error) => {
-                    log::error!("Fanta prototype panel failed to apply operation: {error:#}");
-                    false
-                }
+        let result = self.item.update(cx, |item, cx| {
+            item.apply_for_preview_owner(preview_owner, operation, cx)
+        });
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                log::error!("Fanta prototype panel failed to apply operation: {error:#}");
+                crate::view::show_canvas_notice_deferred(
+                    format!("Could not change the prototype: {error:#}"),
+                    cx,
+                );
+                false
             }
-        })
+        }
     }
 
     fn add_interaction(&mut self, node: NodeId, cx: &mut Context<Self>) -> bool {
@@ -3916,6 +3921,65 @@ mod tests {
             Some(reactions[0].id),
             "a refused add must not open another interaction's details"
         );
+    }
+
+    #[gpui::test]
+    async fn a_refused_prototype_change_shows_a_canvas_notice(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (mut doc, first, _) = document_with_two_frames();
+        let reaction = Reaction {
+            id: ReactionId::new(),
+            trigger: Trigger::Click,
+            action: Action::Back,
+            extra_actions: Vec::new(),
+            transition: None,
+            animation: None,
+        };
+        doc.apply(Operation::AddReaction {
+            node: first,
+            reaction: reaction.clone(),
+        })
+        .expect("add interaction");
+        doc.selection.select_only(first);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/PrototypeRefused.fanta"),
+            doc,
+            cx,
+        );
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let panel = cx.update(|_, cx| cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx)));
+        let other_view = workspace.entity_id();
+        item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(other_view, cx, |_| {
+                ((), DocChange::ContentPreview)
+            })
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.set_trigger_choice(first, reaction.id, TriggerChoice::Hover, cx);
+        });
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(reaction_by_id(doc, first, reaction.id), Some(&reaction));
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.notification_ids().contains(
+                    &workspace::notifications::NotificationId::named(
+                        crate::view::CANVAS_NOTICE_ID.into()
+                    )
+                ),
+                "a refused prototype change must explain itself"
+            );
+        });
     }
 
     #[gpui::test]
