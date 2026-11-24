@@ -2,7 +2,7 @@ use super::*;
 use fanta_gpui::timeline::{
     self as shared, Timeline, TimelineAction as Action, TimelineEasing, TimelinePlayback,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub(super) struct TimelineAdapter {
     pub panel: Entity<Timeline>,
@@ -365,8 +365,10 @@ impl FigView {
                 }
             }
             Action::KeyframesMoveRequested { .. } | Action::KeyframesDeleteRequested { .. } | Action::KeyframesDuplicateRequested { .. } | Action::EasingChangeRequested { .. } | Action::TrackTimingChangeRequested { .. } => {
-                let operations = self.timeline_edit_operations(action, cx);
-                self.apply_inspector_operations(operations, "Edit animation", window, cx);
+                match self.timeline_edit_operations(action, cx) {
+                    Ok(operations) => self.apply_inspector_operations(operations, "Edit animation", window, cx),
+                    Err(message) => show_canvas_notice(message.into(), window, cx),
+                }
             }
             Action::CollapsedChanged { .. } | Action::EmptyStateDismissed => {}
             Action::HelpRequested => show_canvas_notice("Drag keys or timing bars to retime. Double-click a layer name to rename it. Use the + beside a property to add a keyframe.".into(), window, cx),
@@ -399,9 +401,13 @@ impl FigView {
         cx.notify();
     }
 
-    fn timeline_edit_operations(&self, action: &Action, cx: &App) -> Vec<Operation> {
+    fn timeline_edit_operations(
+        &self,
+        action: &Action,
+        cx: &App,
+    ) -> Result<Vec<Operation>, &'static str> {
         let Some(clip_id) = self.active_motion_clip else {
-            return vec![];
+            return Ok(vec![]);
         };
         let Some(clip) = self
             .item
@@ -409,7 +415,11 @@ impl FigView {
             .document()
             .and_then(|document| document.doc.motion.clip(clip_id))
         else {
-            return vec![];
+            return Ok(vec![]);
+        };
+        let shares_a_time = |keyframes: &BTreeMap<KeyframeId, Keyframe>| {
+            let mut times = HashSet::new();
+            !keyframes.values().all(|key| times.insert(key.time_ms))
         };
         let mut operations = vec![];
         for track in clip.tracks.values() {
@@ -494,6 +504,10 @@ impl FigView {
                     _ => {}
                 }
             }
+            // The evaluator keeps one keyframe per time, so a second one would silently do nothing.
+            if shares_a_time(&changed.keyframes) && !shares_a_time(&track.keyframes) {
+                return Err("Two keyframes of one property cannot share a time");
+            }
             if changed != *track {
                 operations.push(Operation::SetAnimationTrack {
                     clip: clip_id,
@@ -504,7 +518,7 @@ impl FigView {
                 });
             }
         }
-        operations
+        Ok(operations)
     }
 }
 
@@ -682,6 +696,59 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn retiming_keyframes_never_stacks_two_on_one_property_time(cx: &mut TestAppContext) {
+        let (view, timeline, target_id, mut cx) = setup(cx, true).await;
+        let cx = &mut cx;
+        let (track_id, keyframe_ids) = insert_opacity_track(&view, target_id, &[0, 500], cx);
+        let [first, second] = keyframe_ids.as_slice() else {
+            panic!("expected two keyframes");
+        };
+        let times = |cx: &mut VisualTestContext| {
+            let track = active_clip_track(&view, track_id, cx).expect("track");
+            let mut times = track
+                .keyframes
+                .values()
+                .map(|key| key.time_ms)
+                .collect::<Vec<_>>();
+            times.sort();
+            times
+        };
+        let actions = [
+            Action::KeyframesMoveRequested {
+                keyframes: vec![shared::TimelineKeyframeTime {
+                    id: second.to_string().into(),
+                    time_ms: 0,
+                }],
+            },
+            Action::KeyframesDuplicateRequested {
+                keyframe_ids: vec![first.to_string().into()],
+                offset_ms: 0,
+            },
+            Action::TrackTimingChangeRequested {
+                track_id: target_id.to_string().into(),
+                start_ms: 200,
+                end_ms: 200,
+            },
+        ];
+        for action in actions {
+            timeline.update(cx, |_, cx| cx.emit(action.clone()));
+            cx.run_until_parked();
+            assert_eq!(times(cx), [0, 500], "{action:?} stacked two keyframes");
+        }
+
+        timeline.update(cx, |_, cx| {
+            cx.emit(Action::KeyframesMoveRequested {
+                keyframes: vec![shared::TimelineKeyframeTime {
+                    id: second.to_string().into(),
+                    time_ms: 900,
+                }],
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(times(cx), [0, 900]);
+    }
+
+    #[gpui::test]
     async fn seeking_during_playback_keeps_the_requested_time(cx: &mut TestAppContext) {
         let (view, timeline, _, mut cx) = setup(cx, true).await;
         let cx = &mut cx;
@@ -691,9 +758,12 @@ mod tests {
         cx.run_until_parked();
         assert!(view.read_with(cx, |view, cx| view.timeline_shell.read(cx).is_playing()));
 
-        timeline.update(cx, |_, cx| cx.emit(Action::SeekRequested { time_ms: 1_200 }));
+        timeline.update(cx, |_, cx| {
+            cx.emit(Action::SeekRequested { time_ms: 1_200 })
+        });
         cx.run_until_parked();
-        cx.executor().advance_clock(std::time::Duration::from_millis(100));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(100));
         cx.run_until_parked();
 
         assert_eq!(
