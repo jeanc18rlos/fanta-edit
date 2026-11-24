@@ -6354,6 +6354,7 @@ impl FigView {
         };
         self.finish_document_edits_for_external_change(cx);
         let value = value.cloned();
+        let mut rejected = None;
         let ops = self.design_ops(cx, |doc| {
             let kind = current_prop_kind(doc, id, prop);
             if !matches!(
@@ -6376,16 +6377,24 @@ impl FigView {
                     Some(VarValue::Boolean { value: *value })
                 }
                 Some(DesignComponentPropertyValue::Text(text)) => match kind {
-                    Some(EnginePropKind::Number) => match text.trim().parse::<f64>() {
-                        Ok(value) if value.is_finite() => Some(VarValue::Float { value }),
-                        _ => return Vec::new(),
-                    },
+                    Some(EnginePropKind::Number) => {
+                        match crate::properties_ops::parse_number(text) {
+                            Some(value) => Some(VarValue::Float { value }),
+                            None => {
+                                rejected = Some("number");
+                                return Vec::new();
+                            }
+                        }
+                    }
                     Some(EnginePropKind::Text) => Some(VarValue::String {
                         value: text.to_string(),
                     }),
                     Some(EnginePropKind::Color) => match parse_color(text) {
                         Some(value) => Some(VarValue::Color { value }),
-                        None => return Vec::new(),
+                        None => {
+                            rejected = Some("color");
+                            return Vec::new();
+                        }
                     },
                     _ => return Vec::new(),
                 },
@@ -6396,6 +6405,13 @@ impl FigView {
             };
             instance_prop_operations(doc, id, prop, new)
         });
+        if let Some(kind) = rejected {
+            crate::view::show_canvas_notice_deferred(
+                format!("Could not read that as a {kind}."),
+                cx,
+            );
+            return;
+        }
         self.design_apply_ops(ops, cx);
     }
 
@@ -14844,6 +14860,63 @@ mod tests {
                 "Literal"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn component_number_edit_reads_like_other_number_fields(cx: &mut TestAppContext) {
+        let (mut doc, page, master_root) = doc_with_rect();
+        let component = ComponentId::new();
+        let number_prop = ComponentPropId::new();
+        let mut definition = ComponentDef::new(component, master_root, "Badge");
+        definition.props = vec![ComponentPropDef {
+            id: number_prop,
+            name: "Count".into(),
+            kind: ComponentPropKind::Number,
+            formatter: Default::default(),
+            default: VarValue::Float { value: 0.0 },
+            bindings: Vec::new(),
+        }];
+        doc.components.defs.insert(component, definition);
+        let mut instance = CanvasNode::new(NodeData::Instance(InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [120.0, 60.0],
+        }));
+        instance.parent = Some(page);
+        let id = instance.id;
+        doc.scene.insert(instance).expect("insert instance");
+        doc.selection.replace_with([id]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        for (text, expected) in [("12px", 12.0), ("1,5", 1.5), ("\u{2212}3", -3.0)] {
+            panel.update_in(cx, |_, _, cx| {
+                cx.emit(DesignPanelAction::ComponentPropertyChangeRequested {
+                    node_id: id.to_string().into(),
+                    property_id: number_prop.to_string().into(),
+                    value: DesignComponentPropertyValue::Text(text.into()),
+                });
+            });
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let doc = &item.document().expect("document ready").doc;
+                let NodeData::Instance(instance) =
+                    &doc.scene.get(id).expect("instance exists").data
+                else {
+                    panic!("instance node");
+                };
+                assert_eq!(
+                    instance.prop_values.get(&number_prop),
+                    Some(&VarValue::Float { value: expected }),
+                    "{text}"
+                );
+            });
+        }
     }
 
     #[gpui::test]
