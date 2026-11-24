@@ -10909,7 +10909,9 @@ impl FigView {
                     self.set_editor_mode_from_action(EditorMode::Motion, window, cx)
                 }
                 ToolbarMode::Dev => self.set_editor_mode_from_action(EditorMode::Dev, window, cx),
-                ToolbarMode::Draw => self.set_editor_mode(EditorMode::Draw, cx),
+                ToolbarMode::Draw => {
+                    self.set_editor_mode_from_action(EditorMode::Draw, window, cx)
+                }
             },
             // The +/- steppers, the zoom menu's percent entries, typed
             // percentages, and the ZoomCanvasTo100 command action all arrive
@@ -10951,7 +10953,9 @@ impl FigView {
                 ToolbarCommand::OpenVariables => {
                     self.set_editor_workspace(EditorWorkspace::Variables, cx)
                 }
-                ToolbarCommand::OpenDrawMode => self.set_editor_mode(EditorMode::Draw, cx),
+                ToolbarCommand::OpenDrawMode => {
+                    self.set_editor_mode_from_action(EditorMode::Draw, window, cx)
+                }
                 ToolbarCommand::OpenDevMode => {
                     self.set_editor_mode_from_action(EditorMode::Dev, window, cx)
                 }

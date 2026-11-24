@@ -6086,6 +6086,59 @@ async fn pane_layout_preserves_invalid_property_input_across_compaction(
     assert_pane_layout_preserves_property_draft("-", cx).await;
 }
 
+#[cfg(feature = "fanta-gpui-ui")]
+#[gpui::test]
+async fn toolbar_draw_mode_commits_pending_property_draft(cx: &mut TestAppContext) {
+    init_visual_test(cx);
+    let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+    let (doc, text, _) = text_selection_doc(false);
+    let (item, view, _host, mut visual) =
+        pane_layout_fixture(&project, doc, BTreeMap::new(), cx);
+    item.update(&mut visual, |item, cx| {
+        item.with_document(cx, |document| {
+            document.doc.selection.select_only(text);
+            ((), DocChange::Selection)
+        })
+        .expect("select mounted text");
+    });
+    draw_pane_layout(&mut visual);
+    let undo_depth_before = item.read_with(&visual, |item, _| {
+        item.document().expect("document").doc.history.undo_depth()
+    });
+    let field = visual
+        .debug_bounds("fig-gpui-design-x")
+        .expect("X input")
+        .center();
+    visual.simulate_click(field, gpui::Modifiers::none());
+    visual.simulate_keystrokes("secondary-a");
+    visual.simulate_input("48");
+    visual.run_until_parked();
+    let mode_control = visual
+        .debug_bounds("toolbar-mode-selector")
+        .expect("mode control");
+    visual.simulate_click(mode_control.center(), gpui::Modifiers::default());
+    draw_pane_layout(&mut visual);
+    let draw = visual
+        .debug_bounds("toolbar-mode-draw")
+        .expect("Draw mode choice");
+    visual.simulate_click(draw.center(), gpui::Modifiers::default());
+    draw_pane_layout(&mut visual);
+    view.read_with(&visual, |view, cx| {
+        assert_eq!(view.editor_mode(cx), EditorMode::Draw)
+    });
+    item.read_with(&visual, |item, _| {
+        let document = item.document().expect("document");
+        assert_eq!(
+            document.doc.history.undo_depth(),
+            undo_depth_before + 1,
+            "entering Draw commits the typed X like the other modes do"
+        );
+        let bounds = document.doc.scene.world_bounds(text).expect("text bounds");
+        assert_eq!(bounds.min_x, 48.0);
+        assert!(!item.content_preview_active());
+    });
+}
+
 async fn assert_mounted_sidebar_divider_drag(
     sidebar_kind: SidebarKind,
     first_move_finishes_drag: bool,
