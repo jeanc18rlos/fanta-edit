@@ -477,7 +477,8 @@ impl ColorPicker {
         let trimmed = text.trim();
         let parsed =
             FantaColor::from_hex(trimmed).or_else(|| FantaColor::from_hex(&format!("#{trimmed}")));
-        if let Some(color) = parsed {
+        // An unchanged colour must not re-derive HSV: grays would lose their hue.
+        if let Some(color) = parsed.filter(|color| *color != self.color()) {
             // Keep the user's cursor and partially-entered spelling intact.
             // Pointer-driven changes still synchronize the canonical hex text.
             self.update_hsva(rgb_to_hsv(color), false, window, cx);
@@ -1558,6 +1559,27 @@ mod render_tests {
         cx.run_until_parked();
         let color = window.read_with(cx, |picker, _| picker.color()).unwrap();
         assert_eq!(color, FantaColor::rgb(0x12, 0x34, 0x56));
+    }
+
+    #[gpui::test]
+    fn dragging_to_gray_keeps_the_hue(cx: &mut TestAppContext) {
+        init_test(cx);
+        let window =
+            cx.add_window(|window, cx| ColorPicker::new(FantaColor::rgb(0, 0, 255), window, cx));
+        window
+            .update(cx, |picker, window, cx| {
+                let hsva = Hsva {
+                    s: 0.0,
+                    ..picker.hsva
+                };
+                picker.set_hsva(hsva, window, cx);
+            })
+            .expect("drag the picker to gray");
+        cx.run_until_parked();
+        let hue = window
+            .read_with(cx, |picker, _| picker.hsva.h)
+            .expect("read the picker");
+        assert!((hue - 240.0).abs() < 0.5, "hue was reset to {hue}");
     }
 
     #[gpui::test]
