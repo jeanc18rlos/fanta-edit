@@ -187,14 +187,20 @@ impl PencilTool {
     /// Simplify the captured points and commit an open stroked path. No-op for
     /// fewer than two distinct points.
     fn commit(&mut self, ctx: &mut ToolContext) {
-        let simplified = rdp(&self.points, ctx.stroke_smoothing);
+        // Both tolerances are screen pixels, like the sampling, so the same
+        // gesture gives the same stroke at any zoom.
+        let world_per_pixel = 1.0 / ctx.viewport.zoom.max(f64::EPSILON);
+        let simplified = rdp(&self.points, ctx.stroke_smoothing * world_per_pixel);
         if simplified.len() < 2 {
             return;
         }
         // Reject a degenerate (zero-extent) stroke — e.g. a bare click whose
         // press and release land on the same point yields two identical samples.
         let p0 = simplified[0];
-        if simplified.iter().all(|p| (*p - p0).length() < 0.5) {
+        if simplified
+            .iter()
+            .all(|p| (*p - p0).length() < 0.5 * world_per_pixel)
+        {
             return;
         }
         // Local path from first point as origin; set transform so place can rebase.
@@ -432,6 +438,41 @@ mod tests {
         assert_eq!(
             doc.scene.get(id).expect("redone stroke").blend_mode,
             fanta_doc::BlendMode::Multiply
+        );
+    }
+
+    #[test]
+    fn same_screen_gesture_simplifies_alike_at_every_zoom() {
+        let arc: Vec<[f64; 2]> = (0..=18)
+            .map(|step| {
+                let angle = f64::from(step) * std::f64::consts::PI / 18.0;
+                [400.0 + 40.0 * angle.cos(), 300.0 - 40.0 * angle.sin()]
+            })
+            .collect();
+        let segment_count = |zoom: f64, points: &[[f64; 2]]| {
+            let (mut doc, mut viewport, snap, size) = ctx_pieces();
+            viewport.zoom = zoom;
+            let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+            ctx.stroke_smoothing = 6.0;
+            let mut tool = PencilTool::new();
+            let (first, rest) = points.split_first().expect("gesture points");
+            tool.handle_event(&mut ctx, press(*first));
+            for point in rest {
+                tool.handle_event(&mut ctx, mv(*point));
+            }
+            tool.handle_event(&mut ctx, release(*points.last().expect("last point")));
+            doc.scene.roots().first().and_then(|id| match &doc.scene.get(*id)?.data {
+                NodeData::Vector(vector) => Some(vector.path.segments.len()),
+                _ => None,
+            })
+        };
+        let at_100 = segment_count(1.0, &arc).expect("stroke at 100%");
+        assert!(at_100 > 3, "the arc keeps its curve at 100%: {at_100}");
+        assert_eq!(segment_count(8.0, &arc), Some(at_100));
+        assert_eq!(segment_count(0.25, &arc), Some(at_100));
+        assert!(
+            segment_count(20.0, &[[400.0, 300.0], [406.0, 300.0]]).is_some(),
+            "a short visible stroke at 2000% is not dropped"
         );
     }
 
