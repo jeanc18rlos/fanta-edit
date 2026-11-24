@@ -2430,7 +2430,8 @@ impl GenerationWorkspace {
                 self.refresh_gallery(false, cx);
                 return false;
             }
-            if index >= record.outputs.len() {
+            // Swapping the active run mid-flight would make accept_response drop the result.
+            if index >= record.outputs.len() || self.task.is_some() {
                 return false;
             }
             self.active_run = Some(run);
@@ -7355,6 +7356,88 @@ mod tests {
             assert!(view.error.is_none());
             assert!(!view.pending);
             assert_eq!(view.outputs.len(), 1, "selecting the running card checks again");
+        });
+    }
+
+    #[gpui::test]
+    async fn generation_in_flight_result_survives_selecting_an_older_gallery_card(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("generated image");
+        let data_url = format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(png.into_inner())
+        );
+        let completed = json!({
+            "id":"new-job", "status":"succeeded", "model":"fanta-image-1",
+            "output":[{"data_url":data_url}],
+        });
+        let http = http_client::FakeHttpClient::create(move |request| {
+            let completed = completed.clone();
+            async move {
+                let response = match (request.method(), request.uri().path()) {
+                    (&Method::GET, "/v1/models") => json!({"models":[]}),
+                    (&Method::GET, "/v1/me") => recovery_account_fixture(),
+                    (&Method::POST, "/v1/generations") => {
+                        json!({"id":"new-job", "status":"processing"})
+                    }
+                    (&Method::GET, "/v1/generations/new-job") => completed,
+                    route => panic!("Unexpected generation request: {route:?}"),
+                };
+                Ok(http_client::Response::builder()
+                    .status(200)
+                    .body(response.to_string().into())?)
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Image, client, cx);
+        let (gallery, _) = parse_gallery_response(json!({"generations":[{
+            "id":"older-job", "kind":"image", "status":"succeeded", "model":"fanta-image-1",
+            "output":[{"data_url":data_url}],
+        }]}))
+        .expect("gallery fixture");
+        view.update(cx, |view, cx| {
+            view.gallery = gallery;
+            view.submit(
+                Submission {
+                    key: "new-job".into(),
+                    request: json!({"model":"fanta-image-1", "prompt":"A sunrise"}),
+                    model: "fanta-image-1".into(),
+                    prompt: "A sunrise".into(),
+                    source: None,
+                    account,
+                    mode: GenerationMode::Image,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.pending && view.task.is_some()));
+        view.update_in(cx, |view, window, cx| {
+            view.handle_generation_action(
+                GenerationAction::OutputSelected {
+                    id: "gen:older-job:0".into(),
+                },
+                window,
+                cx,
+            )
+        });
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.task.is_none());
+            assert_eq!(
+                view.active_run.as_ref().and_then(RunSummary::generation_id),
+                Some("new-job"),
+                "the in-flight job keeps the active card"
+            );
+            assert_eq!(view.outputs.len(), 1, "the in-flight result is shown");
+            assert!(!view.pending);
         });
     }
 
