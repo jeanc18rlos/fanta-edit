@@ -1666,10 +1666,14 @@ impl Render for FantaMotionPanel {
                     )
                     .child(animation_section);
                 if animations.is_empty() {
-                    content = content.child(InspectorEmptyState::new(
-                        "Bring the selection to life",
-                        "Use + to add Position, Scale, Rotation, Size, or Opacity. Each animation creates readable start and end keyframes.",
-                    ));
+                    content = content.child(if editable {
+                        InspectorEmptyState::new(
+                            "Bring the selection to life",
+                            "Use + to add Position, Scale, Rotation, Size, or Opacity. Each animation creates readable start and end keyframes.",
+                        )
+                    } else {
+                        InspectorEmptyState::new("No animations", "This design is read-only.")
+                    });
                 }
                 if let Some(property) = self.selected_property
                     && let Some(summary) = animations.iter().find(|item| item.property == property)
