@@ -634,8 +634,10 @@ impl AudioPlaybackView {
         let Some(player) = self.player.as_ref() else {
             return;
         };
-        let duration = self.duration.unwrap_or_default();
-        if let Err(error) = player.try_seek(position.min(duration)) {
+        let target = self
+            .duration
+            .map_or(position, |duration| position.min(duration));
+        if let Err(error) = player.try_seek(target) {
             self.error = Some(format!("Could not seek audio: {error}").into());
         } else {
             self.error = None;
