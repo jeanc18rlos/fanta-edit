@@ -859,8 +859,15 @@ impl FantaPrototypePanel {
     ) {
         self.apply_operation(
             |doc| {
+                let trigger = choice.into_trigger();
+                // Re-picking the checked kind would reset its delay or keys to defaults.
+                if std::mem::discriminant(&reaction_by_id(doc, node, reaction)?.trigger)
+                    == std::mem::discriminant(&trigger)
+                {
+                    return None;
+                }
                 set_reaction_operation(doc, node, reaction, |reaction| {
-                    reaction.trigger = choice.into_trigger();
+                    reaction.trigger = trigger;
                 })
             },
             cx,
@@ -877,6 +884,11 @@ impl FantaPrototypePanel {
         self.apply_operation(
             |doc| {
                 let action = action_for_choice(doc, node, choice)?;
+                if std::mem::discriminant(&reaction_by_id(doc, node, reaction)?.action)
+                    == std::mem::discriminant(&action)
+                {
+                    return None;
+                }
                 set_reaction_operation(doc, node, reaction, |reaction| {
                     reaction.action = action;
                 })
@@ -913,6 +925,12 @@ impl FantaPrototypePanel {
     ) {
         self.apply_operation(
             |doc| {
+                if matches!(
+                    reaction_by_id(doc, node, reaction)?.action,
+                    Action::UpdateVariant { component: current, .. } if current == component
+                ) {
+                    return None;
+                }
                 let variant = default_variant_value(doc, component);
                 set_reaction_operation(doc, node, reaction, |reaction| {
                     reaction.action = Action::UpdateVariant { component, variant };
@@ -1028,6 +1046,15 @@ impl FantaPrototypePanel {
         self.finish_parameter_edit(cx);
         self.apply_operation(
             |doc| {
+                let current = reaction_by_id(doc, node, reaction)?.transition.as_ref();
+                if choice != TransitionChoice::Instant
+                    && current.is_some_and(|transition| {
+                        std::mem::discriminant(&transition.style)
+                            == std::mem::discriminant(&transition_style(choice))
+                    })
+                {
+                    return None;
+                }
                 set_reaction_operation(doc, node, reaction, |reaction| {
                     if choice == TransitionChoice::Instant {
                         reaction.transition = None;
@@ -4020,6 +4047,39 @@ mod tests {
                     direction: Direction::Up
                 })
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn reselecting_the_current_choice_keeps_its_parameters(cx: &mut TestAppContext) {
+        let reaction = Reaction {
+            id: ReactionId::new(),
+            trigger: Trigger::AfterDelay { delay_ms: 2000 },
+            action: Action::OpenLink {
+                url: "https://example.com".into(),
+            },
+            extra_actions: Vec::new(),
+            transition: Some(Transition {
+                style: TransitionStyle::SlideIn {
+                    direction: Direction::Up,
+                },
+                duration_ms: 300,
+                easing: Easing::EaseInOut,
+            }),
+            animation: None,
+        };
+        let original = reaction.clone();
+        let (panel, item, first) = panel_with_reaction(reaction, cx).await;
+        panel
+            .update(cx, |panel, _, cx| {
+                panel.set_trigger_choice(first, original.id, TriggerChoice::AfterDelay, cx);
+                panel.set_action_choice(first, original.id, ActionChoice::OpenLink, cx);
+                panel.set_transition_choice(first, original.id, TransitionChoice::SlideIn, cx);
+            })
+            .expect("reselect the current choices");
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            assert_eq!(reaction_by_id(doc, first, original.id), Some(&original));
         });
     }
 
