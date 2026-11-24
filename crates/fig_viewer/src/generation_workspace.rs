@@ -7431,7 +7431,11 @@ mod tests {
             assert!(view.task.is_none());
             assert!(view.error.is_none());
             assert!(!view.pending);
-            assert_eq!(view.outputs.len(), 1, "selecting the running card checks again");
+            assert_eq!(
+                view.outputs.len(),
+                1,
+                "selecting the running card checks again"
+            );
         });
     }
 
