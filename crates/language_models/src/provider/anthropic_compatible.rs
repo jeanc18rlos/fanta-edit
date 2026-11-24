@@ -5,7 +5,7 @@ use client::{Client, ClientSettings};
 use credentials_provider::CredentialsProvider;
 use futures::{AsyncReadExt as _, FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
 use gpui::{Action as _, App, AppContext, AsyncApp, Context, Entity, SharedString, Task, Window};
-use http_client::{AsyncBody, CustomHeaders, HttpClient, Method, Request};
+use http_client::{AsyncBody, CustomHeaders, HttpClient, Method, Request, StatusCode};
 use language_model::{
     AuthenticateError, IconOrSvg, LanguageModel, LanguageModelCompletionError,
     LanguageModelCompletionEvent, LanguageModelCostInfo, LanguageModelId, LanguageModelName,
@@ -45,6 +45,9 @@ pub struct AnthropicCompatibleLanguageModelProvider {
     client: Arc<Client>,
     state: Entity<State>,
     catalog: Entity<CatalogState>,
+    // shortcut: read once, so editing this provider's api_url keeps the old
+    // error wording until restart; pass `cx` to the message methods if that matters.
+    managed_account: bool,
 }
 
 #[derive(Clone)]
@@ -563,6 +566,10 @@ impl AnthropicCompatibleLanguageModelProvider {
         })
         .detach();
 
+        let managed_account = is_account_provider(
+            &state.read(cx).settings.api_url,
+            &ClientSettings::get_global(cx).server_url,
+        );
         let provider = Self {
             id: id.clone().into(),
             name: id.into(),
@@ -570,6 +577,7 @@ impl AnthropicCompatibleLanguageModelProvider {
             client,
             state,
             catalog,
+            managed_account,
         };
         provider.refresh_catalog(cx);
         provider
@@ -711,6 +719,30 @@ impl LanguageModelProvider for AnthropicCompatibleLanguageModelProvider {
                 Err(error) => Err(error),
             }
         })
+    }
+
+    fn authentication_error_message(&self) -> SharedString {
+        if self.managed_account {
+            return "Your Fanta sign-in expired. Sign out and sign in again to continue.".into();
+        }
+        format!(
+            "The API key for {} is invalid or has expired. \
+            Update your key in Settings > AI & models to continue.",
+            self.name.0
+        )
+        .into()
+    }
+
+    fn missing_credentials_error_message(&self) -> SharedString {
+        if self.managed_account {
+            return "Sign in to Fanta to use AI with your account credits.".into();
+        }
+        format!(
+            "No API key is configured for {}. \
+            Add your key in Settings > AI & models to continue.",
+            self.name.0
+        )
+        .into()
     }
 
     fn settings_view(&self, cx: &mut App) -> Option<ProviderSettingsView> {
@@ -909,6 +941,11 @@ impl AnthropicCompatibleLanguageModel {
                         && api_error
                             .message
                             .contains("Fanta credit balance is too low") =>
+                {
+                    LanguageModelCompletionError::PaymentRequired
+                }
+                AnthropicError::HttpResponseError { status_code, .. }
+                    if managed_account && status_code == StatusCode::PAYMENT_REQUIRED =>
                 {
                     LanguageModelCompletionError::PaymentRequired
                 }

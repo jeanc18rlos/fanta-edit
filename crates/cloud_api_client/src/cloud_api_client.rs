@@ -266,21 +266,16 @@ impl CloudApiClient {
             },
         )?;
 
-        let mut response = self.http_client.send(request).await?;
+        let response = self.http_client.send(request).await?;
+        let status = response.status();
 
-        if response.status().is_success() {
+        if status.is_success() {
             Ok(true)
+        } else if status == StatusCode::UNAUTHORIZED {
+            Ok(false)
         } else {
-            let mut body = String::new();
-            response.body_mut().read_to_string(&mut body).await?;
-            if response.status() == StatusCode::UNAUTHORIZED {
-                Ok(false)
-            } else {
-                Err(anyhow!(
-                    "Failed to get authenticated user.\nStatus: {:?}\nBody: {body}",
-                    response.status()
-                ))
-            }
+            // The body is not read: it may be a proxy's HTML page, and this error reaches the user.
+            Err(anyhow!("Fanta returned {status} while checking your sign-in"))
         }
     }
 

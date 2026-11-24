@@ -438,6 +438,28 @@ mod tests {
             Err(language_model::LanguageModelCompletionError::PaymentRequired)
         ));
 
+        client.http_client().as_fake().replace_handler(|_, _| async move {
+            Ok(http_client::Response::builder()
+                .status(402)
+                .body("insufficient_credits".into())?)
+        });
+        assert!(matches!(
+            model
+                .stream_completion(LanguageModelRequest::default(), &cx.to_async())
+                .await,
+            Err(language_model::LanguageModelCompletionError::PaymentRequired)
+        ));
+        assert!(
+            provider
+                .missing_credentials_error_message()
+                .contains("Sign in to Fanta")
+        );
+        assert!(
+            provider
+                .authentication_error_message()
+                .contains("sign in again")
+        );
+
         client.sign_out(&cx.to_async()).await;
         assert!(!cx.update(|cx| provider.is_authenticated(cx)));
         assert!(matches!(
@@ -477,6 +499,11 @@ mod tests {
             cx.update(|cx| provider.authenticate(cx)).await,
             Err(AuthenticateError::CredentialsNotFound)
         ));
+        assert!(
+            provider
+                .missing_credentials_error_message()
+                .contains("No API key is configured for external")
+        );
     }
 
     #[gpui::test]

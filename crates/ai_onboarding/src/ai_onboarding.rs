@@ -26,7 +26,7 @@ impl From<client::Status> for SignInStatus {
     fn from(status: client::Status) -> Self {
         if status.is_signing_in() {
             Self::SigningIn
-        } else if status.is_signed_out() {
+        } else if status.is_signed_out() || matches!(status, client::Status::AuthenticationError) {
             Self::SignedOut
         } else {
             Self::SignedIn
@@ -176,5 +176,17 @@ impl Component for FantaAiOnboarding {
                 ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_sign_in_is_shown_as_signed_out() {
+        assert!(SignInStatus::from(client::Status::AuthenticationError) == SignInStatus::SignedOut);
+        assert!(SignInStatus::from(client::Status::Authenticated) == SignInStatus::SignedIn);
+        assert!(SignInStatus::from(client::Status::Authenticating) == SignInStatus::SigningIn);
     }
 }
