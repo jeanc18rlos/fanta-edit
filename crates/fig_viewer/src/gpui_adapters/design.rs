@@ -3378,19 +3378,16 @@ impl FigView {
             return false;
         }
         let item = self.item().clone();
-        item.update(cx, |item, cx| {
+        let result = item.update(cx, |item, cx| {
             if !item.is_editable() {
-                return false;
+                return Ok(false);
             }
             if operations.len() == 1 {
-                let mut applied = false;
+                let mut applied = Ok(false);
                 for operation in operations {
-                    match item.apply_for_preview_owner(preview_owner, operation, cx) {
-                        Ok(()) => applied = true,
-                        Err(error) => {
-                            log::error!("fig design adapter failed to apply operation: {error:#}")
-                        }
-                    }
+                    applied = item
+                        .apply_for_preview_owner(preview_owner, operation, cx)
+                        .map(|()| true);
                 }
                 applied
             } else {
@@ -3398,21 +3395,37 @@ impl FigView {
                     .first()
                     .map(|operation| operation.label().to_string())
                     .unwrap_or_else(|| "Edit".to_string());
-                let applied = item.with_document_for_owner(preview_owner, cx, |document| {
+                item.with_document_for_owner(preview_owner, cx, |document| {
                     let doc = &mut document.doc;
                     doc.history.begin(label, &mut doc.scene);
                     for operation in operations {
                         if let Err(error) = doc.apply(operation) {
-                            log::error!("fig design adapter failed to apply operation: {error:#}");
-                            break;
+                            let error = match doc.abort_transaction() {
+                                Ok(()) => anyhow::anyhow!(error),
+                                Err(rollback_error) => {
+                                    anyhow::anyhow!("{error}; rolling back: {rollback_error}")
+                                }
+                            };
+                            return (Err(error), DocChange::None);
                         }
                     }
                     doc.history.commit(&mut doc.scene);
-                    ((), DocChange::Content)
-                });
-                applied.is_some()
+                    (Ok(true), DocChange::Content)
+                })
+                .unwrap_or(Ok(false))
             }
-        })
+        });
+        match result {
+            Ok(applied) => applied,
+            Err(error) => {
+                log::error!("fig design adapter failed to apply operation: {error:#}");
+                crate::view::show_canvas_notice_deferred(
+                    format!("Could not apply that change: {error}"),
+                    cx,
+                );
+                false
+            }
+        }
     }
 
     fn design_export_target_matches(&self, target: &DesignPanelTarget, cx: &Context<Self>) -> bool {
@@ -17208,6 +17221,51 @@ mod tests {
         );
         emit(cx, 310.0, DesignPanelEditPhase::Cancel);
         assert_eq!(child_x(cx), 170.0, "cancel restores the child");
+    }
+
+    #[gpui::test]
+    async fn a_batch_that_fails_part_way_leaves_the_document_untouched(cx: &mut TestAppContext) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        doc.selection.replace_with([rect]);
+        let (view, _panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let opacity_before = item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            doc.scene.get(rect).expect("rect exists").opacity
+        });
+        let missing = NodeId::new();
+        let applied = view.update_in(cx, |view, _, cx| {
+            view.design_apply_ops(
+                vec![
+                    Operation::SetOpacity {
+                        id: rect,
+                        old: opacity_before,
+                        new: fanta_doc::UnitInterval::new(0.25),
+                    },
+                    Operation::SetOpacity {
+                        id: missing,
+                        old: opacity_before,
+                        new: fanta_doc::UnitInterval::new(0.25),
+                    },
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(!applied, "a failed batch is not reported as applied");
+        item.update(cx, |item, cx| {
+            let doc = &item.document().expect("document ready").doc;
+            assert_eq!(
+                doc.scene.get(rect).expect("rect exists").opacity,
+                opacity_before,
+                "the operations before the failure are rolled back"
+            );
+            assert!(
+                !item.undo(cx).expect("undo call succeeds"),
+                "a failed batch leaves no undo step"
+            );
+        });
     }
 
     #[gpui::test]

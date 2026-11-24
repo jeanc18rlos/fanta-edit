@@ -755,16 +755,27 @@ impl FantaPropertiesPanel {
                 for operation in operations {
                     if let Err(error) = doc.apply(operation) {
                         log::error!("Fanta properties panel failed to apply operation: {error:#}");
-                        break;
+                        doc.abort_transaction().log_err();
+                        return (Err(error), DocChange::None);
                     }
                 }
                 doc.history.commit(&mut doc.scene);
-                ((), DocChange::Content)
+                (Ok(()), DocChange::Content)
             });
-            if applied.is_none() {
-                log::debug!("dropping inspector edit: the document is not ready");
+            match applied {
+                Some(Ok(())) => true,
+                Some(Err(error)) => {
+                    crate::view::show_canvas_notice_deferred(
+                        format!("Could not apply that change: {error}"),
+                        cx,
+                    );
+                    false
+                }
+                None => {
+                    log::debug!("dropping inspector edit: the document is not ready");
+                    false
+                }
             }
-            applied.is_some()
         })
     }
 
