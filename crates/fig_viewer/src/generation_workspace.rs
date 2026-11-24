@@ -1060,6 +1060,38 @@ fn run_from_record(record: &JournalRecord, mode: GenerationMode) -> Result<RunSu
     })
 }
 
+fn restore_record(
+    record: JournalRecord,
+    account: &Arc<str>,
+) -> Result<(Option<RunSummary>, Option<Submission>)> {
+    let mode = GenerationMode::from_label(&record.mode)?;
+    let run = if record.result.is_some() {
+        Some(run_from_record(&record, mode)?)
+    } else {
+        None
+    };
+    let submission = if record.result.is_none()
+        || (record.request.is_some()
+            && record
+                .result
+                .as_ref()
+                .is_some_and(SavedRunResult::requires_input))
+    {
+        Some(Submission {
+            source: record.source.as_ref().map(restore_source).transpose()?,
+            request: record.request.context("The saved request is missing.")?,
+            key: record.key,
+            model: record.model,
+            prompt: record.prompt,
+            mode,
+            account: Some(account.clone()),
+        })
+    } else {
+        None
+    };
+    Ok((run, submission))
+}
+
 fn restore_journal(
     snapshot: JournalSnapshot,
     account: Arc<str>,
@@ -1067,26 +1099,14 @@ fn restore_journal(
     let mut submissions = Vec::new();
     let mut history = Vec::new();
     for record in snapshot.records {
-        let mode = GenerationMode::from_label(&record.mode)?;
-        if record.result.is_some() {
-            history.push(run_from_record(&record, mode)?);
-        }
-        if record.result.is_none()
-            || (record.request.is_some()
-                && record
-                    .result
-                    .as_ref()
-                    .is_some_and(SavedRunResult::requires_input))
-        {
-            submissions.push(Submission {
-                source: record.source.as_ref().map(restore_source).transpose()?,
-                request: record.request.context("The saved request is missing.")?,
-                key: record.key,
-                model: record.model,
-                prompt: record.prompt,
-                mode,
-                account: Some(account.clone()),
-            });
+        let key = record.key.clone();
+        // One unreadable record (for example from a newer build) must not block the catalog and journal.
+        match restore_record(record, &account) {
+            Ok((run, submission)) => {
+                history.extend(run);
+                submissions.extend(submission);
+            }
+            Err(error) => log::warn!("Skipping unreadable saved generation {key}: {error:#}"),
         }
     }
     Ok((submissions, history))
@@ -6724,6 +6744,39 @@ mod tests {
             ..run
         };
         assert!(!response_targets_active_run(Some(&vector), "older"));
+    }
+
+    #[test]
+    fn restoring_saved_experiments_skips_an_unreadable_record() {
+        let record = |key: &str, mode: &str| JournalRecord {
+            key: key.into(),
+            request: None,
+            model: "fanta-image-1".into(),
+            prompt: "A sunrise".into(),
+            source: None,
+            mode: mode.into(),
+            result: Some(SavedRunResult::Generation {
+                id: key.into(),
+                finished: true,
+                dispatch: Default::default(),
+            }),
+        };
+        let snapshot = JournalSnapshot {
+            records: vec![
+                record("from-a-newer-build", "Hologram"),
+                record("readable", GenerationMode::Image.label()),
+            ],
+        };
+        let (submissions, history) =
+            restore_journal(snapshot, Arc::from("account")).expect("readable records restore");
+        assert!(submissions.is_empty());
+        assert_eq!(
+            history
+                .iter()
+                .map(|run| run.generation_id())
+                .collect::<Vec<_>>(),
+            [Some("readable")]
+        );
     }
 
     struct RecoveryTestDirectory {
