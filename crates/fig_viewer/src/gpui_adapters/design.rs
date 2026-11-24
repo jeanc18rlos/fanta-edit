@@ -4555,7 +4555,6 @@ impl FigView {
                     page_id,
                     *color,
                     DesignPanelEditPhase::Commit,
-                    window,
                     cx,
                 );
             }
@@ -4564,7 +4563,7 @@ impl FigView {
                 color,
                 phase,
             } => {
-                self.handle_design_page_background(page_id, *color, *phase, window, cx);
+                self.handle_design_page_background(page_id, *color, *phase, cx);
             }
             DesignPanelAction::PaintColorVariableDetachRequested {
                 node_id: target_node,
@@ -5131,6 +5130,44 @@ impl FigView {
             .all(|id| self.template_allows_node(*id, scope, "change that here", cx))
     }
 
+    /// Snapshot `id` so the gesture's previews and Cancel can restore it.
+    /// Callers check Fill mode for their own scope first.
+    fn begin_design_edit_session(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        self.finish_document_edits_for_external_change(cx);
+        let item = self.item().clone();
+        let (scene_instance, snapshot) = {
+            let item = item.read(cx);
+            if !item.is_editable() {
+                return;
+            }
+            let Some(document) = item.document() else {
+                return;
+            };
+            let Some(node) = document.doc.scene.get(id) else {
+                return;
+            };
+            (
+                document.doc.scene.instance_id(),
+                NodeSnapshot {
+                    id,
+                    transform: node.transform,
+                    opacity: node.opacity,
+                    data: Box::new(node.data.clone()),
+                    effects: node.effects.clone(),
+                    blurs: node.blurs.clone(),
+                    children: child_transforms(&document.doc.scene, id),
+                },
+            )
+        };
+        if let Some(adapter) = self.gpui_design.as_mut() {
+            adapter.session = Some(DesignEditSession {
+                scene_instance,
+                node: id,
+                snapshot,
+            });
+        }
+    }
+
     fn handle_design_phased_edit(
         &mut self,
         id: NodeId,
@@ -5148,39 +5185,7 @@ impl FigView {
                 if !self.design_property_allowed(&[id], property, cx) {
                     return;
                 }
-                self.finish_document_edits_for_external_change(cx);
-                let item = self.item().clone();
-                let (scene_instance, snapshot) = {
-                    let item = item.read(cx);
-                    if !item.is_editable() {
-                        return;
-                    }
-                    let Some(document) = item.document() else {
-                        return;
-                    };
-                    let Some(node) = document.doc.scene.get(id) else {
-                        return;
-                    };
-                    (
-                        document.doc.scene.instance_id(),
-                        NodeSnapshot {
-                            id,
-                            transform: node.transform,
-                            opacity: node.opacity,
-                            data: Box::new(node.data.clone()),
-                            effects: node.effects.clone(),
-                            blurs: node.blurs.clone(),
-                            children: child_transforms(&document.doc.scene, id),
-                        },
-                    )
-                };
-                if let Some(adapter) = self.gpui_design.as_mut() {
-                    adapter.session = Some(DesignEditSession {
-                        scene_instance,
-                        node: id,
-                        snapshot,
-                    });
-                }
+                self.begin_design_edit_session(id, cx);
             }
             DesignPanelEditPhase::Preview => {
                 let Some(session) = self.design_edit_session_for_preview(id, cx) else {
@@ -5312,14 +5317,7 @@ impl FigView {
                 let DesignMediaPaintPlacement::Crop { transform } = media_placement(&media) else {
                     return;
                 };
-                self.handle_design_phased_edit(
-                    id,
-                    DesignPanelProperty::Opacity,
-                    &DesignPanelValue::Number(0.0),
-                    DesignPanelEditPhase::Begin,
-                    window,
-                    cx,
-                );
+                self.begin_design_edit_session(id, cx);
                 if let Some(adapter) = self.gpui_design.as_mut() {
                     adapter.crop_session = Some(DesignCropSession {
                         node: id,
@@ -6048,22 +6046,11 @@ impl FigView {
             };
             pattern.source_node_id = source.to_string().into();
         }
-        // Route through the shared phased machinery by synthesizing the
-        // property key: paint edits reuse a whole-node snapshot, so Begin /
-        // Preview / Cancel behave exactly like ordinary property gestures.
+        // Paint edits reuse the whole-node session of ordinary property
+        // gestures; Cancel synthesizes a property key to share its restore.
         let build = move |doc: &Doc| paint_edit_operations(doc, id, is_stroke, index, &value);
         match phase {
-            DesignPanelEditPhase::Begin => {
-                self.handle_design_phased_edit(
-                    id,
-                    DesignPanelProperty::Opacity,
-                    &DesignPanelValue::Number(0.0),
-                    DesignPanelEditPhase::Begin,
-                    window,
-                    cx,
-                );
-                // Begin captured the snapshot; nothing document-facing yet.
-            }
+            DesignPanelEditPhase::Begin => self.begin_design_edit_session(id, cx),
             DesignPanelEditPhase::Preview => {
                 let Some(session) = self.design_edit_session_for_preview(id, cx) else {
                     return;
@@ -6417,7 +6404,6 @@ impl FigView {
         page_id: &SharedString,
         color: DesignColor,
         phase: DesignPanelEditPhase,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let preview_owner = cx.entity_id();
@@ -6441,14 +6427,7 @@ impl FigView {
             })
         };
         match phase {
-            DesignPanelEditPhase::Begin => self.handle_design_phased_edit(
-                root,
-                DesignPanelProperty::Opacity,
-                &DesignPanelValue::Number(0.0),
-                DesignPanelEditPhase::Begin,
-                window,
-                cx,
-            ),
+            DesignPanelEditPhase::Begin => self.begin_design_edit_session(root, cx),
             DesignPanelEditPhase::Preview => {
                 let Some(session) = self.design_edit_session_for_preview(root, cx) else {
                     return;
@@ -16186,6 +16165,50 @@ mod tests {
                 "nonfinite blur value must not reach the renderer"
             );
         }
+    }
+
+    #[gpui::test]
+    async fn fill_mode_paint_gesture_ignores_a_locked_layer_opacity(cx: &mut TestAppContext) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        doc.scene.get_mut(rect).expect("rect exists").editing =
+            Some(Box::new(fanta_doc::EditingRules {
+                disabled_scopes: [Scope::LayerOpacity].into(),
+                placeholder: None,
+            }));
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| {
+            view.template_fill = true;
+            view.refresh_gpui_design(cx);
+        });
+        cx.run_until_parked();
+
+        let paint = DesignPaint::solid(DesignColor::rgb(0x22, 0xbb, 0x77));
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PaintEditRequested {
+                node_id: SharedString::from(rect.to_string()),
+                collection: DesignPanelCollection::Fill,
+                target: DesignPaintTarget::WholeLayer,
+                paint_id: SharedString::from(format!("{rect}-fill-0")),
+                index: 0,
+                edit: DesignPaintEdit {
+                    property: DesignPaintProperty::Payload,
+                    value: DesignPaintValue::Payload(paint.payload),
+                },
+                phase: DesignPanelEditPhase::Begin,
+            });
+        });
+        cx.run_until_parked();
+        let session_open = view.read_with(cx, |view, _| {
+            view.gpui_design
+                .as_ref()
+                .is_some_and(|adapter| adapter.session.is_some())
+        });
+        assert!(
+            session_open,
+            "a fill gesture must not be refused for the layer-opacity scope"
+        );
     }
 
     #[gpui::test]
