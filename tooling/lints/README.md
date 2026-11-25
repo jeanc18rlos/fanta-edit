@@ -5,10 +5,15 @@ A [dylint](https://github.com/trailofbits/dylint) library that flags various bad
 Install `dylint`, a pinned nightly toolchain and the necessary tools with
 
 ```
-cargo install cargo-dylint dylint-link
+rustup toolchain install 1.98.0 --profile minimal
+cargo +1.98.0 install --locked cargo-dylint@6.4.0 dylint-link@6.4.0
 cd tooling/lints
 rustup toolchain install
 ```
+
+`cargo-dylint` 6.4.0 needs Rust 1.98, newer than the toolchain this repository
+pins, so it is installed with its own. These are the versions the Nightly
+workflow uses.
 
 The channel and its components (`rustc-dev`, `rust-src`, `llvm-tools-preview`)
 are declared in `tooling/lints/rust-toolchain.toml`, so `rustup toolchain install`
@@ -38,7 +43,7 @@ Ideally you run this as part of the `clippy` script in the `fanta/scripts` direc
 Install both tools (version 6 or later):
 
 ```
-cargo install cargo-dylint dylint-link
+cargo +1.98.0 install --locked cargo-dylint@6.4.0 dylint-link@6.4.0
 ```
 
 - `cargo-dylint` is the `cargo` subcommand that builds and runs the lints; `dylint-link` is the linker used to build the lint library.
