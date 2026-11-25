@@ -184,7 +184,7 @@ impl PenTool {
                         last.tan_out = Some(t);
                         last.tan_in = Some(-t);
                     }
-                } else {
+                } else if self.is_drafting() {
                     self.closing = self.within_close_distance(ctx, screen);
                     self.cursor = self.snap(ctx, world);
                 }
