@@ -8984,9 +8984,7 @@ async fn mounted_bound_instance_text_double_click_explains_refusal_without_editi
 async fn unwired_grid_track_and_effect_reorder_controls_explain_themselves(
     cx: &mut TestAppContext,
 ) {
-    use fanta_gpui::design::{
-        DesignGridDimensions, DesignGridTrackAxis, DesignPanelAction, DesignPanelEditPhase,
-    };
+    use fanta_gpui::design::DesignPanelAction;
     init_visual_test(cx);
     let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
     let (mut doc, text, _) = text_selection_doc(false);
@@ -9031,29 +9029,6 @@ async fn unwired_grid_track_and_effect_reorder_controls_explain_themselves(
         });
     };
     let node_id: SharedString = text.to_string().into();
-    let dimensions = DesignGridDimensions::new(3, 2).expect("dimensions");
-    for (phase, expect_notice) in [
-        (DesignPanelEditPhase::Begin, false),
-        (DesignPanelEditPhase::Preview, false),
-        (DesignPanelEditPhase::Commit, true),
-    ] {
-        emit_and_check(
-            DesignPanelAction::GridDimensionsEditRequested {
-                node_id: node_id.clone(),
-                dimensions,
-                phase,
-            },
-            expect_notice,
-        );
-    }
-    emit_and_check(
-        DesignPanelAction::GridTrackAddRequested {
-            node_id: node_id.clone(),
-            axis: DesignGridTrackAxis::Column,
-            insertion_index: 0,
-        },
-        true,
-    );
     emit_and_check(
         DesignPanelAction::EffectReorderRequested {
             node_id,

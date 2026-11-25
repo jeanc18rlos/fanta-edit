@@ -27,10 +27,10 @@ use fanta_gpui::design::{
     DesignExportMode, DesignExportSizing as DesignPanelExportSizing, DesignExportViewData,
     DesignFontFamily, DesignFontSource, DesignFontStyle, DesignFontViewData, DesignGradientStop,
     DesignGridAutoTracks, DesignGridItemAlignment, DesignGridItemsPositioning, DesignGridTrack,
-    DesignGridTrackSizing, DesignImageFilters, DesignItemSpacingMode, DesignLayout,
-    DesignLayoutAlignSelf, DesignLayoutMode, DesignLayoutPositioning, DesignLetterSpacing,
-    DesignLineHeight, DesignMaskType, DesignMediaCropAction, DesignMediaCropToolState,
-    DesignMediaKind, DesignMediaPaintAsset, DesignMediaPaintCapabilities,
+    DesignGridTrackAxis, DesignGridTrackSizing, DesignImageFilters, DesignItemSpacingMode,
+    DesignLayout, DesignLayoutAlignSelf, DesignLayoutMode, DesignLayoutPositioning,
+    DesignLetterSpacing, DesignLineHeight, DesignMaskType, DesignMediaCropAction,
+    DesignMediaCropToolState, DesignMediaKind, DesignMediaPaintAsset, DesignMediaPaintCapabilities,
     DesignMediaPaintPlacement, DesignMediaPaintView, DesignMediaPaintViewData,
     DesignMediaQuarterTurn, DesignPaint, DesignPaintBinding, DesignPaintCollectionEditMode,
     DesignPaintKind, DesignPaintPayload, DesignPaintProperty, DesignPaintSource,
@@ -4645,17 +4645,28 @@ impl FigView {
                     panel.set_active_surface(requested, cx);
                 });
             }
-            DesignPanelAction::GridTrackAddRequested { .. }
-            | DesignPanelAction::GridTrackDeleteRequested { .. }
-            | DesignPanelAction::GridTracksReorderRequested { .. }
-            | DesignPanelAction::EffectReorderRequested { .. } => {
-                crate::view::notify_unavailable(UNWIRED_CONTROL, window, cx);
+            DesignPanelAction::GridTrackAddRequested { node_id: id, .. }
+            | DesignPanelAction::GridTrackDeleteRequested { node_id: id, .. }
+            | DesignPanelAction::GridTracksReorderRequested { node_id: id, .. } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.finish_document_edits_for_external_change(cx);
+                let ops = self.design_ops(cx, |doc| grid_track_action_operations(doc, id, action));
+                self.design_apply_ops(ops, cx);
             }
-            // Only the commit end speaks: Preview fires on every drag frame.
-            DesignPanelAction::GridDimensionsEditRequested { phase, .. } => {
-                if *phase == DesignPanelEditPhase::Commit {
-                    crate::view::notify_unavailable(UNWIRED_CONTROL, window, cx);
-                }
+            DesignPanelAction::GridDimensionsEditRequested {
+                node_id: id, phase, ..
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.handle_design_staged_edit(id, *phase, cx, |doc| {
+                    Some(grid_track_action_operations(doc, id, action))
+                });
+            }
+            DesignPanelAction::EffectReorderRequested { .. } => {
+                crate::view::notify_unavailable(UNWIRED_CONTROL, window, cx);
             }
             _ => {
                 log::debug!("fig design adapter: unhandled action {action:?}");
@@ -6209,17 +6220,28 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if phase == DesignPanelEditPhase::Begin {
+            self.handle_design_phased_edit(id, property, value, phase, window, cx);
+            return;
+        }
+        self.handle_design_staged_edit(id, phase, cx, |doc| {
+            effect_edit_operations(doc, id, reference, property, value)
+        });
+    }
+
+    /// Previews, commits or cancels one gesture's operations against the
+    /// session its Begin opened, so a drag lands as one undo step.
+    fn handle_design_staged_edit(
+        &mut self,
+        id: NodeId,
+        phase: DesignPanelEditPhase,
+        cx: &mut Context<Self>,
+        build: impl Fn(&Doc) -> Option<Vec<Operation>>,
+    ) {
         let preview_owner = cx.entity_id();
         match phase {
             DesignPanelEditPhase::Begin => {
-                self.handle_design_phased_edit(
-                    id,
-                    property,
-                    value,
-                    DesignPanelEditPhase::Begin,
-                    window,
-                    cx,
-                );
+                self.begin_design_edit_session(id, cx);
                 return;
             }
             DesignPanelEditPhase::Preview => {
@@ -6235,9 +6257,7 @@ impl FigView {
                         if !restore_design_edit_session(&mut document.doc, &session) {
                             return ((), DocChange::None);
                         }
-                        if let Some(operations) =
-                            effect_edit_operations(&document.doc, id, reference, property, value)
-                        {
+                        if let Some(operations) = build(&document.doc) {
                             for operation in &operations {
                                 apply_preview_operation(&mut document.doc, operation);
                             }
@@ -6284,12 +6304,7 @@ impl FigView {
             });
             return;
         }
-        let ops = self.design_ops(cx, |doc| {
-            effect_edit_operations(doc, id, reference, property, value).unwrap_or_else(|| {
-                log::debug!("fig design adapter: unhandled effect edit {property:?}");
-                Vec::new()
-            })
-        });
+        let ops = self.design_ops(cx, |doc| build(doc).unwrap_or_default());
         let committed = self.design_apply_ops(ops, cx);
         if session.is_some() {
             item.update(cx, |item, cx| {
@@ -9278,13 +9293,12 @@ fn property_operations(
             let count = number(value)?.round().clamp(1.0, 256.0) as usize;
             let columns = property == P::GridColumnCount;
             Some(grid_layout_operations(doc, id, move |grid| {
-                let (tracks, default) = if columns {
-                    (&mut grid.columns, GridTrack::Flex { fr: 1.0 })
+                let tracks = if columns {
+                    &mut grid.columns
                 } else {
-                    (&mut grid.rows, GridTrack::Hug)
+                    &mut grid.rows
                 };
-                let fill = tracks.last().copied().unwrap_or(default);
-                tracks.resize(count, fill);
+                resize_grid_tracks(tracks, count, columns);
             }))
         }
         (P::GridColumnTrack(index), V::GridTrack(track))
@@ -9948,9 +9962,9 @@ mod tests {
         InstanceNode, PathData, TextPathNode, TextStyleRun, VectorNode,
     };
     use fanta_gpui::design::{
-        DesignFontCatalogState, DesignFontSelection, DesignPageBackground, DesignPageViewData,
-        DesignPaintEdit, DesignPaintTarget, DesignPanelInspectionContext, DesignPanelPermissions,
-        DesignPanelSurface, DesignTypographyTarget,
+        DesignFontCatalogState, DesignFontSelection, DesignGridDimensions, DesignPageBackground,
+        DesignPageViewData, DesignPaintEdit, DesignPaintTarget, DesignPanelInspectionContext,
+        DesignPanelPermissions, DesignPanelSurface, DesignTypographyTarget,
     };
     use gpui::{
         Entity, Modifiers, MouseButton, TestAppContext, VisualTestContext, point, px, size,
@@ -11611,6 +11625,205 @@ mod tests {
                 .and_then(|child| child.layout_child)
                 .is_none_or(|child| child.grid.is_none())
         );
+    }
+
+    /// A selected grid frame with columns `[80px, 2fr, 1fr]` around the rectangle.
+    fn doc_with_grid_frame() -> (Doc, NodeId) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        let create =
+            crate::layer_context_ops::auto_layout(&doc, rect, Some(LayoutMode::Horizontal))
+                .expect("wrap the rectangle in auto layout");
+        let group = crate::layer_context_ops::created_roots(&create)[0];
+        for operation in create {
+            doc.apply(operation).expect("create layout frame");
+        }
+        for (property, value) in [
+            (
+                DesignPanelProperty::LayoutMode,
+                DesignPanelValue::LayoutMode(DesignLayoutMode::Grid),
+            ),
+            (
+                DesignPanelProperty::GridColumnCount,
+                DesignPanelValue::Number(3.0),
+            ),
+            (
+                DesignPanelProperty::GridColumnTrack(0),
+                DesignPanelValue::GridTrack(DesignGridTrack::fixed(80.0)),
+            ),
+            (
+                DesignPanelProperty::GridColumnTrackValue(1),
+                DesignPanelValue::Number(2.0),
+            ),
+        ] {
+            for operation in property_operations(&doc, group, property, &value).expect("grid") {
+                doc.apply(operation).expect("apply grid control");
+            }
+        }
+        doc.selection.replace_with([group]);
+        (doc, group)
+    }
+
+    fn grid_tracks(doc: &Doc, id: NodeId) -> (Vec<GridTrack>, Vec<GridTrack>) {
+        let Some(NodeData::Group(group)) = doc.scene.get(id).map(|node| &node.data) else {
+            panic!("grid frame");
+        };
+        let grid = group.grid.clone().expect("grid tracks");
+        (grid.columns, grid.rows)
+    }
+
+    #[gpui::test]
+    async fn grid_track_buttons_add_delete_and_move_tracks_with_one_undo_each(
+        cx: &mut TestAppContext,
+    ) {
+        let (doc, group) = doc_with_grid_frame();
+        let (view, panel, mut visual) = setup_view(doc, cx).await;
+        let item = view.read_with(&visual, |view, _| view.item().clone());
+        let node_id: SharedString = group.to_string().into();
+        let fixed = GridTrack::Fixed { size: 80.0 };
+        let two = GridTrack::Flex { fr: 2.0 };
+        let one = GridTrack::Flex { fr: 1.0 };
+        let cases = [
+            (
+                DesignPanelAction::GridTrackAddRequested {
+                    node_id: node_id.clone(),
+                    axis: DesignGridTrackAxis::Column,
+                    insertion_index: 1,
+                },
+                vec![fixed, one, two, one],
+            ),
+            (
+                DesignPanelAction::GridTrackDeleteRequested {
+                    node_id: node_id.clone(),
+                    axis: DesignGridTrackAxis::Column,
+                    index: 0,
+                },
+                vec![two, one],
+            ),
+            (
+                // The panel's move-down button on the first track.
+                DesignPanelAction::GridTracksReorderRequested {
+                    node_id: node_id.clone(),
+                    axis: DesignGridTrackAxis::Column,
+                    from_indices: vec![0],
+                    insertion_index: 2,
+                },
+                vec![two, fixed, one],
+            ),
+            (
+                // The panel's move-up button on the last track.
+                DesignPanelAction::GridTracksReorderRequested {
+                    node_id: node_id.clone(),
+                    axis: DesignGridTrackAxis::Column,
+                    from_indices: vec![2],
+                    insertion_index: 1,
+                },
+                vec![fixed, one, two],
+            ),
+        ];
+        for (action, expected) in cases {
+            let (before, depth) = item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                (grid_tracks(doc, group), doc.history.undo_depth())
+            });
+            panel.update_in(&mut visual, |_, _, cx| cx.emit(action.clone()));
+            visual.run_until_parked();
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(grid_tracks(doc, group).0, expected, "{action:?}");
+                assert_eq!(doc.history.undo_depth(), depth + 1, "{action:?}");
+            });
+            let echoed = panel.read_with(&visual, |panel, _| {
+                panel
+                    .node()
+                    .layout
+                    .as_ref()
+                    .expect("layout")
+                    .grid_columns
+                    .clone()
+            });
+            let expected_echo: Vec<DesignGridTrack> =
+                expected.iter().map(design_grid_track).collect();
+            assert_eq!(echoed, expected_echo, "the panel shows the new tracks");
+            item.update(&mut visual, |item, cx| {
+                assert!(item.undo(cx).expect("one Undo"));
+            });
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(grid_tracks(doc, group), before, "{action:?}");
+                assert_eq!(doc.history.undo_depth(), depth);
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn grid_dimensions_gesture_previews_and_commits_one_undo_step(cx: &mut TestAppContext) {
+        let (doc, group) = doc_with_grid_frame();
+        let (view, panel, mut visual) = setup_view(doc, cx).await;
+        let item = view.read_with(&visual, |view, _| view.item().clone());
+        let node_id: SharedString = group.to_string().into();
+        let (before, depth) = item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            (grid_tracks(doc, group), doc.history.undo_depth())
+        });
+        let rows = before.1.len();
+        let emit = |visual: &mut VisualTestContext, columns: usize, phase: DesignPanelEditPhase| {
+            let action = DesignPanelAction::GridDimensionsEditRequested {
+                node_id: node_id.clone(),
+                dimensions: DesignGridDimensions::new(columns, rows).expect("dimensions"),
+                phase,
+            };
+            panel.update_in(visual, |_, _, cx| cx.emit(action));
+            visual.run_until_parked();
+        };
+        emit(&mut visual, 3, DesignPanelEditPhase::Begin);
+        emit(&mut visual, 4, DesignPanelEditPhase::Preview);
+        emit(&mut visual, 5, DesignPanelEditPhase::Preview);
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(grid_tracks(doc, group).0.len(), 5, "the preview shows");
+            assert_eq!(doc.history.undo_depth(), depth, "previews add no undo step");
+        });
+        emit(&mut visual, 5, DesignPanelEditPhase::Cancel);
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(grid_tracks(doc, group), before, "Cancel restores");
+            assert_eq!(doc.history.undo_depth(), depth);
+        });
+
+        emit(&mut visual, 3, DesignPanelEditPhase::Begin);
+        emit(&mut visual, 4, DesignPanelEditPhase::Preview);
+        emit(&mut visual, 2, DesignPanelEditPhase::Commit);
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(grid_tracks(doc, group).0, before.0[..2].to_vec());
+            assert_eq!(doc.history.undo_depth(), depth + 1, "one gesture, one step");
+        });
+        // The picker sends a lone Commit.
+        emit(&mut visual, 4, DesignPanelEditPhase::Commit);
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(grid_tracks(doc, group).0.len(), 4);
+            assert_eq!(doc.history.undo_depth(), depth + 2);
+        });
+        let echoed = panel.read_with(&visual, |panel, _| {
+            panel
+                .node()
+                .layout
+                .as_ref()
+                .expect("layout")
+                .grid_columns
+                .len()
+        });
+        assert_eq!(echoed, 4, "the panel shows the new column count");
+        item.update(&mut visual, |item, cx| {
+            assert!(item.undo(cx).expect("Undo"));
+            assert!(item.undo(cx).expect("Undo"));
+        });
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(grid_tracks(doc, group), before);
+            assert_eq!(doc.history.undo_depth(), depth);
+        });
     }
 
     #[test]
@@ -17965,6 +18178,112 @@ fn grid_layout_operations(
             change(grid);
         }
     })
+}
+
+fn default_grid_track(columns: bool) -> GridTrack {
+    if columns {
+        GridTrack::Flex { fr: 1.0 }
+    } else {
+        GridTrack::Hug
+    }
+}
+
+fn resize_grid_tracks(tracks: &mut Vec<GridTrack>, count: usize, columns: bool) {
+    let fill = tracks
+        .last()
+        .copied()
+        .unwrap_or_else(|| default_grid_track(columns));
+    tracks.resize(count, fill);
+}
+
+fn grid_axis_tracks(
+    grid: &mut fanta_doc::GridLayout,
+    axis: DesignGridTrackAxis,
+) -> &mut Vec<GridTrack> {
+    match axis {
+        DesignGridTrackAxis::Column => &mut grid.columns,
+        DesignGridTrackAxis::Row => &mut grid.rows,
+    }
+}
+
+/// The panel's grid track buttons and dimensions picker as document edits.
+fn grid_track_action_operations(
+    doc: &Doc,
+    id: NodeId,
+    action: &DesignPanelAction,
+) -> Vec<Operation> {
+    match action {
+        DesignPanelAction::GridTrackAddRequested {
+            axis,
+            insertion_index,
+            ..
+        } => grid_layout_operations(doc, id, |grid| {
+            let tracks = grid_axis_tracks(grid, *axis);
+            let index = (*insertion_index).min(tracks.len());
+            tracks.insert(
+                index,
+                default_grid_track(*axis == DesignGridTrackAxis::Column),
+            );
+        }),
+        DesignPanelAction::GridTrackDeleteRequested { axis, index, .. } => {
+            grid_layout_operations(doc, id, |grid| {
+                let tracks = grid_axis_tracks(grid, *axis);
+                // A grid keeps at least one track on each axis.
+                if tracks.len() > 1 && *index < tracks.len() {
+                    tracks.remove(*index);
+                }
+            })
+        }
+        DesignPanelAction::GridTracksReorderRequested {
+            axis,
+            from_indices,
+            insertion_index,
+            ..
+        } => grid_layout_operations(doc, id, |grid| {
+            reorder_grid_tracks(
+                grid_axis_tracks(grid, *axis),
+                from_indices,
+                *insertion_index,
+            );
+        }),
+        DesignPanelAction::GridDimensionsEditRequested { dimensions, .. } => {
+            grid_layout_operations(doc, id, |grid| {
+                resize_grid_tracks(&mut grid.columns, dimensions.columns.clamp(1, 256), true);
+                resize_grid_tracks(&mut grid.rows, dimensions.rows.clamp(1, 256), false);
+            })
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Moves the tracks at `from_indices` to sit before `insertion_index`, both
+/// counted in the original order (Figma's `fromIndices`/`insertionIndex`).
+fn reorder_grid_tracks(
+    tracks: &mut Vec<GridTrack>,
+    from_indices: &[usize],
+    insertion_index: usize,
+) {
+    let mut moving: Vec<usize> = from_indices
+        .iter()
+        .copied()
+        .filter(|index| *index < tracks.len())
+        .collect();
+    moving.sort_unstable();
+    moving.dedup();
+    let insertion_index = insertion_index.min(tracks.len());
+    let before_insertion = moving
+        .iter()
+        .filter(|index| **index < insertion_index)
+        .count();
+    let moved: Vec<GridTrack> = moving
+        .iter()
+        .filter_map(|index| tracks.get(*index).copied())
+        .collect();
+    for index in moving.iter().rev() {
+        tracks.remove(*index);
+    }
+    let insertion_index = insertion_index.saturating_sub(before_insertion);
+    tracks.splice(insertion_index..insertion_index, moved);
 }
 
 /// How many rows a grid frame's children occupy, auto-added ones included.
