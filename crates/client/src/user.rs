@@ -228,6 +228,7 @@ impl UserStore {
                             if let Some(user_id) = client.user_id() {
                                 let system_id =
                                     client.telemetry().system_id().map(|id| id.to_string());
+                                let session_token = client.account_access_token();
                                 let response = match client
                                     .cloud_client()
                                     .get_authenticated_user(system_id)
@@ -236,10 +237,15 @@ impl UserStore {
                                     Ok(response) => response,
                                     Err(error) => {
                                         log::error!("failed to load the signed-in account: {error:#}");
-                                        // A failed refresh keeps the account that already loaded.
-                                        if this.read_with(cx, |this, _| this.current_user().is_none())? {
+                                        // A failed refresh keeps the account that already loaded, and a
+                                        // session replaced while the request ran is not this one to end.
+                                        let same_session = session_token.is_some()
+                                            && client.account_access_token() == session_token;
+                                        if same_session
+                                            && this.read_with(cx, |this, _| this.current_user().is_none())?
+                                        {
                                             client.abandon_session(
-                                                "Could not load your Fanta account. Select Sign In to try again.",
+                                                "Could not load your Fanta account. Sign in again.",
                                                 cx,
                                             );
                                         }
@@ -1128,7 +1134,56 @@ mod tests {
         assert!(client.account_access_token().is_none());
         assert_eq!(
             client.account_notices().borrow().as_deref(),
-            Some("Could not load your Fanta account. Select Sign In to try again.")
+            Some("Could not load your Fanta account. Sign in again.")
         );
+    }
+
+    #[gpui::test]
+    async fn test_failed_account_load_after_sign_out_changes_nothing(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let (release_tx, release_rx) = futures::channel::oneshot::channel::<()>();
+        let release_rx = Arc::new(parking_lot::Mutex::new(Some(release_rx)));
+        let http_client = FakeHttpClient::create(move |request| {
+            let release_rx = if request.uri().path() == "/client/users/me" {
+                release_rx.lock().take()
+            } else {
+                None
+            };
+            async move {
+                let Some(release_rx) = release_rx else {
+                    return Ok(http_client::Response::builder().status(200).body("{}".into())?);
+                };
+                release_rx.await.ok();
+                Ok(http_client::Response::builder()
+                    .status(503)
+                    .body("<html>Service Unavailable</html>".into())?)
+            }
+        });
+        let client =
+            cx.update(|cx| Client::new(Arc::new(FakeSystemClock::new()), http_client, cx));
+        let _user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(Credentials {
+                    user_id: 1,
+                    access_token: "token".into(),
+                })
+            })
+        });
+
+        client
+            .sign_in(false, &cx.to_async())
+            .await
+            .expect("browser sign-in should succeed");
+        cx.run_until_parked();
+        client.sign_out(&cx.to_async()).await;
+        release_tx.send(()).ok();
+        cx.run_until_parked();
+
+        assert_eq!(*client.status().borrow(), Status::SignedOut);
+        assert_eq!(client.account_notices().borrow().as_deref(), None);
     }
 }
