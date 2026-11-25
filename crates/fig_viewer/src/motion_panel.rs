@@ -22,6 +22,7 @@ use crate::document::{DocChange, FigItem, FigItemEvent};
 use crate::motion_edit::{MotionPropertyEditSession, evaluated_motion_value};
 use crate::properties_ops::{fanta_color_rgba, format_number};
 use crate::timeline::{TimelineEvent, TimelineProperty, TimelineShell};
+use crate::view::show_canvas_notice_deferred;
 
 const DEFAULT_CLIP_DURATION_MS: u32 = 2_000;
 const DEFAULT_ANIMATION_DURATION_MS: u32 = 500;
@@ -713,6 +714,12 @@ impl FantaMotionPanel {
             });
             if restored.is_none() {
                 item.finish_content_preview(preview_owner, false, cx);
+                if commit {
+                    show_canvas_notice_deferred(
+                        "Could not set the keyframe: the design is busy with another edit".into(),
+                        cx,
+                    );
+                }
                 return;
             }
             let operation = if commit { session.operation() } else { None };
@@ -723,6 +730,7 @@ impl FantaMotionPanel {
             if let Err(error) = item.apply_for_preview_owner(preview_owner, operation, cx) {
                 item.finish_content_preview(preview_owner, false, cx);
                 log::error!("committing an Auto key property failed: {error:#}");
+                show_canvas_notice_deferred(format!("Could not set the keyframe: {error:#}"), cx);
             }
         });
     }
@@ -2965,5 +2973,141 @@ mod tests {
                 .property,
             AnimationProperty::Scale
         );
+    }
+
+    struct WorkspacePanel {
+        item: Entity<FigItem>,
+        panel: Entity<FantaMotionPanel>,
+        workspace: Entity<workspace::Workspace>,
+    }
+
+    async fn mount_panel_in_workspace(
+        document: Doc,
+        clip: AnimationClipId,
+        cx: &mut gpui::TestAppContext,
+    ) -> (WorkspacePanel, &mut gpui::VisualTestContext) {
+        use project::{FakeFs, Project};
+        use settings::SettingsStore;
+
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            #[cfg(feature = "fanta-gpui-ui")]
+            {
+                gpui_component::init(cx);
+                fanta_gpui::init(cx);
+                crate::theme_bridge::init(cx);
+            }
+        });
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        cx.update(|cx| {
+            client::Client::set_global(project.read(cx).client(), cx);
+            <dyn fs::Fs>::set_global(file_system, cx);
+        });
+        let item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/Motion-panel-notice.fig".into(),
+            document,
+            cx,
+        );
+        let (multi_workspace, visual) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(visual, |multi_workspace, _| {
+            multi_workspace.workspace().clone()
+        });
+        let panel = visual.update(|window, cx| {
+            let timeline = cx.new(|cx| {
+                let mut timeline = TimelineShell::new();
+                timeline.set_model(
+                    crate::timeline::TimelineViewModel::for_clip("Notice", 2_000_000, Vec::new()),
+                    cx,
+                );
+                timeline.seek_to(500_000, cx);
+                timeline
+            });
+            window.activate_window();
+            cx.new(|cx| {
+                let mut panel = FantaMotionPanel::new(item.clone(), timeline, window, cx);
+                panel.set_active_clip(Some(clip), cx);
+                panel.set_auto_keyframe(true, cx);
+                panel
+            })
+        });
+        visual.run_until_parked();
+        (
+            WorkspacePanel {
+                item,
+                panel,
+                workspace,
+            },
+            visual,
+        )
+    }
+
+    fn shows_canvas_notice(
+        workspace: &Entity<workspace::Workspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> bool {
+        workspace.read_with(cx, |workspace, _| {
+            workspace
+                .notification_ids()
+                .contains(&workspace::notifications::NotificationId::named(
+                    crate::view::CANVAS_NOTICE_ID.into(),
+                ))
+        })
+    }
+
+    fn type_into_position_x(
+        panel: &Entity<FantaMotionPanel>,
+        text: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        let text = text.to_string();
+        panel.update_in(cx, |panel, window, cx| {
+            panel.start_numeric_property(
+                TimelineProperty::PositionX,
+                ResolvedVarValue::Float { value: 300. },
+                window,
+                cx,
+            );
+            panel
+                .field_editor
+                .update(cx, |editor, cx| editor.set_text(text, window, cx));
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn failed_auto_key_commit_shows_a_notice(cx: &mut gpui::TestAppContext) {
+        let (mut document, _) = document_with_selected_node();
+        let clip = create_clip(&mut document, "Auto key failure");
+        document.history = Default::default();
+        let (mounted, cx) = mount_panel_in_workspace(document, clip, cx).await;
+        type_into_position_x(&mounted.panel, "42", cx);
+        mounted
+            .item
+            .read_with(cx, |item, _| assert!(item.content_preview_active()));
+        mounted
+            .item
+            .update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+
+        mounted
+            .panel
+            .update(cx, |panel, cx| panel.commit_numeric_property(cx));
+        cx.run_until_parked();
+
+        assert!(
+            shows_canvas_notice(&mounted.workspace, cx),
+            "a typed value that could not be committed must not vanish silently"
+        );
+        mounted.item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0)
+        });
     }
 }
