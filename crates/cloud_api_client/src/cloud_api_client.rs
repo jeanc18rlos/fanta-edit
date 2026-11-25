@@ -44,7 +44,7 @@ pub enum ClientApiError {
         source: anyhow::Error,
     },
     /// Server returned a non-success HTTP status (other than 401).
-    #[error("{host} returned {status}")]
+    #[error("{}", server_error_message(.host, *.status, .body))]
     ServerError {
         host: String,
         status: StatusCode,
@@ -57,6 +57,23 @@ pub enum ClientApiError {
     /// This typically indicates a programming error.
     #[error("failed to build request")]
     RequestBuildFailed(#[source] anyhow::Error),
+}
+
+/// Shows the server's own explanation when the body carries one; the raw body may be a proxy's HTML page.
+fn server_error_message(host: &str, status: StatusCode, body: &str) -> String {
+    let value: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let explanation = value["error"]["message"]
+        .as_str()
+        .or_else(|| value["detail"].as_str())
+        .map(str::trim)
+        .filter(|message| !message.is_empty());
+    match explanation {
+        Some(message) => {
+            let message: String = message.chars().take(300).collect();
+            format!("{message} (HTTP {status})")
+        }
+        None => format!("{host} returned {status}"),
+    }
 }
 
 pub struct CloudApiClient {
@@ -340,4 +357,41 @@ fn build_request(
             format!("{} {}", credentials.user_id, credentials.access_token),
         )
         .body(body.into())?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server_error(status: u16, body: &str) -> String {
+        ClientApiError::ServerError {
+            host: "api-v2.fantaisa.net".into(),
+            status: StatusCode::from_u16(status).expect("valid status"),
+            body: body.into(),
+        }
+        .to_string()
+    }
+
+    #[test]
+    fn test_server_error_shows_the_server_explanation_but_never_a_raw_body() {
+        assert_eq!(
+            server_error(
+                402,
+                r#"{"type":"error","error":{"type":"billing_error","message":"Your workspace is out of credits."}}"#
+            ),
+            "Your workspace is out of credits. (HTTP 402 Payment Required)"
+        );
+        assert_eq!(
+            server_error(403, r#"{"detail":"Only workspace owners can do this."}"#),
+            "Only workspace owners can do this. (HTTP 403 Forbidden)"
+        );
+        assert_eq!(
+            server_error(502, "<html><body>Bad Gateway</body></html>"),
+            "api-v2.fantaisa.net returned 502 Bad Gateway"
+        );
+        assert_eq!(
+            server_error(422, r#"{"detail":[{"loc":["body"],"msg":"field required"}]}"#),
+            "api-v2.fantaisa.net returned 422 Unprocessable Entity"
+        );
+    }
 }
