@@ -40,7 +40,7 @@ tracing.workspace = true
 
 # Container format. `.fant` files are zip archives; this is the canonical Rust
 # crate for reading and writing them with broad codec support.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # JSON manifest + canonical doc projection. `serde_json::Value` is also used as
 # the typed seam for schema migrations so older docs can be transformed in
