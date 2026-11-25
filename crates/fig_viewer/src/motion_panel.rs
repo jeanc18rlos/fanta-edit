@@ -722,7 +722,7 @@ impl FantaMotionPanel {
                 item.finish_content_preview(preview_owner, false, cx);
                 if commit {
                     show_canvas_notice_deferred(
-                        "Could not set the keyframe: the design is busy with another edit".into(),
+                        "Could not set the keyframe: the design cannot be edited right now".into(),
                         cx,
                     );
                 }
