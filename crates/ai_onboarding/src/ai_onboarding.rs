@@ -12,7 +12,7 @@ pub use edit_prediction_onboarding_content::EditPredictionOnboarding;
 use std::sync::Arc;
 
 use client::{Client, UserStore};
-use gpui::{AnyElement, Entity, IntoElement, ParentElement, TaskExt};
+use gpui::{AnyElement, Entity, IntoElement, ParentElement};
 use ui::{RegisterComponent, Tooltip, prelude::*};
 
 #[derive(PartialEq)]
@@ -59,12 +59,14 @@ impl FantaAiOnboarding {
             plan: store.plan(),
             account_too_young: store.account_too_young(),
             continue_with_fanta_ai,
+            // While the browser sign-in is pending, the same button cancels it.
             sign_in: Arc::new(move |_window, cx| {
-                cx.spawn({
+                if client.status().borrow().is_signing_in() {
                     let client = client.clone();
-                    async move |cx| client.sign_in_with_optional_connect(true, cx).await
-                })
-                .detach_and_log_err(cx);
+                    cx.spawn(async move |cx| client.cancel_sign_in(cx)).detach();
+                } else {
+                    client.sign_in_and_report(true, cx);
+                }
             }),
             dismiss_onboarding: None,
         }
@@ -110,7 +112,7 @@ impl FantaAiOnboarding {
             SignInStatus::SigningIn => (
                 "Connect your Fanta account",
                 "Finish signing in in your browser to return to your design.",
-                "Signing in…",
+                "Cancel sign-in",
                 self.sign_in.clone(),
             ),
             SignInStatus::SignedIn => (
@@ -130,7 +132,6 @@ impl FantaAiOnboarding {
                 Button::new("connect-fanta-account", button_label)
                     .full_width()
                     .style(ButtonStyle::Filled)
-                    .disabled(self.sign_in_status == SignInStatus::SigningIn)
                     .on_click(move |_, window, cx| callback(window, cx)),
             )
             .children(self.render_dismiss_button())
