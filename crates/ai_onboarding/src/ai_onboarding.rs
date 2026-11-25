@@ -37,6 +37,7 @@ impl From<client::Status> for SignInStatus {
 #[derive(RegisterComponent, IntoElement)]
 pub struct FantaAiOnboarding {
     pub sign_in_status: SignInStatus,
+    pub can_cancel_sign_in: bool,
     pub plan: Option<Plan>,
     pub account_too_young: bool,
     pub continue_with_fanta_ai: Arc<dyn Fn(&mut Window, &mut App)>,
@@ -56,12 +57,13 @@ impl FantaAiOnboarding {
 
         Self {
             sign_in_status: status.into(),
+            can_cancel_sign_in: client.is_waiting_for_browser(),
             plan: store.plan(),
             account_too_young: store.account_too_young(),
             continue_with_fanta_ai,
             // While the browser sign-in is pending, the same button cancels it.
             sign_in: Arc::new(move |_window, cx| {
-                if client.status().borrow().is_signing_in() {
+                if client.is_waiting_for_browser() {
                     let client = client.clone();
                     cx.spawn(async move |cx| client.cancel_sign_in(cx)).detach();
                 } else {
@@ -112,7 +114,11 @@ impl FantaAiOnboarding {
             SignInStatus::SigningIn => (
                 "Connect your Fanta account",
                 "Finish signing in in your browser to return to your design.",
-                "Cancel sign-in",
+                if self.can_cancel_sign_in {
+                    "Cancel sign-in"
+                } else {
+                    "Signing in…"
+                },
                 self.sign_in.clone(),
             ),
             SignInStatus::SignedIn => (
@@ -132,6 +138,9 @@ impl FantaAiOnboarding {
                 Button::new("connect-fanta-account", button_label)
                     .full_width()
                     .style(ButtonStyle::Filled)
+                    .disabled(
+                        self.sign_in_status == SignInStatus::SigningIn && !self.can_cancel_sign_in,
+                    )
                     .on_click(move |_, window, cx| callback(window, cx)),
             )
             .children(self.render_dismiss_button())
@@ -167,6 +176,7 @@ impl Component for FantaAiOnboarding {
                 AgentPanelOnboardingCard::new().child(
                     FantaAiOnboarding {
                         sign_in_status: SignInStatus::SignedOut,
+                        can_cancel_sign_in: false,
                         plan: None,
                         account_too_young: false,
                         continue_with_fanta_ai: Arc::new(|_, _| {}),

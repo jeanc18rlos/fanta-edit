@@ -348,6 +348,7 @@ struct ClientState {
         watch::Sender<Option<SharedString>>,
         watch::Receiver<Option<SharedString>>,
     ),
+    waiting_for_browser: bool,
     _reconnect_task: Option<Task<()>>,
     _cloud_connection_task: Option<Task<()>>,
 }
@@ -463,6 +464,7 @@ impl Default for ClientState {
             status: watch::channel_with(Status::SignedOut),
             cloud_connection_id: watch::channel_with(0),
             account_notice: watch::channel(),
+            waiting_for_browser: false,
             _reconnect_task: None,
             _cloud_connection_task: None,
         }
@@ -749,13 +751,14 @@ impl Client {
         .detach();
     }
 
-    /// Ends a sign-in that is still waiting for the browser.
+    /// Whether a sign-in is waiting for the browser, the only step [`Client::cancel_sign_in`] can stop.
+    pub fn is_waiting_for_browser(&self) -> bool {
+        self.state.read().waiting_for_browser
+    }
+
+    /// Ends a sign-in that is still waiting for the browser; other steps cannot be stopped.
     pub fn cancel_sign_in(self: &Arc<Self>, cx: &AsyncApp) {
-        let waiting_for_browser = matches!(
-            *self.status().borrow(),
-            Status::Authenticating | Status::Reauthenticating
-        ) && self.account_access_token().is_none();
-        if waiting_for_browser {
+        if self.is_waiting_for_browser() {
             self.set_status(Status::SignedOut, cx);
         }
     }
@@ -1005,18 +1008,26 @@ impl Client {
         }
 
         if credentials.is_none() {
-            let mut status_rx = self.status();
-            let _ = status_rx.next().await;
             // A dropped attempt would otherwise leave the status on Authenticating with nobody to finish it.
             let sign_out_if_dropped = util::defer({
                 let client = self.clone();
                 let cx = cx.clone();
-                move || client.set_status(Status::SignedOut, &cx)
+                move || {
+                    client.state.write().waiting_for_browser = false;
+                    client.set_status(Status::SignedOut, &cx)
+                }
             });
+            self.state.write().waiting_for_browser = true;
+            // Re-announce the status so views redraw and offer to cancel the browser wait.
+            let status = *self.status().borrow();
+            self.set_status(status, cx);
+            let mut status_rx = self.status();
+            let _ = status_rx.next().await;
             let authenticate = futures::select_biased! {
                 authenticate = self.authenticate(cx).fuse() => Some(authenticate),
                 _ = status_rx.next().fuse() => None,
             };
+            self.state.write().waiting_for_browser = false;
             sign_out_if_dropped.abort();
             match authenticate {
                 Some(Ok(creds)) => {
@@ -2512,6 +2523,47 @@ mod tests {
         assert_eq!(*client.status().borrow(), Status::Authenticated);
         second.await.expect("the next sign-in should run its own attempt");
         assert_eq!(*attempts.lock(), 2);
+    }
+
+    #[gpui::test]
+    async fn test_cancel_is_refused_while_the_saved_sign_in_is_checked(cx: &mut TestAppContext) {
+        init_test(cx);
+        let provider = Arc::new(CountingCredentialsProvider::default());
+        *provider.credentials.lock() = Some(("1".into(), b"saved-token".to_vec()));
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let http_client = FakeHttpClient::create(move |_request| {
+            let release_rx = release_rx.lock().take();
+            async move {
+                if let Some(release_rx) = release_rx {
+                    release_rx.await.ok();
+                }
+                Ok(http_client::Response::builder()
+                    .status(200)
+                    .body("{}".into())?)
+            }
+        });
+        let client = cx.update(|cx| {
+            cx.set_global(fanta_credentials_provider::FantaCredentialsProvider(
+                provider.clone(),
+            ));
+            Client::new(Arc::new(FakeSystemClock::new()), http_client, cx)
+        });
+
+        let sign_in = cx.spawn({
+            let client = client.clone();
+            move |cx| async move { client.sign_in(true, &cx).await }
+        });
+        cx.run_until_parked();
+        assert_eq!(*client.status().borrow(), Status::Authenticating);
+        assert!(!client.is_waiting_for_browser());
+
+        client.cancel_sign_in(&cx.to_async());
+        assert_eq!(*client.status().borrow(), Status::Authenticating);
+
+        release_tx.send(()).ok();
+        sign_in.await.expect("the saved sign-in should be accepted");
+        assert_eq!(*client.status().borrow(), Status::Authenticated);
     }
 
     #[gpui::test]
