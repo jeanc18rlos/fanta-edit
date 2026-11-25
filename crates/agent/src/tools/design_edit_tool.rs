@@ -55,6 +55,16 @@ pub struct DesignEditToolInput {
 
 pub struct DesignEditTool;
 
+fn given_label(label: Option<String>) -> Option<String> {
+    label
+        .map(|label| label.trim().to_owned())
+        .filter(|label| !label.is_empty())
+}
+
+fn batch_label(label: Option<String>) -> String {
+    given_label(label).unwrap_or_else(|| "Agent edit".to_string())
+}
+
 impl AgentTool for DesignEditTool {
     type Input = DesignEditToolInput;
     type Output = LanguageModelToolResultContent;
@@ -71,7 +81,7 @@ impl AgentTool for DesignEditTool {
         _cx: &mut App,
     ) -> SharedString {
         match input {
-            Ok(input) => match (input.label, input.ops.len()) {
+            Ok(input) => match (given_label(input.label), input.ops.len()) {
                 (Some(label), _) => format!("Edit design: {label}").into(),
                 (None, 1) => "Edit design (1 op)".into(),
                 (None, count) => format!("Edit design ({count} ops)").into(),
@@ -88,7 +98,7 @@ impl AgentTool for DesignEditTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(tool_content_err)?;
-            let label = input.label.unwrap_or_else(|| "Agent edit".to_string());
+            let label = batch_label(input.label);
             let apply = cx
                 .update(|cx| {
                     event_stream.report_design_activity(&label, None, None, None, cx);
@@ -122,5 +132,26 @@ impl AgentTool for DesignEditTool {
             // repairs the failing op; the per-op statuses say which one.
             if applied { Ok(text) } else { Err(text) }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn blank_labels_fall_back_to_the_default_title_and_history_label(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for label in ["", "   "] {
+            let input = DesignEditToolInput {
+                ops: Vec::new(),
+                label: Some(label.into()),
+            };
+            assert_eq!(batch_label(input.label.clone()), "Agent edit");
+            let title = cx.update(|cx| DesignEditTool.initial_title(Ok(input), cx));
+            assert_eq!(title.as_ref(), "Edit design (0 ops)");
+        }
+        assert_eq!(batch_label(Some("Add login card".into())), "Add login card");
     }
 }
