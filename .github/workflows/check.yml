@@ -83,6 +83,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+          # script/check-ui-feedback compares a pull request with its base,
+          # the first parent of the merge commit.
+          fetch-depth: 2
 
       # cargo-deny has cargo download every locked crate to read its manifest:
       # three minutes without this cache. No target directory: nothing compiles.

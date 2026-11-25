@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""Fail when a change adds editor code that hides a failure or a dead control.
+
+Compares the working tree with its base (the merge base with origin/main, or
+the parent commit in a pull-request checkout) and counts, in the files the
+change touches under the editor's interface crates:
+
+  silent-failure    an error that is logged, discarded or dropped and never
+                    shown: `.log_err()`, `let _ = …`, an `Err` arm that only logs
+  unwired-control   an empty `=> {}` arm for a panel's `…Requested` action
+  debug-in-notice   `{:?}` in a message passed to a canvas notice
+  notice-wording    a message that opens with "Couldn't", "Can't" or "Unable to"
+
+The change may not raise a count. A site that is right as it stands takes a
+`// silent: <reason>` comment on its line or the line above. It needs no build.
+
+  script/check-ui-feedback          check the change against its base
+  script/check-ui-feedback --all    list every site in the tree; never fails
+"""
+
+import argparse
+import collections
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+BASE = "origin/main"
+ROOTS = ("crates/fig_viewer/src/", "crates/fanta_ui/src/")
+ALLOW = "// silent:"
+ADVICE = {
+    "silent-failure": "Show the user what failed (show_canvas_notice, show_canvas_notice_deferred) "
+    "or return the error to a caller that does.",
+    "unwired-control": "Handle the action, or say it is unavailable (notify_unavailable).",
+    "debug-in-notice": "Write the name the user sees, not a Rust Debug form.",
+    "notice-wording": 'Start a failure with "Could not …".',
+}
+NOTICE_CALL = re.compile(r"\b(?:show_canvas_notice(?:_deferred)?|notify_unavailable)\(")
+ERR_HANDLER = re.compile(r"\bErr\([^()]*\)\s*(=>|=(?!=))")
+LOGS = re.compile(r"\blog::\w+!|\beprintln!")
+SURFACES = re.compile(
+    r"notice|notify_|[Tt]oast|prompt|\.fail\(|error_message|\berror\s*=[^=]|set_error"
+    r"|return Err|\bErr\(|bail!|emit\(|\?\s*[;)]"
+)
+WORDING = re.compile(r"(?:Couldn't|Can't|Unable to)\b")
+# A literal in one of these never reaches the user as a notice.
+NOT_A_NOTICE = re.compile(r"log::|tracing::|\.context\(|anyhow!|bail!|expect\(|assert|panic!|unreachable!")
+CLOSERS = {"{": "}", "(": ")", "[": "]"}
+
+
+def mask(source):
+    """Blank comments and literal contents, keeping offsets; also return the string literals."""
+    masked = list(source)
+    literals = []
+    index, length = 0, len(source)
+
+    def blank(start, end):
+        for position in range(start, min(end, length)):
+            if masked[position] != "\n":
+                masked[position] = " "
+
+    while index < length:
+        character, pair = source[index], source[index : index + 2]
+        raw = re.match(r'r(#*)"', source[index : index + 16]) if character == "r" else None
+        if pair == "//":
+            end = source.find("\n", index)
+            end = length if end == -1 else end
+            blank(index, end)
+            index = end
+        elif pair == "/*":
+            end = source.find("*/", index + 2)
+            end = length if end == -1 else end + 2
+            blank(index, end)
+            index = end
+        elif raw and not (index and (source[index - 1].isalnum() or source[index - 1] == "_")):
+            start = index + raw.end()
+            end = source.find('"' + raw.group(1), start)
+            end = length if end == -1 else end
+            literals.append((start, end))
+            blank(start, end)
+            index = end + 1 + len(raw.group(1))
+        elif character == '"':
+            end = index + 1
+            while end < length and source[end] != '"':
+                end += 2 if source[end] == "\\" else 1
+            literals.append((index + 1, end))
+            blank(index + 1, end)
+            index = end + 1
+        elif character == "'":
+            literal = re.match(r"'(?:\\.[^']*|[^\\'])'", source[index : index + 12])
+            if literal:
+                blank(index + 1, index + literal.end() - 1)
+            # Otherwise a lifetime.
+            index += literal.end() if literal else 1
+        else:
+            index += 1
+    return "".join(masked), literals
+
+
+def closing(masked, opener_index):
+    """The index just past the bracket that closes the one at `opener_index`."""
+    opener = masked[opener_index]
+    depth = 0
+    for index in range(opener_index, len(masked)):
+        if masked[index] == opener:
+            depth += 1
+        elif masked[index] == CLOSERS[opener]:
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return len(masked)
+
+
+def arm_end(masked, start):
+    """The end of a match arm's expression that is not a block."""
+    depth = 0
+    for index in range(start, len(masked)):
+        character = masked[index]
+        if character in CLOSERS:
+            depth += 1
+        elif character in CLOSERS.values():
+            if depth == 0:
+                return index
+            depth -= 1
+        elif character == "," and depth == 0:
+            return index
+    return len(masked)
+
+
+def err_handler_body(masked, match):
+    """The code that runs for an `Err` arm or an `if let Err(…) = …` block, or None."""
+    index = match.end()
+    if match.group(1) == "=":
+        if not masked[: match.start()].rstrip().endswith("let"):
+            return None
+        depth = 0
+        while index < len(masked) and (depth or masked[index] != "{"):
+            depth += {"(": 1, "[": 1, ")": -1, "]": -1}.get(masked[index], 0)
+            if masked[index] == ";":
+                return None
+            index += 1
+        return masked[index : closing(masked, index)] if index < len(masked) else None
+    while index < len(masked) and masked[index].isspace():
+        index += 1
+    if index < len(masked) and masked[index] == "{":
+        return masked[index : closing(masked, index)]
+    return masked[index : arm_end(masked, index)]
+
+
+def arm_pattern(masked, arrow):
+    """The pattern of the match arm whose `=>` starts at `arrow`."""
+    depth = 0
+    index = arrow - 1
+    while index >= 0:
+        character = masked[index]
+        if character in ")]}":
+            # A `}` that is not followed by more pattern closes the arm above.
+            if not depth and character == "}" and not re.match(r"\s*(?:=>|\||if\b)", masked[index + 1 :]):
+                break
+            depth += 1
+        elif character in "([{":
+            if not depth:
+                break
+            depth -= 1
+        elif character == "," and not depth:
+            break
+        index -= 1
+    return index + 1
+
+
+def unwired_arm(masked, arrow):
+    """Whether the empty arm whose `=>` starts at `arrow` drops a `…Requested` action for good."""
+    start = arm_pattern(masked, arrow)
+    variants = set(re.findall(r"\b(\w+Requested)\b", masked[start:arrow]))
+    earlier = "\n".join(masked[:start].splitlines()[-80:])
+    # A guarded arm above handles the action; this arm is its "otherwise".
+    return any(
+        not re.search(rf"\b{variant}\b[^\n]*\bif\b", earlier) for variant in variants
+    )
+
+
+def enclosing_calls(masked, offset):
+    """The text before each call bracket around `offset`, as far out as its statement."""
+    depth, heads = 0, []
+    for index in range(offset - 1, -1, -1):
+        character = masked[index]
+        if character == ")":
+            depth += 1
+        elif character == "(" and depth:
+            depth -= 1
+        elif character == "(":
+            heads.append(masked[max(0, index - 24) : index + 1])
+        elif character in ";{}" and not depth:
+            break
+    return " ".join(heads)
+
+
+def find_sites(source):
+    """Every site in one file, as (rule, line number, line text)."""
+    masked, literals = mask(source)
+    lines = source.splitlines()
+    line_of = lambda offset: masked.count("\n", 0, offset)
+    found = []
+
+    for match in re.finditer(r"\.log_err\(\)|^\s*let _ = ", masked, re.MULTILINE):
+        found.append(("silent-failure", line_of(match.end() - 1)))
+    for match in ERR_HANDLER.finditer(masked):
+        body = err_handler_body(masked, match)
+        if body is None or SURFACES.search(body):
+            continue
+        if LOGS.search(body) or not body.strip("{}() \n"):
+            found.append(("silent-failure", line_of(match.start())))
+    for match in re.finditer(r"=>\s*\{\s*\}", masked):
+        if unwired_arm(masked, match.start()):
+            found.append(("unwired-control", line_of(match.start())))
+    for match in NOTICE_CALL.finditer(masked):
+        if masked[: match.start()].rstrip().endswith("fn"):
+            continue
+        arguments = source[match.end() : closing(masked, match.end() - 1)]
+        if re.search(r":#?\?\}", arguments):
+            found.append(("debug-in-notice", line_of(match.start())))
+    for start, end in literals:
+        if WORDING.match(source[start:end]) and not NOT_A_NOTICE.search(enclosing_calls(masked, start)):
+            found.append(("notice-wording", line_of(start)))
+
+    sites = []
+    for rule, line in found:
+        if ALLOW in lines[line] or (line and ALLOW in lines[line - 1]):
+            continue
+        sites.append((rule, line + 1, lines[line].strip()))
+    return sites
+
+
+def is_checked(path):
+    parts = pathlib.PurePosixPath(path).parts
+    name = parts[-1]
+    return (
+        path.startswith(ROOTS)
+        and name.endswith(".rs")
+        and "tests" not in parts
+        and name != "tests.rs"
+        and not name.endswith("_tests.rs")
+    )
+
+
+def production_code(source):
+    """The file without its trailing `#[cfg(test)] mod … {` block."""
+    tests = re.search(r"^#\[cfg\(test\)\]\n(?:pub(?:\(\w+\))? )?mod \w+ \{", source, re.MULTILINE)
+    return source[: tests.start()] if tests else source
+
+
+def git(*arguments):
+    result = subprocess.run(
+        ["git", *arguments], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+    )
+    return result.stdout if result.returncode == 0 else None
+
+
+def base_revision():
+    # A pull-request checkout has no origin/main; its merge commit's first parent is the base.
+    for arguments in (["merge-base", BASE, "HEAD"], ["rev-parse", "--verify", "--quiet", "HEAD^1"]):
+        revision = git(*arguments)
+        if revision and revision.strip():
+            return revision.strip()
+    return None
+
+
+def added_sites(base_sources, head_sources):
+    """Per rule, the sites the change adds, when it raises the rule's count."""
+    base = collections.defaultdict(collections.Counter)
+    head = collections.defaultdict(list)
+    for source in base_sources.values():
+        for rule, _, text in find_sites(production_code(source)):
+            base[rule][text] += 1
+    for path, source in sorted(head_sources.items()):
+        for rule, line, text in find_sites(production_code(source)):
+            head[rule].append((path, line, text))
+    added = {}
+    for rule, sites in head.items():
+        if len(sites) <= sum(base[rule].values()):
+            continue
+        remaining = collections.Counter(base[rule])
+        added[rule] = []
+        for path, line, text in sites:
+            if remaining[text]:
+                remaining[text] -= 1
+            else:
+                added[rule].append((path, line, text))
+    return added
+
+
+def check_change():
+    revision = base_revision()
+    if revision is None:
+        print("script/check-ui-feedback: no base commit to compare with (fetch-depth: 2 in CI)")
+        return 1 if os.environ.get("CI") else 0
+    changed = (git("diff", "--name-only", "--no-renames", revision) or "").splitlines()
+    changed += (git("ls-files", "--others", "--exclude-standard") or "").splitlines()
+    paths = sorted({path for path in changed if is_checked(path)})
+    base_sources = {path: git("show", f"{revision}:{path}") for path in paths}
+    base_sources = {path: source for path, source in base_sources.items() if source is not None}
+    head_sources = {
+        path: (ROOT / path).read_text(encoding="utf-8") for path in paths if (ROOT / path).is_file()
+    }
+    added = added_sites(base_sources, head_sources)
+    for rule, sites in sorted(added.items()):
+        print(f"{rule}: this change adds {len(sites)}. {ADVICE[rule]}")
+        for path, line, text in sites:
+            print(f"  {path}:{line}: {text[:110]}")
+    if added:
+        print(f"A site that is right as it stands takes `{ALLOW} <reason>` on the line above.")
+        return 1
+    print(f"script/check-ui-feedback: nothing added in {len(paths)} changed interface files")
+    return 0
+
+
+def list_all():
+    counts = collections.Counter()
+    for path in (git("ls-files", *ROOTS) or "").splitlines():
+        if not is_checked(path):
+            continue
+        source = (ROOT / path).read_text(encoding="utf-8")
+        for rule, line, text in find_sites(production_code(source)):
+            counts[rule] += 1
+            print(f"{rule}: {path}:{line}: {text[:110]}")
+    print(", ".join(f"{count} {rule}" for rule, count in sorted(counts.items())) or "no sites")
+    return 0
+
+
+def self_test():
+    def rules(source):
+        return sorted(rule for rule, _, _ in find_sites(source))
+
+    assert rules("fn a() { save(cx).log_err(); }") == ["silent-failure"]
+    assert rules("fn a() {\n    let _ = save(cx);\n}") == ["silent-failure"]
+    assert rules('fn a() { if let Err(error) = save() { log::error!("{error:#}"); } }') == [
+        "silent-failure"
+    ]
+    assert rules("fn a() { match save() { Ok(()) => {}, Err(_) => {} } }") == ["silent-failure"]
+    assert rules('fn a() { match save() { Ok(()) => {}, Err(error) => log::warn!("{error}"), } }') == [
+        "silent-failure"
+    ]
+    shown = 'Err(error) => { log::error!("{error:#}"); show_canvas_notice_deferred(text, cx); }'
+    assert rules(f"fn a() {{ match save() {{ Ok(()) => {{}}, {shown} }} }}") == []
+    assert rules("fn a() -> Result<()> { if let Err(error) = save() { return Err(error); } }") == []
+    # Text inside a string or a comment is not code.
+    assert rules('fn a() { let text = "x.log_err(); } Err(e) => {}"; } // y.log_err()') == []
+    assert rules("// silent: nobody waits for the cache\nfn a() { warm(cx).log_err(); }") == []
+
+    arm = "match action {\n    Action::RenameRequested { .. } => {}\n}"
+    assert rules(arm) == ["unwired-control"]
+    alternatives = "match action {\n    Action::Opened\n    | Action::SortRequested => {}\n}"
+    assert rules(alternatives) == ["unwired-control"]
+    guarded = "match action {\n    Action::RenameRequested if ready => rename(),\n" + arm.split("\n", 1)[1]
+    assert rules(guarded) == []
+    assert rules("match action {\n    Action::Opened => {}\n}") == []
+    after_block = "match action {\n    Action::SortRequested => {\n        sort();\n    }\n    Action::Opened => {}\n}"
+    assert rules(after_block) == []
+    assert rules("match action { Action::SortRequested { .. } => sort(), _ => {} }") == []
+
+    assert rules('fn a() { notify_unavailable(&format!("{other:?}"), window, cx); }') == [
+        "debug-in-notice"
+    ]
+    assert rules('fn a() { show_canvas_notice(format!("Could not save {name}."), window, cx); }') == []
+    assert rules('fn a() -> String { "Unable to encode the selection.".into() }') == ["notice-wording"]
+    assert rules('fn a() { log::error!("Unable to encode the selection."); }') == []
+    logged_then_shown = 'fn a() -> String { log::error!("{error:#}"); format!("Unable to encode: {error}") }'
+    assert rules(logged_then_shown) == ["notice-wording"]
+
+    tested = 'fn a() {}\n#[cfg(test)]\nmod tests {\n    fn b() { save().log_err(); }\n}\n'
+    assert rules(production_code(tested)) == []
+    assert is_checked("crates/fig_viewer/src/view.rs")
+    assert not is_checked("crates/fig_viewer/src/view/tests.rs")
+    assert not is_checked("crates/client/src/client.rs")
+
+    old = {"a.rs": "fn a() { save(cx).log_err(); }"}
+    moved = {"b.rs": "fn renamed() {\n    save(cx).log_err();\n}"}
+    assert added_sites(old, moved) == {}
+    grown = {"a.rs": old["a.rs"] + "\nfn b() { load(cx).log_err(); }"}
+    assert added_sites(old, grown) == {"silent-failure": [("a.rs", 2, "fn b() { load(cx).log_err(); }")]}
+    print("script/check-ui-feedback: self-test passes")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument("--all", action="store_true", help="list every site in the tree")
+    parser.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
+    arguments = parser.parse_args()
+    if arguments.self_test:
+        return self_test()
+    return list_all() if arguments.all else check_change()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

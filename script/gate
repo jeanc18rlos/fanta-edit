@@ -25,6 +25,9 @@ FAST_CHECKS = [
     ("architecture-tests", ["python3", "script/test-architecture"]),
     ("bash-guard", ["python3", ".claude/hooks/guard_bash.py", "--self-test"]),
     ("gate", ["script/gate", "--self-test"]),
+    ("ui-feedback-tests", ["script/check-ui-feedback", "--self-test"]),
+    # Compares with the base commit, so CI's hygiene checkout fetches two commits.
+    ("ui-feedback", ["script/check-ui-feedback"]),
     # Starts a server on a free loopback port; no network.
     ("serve-project", ["python3", "script/test-serve-project"]),
     ("typos", ["typos", "--config", "typos.toml"]),
