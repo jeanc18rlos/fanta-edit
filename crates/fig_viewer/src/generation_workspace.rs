@@ -5520,10 +5520,7 @@ async fn api_json(
         let message = match status.as_u16() {
             401 => "Your Fanta session expired. Sign in again to continue.".into(),
             402 => "You need more Fanta credits. Open Credits & billing to top up.".into(),
-            429 => {
-                "Fanta is busy with your other requests. Wait a moment and check the job status."
-                    .into()
-            }
+            429 => "Fanta is busy with your other requests. Wait a moment and try again.".into(),
             _ => error_message(&value),
         };
         return Err(ApiRejected {
@@ -7222,6 +7219,30 @@ mod tests {
         assert_eq!(
             models.first().map(|model| model.id.as_str()),
             Some("fanta-image-1")
+        );
+    }
+
+    #[gpui::test]
+    async fn catalog_rate_limit_does_not_mention_a_job(cx: &mut gpui::TestAppContext) {
+        let http = http_client::FakeHttpClient::create(|_| async move {
+            Ok(http_client::Response::builder()
+                .status(429)
+                .body(r#"{"error":"rate_limited"}"#.into())?)
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let error = fetch_catalog(
+            &client,
+            "https://api.fantaisa.net",
+            client.account_access_token().as_deref(),
+            &cx.executor(),
+        )
+        .await
+        .err()
+        .expect("rate-limited catalog");
+        assert_eq!(
+            error.to_string(),
+            "Fanta is busy with your other requests. Wait a moment and try again."
         );
     }
 
