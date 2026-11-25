@@ -6571,3 +6571,45 @@ fn starting_a_flow_cancels_a_running_navigation_transition() {
     );
     assert!(session.smart_animate.is_none());
 }
+
+#[test]
+fn scroll_to_inside_an_overlay_leaves_the_base_camera_alone() {
+    // Overlay descendants get layer-local identities, so the overlay root is
+    // the target whose bounds this layer resolves.
+    let mut doc = Doc::new();
+    let mut overlay = frame_sized(1000.0, 0.0, 100.0, 100.0, Color::rgb(0, 255, 0));
+    let overlay_id = overlay.id;
+    overlay.reactions.push(click(
+        1,
+        Trigger::Click,
+        Action::ScrollTo { target: overlay_id },
+    ));
+    doc.apply(Operation::create_node(overlay)).unwrap();
+    let mut base = frame_sized(0.0, 0.0, 200.0, 200.0, Color::WHITE);
+    let base_id = base.id;
+    base.reactions.push(click(
+        2,
+        Trigger::Click,
+        Action::OpenOverlay {
+            frame: overlay_id,
+            overlay: OverlaySettings {
+                position: OverlayPosition::Center,
+                background_dim: false,
+                close_on_click_outside: false,
+            },
+        },
+    ));
+    doc.apply(Operation::create_node(base)).unwrap();
+
+    let mut session = PresentSession::new(&doc, Some(base_id), DVec2::splat(200.0)).unwrap();
+    session.handle_pointer(DVec2::new(100.0, 100.0), PointerEvent::Click);
+    assert_eq!(session.overlays.len(), 1, "overlay opened");
+    let base_camera = session.camera;
+
+    session.handle_pointer(DVec2::new(100.0, 100.0), PointerEvent::Click);
+
+    assert_eq!(
+        session.camera.center, base_camera.center,
+        "a ScrollTo fired in an overlay must not move the base frame's camera"
+    );
+}

@@ -3224,6 +3224,16 @@ impl PlaybackSession {
                     }
 
                     // Default (no scrollable parent): pan the main camera.
+                    // An overlay draws with its own placement camera, so only
+                    // a reaction on the base frame may move this one.
+                    let from_base = self
+                        .dispatch_layer
+                        .map_or(self.overlays.is_empty(), |(layer, _)| {
+                            layer == self.current_layer
+                        });
+                    if !from_base {
+                        return PresentResponse::default();
+                    }
                     let cx = (bounds.min_x + bounds.max_x) * 0.5;
                     let cy = (bounds.min_y + bounds.max_y) * 0.5;
                     self.camera.center = [cx, cy];
