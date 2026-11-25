@@ -633,8 +633,10 @@ impl AudioPlaybackView {
         let Some(player) = self.player.as_ref() else {
             return;
         };
-        let duration = self.duration.unwrap_or_default();
-        if let Err(error) = player.try_seek(position.min(duration)) {
+        let target = self
+            .duration
+            .map_or(position, |duration| position.min(duration));
+        if let Err(error) = player.try_seek(target) {
             self.error = Some(format!("Could not seek audio: {error}").into());
         } else {
             self.error = None;
@@ -1059,36 +1061,60 @@ fn run_from_record(record: &JournalRecord, mode: GenerationMode) -> Result<RunSu
     })
 }
 
-fn restore_journal(
-    snapshot: JournalSnapshot,
-    account: Arc<str>,
-) -> Result<(Vec<Submission>, Vec<RunSummary>)> {
+fn restore_record(
+    record: JournalRecord,
+    account: &Arc<str>,
+) -> Result<(Option<RunSummary>, Option<Submission>)> {
+    let mode = GenerationMode::from_label(&record.mode)?;
+    let run = if record.result.is_some() {
+        Some(run_from_record(&record, mode)?)
+    } else {
+        None
+    };
+    let submission = if record.result.is_none()
+        || (record.request.is_some()
+            && record
+                .result
+                .as_ref()
+                .is_some_and(SavedRunResult::requires_input))
+    {
+        Some(Submission {
+            source: record.source.as_ref().map(restore_source).transpose()?,
+            request: record.request.context("The saved request is missing.")?,
+            key: record.key,
+            model: record.model,
+            prompt: record.prompt,
+            mode,
+            account: Some(account.clone()),
+        })
+    } else {
+        None
+    };
+    Ok((run, submission))
+}
+
+type RestoredJournal = (Vec<Submission>, Vec<RunSummary>, Vec<String>);
+
+fn restore_journal(snapshot: JournalSnapshot, account: Arc<str>) -> Result<RestoredJournal> {
     let mut submissions = Vec::new();
     let mut history = Vec::new();
+    let mut unreadable = Vec::new();
     for record in snapshot.records {
-        let mode = GenerationMode::from_label(&record.mode)?;
-        if record.result.is_some() {
-            history.push(run_from_record(&record, mode)?);
-        }
-        if record.result.is_none()
-            || (record.request.is_some()
-                && record
-                    .result
-                    .as_ref()
-                    .is_some_and(SavedRunResult::requires_input))
-        {
-            submissions.push(Submission {
-                source: record.source.as_ref().map(restore_source).transpose()?,
-                request: record.request.context("The saved request is missing.")?,
-                key: record.key,
-                model: record.model,
-                prompt: record.prompt,
-                mode,
-                account: Some(account.clone()),
-            });
+        let key = record.key.clone();
+        // One unreadable record (for example from a newer build) must not block the catalog and journal.
+        match restore_record(record, &account) {
+            Ok((run, submission)) => {
+                history.extend(run);
+                submissions.extend(submission);
+            }
+            // silent: restore_history tells the user once, from the returned unreadable keys.
+            Err(error) => {
+                log::warn!("Skipping unreadable saved generation {key}: {error:#}");
+                unreadable.push(key);
+            }
         }
     }
-    Ok((submissions, history))
+    Ok((submissions, history, unreadable))
 }
 
 async fn persist_generation_status(
@@ -1096,7 +1122,7 @@ async fn persist_generation_status(
     response: &mut GenerationResponse,
     account: Option<Arc<str>>,
     cx: &gpui::AsyncApp,
-) -> Result<Option<(Vec<Submission>, Vec<RunSummary>)>> {
+) -> Result<Option<RestoredJournal>> {
     let (changed, observed) = journal.observe_generation(response.saved_result()).await?;
     response.honor_saved_claim(observed.as_ref());
     if !changed {
@@ -1107,6 +1133,34 @@ async fn persist_generation_status(
     cx.background_spawn(async move { restore_journal(snapshot, account) })
         .await
         .map(Some)
+}
+
+fn released_unreadable_notice(released: usize) -> Option<String> {
+    match released {
+        0 => None,
+        1 => Some("Removed 1 saved request that this version of Fanta could not read, to make room for a new one. Any result it produced stays in the gallery.".into()),
+        count => Some(format!("Removed {count} saved requests that this version of Fanta could not read, to make room for a new one. Any results they produced stay in the gallery.")),
+    }
+}
+
+// A running job is saved again by its next poll; a finished one already shows its result.
+fn status_save_failure(
+    error: &anyhow::Error,
+    still_running: bool,
+    shown_error: Option<&SharedString>,
+) -> Option<SharedString> {
+    // The cause is a local storage error the user cannot act on, so it goes to the log.
+    log::error!("Could not save generation status: {error:#}");
+    // A finished job's own failure says more than the save failure, so it stays on screen.
+    if !still_running && shown_error.is_some() {
+        return None;
+    }
+    let next = if still_running {
+        "Fanta will try again at the next status check."
+    } else {
+        "The result shown here is not affected."
+    };
+    Some(format!("Could not save this generation's status. {next}").into())
 }
 
 #[derive(Debug)]
@@ -1190,6 +1244,7 @@ struct GenerationWorkspace {
     playback_file: Option<tempfile::TempPath>,
     unresolved_submission: Option<Submission>,
     recovered_submissions: Vec<Submission>,
+    unreadable_records: Vec<String>,
     journal: Option<GenerationJournal>,
     _account_task: Task<()>,
     account: Option<Arc<str>>,
@@ -2389,6 +2444,14 @@ impl GenerationWorkspace {
                 }
                 return true;
             }
+            // A running card whose polling stopped (failed check or timeout) resumes when clicked.
+            if self.pending
+                && self.task.is_none()
+                && let Some(run) = self.active_run.clone()
+            {
+                self.check_status(run, cx);
+                return true;
+            }
             return false;
         }
         if let Some(record) = self
@@ -2421,7 +2484,8 @@ impl GenerationWorkspace {
                 self.refresh_gallery(false, cx);
                 return false;
             }
-            if index >= record.outputs.len() {
+            // Swapping the active run mid-flight would make accept_response drop the result.
+            if index >= record.outputs.len() || self.task.is_some() {
                 return false;
             }
             self.active_run = Some(run);
@@ -2538,6 +2602,7 @@ impl GenerationWorkspace {
             playback_file: None,
             unresolved_submission: None,
             recovered_submissions: Vec::new(),
+            unreadable_records: Vec::new(),
             journal: None,
             _account_task: account_task,
             account: client.account_access_token(),
@@ -2578,6 +2643,7 @@ impl GenerationWorkspace {
         self.preview_request = None;
         self.unresolved_submission = None;
         self.recovered_submissions.clear();
+        self.unreadable_records.clear();
         self.journal = None;
         self.source = None;
         self.end_frame = None;
@@ -2677,11 +2743,12 @@ impl GenerationWorkspace {
                 this.catalog_task = None;
                 this.catalog_request = None;
                 match result {
-                    Ok((models, journal, (submissions, history), member_id)) => {
+                    Ok((models, journal, (submissions, history, unreadable), member_id)) => {
                         this.models = models;
                         this.journal = Some(journal);
                         this.member_id = Some(member_id);
-                        this.restore_history(submissions, history);
+                        this.error = None;
+                        this.restore_history(submissions, history, unreadable);
                         this.choose_default_model();
                         this.apply_prepared_model();
                         if this.mode.generation_kind().is_some()
@@ -2700,7 +2767,6 @@ impl GenerationWorkspace {
                                 })
                                 .map(|model| model.id.clone());
                         }
-                        this.error = None;
                         // Legacy recovery fixtures provide strict HTTP scripts. Gallery
                         // requests are exercised separately from those submission flows.
                         #[cfg(not(test))]
@@ -2860,7 +2926,17 @@ impl GenerationWorkspace {
         }));
     }
 
-    fn restore_history(&mut self, mut submissions: Vec<Submission>, history: Vec<RunSummary>) {
+    fn restore_history(
+        &mut self,
+        mut submissions: Vec<Submission>,
+        history: Vec<RunSummary>,
+        unreadable: Vec<String>,
+    ) {
+        if self.unreadable_records.is_empty() && !unreadable.is_empty() {
+            self.error =
+                Some("Could not read some saved experiments, so they are not shown.".into());
+        }
+        self.unreadable_records = unreadable;
         self.unresolved_submission = if submissions.is_empty() {
             None
         } else {
@@ -3128,15 +3204,6 @@ impl GenerationWorkspace {
             source: None,
             mode: GenerationMode::Vector.label().into(),
         };
-        self.pending = false;
-        self.outputs.clear();
-        self.preview = None;
-        self.preview_task = None;
-        self.prepared_video = None;
-        self.clear_playback(cx);
-        self.preview_request = None;
-        self.active_run = None;
-        self.active_title = None;
         self.error = None;
         self.status = "Creating vector artwork…".into();
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -3162,6 +3229,7 @@ impl GenerationWorkspace {
                         };
                         this.active_run = Some(run.clone());
                         this.active_title = None;
+                        this.pending = false;
                         this.history.insert(0, run);
                         let mut vectors = 0;
                         this.history.retain(|run| match run.result {
@@ -3235,11 +3303,16 @@ impl GenerationWorkspace {
         } = submission;
         let client = self.client.clone();
         let base_url = self.base_url.clone();
+        let unreadable = self.unreadable_records.clone();
         self.pending = false;
         self.error = None;
         self.status = "Saving your request for recovery…".into();
         self.task = Some(cx.spawn(async move |this, cx| {
+            let mut released = 0;
             let result = async {
+                if !unreadable.is_empty() {
+                    released = journal.release_unreadable(key.clone(), unreadable).await?;
+                }
                 let previous = journal.prepare(saved).await.map_err(|error| anyhow!("{error:#}"))?;
                 let mut response = match &previous.result {
                     Some(SavedRunResult::Generation { id, .. }) => {
@@ -3289,7 +3362,7 @@ impl GenerationWorkspace {
                 anyhow::Ok((response, restored))
             }.await;
             match result {
-                Ok((response, (submissions, history))) => {
+                Ok((response, (submissions, history, unreadable))) => {
                     let run = RunSummary {
                         result: RunResult::Generation { id: response.id.clone() },
                         model, prompt, source, mode,
@@ -3299,7 +3372,7 @@ impl GenerationWorkspace {
                             this.sync_account(cx);
                             return false;
                         }
-                        this.restore_history(submissions, history);
+                        this.restore_history(submissions, history, unreadable);
                         this.active_run = Some(run);
                         this.active_title = None;
                         this.outputs.clear();
@@ -3309,6 +3382,12 @@ impl GenerationWorkspace {
                         this.clear_playback(cx);
                         this.preview_request = None;
                         this.accept_response(&response, cx);
+                        if let Some(notice) = released_unreadable_notice(released) {
+                            this.error = Some(match this.error.take() {
+                                Some(error) => format!("{error} {notice}"),
+                                None => notice,
+                            }.into());
+                        }
                         true
                     }).log_err().unwrap_or(false);
                     if applied && response.should_poll() {
@@ -3316,6 +3395,9 @@ impl GenerationWorkspace {
                     }
                 }
                 Err(mut error) => {
+                    if let Some(notice) = released_unreadable_notice(released) {
+                        error = anyhow!("{error} {notice}");
+                    }
                     let mut discarded = false;
                     if error.downcast_ref::<ApiRejected>().is_some_and(|error| {
                         error.unreserved && error.status < 500 && error.status != 409 && !retrying
@@ -3392,20 +3474,28 @@ impl GenerationWorkspace {
                             }
                             let persistence_error = match persisted {
                                 Ok(restored) => {
-                                    if let Some((submissions, history)) = restored {
-                                        this.restore_history(submissions, history);
+                                    if let Some((submissions, history, unreadable)) = restored {
+                                        this.restore_history(submissions, history, unreadable);
                                     }
                                     None
                                 }
                                 Err(error) => Some(error),
                             };
                             this.accept_response(&response, cx);
-                            if let Some(error) = persistence_error {
-                                this.error = Some(format!("The saved status could not be updated: {error}. Check status again to finish recovery.").into());
+                            if let Some(error) = persistence_error
+                                && let Some(message) = status_save_failure(
+                                    &error,
+                                    response.should_poll(),
+                                    this.error.as_ref(),
+                                )
+                            {
+                                this.error = Some(message);
                             }
                             true
                         })
-                        .log_err().unwrap_or(false);
+                        // silent: the update fails only when the workspace was closed, so no screen is left to tell.
+                        .log_err()
+                        .unwrap_or(false);
                     if !applied {
                         return;
                     }
@@ -3421,7 +3511,7 @@ impl GenerationWorkspace {
                         }
                         this.error = Some(
                             format!(
-                                "Status check failed: {error}. Use Check status to resume this job."
+                                "Status check failed: {error}. Select the running card to check again."
                             )
                             .into(),
                         );
@@ -3438,6 +3528,8 @@ impl GenerationWorkspace {
                 return;
             }
             this.status = "This job is still running. Check its status again in a moment.".into();
+            this.error =
+                Some("This job is still running. Select the running card to check again.".into());
             cx.notify();
         })
         .log_err();
@@ -3491,6 +3583,11 @@ impl GenerationWorkspace {
         let client = self.client.clone();
         let base_url = self.base_url.clone();
         let account = self.client.account_access_token();
+        // A failed check of the job that is still running must leave its card to click again.
+        let still_running = self.pending
+            && run
+                .generation_id()
+                .is_some_and(|id| response_targets_active_run(self.active_run.as_ref(), id));
         self.outputs.clear();
         self.preview = None;
         self.preview_task = None;
@@ -3528,33 +3625,47 @@ impl GenerationWorkspace {
             .await
             .and_then(parse_generation_response)
             .and_then(|response| {
-                ensure!(response.id == generation_id, "The status response did not match the saved generation.");
+                ensure!(
+                    response.id == generation_id,
+                    "The status response did not match the saved generation."
+                );
                 Ok(response)
             });
             match result {
                 Ok(mut response) => {
-                    let persisted = persist_generation_status(&journal, &mut response, account.clone(), cx).await;
-                    let applied = this.update(cx, |this, cx| {
-                        if this.client.account_access_token() != account {
-                            this.sync_account(cx);
-                            return false;
-                        }
-                        let persistence_error = match persisted {
-                            Ok(restored) => {
-                                if let Some((submissions, history)) = restored {
-                                    this.restore_history(submissions, history);
-                                }
-                                None
+                    let persisted =
+                        persist_generation_status(&journal, &mut response, account.clone(), cx)
+                            .await;
+                    let applied = this
+                        .update(cx, |this, cx| {
+                            if this.client.account_access_token() != account {
+                                this.sync_account(cx);
+                                return false;
                             }
-                            Err(error) => Some(error),
-                        };
-                        this.accept_response(&response, cx);
-                        if let Some(error) = persistence_error {
-                            this.error = Some(format!("The saved status could not be updated: {error}. Check status again to finish recovery.").into());
-                        }
-                        true
-                    })
-                        .log_err().unwrap_or(false);
+                            let persistence_error = match persisted {
+                                Ok(restored) => {
+                                    if let Some((submissions, history, unreadable)) = restored {
+                                        this.restore_history(submissions, history, unreadable);
+                                    }
+                                    None
+                                }
+                                Err(error) => Some(error),
+                            };
+                            this.accept_response(&response, cx);
+                            if let Some(error) = persistence_error
+                                && let Some(message) = status_save_failure(
+                                    &error,
+                                    response.should_poll(),
+                                    this.error.as_ref(),
+                                )
+                            {
+                                this.error = Some(message);
+                            }
+                            true
+                        })
+                        // silent: the update fails only when the workspace was closed, so no screen is left to tell.
+                        .log_err()
+                        .unwrap_or(false);
                     if applied && response.should_poll() {
                         Self::poll(
                             this.clone(),
@@ -3575,7 +3686,10 @@ impl GenerationWorkspace {
                             return;
                         }
                         this.fail(error, cx);
-                    }).log_err();
+                        this.pending = still_running;
+                    })
+                    // silent: the update fails only when the workspace was closed, so no screen is left to tell.
+                    .log_err();
                 }
             }
             this.update(cx, |this, cx| {
@@ -4428,16 +4542,8 @@ impl GenerationWorkspace {
                     client.account_access_token() == account,
                     "Your Fanta account changed. Choose the result again before playing it."
                 );
-                cx.background_spawn(async move {
-                    generation_media::mp4_metadata(&bytes)?;
-                    let file = tempfile::Builder::new()
-                        .prefix("fanta-generation-")
-                        .suffix(".mp4")
-                        .tempfile()?;
-                    std::fs::write(file.path(), &bytes)?;
-                    Ok::<_, anyhow::Error>(file.into_temp_path())
-                })
-                .await
+                cx.background_spawn(async move { write_playback_file(&bytes, &output.mime) })
+                    .await
             }
             .await;
             this.update(cx, |this, cx| {
@@ -4451,7 +4557,7 @@ impl GenerationWorkspace {
                         this.error = None;
                         cx.open_with_system(&file);
                         this.playback_file = Some(file);
-                        this.status = "Opened in your video player.".into();
+                        this.status = "Opened in your media player.".into();
                     }
                     Err(error) => this.fail(error, cx),
                 }
@@ -5319,6 +5425,26 @@ fn vector_output(svg: Arc<[u8]>) -> MediaOutput {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+fn write_playback_file(bytes: &[u8], mime: &str) -> Result<tempfile::TempPath> {
+    let suffix = if mime.starts_with("audio/") {
+        let format = fanta_format::MediaRegistry::with_builtins()
+            .sniff(bytes)
+            .filter(|format| format.family == "audio")
+            .context("The generated file is not a supported audio file.")?;
+        format!(".{}", format.extension)
+    } else {
+        generation_media::mp4_metadata(bytes)?;
+        ".mp4".to_owned()
+    };
+    let file = tempfile::Builder::new()
+        .prefix("fanta-generation-")
+        .suffix(&suffix)
+        .tempfile()?;
+    std::fs::write(file.path(), bytes)?;
+    Ok(file.into_temp_path())
+}
+
 async fn fetch_catalog(
     client: &Arc<Client>,
     base_url: &str,
@@ -5336,8 +5462,22 @@ async fn fetch_catalog(
         executor,
     )
     .await?;
-    let mut models: Vec<GenerationModel> = serde_json::from_value(value["models"].clone())
-        .context("The model catalog could not be read")?;
+    // One malformed or newly shaped entry must not hide every other model.
+    let entries = value["models"]
+        .as_array()
+        .context("The model catalog could not be read.")?;
+    let mut models: Vec<GenerationModel> = entries
+        .iter()
+        .filter_map(|entry| {
+            serde_json::from_value(entry.clone())
+                .map_err(|error| log::warn!("Skipping unreadable model catalog entry: {error}"))
+                .ok()
+        })
+        .collect();
+    ensure!(
+        !models.is_empty() || entries.is_empty(),
+        "The model catalog could not be read."
+    );
     models.sort_by_key(|model| {
         (
             !model.gateway(),
@@ -5415,10 +5555,7 @@ async fn api_json(
         let message = match status.as_u16() {
             401 => "Your Fanta session expired. Sign in again to continue.".into(),
             402 => "You need more Fanta credits. Open Credits & billing to top up.".into(),
-            429 => {
-                "Fanta is busy with your other requests. Wait a moment and check the job status."
-                    .into()
-            }
+            429 => "Fanta is busy with your other requests. Wait a moment and try again.".into(),
             _ => error_message(&value),
         };
         return Err(ApiRejected {
@@ -5698,6 +5835,8 @@ fn option_label(key: &str) -> String {
         "generate_audio" => return "Generate audio".into(),
         "force_instrumental" => return "Instrumental".into(),
         "enable_prompt_expansion" => return "Prompt expansion".into(),
+        "num_outputs" => return "Number of outputs".into(),
+        "cfg_scale" => return "Guidance scale".into(),
         _ => {}
     }
     let mut words = key.split('_');
@@ -5732,7 +5871,10 @@ fn option_choice_label(key: &str, value: &str) -> String {
     }
     if key == "music_length_ms" {
         if let Ok(milliseconds) = value.parse::<u64>() {
-            return format!("{} s", milliseconds / 1000);
+            if milliseconds % 1000 == 0 {
+                return format!("{} s", milliseconds / 1000);
+            }
+            return format!("{} s", milliseconds as f64 / 1000.);
         }
     }
     if key == "aspect_ratio" {
@@ -5743,10 +5885,7 @@ fn option_choice_label(key: &str, value: &str) -> String {
             _ => value.to_owned(),
         };
     }
-    if value.contains('_') {
-        return value.replace('_', " ");
-    }
-    value.to_owned()
+    value.replace('_', " ")
 }
 
 fn generation_templates() -> Vec<GenerationTemplate> {
@@ -5811,12 +5950,16 @@ fn build_screen_request(
                     .iter()
                     .any(|candidate| option_value(candidate).as_deref() == Some(value)),
                 "Choose a valid {}.",
-                option_label(key),
+                option_label(key).to_lowercase(),
             );
         }
         let field = control["request_field"].as_str().unwrap_or(key);
         let encoded = if control["default"].is_boolean() || value == "true" || value == "false" {
-            ensure!(matches!(value, "true" | "false"), "Choose a valid {key}.");
+            ensure!(
+                matches!(value, "true" | "false"),
+                "Choose On or Off for {}.",
+                option_label(key)
+            );
             json!(value == "true")
         } else if control["default"].is_number()
             || matches!(
@@ -5831,9 +5974,13 @@ fn build_screen_request(
                     | "num_outputs"
             )
         {
-            let number: Value =
-                serde_json::from_str(value).with_context(|| format!("Choose a valid {key}."))?;
-            ensure!(number.is_number(), "Choose a valid {key}.");
+            let number: Value = serde_json::from_str(value)
+                .with_context(|| format!("Choose a valid {}.", option_label(key).to_lowercase()))?;
+            ensure!(
+                number.is_number(),
+                "Choose a valid {}.",
+                option_label(key).to_lowercase()
+            );
             number
         } else {
             json!(value)
@@ -6018,12 +6165,13 @@ fn build_request(
             let value = text
                 .trim()
                 .parse::<f64>()
-                .with_context(|| format!("Enter a valid value for {key}."))?;
+                .with_context(|| format!("Enter a valid value for {}.", option_label(key)))?;
             let min = model.capabilities[key]["min"].as_f64().unwrap_or(0.);
             let max = model.capabilities[key]["max"].as_f64().unwrap_or(100.);
             ensure!(
                 value.is_finite() && (min..=max).contains(&value),
-                "{key} must be between {min} and {max}."
+                "{} must be between {min} and {max}.",
+                option_label(key)
             );
             ensure!(
                 key != "steps" || value.fract() == 0.,
@@ -6141,17 +6289,44 @@ fn unsuitable_gallery_title(text: &str) -> bool {
         || lower.contains("://")
         || lower.contains("www.")
         || lower.contains("password")
-        || lower.contains("secret")
+        || lower.contains("passcode")
+        || reveals_secret(&lower)
         || lower.contains("api key")
         || lower.contains("ignore previous")
         || lower.contains("system prompt")
-        || text
-            .split(|c: char| !c.is_ascii_digit())
-            .any(|digits| digits.len() >= 4)
+        || contains_long_number(text)
         || text.chars().any(|c| {
             c.is_control()
                 || matches!(c, '<' | '>' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
         })
+}
+
+// "Secret" alone is an ordinary word ("Secret garden", "Secretary"); before a value it reveals one.
+fn reveals_secret(lower: &str) -> bool {
+    lower.match_indices("secret").any(|(index, keyword)| {
+        let rest = lower[index + keyword.len()..].trim_start();
+        rest.starts_with([':', '='])
+            || ["is ", "was ", "key", "code"]
+                .iter()
+                .any(|word| rest.starts_with(word))
+    })
+}
+
+// Five or more digits before the next letter (phone, card, ID numbers, however they are spaced);
+// years and resolutions such as "2026" or "1920x1080" stay readable.
+fn contains_long_number(text: &str) -> bool {
+    let mut digits = 0;
+    for character in text.chars() {
+        if character.is_ascii_digit() {
+            digits += 1;
+            if digits >= 5 {
+                return true;
+            }
+        } else if character.is_alphabetic() {
+            digits = 0;
+        }
+    }
+    false
 }
 
 fn preferred_gallery_title<'a>(
@@ -6511,6 +6686,46 @@ mod tests {
     }
 
     #[test]
+    fn gallery_titles_allow_years_and_ordinary_words_but_not_personal_numbers_or_credentials() {
+        for title in [
+            "Poster for the 2026 design summit",
+            "Secret garden at dusk",
+            "Secretary desk",
+            "1080p wallpaper",
+            "1920x1080 wallpaper",
+            "Top 10 of 2026",
+        ] {
+            assert_eq!(
+                gallery_creation_title(Some(title), None, GenerationKind::Image),
+                title
+            );
+        }
+        for title in [
+            "My SSN is 123-45-6789",
+            "code 482913",
+            "4111, 1111, 1111, 1111",
+            "4111  1111  1111  1111",
+            "555-123-4567",
+            "password123",
+            "my password hunter2",
+            "passwords: x",
+            "Password manager icon",
+            "Passcode 12",
+            "My secret is hunter2",
+            "Secret: hunter2",
+            "Client secret = abc",
+            "Secret key ring",
+            "Secret code card",
+        ] {
+            assert_eq!(
+                gallery_creation_title(Some(title), None, GenerationKind::Image),
+                "Image creation",
+                "{title}"
+            );
+        }
+    }
+
+    #[test]
     fn narration_uses_spoken_text_instead_of_an_unrelated_server_title() {
         let mut narration = model("audio");
         narration.id = "grok-tts".into();
@@ -6702,6 +6917,51 @@ mod tests {
             ..run
         };
         assert!(!response_targets_active_run(Some(&vector), "older"));
+    }
+
+    #[test]
+    fn released_unreadable_notice_counts_the_removed_requests() {
+        assert_eq!(released_unreadable_notice(0), None);
+        assert_eq!(
+            released_unreadable_notice(2).as_deref(),
+            Some(
+                "Removed 2 saved requests that this version of Fanta could not read, to make room for a new one. Any results they produced stay in the gallery."
+            )
+        );
+    }
+
+    #[test]
+    fn restoring_saved_experiments_skips_an_unreadable_record() {
+        let record = |key: &str, mode: &str| JournalRecord {
+            key: key.into(),
+            request: None,
+            model: "fanta-image-1".into(),
+            prompt: "A sunrise".into(),
+            source: None,
+            mode: mode.into(),
+            result: Some(SavedRunResult::Generation {
+                id: key.into(),
+                finished: true,
+                dispatch: Default::default(),
+            }),
+        };
+        let snapshot = JournalSnapshot {
+            records: vec![
+                record("from-a-newer-build", "Hologram"),
+                record("readable", GenerationMode::Image.label()),
+            ],
+        };
+        let (submissions, history, unreadable) =
+            restore_journal(snapshot, Arc::from("account")).expect("readable records restore");
+        assert!(submissions.is_empty());
+        assert_eq!(unreadable, ["from-a-newer-build"]);
+        assert_eq!(
+            history
+                .iter()
+                .map(|run| run.generation_id())
+                .collect::<Vec<_>>(),
+            [Some("readable")]
+        );
     }
 
     struct RecoveryTestDirectory {
@@ -7080,6 +7340,30 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn catalog_rate_limit_does_not_mention_a_job(cx: &mut gpui::TestAppContext) {
+        let http = http_client::FakeHttpClient::create(|_| async move {
+            Ok(http_client::Response::builder()
+                .status(429)
+                .body(r#"{"error":"rate_limited"}"#.into())?)
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let error = fetch_catalog(
+            &client,
+            "https://api.fantaisa.net",
+            client.account_access_token().as_deref(),
+            &cx.executor(),
+        )
+        .await
+        .err()
+        .expect("rate-limited catalog");
+        assert_eq!(
+            error.to_string(),
+            "Fanta is busy with your other requests. Wait a moment and try again."
+        );
+    }
+
+    #[gpui::test]
     async fn catalog_without_an_account_requires_sign_in_without_sending_a_request(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -7281,6 +7565,318 @@ mod tests {
         assert_string_seed_generation_completes(true, cx).await;
     }
 
+    #[gpui::test]
+    async fn generation_running_card_resumes_after_a_failed_status_check(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("generated image");
+        let completed = json!({
+            "id":"resumed-job", "status":"succeeded", "model":"fanta-image-1",
+            "output":[{"data_url":format!("data:image/png;base64,{}", STANDARD.encode(png.into_inner()))}],
+        });
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let http = http_client::FakeHttpClient::create({
+            let polls = polls.clone();
+            move |request| {
+                let completed = completed.clone();
+                let polls = polls.clone();
+                async move {
+                    let (status, response) = match (request.method(), request.uri().path()) {
+                        (&Method::GET, "/v1/models") => (200, json!({"models":[]})),
+                        (&Method::GET, "/v1/me") => (200, recovery_account_fixture()),
+                        (&Method::POST, "/v1/generations") => {
+                            (200, json!({"id":"resumed-job", "status":"processing"}))
+                        }
+                        (&Method::GET, "/v1/generations/resumed-job") => {
+                            if polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                                (503, json!({"error":"Temporarily unavailable"}))
+                            } else {
+                                (200, completed)
+                            }
+                        }
+                        route => panic!("Unexpected generation request: {route:?}"),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(status)
+                        .body(response.to_string().into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Image, client, cx);
+        view.update(cx, |view, cx| {
+            view.submit(
+                Submission {
+                    key: "resumed-job".into(),
+                    request: json!({"model":"fanta-image-1", "prompt":"A sunrise"}),
+                    model: "fanta-image-1".into(),
+                    prompt: "A sunrise".into(),
+                    source: None,
+                    account,
+                    mode: GenerationMode::Image,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.task.is_none() && view.pending && view.outputs.is_empty());
+            assert!(view.error.is_some(), "the failed status check is reported");
+            let running = view
+                .generation_view_data(cx)
+                .outputs
+                .into_iter()
+                .find(|output| output.status == GenerationOutputStatus::Running)
+                .expect("the job stays visible as running");
+            assert_eq!(running.id.as_ref(), "gen:resumed-job:0");
+        });
+        let select_running_card = |cx: &mut gpui::VisualTestContext| {
+            view.update_in(cx, |view, window, cx| {
+                view.handle_generation_action(
+                    GenerationAction::OutputSelected {
+                        id: "gen:resumed-job:0".into(),
+                    },
+                    window,
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+        };
+        select_running_card(cx);
+        view.read_with(cx, |view, cx| {
+            assert!(view.task.is_none() && view.error.is_some());
+            assert!(
+                view.generation_view_data(cx)
+                    .outputs
+                    .iter()
+                    .any(|output| output.status == GenerationOutputStatus::Running),
+                "a check that fails again keeps the running card"
+            );
+        });
+        select_running_card(cx);
+        view.read_with(cx, |view, _| {
+            assert!(view.task.is_none());
+            assert!(view.error.is_none());
+            assert!(!view.pending);
+            assert_eq!(
+                view.outputs.len(),
+                1,
+                "selecting the running card checks again"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn generation_in_flight_result_survives_selecting_an_older_gallery_card(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("generated image");
+        let data_url = format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(png.into_inner())
+        );
+        let completed = json!({
+            "id":"new-job", "status":"succeeded", "model":"fanta-image-1",
+            "output":[{"data_url":data_url}],
+        });
+        let http = http_client::FakeHttpClient::create(move |request| {
+            let completed = completed.clone();
+            async move {
+                let response = match (request.method(), request.uri().path()) {
+                    (&Method::GET, "/v1/models") => json!({"models":[]}),
+                    (&Method::GET, "/v1/me") => recovery_account_fixture(),
+                    (&Method::POST, "/v1/generations") => {
+                        json!({"id":"new-job", "status":"processing"})
+                    }
+                    (&Method::GET, "/v1/generations/new-job") => completed,
+                    route => panic!("Unexpected generation request: {route:?}"),
+                };
+                Ok(http_client::Response::builder()
+                    .status(200)
+                    .body(response.to_string().into())?)
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Image, client, cx);
+        let (gallery, _) = parse_gallery_response(json!({"generations":[{
+            "id":"older-job", "kind":"image", "status":"succeeded", "model":"fanta-image-1",
+            "output":[{"data_url":data_url}],
+        }]}))
+        .expect("gallery fixture");
+        view.update(cx, |view, cx| {
+            view.gallery = gallery;
+            view.submit(
+                Submission {
+                    key: "new-job".into(),
+                    request: json!({"model":"fanta-image-1", "prompt":"A sunrise"}),
+                    model: "fanta-image-1".into(),
+                    prompt: "A sunrise".into(),
+                    source: None,
+                    account,
+                    mode: GenerationMode::Image,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.pending && view.task.is_some()));
+        view.update_in(cx, |view, window, cx| {
+            view.handle_generation_action(
+                GenerationAction::OutputSelected {
+                    id: "gen:older-job:0".into(),
+                },
+                window,
+                cx,
+            )
+        });
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.task.is_none());
+            assert_eq!(
+                view.active_run.as_ref().and_then(RunSummary::generation_id),
+                Some("new-job"),
+                "the in-flight job keeps the active card"
+            );
+            assert_eq!(view.outputs.len(), 1, "the in-flight result is shown");
+            assert!(!view.pending);
+        });
+    }
+
+    #[gpui::test]
+    async fn catalog_skips_an_unreadable_model_entry(cx: &mut gpui::TestAppContext) {
+        let http = http_client::FakeHttpClient::create(|_| async move {
+            Ok(http_client::Response::builder().status(200).body(
+                r#"{"models":[{"id":"fanta-image-1","kind":"image"},{"id":null,"kind":"image"},{"id":"future-model","kind":"image","max_output_tokens":1.5}]}"#.into(),
+            )?)
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let models = fetch_catalog(
+            &client,
+            "https://api.fantaisa.net",
+            client.account_access_token().as_deref(),
+            &cx.executor(),
+        )
+        .await
+        .expect("the readable models stay available");
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["fanta-image-1"]
+        );
+
+        let http = http_client::FakeHttpClient::create(|_| async move {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(r#"{"models":[{"id":null,"kind":"image"}]}"#.into())?)
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let unreadable = fetch_catalog(
+            &client,
+            "https://api.fantaisa.net",
+            client.account_access_token().as_deref(),
+            &cx.executor(),
+        )
+        .await;
+        assert!(
+            unreadable.is_err(),
+            "a catalog with no readable model is reported, not shown as empty"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn generation_play_writes_a_generated_audio_file_with_its_own_extension() {
+        let mut wav = b"RIFF\x24\x00\x00\x00WAVEfmt ".to_vec();
+        wav.resize(44, 0);
+        let file = write_playback_file(&wav, "audio/wav").expect("audio written for playback");
+        assert_eq!(
+            file.extension().and_then(|extension| extension.to_str()),
+            Some("wav")
+        );
+        assert!(write_playback_file(b"not audio", "audio/mpeg").is_err());
+    }
+
+    #[gpui::test]
+    async fn generation_failed_vector_request_keeps_the_previous_artwork(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="24"><path d="M2 2L30 2L16 22Z" fill="#22c55e"/></svg>"##;
+        let messages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let http = http_client::FakeHttpClient::create({
+            let messages = messages.clone();
+            move |request| {
+                let messages = messages.clone();
+                async move {
+                    let (status, response) = match (request.method(), request.uri().path()) {
+                        (&Method::GET, "/v1/models") => (
+                            200,
+                            json!({"models": [{
+                                "id": "claude-sonnet-5", "kind": "chat", "max_output_tokens": 4096
+                            }]}),
+                        ),
+                        (&Method::GET, "/v1/me") => (200, recovery_account_fixture()),
+                        (&Method::POST, "/v1/messages") => {
+                            if messages.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                                (
+                                    200,
+                                    json!({
+                                        "id": "msg_first",
+                                        "stop_reason": "end_turn",
+                                        "content": [{"type": "text", "text": SVG}]
+                                    }),
+                                )
+                            } else {
+                                (503, json!({"error": "Temporarily unavailable"}))
+                            }
+                        }
+                        route => panic!("Unexpected vector request: {route:?}"),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(status)
+                        .body(response.to_string().into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Vector, client, cx);
+        for prompt_text in ["a green triangle", "a blue square"] {
+            view.update_in(cx, |view, window, cx| {
+                let prompt = view.prompt.clone();
+                prompt.update(cx, |prompt, cx| prompt.set_text(prompt_text, window, cx));
+                view.generate(window, cx);
+            });
+            cx.run_until_parked();
+        }
+        view.read_with(cx, |view, _| {
+            assert!(view.task.is_none());
+            assert!(view.error.is_some(), "the failed request is reported");
+            assert_eq!(view.outputs.len(), 1, "the earlier artwork stays shown");
+            assert!(matches!(
+                view.active_run.as_ref().map(|run| &run.result),
+                Some(RunResult::VectorMessage { message_id, .. })
+                    if message_id.as_deref() == Some("msg_first")
+            ));
+        });
+    }
+
     struct PendingBody;
 
     async fn assert_generation_recovery_after_tab_close(
@@ -7397,6 +7993,202 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         assert_generation_recovery_after_tab_close(true, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_recovery_unreadable_saved_requests_do_not_block_generate(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let submissions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let http = http_client::FakeHttpClient::create({
+            let submissions = submissions.clone();
+            move |request| {
+                let submissions = submissions.clone();
+                async move {
+                    let response = match (request.method(), request.uri().path()) {
+                        (&Method::GET, "/v1/models") => json!({"models": []}),
+                        (&Method::GET, "/v1/me") => recovery_account_fixture(),
+                        (&Method::POST, "/v1/generations") => {
+                            let key = request.headers()["Idempotency-Key"].to_str()?.to_owned();
+                            submissions.lock().expect("submission log").push(key);
+                            json!({"id": "after-unreadable", "status": "processing"})
+                        }
+                        route => panic!("Unexpected generation request: {route:?}"),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(response.to_string().into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Image, client.clone(), cx);
+        let journal = view
+            .read_with(cx, |view, _| view.journal.clone())
+            .expect("loaded journal");
+        for index in 0..8 {
+            journal
+                .prepare(SavedSubmission {
+                    key: format!("from-a-newer-build-{index}"),
+                    request: json!({"model": "fanta-hologram-1", "prompt": "A sunrise"}),
+                    model: "fanta-hologram-1".into(),
+                    prompt: "A sunrise".into(),
+                    source: None,
+                    mode: "Hologram".into(),
+                })
+                .await
+                .expect("saved request from a newer build");
+        }
+        let mut reopened_context = cx.cx.clone();
+        cx.update(|window, _| window.remove_window());
+        drop(view);
+        reopened_context.run_until_parked();
+        let (view, cx) =
+            visual_workspace_with_client(GenerationMode::Image, client, &mut reopened_context);
+        view.read_with(cx, |view, _| {
+            assert!(view.unresolved_submission.is_none());
+            assert_eq!(
+                view.error
+                    .as_ref()
+                    .map(|error| error.to_string())
+                    .as_deref(),
+                Some("Could not read some saved experiments, so they are not shown.")
+            );
+        });
+        view.update(cx, |view, cx| {
+            view.submit(
+                Submission {
+                    key: "after-unreadable".into(),
+                    request: json!({"model": "fanta-image-1", "prompt": "A sunrise"}),
+                    model: "fanta-image-1".into(),
+                    prompt: "A sunrise".into(),
+                    source: None,
+                    account,
+                    mode: GenerationMode::Image,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.error.as_ref().map(ToString::to_string).as_deref(),
+                Some(
+                    "Removed 1 saved request that this version of Fanta could not read, to make room for a new one. Any result it produced stays in the gallery."
+                )
+            );
+            assert_eq!(
+                view.history.first().and_then(RunSummary::generation_id),
+                Some("after-unreadable")
+            );
+        });
+        assert_eq!(
+            *submissions.lock().expect("submission log"),
+            ["after-unreadable"]
+        );
+        let remaining = journal.load().await.expect("journal").records;
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|record| record.key.starts_with("from-a-newer-build"))
+                .count(),
+            7,
+            "only the oldest unreadable request gives way"
+        );
+    }
+
+    async fn assert_status_save_failure(
+        finished_with_media: bool,
+        expected: &str,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("generated image");
+        let completed = if finished_with_media {
+            json!({
+                "id": "status-save", "status": "succeeded", "model": "fanta-image-1",
+                "output": [{"data_url": format!("data:image/png;base64,{}", STANDARD.encode(png.into_inner()))}],
+            })
+        } else {
+            json!({"id": "status-save", "status": "failed", "error": {"message": "The model refused this prompt."}})
+        };
+        let http = http_client::FakeHttpClient::create(move |request| {
+            let completed = completed.clone();
+            async move {
+                let response = match (request.method(), request.uri().path()) {
+                    (&Method::GET, "/v1/models") => json!({"models": []}),
+                    (&Method::GET, "/v1/me") => recovery_account_fixture(),
+                    (&Method::POST, "/v1/generations") => {
+                        json!({"id": "status-save", "status": "processing"})
+                    }
+                    (&Method::GET, "/v1/generations/status-save") => completed,
+                    route => panic!("Unexpected generation request: {route:?}"),
+                };
+                Ok(http_client::Response::builder()
+                    .status(200)
+                    .body(response.to_string().into())?)
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Image, client, cx);
+        view.update(cx, |view, cx| {
+            view.submit(
+                Submission {
+                    key: "status-save".into(),
+                    request: json!({"model": "fanta-image-1", "prompt": "A sunrise"}),
+                    model: "fanta-image-1".into(),
+                    prompt: "A sunrise".into(),
+                    source: None,
+                    account,
+                    mode: GenerationMode::Image,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.pending));
+        let database = cx.update(|_, cx| db::kvp::KeyValueStore::global(cx));
+        database
+            .write(|connection| {
+                connection.exec(
+                    "CREATE TRIGGER fail_status_save BEFORE INSERT ON scoped_kv_store
+                     BEGIN SELECT RAISE(FAIL,'disk write failed'); END;",
+                )?()
+            })
+            .await
+            .expect("install storage failure");
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.outputs.len(), usize::from(finished_with_media));
+            assert_eq!(
+                view.error.as_ref().map(ToString::to_string).as_deref(),
+                Some(expected)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn generation_status_save_failure_names_no_missing_control(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_status_save_failure(
+            true,
+            "Could not save this generation's status. The result shown here is not affected.",
+            cx,
+        )
+        .await;
+    }
+
+    #[gpui::test]
+    async fn generation_status_save_failure_keeps_the_job_failure(cx: &mut gpui::TestAppContext) {
+        assert_status_save_failure(false, "The model refused this prompt.", cx).await;
     }
 
     #[gpui::test]
@@ -9055,6 +9847,77 @@ mod tests {
 
         submission.options[1].value = "3".into();
         assert!(build_screen_request(&model, &submission, None, None, None).is_err());
+    }
+
+    #[test]
+    fn option_labels_read_as_plain_words_and_keep_millisecond_lengths() {
+        assert_eq!(option_label("num_outputs"), "Number of outputs");
+        assert_eq!(option_label("cfg_scale"), "Guidance scale");
+        assert_eq!(option_choice_label("quality", "pro"), "pro");
+        assert_eq!(option_choice_label("quality", "pro_max"), "pro max");
+        assert_eq!(
+            option_choice_label("output_format", "mp3_44100_128"),
+            "mp3 44100 128"
+        );
+        assert_eq!(option_choice_label("music_length_ms", "30000"), "30 s");
+        assert_eq!(option_choice_label("music_length_ms", "2500"), "2.5 s");
+        assert_eq!(option_choice_label("music_length_ms", "2999"), "2.999 s");
+        assert_eq!(option_choice_label("music_length_ms", "500"), "0.5 s");
+    }
+
+    #[test]
+    fn invalid_control_values_name_the_control_label() {
+        let mut video = model("video");
+        video.capabilities = json!({
+            "operations": ["text_to_video"],
+            "controls": {
+                "fps": {"default": 16, "location": "input"},
+                "generate_audio": {"default": true, "location": "input"}
+            }
+        });
+        for (key, value, expected) in [
+            ("fps", "fast", "Choose a valid frame rate."),
+            (
+                "generate_audio",
+                "maybe",
+                "Choose On or Off for Generate audio.",
+            ),
+        ] {
+            let mut submission =
+                screen_submission(&video, GenerationRecipe::TextVideo, "A fox running");
+            submission
+                .options
+                .push(fanta_gpui::generation::GenerationOptionSelection {
+                    key: key.into(),
+                    value: value.into(),
+                });
+            let error = build_screen_request(&video, &submission, None, None, None)
+                .expect_err("invalid control value");
+            assert_eq!(error.to_string(), expected);
+        }
+        let mut legacy = model("image");
+        legacy.capabilities = json!({"steps": {"min": 10, "max": 50}});
+        for (steps, expected) in [
+            ("many", "Enter a valid value for Steps."),
+            ("60", "Steps must be between 10 and 50."),
+        ] {
+            let error = build_request(
+                &legacy,
+                "A fox",
+                "",
+                "1024x1024",
+                "",
+                steps,
+                "",
+                "",
+                "",
+                None,
+                None,
+                &[],
+            )
+            .expect_err("invalid legacy steps");
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[gpui::test]
