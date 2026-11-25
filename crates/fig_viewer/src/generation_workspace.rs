@@ -1136,6 +1136,18 @@ async fn persist_generation_status(
         .map(Some)
 }
 
+// A running job is saved again by its next poll; a finished one already shows its result.
+fn status_save_failure(error: &anyhow::Error, still_running: bool) -> SharedString {
+    let next = if still_running {
+        "Fanta will try again at the next status check."
+    } else {
+        "The result shown here is not affected."
+    };
+    // The cause is a local storage error the user cannot act on, so it goes to the log.
+    log::error!("Could not save generation status: {error:#}");
+    format!("Could not save this generation's status. {next}").into()
+}
+
 #[derive(Debug)]
 struct ApiRejected {
     status: u16,
@@ -3446,11 +3458,13 @@ impl GenerationWorkspace {
                             };
                             this.accept_response(&response, cx);
                             if let Some(error) = persistence_error {
-                                this.error = Some(format!("The saved status could not be updated: {error}. Check status again to finish recovery.").into());
+                                this.error =
+                                    Some(status_save_failure(&error, response.should_poll()));
                             }
                             true
                         })
-                        .log_err().unwrap_or(false);
+                        .log_err()
+                        .unwrap_or(false);
                     if !applied {
                         return;
                     }
@@ -3580,33 +3594,41 @@ impl GenerationWorkspace {
             .await
             .and_then(parse_generation_response)
             .and_then(|response| {
-                ensure!(response.id == generation_id, "The status response did not match the saved generation.");
+                ensure!(
+                    response.id == generation_id,
+                    "The status response did not match the saved generation."
+                );
                 Ok(response)
             });
             match result {
                 Ok(mut response) => {
-                    let persisted = persist_generation_status(&journal, &mut response, account.clone(), cx).await;
-                    let applied = this.update(cx, |this, cx| {
-                        if this.client.account_access_token() != account {
-                            this.sync_account(cx);
-                            return false;
-                        }
-                        let persistence_error = match persisted {
-                            Ok(restored) => {
-                                if let Some((submissions, history, unreadable)) = restored {
-                                    this.restore_history(submissions, history, unreadable);
-                                }
-                                None
+                    let persisted =
+                        persist_generation_status(&journal, &mut response, account.clone(), cx)
+                            .await;
+                    let applied = this
+                        .update(cx, |this, cx| {
+                            if this.client.account_access_token() != account {
+                                this.sync_account(cx);
+                                return false;
                             }
-                            Err(error) => Some(error),
-                        };
-                        this.accept_response(&response, cx);
-                        if let Some(error) = persistence_error {
-                            this.error = Some(format!("The saved status could not be updated: {error}. Check status again to finish recovery.").into());
-                        }
-                        true
-                    })
-                        .log_err().unwrap_or(false);
+                            let persistence_error = match persisted {
+                                Ok(restored) => {
+                                    if let Some((submissions, history, unreadable)) = restored {
+                                        this.restore_history(submissions, history, unreadable);
+                                    }
+                                    None
+                                }
+                                Err(error) => Some(error),
+                            };
+                            this.accept_response(&response, cx);
+                            if let Some(error) = persistence_error {
+                                this.error =
+                                    Some(status_save_failure(&error, response.should_poll()));
+                            }
+                            true
+                        })
+                        .log_err()
+                        .unwrap_or(false);
                     if applied && response.should_poll() {
                         Self::poll(
                             this.clone(),
@@ -3628,7 +3650,8 @@ impl GenerationWorkspace {
                         }
                         this.fail(error, cx);
                         this.pending = still_running;
-                    }).log_err();
+                    })
+                    .log_err();
                 }
             }
             this.update(cx, |this, cx| {
@@ -7897,6 +7920,78 @@ mod tests {
             7,
             "only the oldest unreadable request gives way"
         );
+    }
+
+    #[gpui::test]
+    async fn generation_status_save_failure_names_no_missing_control(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("generated image");
+        let completed = json!({
+            "id": "status-save", "status": "succeeded", "model": "fanta-image-1",
+            "output": [{"data_url": format!("data:image/png;base64,{}", STANDARD.encode(png.into_inner()))}],
+        });
+        let http = http_client::FakeHttpClient::create(move |request| {
+            let completed = completed.clone();
+            async move {
+                let response = match (request.method(), request.uri().path()) {
+                    (&Method::GET, "/v1/models") => json!({"models": []}),
+                    (&Method::GET, "/v1/me") => recovery_account_fixture(),
+                    (&Method::POST, "/v1/generations") => {
+                        json!({"id": "status-save", "status": "processing"})
+                    }
+                    (&Method::GET, "/v1/generations/status-save") => completed,
+                    route => panic!("Unexpected generation request: {route:?}"),
+                };
+                Ok(http_client::Response::builder()
+                    .status(200)
+                    .body(response.to_string().into())?)
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Image, client, cx);
+        view.update(cx, |view, cx| {
+            view.submit(
+                Submission {
+                    key: "status-save".into(),
+                    request: json!({"model": "fanta-image-1", "prompt": "A sunrise"}),
+                    model: "fanta-image-1".into(),
+                    prompt: "A sunrise".into(),
+                    source: None,
+                    account,
+                    mode: GenerationMode::Image,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.pending));
+        let database = cx.update(|_, cx| db::kvp::KeyValueStore::global(cx));
+        database
+            .write(|connection| {
+                connection.exec(
+                    "CREATE TRIGGER fail_status_save BEFORE INSERT ON scoped_kv_store
+                     BEGIN SELECT RAISE(FAIL,'disk write failed'); END;",
+                )?()
+            })
+            .await
+            .expect("install storage failure");
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.outputs.len(), 1);
+            assert_eq!(
+                view.error.as_ref().map(ToString::to_string).as_deref(),
+                Some(
+                    "Could not save this generation's status. The result shown here is not affected."
+                )
+            );
+        });
     }
 
     #[gpui::test]
