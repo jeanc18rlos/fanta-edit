@@ -6613,3 +6613,38 @@ fn scroll_to_inside_an_overlay_leaves_the_base_camera_alone() {
         "a ScrollTo fired in an overlay must not move the base frame's camera"
     );
 }
+
+#[test]
+fn navigating_or_opening_an_overlay_to_a_missing_frame_reports_a_diagnostic() {
+    let missing = CanvasNode::new(NodeData::Group(GroupNode::default())).id;
+    for action in [
+        Action::Navigate { to: missing },
+        Action::OpenOverlay {
+            frame: missing,
+            overlay: OverlaySettings {
+                position: OverlayPosition::Center,
+                background_dim: false,
+                close_on_click_outside: false,
+            },
+        },
+    ] {
+        let mut doc = Doc::new();
+        let mut a = frame(0.0);
+        let a_id = a.id;
+        a.reactions.push(click(1, Trigger::Click, action.clone()));
+        doc.apply(Operation::create_node(a)).unwrap();
+        let mut session = PresentSession::new(&doc, Some(a_id), DVec2::splat(200.0)).unwrap();
+        session.take_playback_events();
+
+        session.handle_pointer(DVec2::new(100.0, 100.0), PointerEvent::Click);
+
+        assert_eq!(session.current_frame(), a_id);
+        assert!(
+            session.take_playback_events().iter().any(|event| matches!(
+                event,
+                PlaybackEvent::Diagnostic { diagnostic } if diagnostic.code == "targetMissing"
+            )),
+            "{action:?} to a deleted frame must report why nothing happened"
+        );
+    }
+}

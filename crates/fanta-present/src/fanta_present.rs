@@ -2973,6 +2973,7 @@ impl PlaybackSession {
         match action {
             Action::Navigate { to } => {
                 if !self.doc.scene.contains(*to) {
+                    self.report_missing_target("Navigate");
                     return PresentResponse::default();
                 }
                 let from_frame = self.current;
@@ -3437,6 +3438,15 @@ impl PlaybackSession {
 
     /// Push an overlay frame onto the stack, placed per its settings at the
     /// current layer's zoom. A missing or bounds-less overlay frame is a no-op.
+    fn report_missing_target(&mut self, action: &str) {
+        self.playback_events.push(PlaybackEvent::Diagnostic {
+            diagnostic: PlaybackDiagnostic {
+                code: "targetMissing".into(),
+                message: format!("{action} points at a frame that no longer exists"),
+            },
+        });
+    }
+
     fn open_overlay(
         &mut self,
         frame: NodeId,
@@ -3444,6 +3454,7 @@ impl PlaybackSession {
         transition: Option<&Transition>,
     ) -> PresentResponse {
         if !self.doc.scene.contains(frame) {
+            self.report_missing_target("Open overlay");
             return PresentResponse::default();
         }
         let resolved = self.resolved_layer_with_identity(frame, self.next_layer, false);
