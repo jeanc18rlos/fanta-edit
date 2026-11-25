@@ -29,7 +29,8 @@ impl AgentPanelOnboarding {
                 | language_model::Event::AddedProvider(_)
                 | language_model::Event::RemovedProvider(_)
                 | language_model::Event::ProvidersChanged => {
-                    this.has_configured_providers = Self::has_configured_providers(cx)
+                    this.has_configured_providers = Self::has_configured_providers(cx);
+                    cx.notify();
                 }
                 _ => {}
             },

@@ -359,6 +359,66 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_failed_catalog_refresh_keeps_the_live_models(cx: &mut TestAppContext) {
+        let (client, credentials_provider) = cx.update(init_test);
+        client.http_client().as_fake().replace_handler(|_, request| async move {
+            let body = if request.uri().path() == "/v1/models" {
+                serde_json::json!({ "models": [
+                    { "id": "gpt-6-sol", "kind": "chat", "capabilities": { "display_name": "GPT-6 Sol", "tools": true } }
+                ] })
+                .to_string()
+            } else {
+                "{}".to_string()
+            };
+            Ok(http_client::Response::builder().status(200).body(body.into())?)
+        });
+        let provider = cx.update(|cx| {
+            AnthropicCompatibleLanguageModelProvider::new(
+                "Fanta".into(),
+                client.clone(),
+                credentials_provider,
+                cx,
+            )
+        });
+        client.override_authenticate(|_| {
+            gpui::Task::ready(Ok(client::Credentials {
+                user_id: 1,
+                access_token: "fnt_live_account_token".into(),
+            }))
+        });
+        client
+            .sign_in(false, &cx.to_async())
+            .await
+            .expect("test account sign-in failed");
+        cx.run_until_parked();
+        let model_ids = |cx: &mut TestAppContext| {
+            cx.update(|cx| provider.provided_models(cx))
+                .iter()
+                .map(|model| model.id().0.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(model_ids(cx), ["gpt-6-sol"]);
+
+        client.http_client().as_fake().replace_handler(|_, request| async move {
+            let status = if request.uri().path() == "/v1/models" { 503 } else { 200 };
+            Ok(http_client::Response::builder()
+                .status(status)
+                .body("<html>Service Unavailable</html>".into())?)
+        });
+        client
+            .sign_in(false, &cx.to_async())
+            .await
+            .expect("test account sign-in refresh failed");
+        cx.run_until_parked();
+
+        assert_eq!(model_ids(cx), ["gpt-6-sol"]);
+        assert_eq!(
+            cx.update(|cx| provider.catalog_error(cx)).as_deref(),
+            Some("Could not refresh the Fanta model list. The last list loaded is shown.")
+        );
+    }
+
+    #[gpui::test]
     async fn test_managed_provider_uses_account_token_for_streaming(cx: &mut TestAppContext) {
         let (client, credentials_provider) = cx.update(init_test);
         let provider = cx.update(|cx| {
@@ -438,6 +498,31 @@ mod tests {
             Err(language_model::LanguageModelCompletionError::PaymentRequired)
         ));
 
+        client
+            .http_client()
+            .as_fake()
+            .replace_handler(|_, _| async move {
+                Ok(http_client::Response::builder()
+                    .status(402)
+                    .body("insufficient_credits".into())?)
+            });
+        assert!(matches!(
+            model
+                .stream_completion(LanguageModelRequest::default(), &cx.to_async())
+                .await,
+            Err(language_model::LanguageModelCompletionError::PaymentRequired)
+        ));
+        assert!(
+            provider
+                .missing_credentials_error_message()
+                .contains("Sign in to Fanta")
+        );
+        assert!(
+            provider
+                .authentication_error_message()
+                .contains("sign in again")
+        );
+
         client.sign_out(&cx.to_async()).await;
         assert!(!cx.update(|cx| provider.is_authenticated(cx)));
         assert!(matches!(
@@ -477,6 +562,11 @@ mod tests {
             cx.update(|cx| provider.authenticate(cx)).await,
             Err(AuthenticateError::CredentialsNotFound)
         ));
+        assert!(
+            provider
+                .missing_credentials_error_message()
+                .contains("No API key is configured for external")
+        );
     }
 
     #[gpui::test]
