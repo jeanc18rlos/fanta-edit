@@ -1136,6 +1136,14 @@ async fn persist_generation_status(
         .map(Some)
 }
 
+fn released_unreadable_notice(released: usize) -> Option<String> {
+    match released {
+        0 => None,
+        1 => Some("Removed 1 saved request that this version of Fanta could not read, to make room for a new one. Any result it produced stays in the gallery.".into()),
+        count => Some(format!("Removed {count} saved requests that this version of Fanta could not read, to make room for a new one. Any results they produced stay in the gallery.")),
+    }
+}
+
 // A running job is saved again by its next poll; a finished one already shows its result.
 fn status_save_failure(error: &anyhow::Error, still_running: bool) -> SharedString {
     let next = if still_running {
@@ -3293,9 +3301,10 @@ impl GenerationWorkspace {
         self.error = None;
         self.status = "Saving your request for recovery…".into();
         self.task = Some(cx.spawn(async move |this, cx| {
+            let mut released = 0;
             let result = async {
                 if !unreadable.is_empty() {
-                    journal.release_unreadable(unreadable).await?;
+                    released = journal.release_unreadable(key.clone(), unreadable).await?;
                 }
                 let previous = journal.prepare(saved).await.map_err(|error| anyhow!("{error:#}"))?;
                 let mut response = match &previous.result {
@@ -3366,6 +3375,12 @@ impl GenerationWorkspace {
                         this.clear_playback(cx);
                         this.preview_request = None;
                         this.accept_response(&response, cx);
+                        if let Some(notice) = released_unreadable_notice(released) {
+                            this.error = Some(match this.error.take() {
+                                Some(error) => format!("{error} {notice}"),
+                                None => notice,
+                            }.into());
+                        }
                         true
                     }).log_err().unwrap_or(false);
                     if applied && response.should_poll() {
@@ -3373,6 +3388,9 @@ impl GenerationWorkspace {
                     }
                 }
                 Err(mut error) => {
+                    if let Some(notice) = released_unreadable_notice(released) {
+                        error = anyhow!("{error} {notice}");
+                    }
                     let mut discarded = false;
                     if error.downcast_ref::<ApiRejected>().is_some_and(|error| {
                         error.unreserved && error.status < 500 && error.status != 409 && !retrying
@@ -6889,6 +6907,17 @@ mod tests {
     }
 
     #[test]
+    fn released_unreadable_notice_counts_the_removed_requests() {
+        assert_eq!(released_unreadable_notice(0), None);
+        assert_eq!(
+            released_unreadable_notice(2).as_deref(),
+            Some(
+                "Removed 2 saved requests that this version of Fanta could not read, to make room for a new one. Any results they produced stay in the gallery."
+            )
+        );
+    }
+
+    #[test]
     fn restoring_saved_experiments_skips_an_unreadable_record() {
         let record = |key: &str, mode: &str| JournalRecord {
             key: key.into(),
@@ -8006,7 +8035,12 @@ mod tests {
         });
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert!(view.error.is_none(), "{:?}", view.error);
+            assert_eq!(
+                view.error.as_ref().map(ToString::to_string).as_deref(),
+                Some(
+                    "Removed 1 saved request that this version of Fanta could not read, to make room for a new one. Any result it produced stays in the gallery."
+                )
+            );
             assert_eq!(
                 view.history.first().and_then(RunSummary::generation_id),
                 Some("after-unreadable")
