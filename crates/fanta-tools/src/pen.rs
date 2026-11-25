@@ -35,6 +35,12 @@ use smallvec::SmallVec;
 const PEN_STROKE_WIDTH: f64 = 2.0;
 /// Screen distance within which a press on the first anchor closes the path.
 const CLOSE_PX: f64 = 10.0;
+/// A closed shape thinner than this on average, in screen pixels, draws as an
+/// invisible sliver. Mean width (twice the area over the perimeter) rather
+/// than area, because a sliver along a long segment has a large area: a
+/// 1-pixel release jitter on a 100-pixel segment encloses about 60 square
+/// pixels but is only 0.6 pixels wide.
+const MIN_CLOSED_WIDTH_PX: f64 = 1.0;
 
 /// One placed anchor: a position plus optional in/out tangent handles, stored as
 /// world-space DELTAS from the anchor (so they transform with the node later).
@@ -66,6 +72,8 @@ pub struct PenTool {
     cursor: DVec2,
     /// The pointer is within the close distance of the first anchor.
     closing: bool,
+    /// Viewport zoom at the last pointer event, to measure a close in pixels.
+    zoom: f64,
     /// The color of the last press, kept for a commit on a tool switch whose
     /// context carries the next tool's color.
     color: Option<Color>,
@@ -131,6 +139,7 @@ impl Tool for PenTool {
 
 impl PenTool {
     fn handle_pointer(&mut self, ctx: &mut ToolContext, p: PointerEvent) -> ToolResponse {
+        self.zoom = ctx.viewport.zoom;
         match p {
             PointerEvent::Press {
                 screen,
@@ -220,13 +229,30 @@ impl PenTool {
                 .is_some_and(|first| ctx.world_to_screen(first.pos).distance(screen) <= CLOSE_PX)
     }
 
-    /// Two straight anchors close into a fill with no area, which cannot be seen.
+    /// Whether closing the draft encloses a shape wide enough to see.
     fn close_has_area(&self) -> bool {
-        self.anchors.len() > 2
-            || self
-                .anchors
-                .iter()
-                .any(|anchor| anchor.tan_in.is_some() || anchor.tan_out.is_some())
+        let outline = self.closed_outline();
+        let mut twice_area = 0.0;
+        let mut perimeter = 0.0;
+        for (index, point) in outline.iter().enumerate() {
+            let next = outline[(index + 1) % outline.len()];
+            twice_area += point[0] * next[1] - next[0] * point[1];
+            perimeter += DVec2::from(*point).distance(DVec2::from(next));
+        }
+        perimeter > 0.0 && twice_area.abs() / perimeter * self.zoom >= MIN_CLOSED_WIDTH_PX
+    }
+
+    /// The draft flattened, ending with the closing segment back to the first anchor.
+    fn closed_outline(&self) -> Vec<[f64; 2]> {
+        let (Some(first), Some(last)) = (self.anchors.first(), self.anchors.last()) else {
+            return Vec::new();
+        };
+        let mut points = vec![[first.pos.x, first.pos.y]];
+        for pair in self.anchors.windows(2) {
+            flatten_segment(&mut points, &pair[0], &pair[1]);
+        }
+        flatten_segment(&mut points, last, first);
+        points
     }
 
     /// Snap against the scene and the draft's own anchors.
@@ -792,6 +818,74 @@ mod tests {
             }
             _ => panic!("expected vector"),
         }
+    }
+
+    fn committed_vector(ctx: &ToolContext) -> VectorNode {
+        let id = ctx.doc.scene.roots()[0];
+        match ctx.doc.scene.get(id).map(|node| &node.data) {
+            Some(NodeData::Vector(vector)) => vector.clone(),
+            other => panic!("expected a vector, got {other:?}"),
+        }
+    }
+
+    /// Three anchors on one line enclose nothing, so closing commits the open path.
+    #[test]
+    fn closing_collinear_anchors_commits_the_open_path() {
+        let (mut doc, mut viewport, snap, size) = ctx_pieces();
+        let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+        let mut tool = PenTool::new();
+        click(&mut tool, &mut ctx, [400.0, 300.0]);
+        click(&mut tool, &mut ctx, [500.0, 300.0]);
+        click(&mut tool, &mut ctx, [600.0, 300.0]);
+        click(&mut tool, &mut ctx, [400.0, 300.0]);
+        assert!(!tool.is_drafting());
+        let vector = committed_vector(&ctx);
+        assert!(!matches!(
+            vector.path.segments.last(),
+            Some(PathSegment::Close)
+        ));
+        assert_eq!(vector.strokes.len(), 1);
+        assert!(vector.fills.is_empty());
+    }
+
+    /// A click whose release jitters by a pixel leaves a tiny handle; closing
+    /// two such anchors would make a sliver, so it commits the open line.
+    #[test]
+    fn closing_two_anchors_with_click_jitter_commits_the_open_line() {
+        let (mut doc, mut viewport, snap, size) = ctx_pieces();
+        let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+        let mut tool = PenTool::new();
+        click(&mut tool, &mut ctx, [400.0, 300.0]);
+        tool.handle_event(&mut ctx, press([500.0, 300.0]));
+        tool.handle_event(&mut ctx, mv([500.0, 301.0]));
+        tool.handle_event(&mut ctx, release([500.0, 301.0]));
+        click(&mut tool, &mut ctx, [400.0, 300.0]);
+        assert!(!tool.is_drafting());
+        let vector = committed_vector(&ctx);
+        assert!(!matches!(
+            vector.path.segments.last(),
+            Some(PathSegment::Close)
+        ));
+        assert!(vector.fills.is_empty());
+    }
+
+    /// Two anchors with a real handle enclose a lens, so they still close.
+    #[test]
+    fn closing_two_anchors_with_a_handle_fills_the_shape() {
+        let (mut doc, mut viewport, snap, size) = ctx_pieces();
+        let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+        let mut tool = PenTool::new();
+        click(&mut tool, &mut ctx, [400.0, 300.0]);
+        tool.handle_event(&mut ctx, press([500.0, 300.0]));
+        tool.handle_event(&mut ctx, mv([500.0, 340.0]));
+        tool.handle_event(&mut ctx, release([500.0, 340.0]));
+        click(&mut tool, &mut ctx, [400.0, 300.0]);
+        let vector = committed_vector(&ctx);
+        assert!(matches!(
+            vector.path.segments.last(),
+            Some(PathSegment::Close)
+        ));
+        assert_eq!(vector.fills.len(), 1);
     }
 
     #[test]
