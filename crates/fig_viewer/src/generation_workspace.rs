@@ -5798,6 +5798,8 @@ fn option_label(key: &str) -> String {
         "generate_audio" => return "Generate audio".into(),
         "force_instrumental" => return "Instrumental".into(),
         "enable_prompt_expansion" => return "Prompt expansion".into(),
+        "num_outputs" => return "Number of outputs".into(),
+        "cfg_scale" => return "Guidance scale".into(),
         _ => {}
     }
     let mut words = key.split('_');
@@ -5832,7 +5834,10 @@ fn option_choice_label(key: &str, value: &str) -> String {
     }
     if key == "music_length_ms" {
         if let Ok(milliseconds) = value.parse::<u64>() {
-            return format!("{} s", milliseconds / 1000);
+            if milliseconds % 1000 == 0 {
+                return format!("{} s", milliseconds / 1000);
+            }
+            return format!("{} s", milliseconds as f64 / 1000.);
         }
     }
     if key == "aspect_ratio" {
@@ -5844,7 +5849,12 @@ fn option_choice_label(key: &str, value: &str) -> String {
         };
     }
     if value.contains('_') {
-        return value.replace('_', " ");
+        let mut chars = value.chars();
+        return chars
+            .next()
+            .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+            .unwrap_or_default()
+            .replace('_', " ");
     }
     value.to_owned()
 }
@@ -9680,6 +9690,17 @@ mod tests {
 
         submission.options[1].value = "3".into();
         assert!(build_screen_request(&model, &submission, None, None, None).is_err());
+    }
+
+    #[test]
+    fn option_labels_read_as_plain_words_and_keep_millisecond_lengths() {
+        assert_eq!(option_label("num_outputs"), "Number of outputs");
+        assert_eq!(option_label("cfg_scale"), "Guidance scale");
+        assert_eq!(option_choice_label("quality", "pro_max"), "Pro max");
+        assert_eq!(option_choice_label("music_length_ms", "30000"), "30 s");
+        assert_eq!(option_choice_label("music_length_ms", "2500"), "2.5 s");
+        assert_eq!(option_choice_label("music_length_ms", "2999"), "2.999 s");
+        assert_eq!(option_choice_label("music_length_ms", "500"), "0.5 s");
     }
 
     #[test]
