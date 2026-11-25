@@ -1362,6 +1362,40 @@ fn effect_ref(effect_id: &str) -> Option<EffectRef> {
     None
 }
 
+/// Moves one effect of the panel's list, which shows the node's shadows and
+/// then its blurs. `None` when the move crosses from one list to the other:
+/// the engine always draws shadows before blurs, so that order cannot be saved.
+fn effect_reorder_operations(
+    doc: &Doc,
+    id: NodeId,
+    from_index: usize,
+    to_index: usize,
+) -> Option<Vec<Operation>> {
+    let Some(node) = doc.scene.get(id) else {
+        return Some(Vec::new());
+    };
+    let shadows = node.effects.len();
+    match (from_index < shadows, to_index < shadows) {
+        (true, true) => Some(effects_operations(doc, id, |effects| {
+            move_list_item(effects, from_index, to_index)
+        })),
+        (false, false) => Some(blurs_operations(doc, id, |blurs| {
+            move_list_item(blurs, from_index - shadows, to_index - shadows)
+        })),
+        _ => None,
+    }
+}
+
+fn move_list_item<T>(list: &mut [T], from: usize, to: usize) {
+    if from < to {
+        if let Some(range) = list.get_mut(from..=to) {
+            range.rotate_left(1);
+        }
+    } else if let Some(range) = list.get_mut(to..=from) {
+        range.rotate_right(1);
+    }
+}
+
 fn design_layout(
     doc: &Doc,
     node: &fanta_doc::CanvasNode,
@@ -4665,8 +4699,35 @@ impl FigView {
                     Some(grid_track_action_operations(doc, id, action))
                 });
             }
-            DesignPanelAction::EffectReorderRequested { .. } => {
-                crate::view::notify_unavailable(UNWIRED_CONTROL, window, cx);
+            DesignPanelAction::EffectReorderRequested {
+                node_id: id,
+                from_index,
+                to_index,
+                ..
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.finish_document_edits_for_external_change(cx);
+                let mut crosses_lists = false;
+                let ops = self.design_ops(cx, |doc| {
+                    effect_reorder_operations(doc, id, *from_index, *to_index).unwrap_or_else(
+                        || {
+                            crosses_lists = true;
+                            Vec::new()
+                        },
+                    )
+                });
+                if crosses_lists {
+                    crate::view::show_canvas_notice(
+                        "Could not move that effect there: shadows are always drawn before blurs."
+                            .to_string(),
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+                self.design_apply_ops(ops, cx);
             }
             _ => {
                 log::debug!("fig design adapter: unhandled action {action:?}");
@@ -11750,6 +11811,71 @@ mod tests {
             item.read_with(&visual, |item, _| {
                 let doc = item.doc().expect("document");
                 assert_eq!(grid_tracks(doc, group), before, "{action:?}");
+                assert_eq!(doc.history.undo_depth(), depth);
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn effect_drag_reorders_shadows_and_blurs_with_one_undo_each(cx: &mut TestAppContext) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        let node = doc.scene.get_mut(rect).expect("rectangle");
+        node.effects.push(default_shadow());
+        node.effects.push(Shadow {
+            kind: ShadowKind::Inner,
+            ..default_shadow()
+        });
+        node.blurs.push(default_blur(BlurKind::Layer));
+        node.blurs.push(default_blur(BlurKind::Background));
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut visual) = setup_view(doc, cx).await;
+        let item = view.read_with(&visual, |view, _| view.item().clone());
+        use DesignEffectKind::{BackgroundBlur, DropShadow, InnerShadow, LayerBlur};
+        for (from_index, to_index, expected) in [
+            (0, 1, [InnerShadow, DropShadow, LayerBlur, BackgroundBlur]),
+            (3, 2, [DropShadow, InnerShadow, BackgroundBlur, LayerBlur]),
+        ] {
+            let depth = item.read_with(&visual, |item, _| {
+                item.doc().expect("document").history.undo_depth()
+            });
+            panel.update_in(&mut visual, |_, _, cx| {
+                cx.emit(DesignPanelAction::EffectReorderRequested {
+                    node_id: rect.to_string().into(),
+                    effect_id: SharedString::default(),
+                    from_index,
+                    to_index,
+                })
+            });
+            visual.run_until_parked();
+            let kinds = |doc: &Doc| {
+                design_effects(doc.scene.get(rect).expect("rectangle"))
+                    .iter()
+                    .map(|effect| effect.kind)
+                    .collect::<Vec<_>>()
+            };
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(kinds(doc), expected);
+                assert_eq!(doc.history.undo_depth(), depth + 1);
+            });
+            let echoed = panel.read_with(&visual, |panel, _| {
+                panel
+                    .node()
+                    .effects
+                    .iter()
+                    .map(|effect| effect.kind)
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(echoed, expected, "the panel shows the new order");
+            item.update(&mut visual, |item, cx| {
+                assert!(item.undo(cx).expect("one Undo"));
+            });
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(
+                    kinds(doc),
+                    [DropShadow, InnerShadow, LayerBlur, BackgroundBlur]
+                );
                 assert_eq!(doc.history.undo_depth(), depth);
             });
         }

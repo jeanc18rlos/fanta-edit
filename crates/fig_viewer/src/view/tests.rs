@@ -8981,7 +8981,7 @@ async fn mounted_bound_instance_text_double_click_explains_refusal_without_editi
 
 #[cfg(feature = "fanta-gpui-ui")]
 #[gpui::test]
-async fn unwired_grid_track_and_effect_reorder_controls_explain_themselves(
+async fn effect_move_between_shadows_and_blurs_explains_refusal(
     cx: &mut TestAppContext,
 ) {
     use fanta_gpui::design::DesignPanelAction;
@@ -8989,9 +8989,13 @@ async fn unwired_grid_track_and_effect_reorder_controls_explain_themselves(
     let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
     let (mut doc, text, _) = text_selection_doc(false);
     doc.selection.select_only(text);
+    let node = doc.scene.get_mut(text).expect("text layer");
+    node.effects.push(crate::properties_ops::default_shadow());
+    node.blurs
+        .push(crate::properties_ops::default_blur(fanta_doc::BlurKind::Layer));
     let item = crate::document::ready_item_for_test(
         &project,
-        std::path::PathBuf::from("/tmp/Unwired.fig"),
+        std::path::PathBuf::from("/tmp/Effects.fig"),
         doc,
         cx,
     );
@@ -9009,35 +9013,39 @@ async fn unwired_grid_track_and_effect_reorder_controls_explain_themselves(
         view
     });
     visual.run_until_parked();
-    let notice = NotificationId::named(CANVAS_NOTICE_ID.into());
-    let mut emit_and_check = |action: DesignPanelAction, expect_notice: bool| {
-        visual.update(|window, cx| {
-            view.update(cx, |view, cx| {
-                view.refresh_gpui_design(cx);
-                let panel = view.gpui_design.as_ref().expect("Design").panel.clone();
-                view.handle_design_action(&panel, &action, window, cx);
-            })
-        });
-        visual.run_until_parked();
-        workspace.update(visual, |workspace, cx| {
-            assert_eq!(
-                workspace.notification_ids().contains(&notice),
-                expect_notice,
-                "{action:?}"
-            );
-            workspace.dismiss_toast(&notice, cx);
-        });
+    let before = item.read_with(visual, |item, _| {
+        let doc = item.doc().expect("document");
+        (
+            serde_json::to_value(&doc.scene).expect("scene"),
+            doc.history.undo_depth(),
+        )
+    });
+    let action = DesignPanelAction::EffectReorderRequested {
+        node_id: text.to_string().into(),
+        effect_id: "shadow-0".into(),
+        from_index: 0,
+        to_index: 1,
     };
-    let node_id: SharedString = text.to_string().into();
-    emit_and_check(
-        DesignPanelAction::EffectReorderRequested {
-            node_id,
-            effect_id: "effect-0".into(),
-            from_index: 0,
-            to_index: 1,
-        },
-        true,
-    );
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.refresh_gpui_design(cx);
+            let panel = view.gpui_design.as_ref().expect("Design").panel.clone();
+            view.handle_design_action(&panel, &action, window, cx);
+        })
+    });
+    visual.run_until_parked();
+    let notice = NotificationId::named(CANVAS_NOTICE_ID.into());
+    workspace.read_with(visual, |workspace, _| {
+        assert!(
+            workspace.notification_ids().contains(&notice),
+            "moving a shadow below a blur says why it cannot"
+        );
+    });
+    item.read_with(visual, |item, _| {
+        let doc = item.doc().expect("document");
+        assert_eq!(serde_json::to_value(&doc.scene).expect("scene"), before.0);
+        assert_eq!(doc.history.undo_depth(), before.1);
+    });
 }
 
 #[gpui::test]
