@@ -9448,6 +9448,27 @@ mod tests {
         assert!(!cx.update(|_, cx| OnboardingUpsell::dismissed(cx)));
     }
 
+    #[gpui::test]
+    async fn test_dismissing_onboarding_while_signed_in_is_remembered(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let client = panel.read_with(&cx, |panel, cx| {
+            panel
+                .workspace
+                .upgrade()
+                .map(|workspace| workspace.read(cx).client().clone())
+        });
+        let client = client.expect("the panel's workspace should be alive");
+        let _server = client::test::FakeServer::for_client(1, &client, &cx).await;
+        cx.run_until_parked();
+
+        panel.update(&mut cx, |panel, cx| {
+            assert!(panel.user_store.read(cx).current_user().is_some());
+            panel.dismiss_ai_onboarding(cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.update(|_, cx| OnboardingUpsell::dismissed(cx)));
+    }
+
     async fn setup_visible_panel(
         cx: &mut TestAppContext,
     ) -> (Entity<AgentPanel>, VisualTestContext) {
