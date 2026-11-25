@@ -676,6 +676,12 @@ impl FantaMotionPanel {
         let value = edited
             .then(|| parse_motion_numeric_value(property, text.trim()))
             .flatten();
+        if edited && value.is_none() {
+            show_canvas_notice_deferred(
+                format!("Could not set {}: enter a number", property.label()),
+                cx,
+            );
+        }
         if let Some(value) = value.clone() {
             self.preview_property_value(value, cx);
         }
@@ -3114,6 +3120,28 @@ mod tests {
         assert!(
             shows_canvas_notice(&mounted.workspace, cx),
             "a typed value that could not be committed must not vanish silently"
+        );
+        mounted.item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0)
+        });
+    }
+
+    #[gpui::test]
+    async fn invalid_numeric_motion_input_shows_a_notice(cx: &mut gpui::TestAppContext) {
+        let (mut document, _) = document_with_selected_node();
+        let clip = create_clip(&mut document, "Invalid input");
+        document.history = Default::default();
+        let (mounted, cx) = mount_panel_in_workspace(document, clip, cx).await;
+        type_into_position_x(&mounted.panel, "12px", cx);
+
+        mounted
+            .panel
+            .update(cx, |panel, cx| panel.commit_numeric_property(cx));
+        cx.run_until_parked();
+
+        assert!(
+            shows_canvas_notice(&mounted.workspace, cx),
+            "rejected input must say why the field reverted"
         );
         mounted.item.read_with(cx, |item, _| {
             assert_eq!(item.doc().expect("document").history.undo_depth(), 0)
