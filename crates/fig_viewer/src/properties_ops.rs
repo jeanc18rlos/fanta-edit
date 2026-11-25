@@ -6,9 +6,9 @@
 
 use fanta_canvas::transform_angle;
 use fanta_doc::{
-    BlendMode, Blur, BlurKind, Bounds as FantaBounds, Color as FantaColor, ComponentPropId, Doc,
-    Fill, Gradient, GroupNode, LayoutMode, NodeData, NodeId, Operation, Shadow, Transform2D,
-    UnitInterval, VarValue,
+    BlendMode, Blur, BlurKind, BoundProp, Bounds as FantaBounds, Color as FantaColor,
+    ComponentPropId, Doc, Fill, Gradient, GroupNode, LayoutMode, NodeData, NodeId, Operation,
+    Shadow, Transform2D, UnitInterval, VarValue,
 };
 use glam::DVec2;
 use gpui::Rgba;
@@ -1140,6 +1140,93 @@ pub(crate) fn add_fill(data: &mut NodeData) {
             }
         }
         _ => {}
+    }
+}
+
+/// `paint_edit`, a change to `id`'s fills or strokes, preceded by the
+/// bind/unbind operations that keep each variable binding on its paint:
+/// `new_index` maps an old paint index to its new one, `None` for a removed
+/// paint. Nothing when the paint edit changes nothing.
+pub(crate) fn with_paint_bindings_remapped(
+    doc: &Doc,
+    id: NodeId,
+    is_stroke: bool,
+    new_index: impl Fn(usize) -> Option<usize>,
+    paint_edit: Vec<Operation>,
+) -> Vec<Operation> {
+    let Some(node) = doc.scene.get(id).filter(|_| !paint_edit.is_empty()) else {
+        return paint_edit;
+    };
+    let reindex = |prop: BoundProp| -> Option<Option<BoundProp>> {
+        let moved =
+            |index: u16| new_index(usize::from(index)).and_then(|index| u16::try_from(index).ok());
+        Some(match (prop, is_stroke) {
+            (BoundProp::FillColor { index }, false) => {
+                moved(index).map(|index| BoundProp::FillColor { index })
+            }
+            (BoundProp::ImageFill { index }, false) => {
+                moved(index).map(|index| BoundProp::ImageFill { index })
+            }
+            (BoundProp::StrokeColor { index }, true) => {
+                moved(index).map(|index| BoundProp::StrokeColor { index })
+            }
+            (BoundProp::StrokeWidth { index }, true) => {
+                moved(index).map(|index| BoundProp::StrokeWidth { index })
+            }
+            _ => return None,
+        })
+    };
+    let kept: std::collections::BTreeMap<BoundProp, _> = node
+        .bindings
+        .iter()
+        .filter_map(|(prop, variable)| Some((reindex(*prop)??, *variable)))
+        .collect();
+    let dropped = node
+        .bindings
+        .iter()
+        .filter(|(prop, _)| reindex(**prop).is_some() && !kept.contains_key(*prop));
+    // The paint goes away or moves, so nothing is baked onto the node.
+    let unbind = dropped.map(|(prop, variable)| Operation::UnbindProperty {
+        node: id,
+        prop: *prop,
+        variable: *variable,
+        old_data: Box::new(node.data.clone()),
+        new_data: Box::new(node.data.clone()),
+        old_opacity: node.opacity,
+        new_opacity: node.opacity,
+        old_flags: node.flags,
+        new_flags: node.flags,
+    });
+    let bind = kept
+        .iter()
+        .map(|(prop, variable)| (*prop, *variable))
+        .filter(|(prop, variable)| node.bindings.get(prop) != Some(variable))
+        .map(|(prop, variable)| Operation::BindProperty {
+            node: id,
+            prop,
+            old: node.bindings.get(&prop).copied(),
+            new: variable,
+        });
+    unbind.chain(bind).chain(paint_edit).collect()
+}
+
+/// Where each paint lands after `list.remove(from)` then `list.insert(to, _)`.
+pub(crate) fn moved_paint_index(from: usize, to: usize) -> impl Fn(usize) -> Option<usize> {
+    move |index| {
+        if index == from {
+            return Some(to);
+        }
+        let index = if index > from { index - 1 } else { index };
+        Some(if index >= to { index + 1 } else { index })
+    }
+}
+
+/// Where each paint lands after `list.remove(removed)`.
+pub(crate) fn removed_paint_index(removed: usize) -> impl Fn(usize) -> Option<usize> {
+    move |index| match index.cmp(&removed) {
+        std::cmp::Ordering::Less => Some(index),
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => Some(index - 1),
     }
 }
 

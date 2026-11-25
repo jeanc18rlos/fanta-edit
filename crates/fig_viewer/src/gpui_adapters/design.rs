@@ -70,9 +70,10 @@ use crate::properties_ops::{
     apply_preview_operation, blurs_operations, child_transforms, default_blur, default_shadow,
     detach_instance_operations, effects_operations, field_operations, finite_transform_operations,
     format_number, instance_prop_operations, layout_gap_operations, layout_limit_operations,
-    layout_padding_operations, parse_color, parse_number, position_operations, read_field_text,
-    replace_data_operation, restore_snapshot, set_clip_content_meta_operation,
-    set_corner_radius_corner, set_fill_color, shadow_field_operations, stroke_list_mut,
+    layout_padding_operations, moved_paint_index, parse_color, parse_number, position_operations,
+    read_field_text, removed_paint_index, replace_data_operation, restore_snapshot,
+    set_clip_content_meta_operation, set_corner_radius_corner, set_fill_color,
+    shadow_field_operations, stroke_list_mut, with_paint_bindings_remapped,
 };
 use crate::properties_snapshot::PaintKind as EnginePaintKind;
 use crate::properties_snapshot::{
@@ -4216,7 +4217,7 @@ impl FigView {
                 self.finish_document_edits_for_external_change(cx);
                 self.forget_hidden_paint_alpha(id, is_stroke);
                 let ops = self.design_ops(cx, |doc| {
-                    replace_data_operation(doc, id, |data| {
+                    let operations = replace_data_operation(doc, id, |data| {
                         if is_stroke {
                             if let Some(strokes) = stroke_list_mut(data)
                                 && from < strokes.len()
@@ -4256,7 +4257,14 @@ impl FigView {
                                 group.background_fills.extend(fills);
                             }
                         }
-                    })
+                    });
+                    with_paint_bindings_remapped(
+                        doc,
+                        id,
+                        is_stroke,
+                        moved_paint_index(from, to),
+                        operations,
+                    )
                 });
                 self.design_apply_ops(ops, cx);
             }
@@ -4319,7 +4327,7 @@ impl FigView {
                 self.finish_document_edits_for_external_change(cx);
                 self.forget_hidden_paint_alpha(id, is_stroke);
                 let ops = self.design_ops(cx, |doc| {
-                    replace_data_operation(doc, id, |data| {
+                    let operations = replace_data_operation(doc, id, |data| {
                         if is_stroke {
                             if let Some(strokes) = stroke_list_mut(data)
                                 && index < strokes.len()
@@ -4329,7 +4337,14 @@ impl FigView {
                         } else {
                             crate::properties_ops::remove_fill(data, index);
                         }
-                    })
+                    });
+                    with_paint_bindings_remapped(
+                        doc,
+                        id,
+                        is_stroke,
+                        removed_paint_index(index),
+                        operations,
+                    )
                 });
                 self.design_apply_ops(ops, cx);
             }
@@ -11876,6 +11891,101 @@ mod tests {
                     kinds(doc),
                     [DropShadow, InnerShadow, LayerBlur, BackgroundBlur]
                 );
+                assert_eq!(doc.history.undo_depth(), depth);
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn paint_bindings_follow_their_paint_when_paints_move_or_go(cx: &mut TestAppContext) {
+        let (mut doc, _page, rect, _, _, color) = doc_with_bound_paints();
+        let node = doc.scene.get_mut(rect).expect("rectangle");
+        let NodeData::Vector(vector) = &mut node.data else {
+            panic!("vector")
+        };
+        vector
+            .fills
+            .push(Fill::solid(FantaColor::rgb(0x10, 0x20, 0x30)));
+        vector
+            .strokes
+            .push(fanta_doc::Stroke::solid(FantaColor::WHITE, 4.));
+        node.bindings
+            .insert(BoundProp::StrokeWidth { index: 1 }, color);
+        let original = node.bindings.clone();
+        let alias = original[&BoundProp::StrokeColor { index: 0 }];
+        let (view, panel, mut visual) = setup_view(doc, cx).await;
+        let item = view.read_with(&visual, |view, _| view.item().clone());
+        let id: SharedString = rect.to_string().into();
+        let fill = DesignPanelCollection::Fill;
+        let stroke = DesignPanelCollection::Stroke;
+        let reorder = |collection, from_index, to_index| DesignPanelAction::PaintReorderRequested {
+            node_id: id.clone(),
+            collection,
+            target: DesignPaintTarget::WholeLayer,
+            paint_id: SharedString::default(),
+            from_index,
+            to_index,
+        };
+        let remove = |collection, index| DesignPanelAction::CollectionItemRemoveRequested {
+            node_id: id.clone(),
+            collection,
+            target: DesignPaintTarget::WholeLayer,
+            index,
+        };
+        let cases = [
+            (
+                reorder(fill, 0, 1),
+                vec![
+                    (BoundProp::FillColor { index: 1 }, color),
+                    (BoundProp::StrokeColor { index: 0 }, alias),
+                    (BoundProp::StrokeWidth { index: 1 }, color),
+                ],
+            ),
+            (
+                reorder(stroke, 1, 0),
+                vec![
+                    (BoundProp::FillColor { index: 0 }, color),
+                    (BoundProp::StrokeColor { index: 1 }, alias),
+                    (BoundProp::StrokeWidth { index: 0 }, color),
+                ],
+            ),
+            (
+                remove(fill, 0),
+                vec![
+                    (BoundProp::StrokeColor { index: 0 }, alias),
+                    (BoundProp::StrokeWidth { index: 1 }, color),
+                ],
+            ),
+            (
+                remove(stroke, 0),
+                vec![
+                    (BoundProp::FillColor { index: 0 }, color),
+                    (BoundProp::StrokeWidth { index: 0 }, color),
+                ],
+            ),
+        ];
+        for (action, expected) in cases {
+            let depth = item.read_with(&visual, |item, _| {
+                item.doc().expect("document").history.undo_depth()
+            });
+            panel.update_in(&mut visual, |_, _, cx| cx.emit(action.clone()));
+            visual.run_until_parked();
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                let bindings = &doc.scene.get(rect).expect("rectangle").bindings;
+                assert_eq!(
+                    bindings.clone(),
+                    expected.into_iter().collect::<BTreeMap<_, _>>(),
+                    "{action:?}"
+                );
+                assert_eq!(doc.history.undo_depth(), depth + 1, "{action:?}");
+            });
+            item.update(&mut visual, |item, cx| {
+                assert!(item.undo(cx).expect("one Undo"));
+            });
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(doc.scene.get(rect).expect("rectangle").bindings, original);
                 assert_eq!(doc.history.undo_depth(), depth);
             });
         }
