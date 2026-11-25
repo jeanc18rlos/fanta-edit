@@ -24,7 +24,7 @@ thiserror.workspace = true
 # which only compiles when another crate in the graph (fanta-text on native
 # targets) enables it. The WebAssembly runtime has no such crate. zopfli comes
 # along but is unreachable from the player and drops out at link time.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 # sha2 0.10 selects its runtime-detected ARM SHA instructions only with `asm`.
