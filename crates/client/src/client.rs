@@ -1146,6 +1146,24 @@ impl Client {
             return Ok(());
         }
 
+        // Starting another attempt would cancel the pending one and open a second browser tab.
+        let pending = matches!(
+            *self.status().borrow(),
+            Status::Authenticating | Status::Reauthenticating
+        ) && self.account_access_token().is_none();
+        if pending {
+            let mut status = self.status();
+            while let Some(status) = status.next().await {
+                if !matches!(status, Status::Authenticating | Status::Reauthenticating) {
+                    break;
+                }
+            }
+            if self.account_access_token().is_some() {
+                return Ok(());
+            }
+            anyhow::bail!("Sign-in did not complete.");
+        }
+
         let (is_staff_tx, is_staff_rx) = oneshot::channel::<bool>();
         let mut is_staff_tx = Some(is_staff_tx);
         cx.update(|cx| {
@@ -2396,6 +2414,53 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(*client.status().borrow(), Status::SignedOut);
         assert_eq!(client.account_notices().borrow().as_deref(), None);
+    }
+
+    #[gpui::test]
+    async fn test_second_sign_in_waits_for_the_pending_browser_sign_in(cx: &mut TestAppContext) {
+        init_test(cx);
+        let client = cx.update(|cx| {
+            Client::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::with_200_response(),
+                cx,
+            )
+        });
+        let (finish_tx, finish_rx) = oneshot::channel::<()>();
+        let finish_rx = Arc::new(Mutex::new(Some(finish_rx)));
+        let attempts = Arc::new(Mutex::new(0));
+        client.override_authenticate({
+            let attempts = attempts.clone();
+            move |cx| {
+                *attempts.lock() += 1;
+                let finish_rx = finish_rx.lock().take();
+                cx.background_spawn(async move {
+                    finish_rx.context("a second browser sign-in was started")?.await?;
+                    Ok(Credentials {
+                        user_id: 2,
+                        access_token: "token".into(),
+                    })
+                })
+            }
+        });
+
+        let first = cx.spawn({
+            let client = client.clone();
+            move |cx| async move { client.sign_in_with_optional_connect(false, &cx).await }
+        });
+        cx.run_until_parked();
+        let second = cx.spawn({
+            let client = client.clone();
+            move |cx| async move { client.sign_in_with_optional_connect(false, &cx).await }
+        });
+        cx.run_until_parked();
+        finish_tx.send(()).ok();
+        cx.run_until_parked();
+
+        first.await.expect("the first sign-in should complete");
+        second.await.expect("the second sign-in should share the first");
+        assert_eq!(*attempts.lock(), 1);
+        assert_eq!(*client.status().borrow(), Status::Authenticated);
     }
 
     #[test]
