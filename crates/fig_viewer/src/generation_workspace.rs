@@ -6259,18 +6259,50 @@ fn unsuitable_gallery_title(text: &str) -> bool {
     lower.contains('@')
         || lower.contains("://")
         || lower.contains("www.")
-        || lower.contains("password")
-        || lower.contains("secret")
+        || reveals_credential(&lower)
         || lower.contains("api key")
         || lower.contains("ignore previous")
         || lower.contains("system prompt")
-        || text
-            .split(|c: char| !c.is_ascii_digit())
-            .any(|digits| digits.len() >= 4)
+        || contains_long_number(text)
         || text.chars().any(|c| {
             c.is_control()
                 || matches!(c, '<' | '>' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
         })
+}
+
+// "Password: x" or "my secret is x", not ordinary words such as "Secret garden" or "Secretary".
+fn reveals_credential(lower: &str) -> bool {
+    ["password", "passcode", "secret"].iter().any(|keyword| {
+        lower.match_indices(keyword).any(|(index, _)| {
+            let rest = lower[index + keyword.len()..].trim_start();
+            rest.starts_with([':', '='])
+                || ["is ", "was ", "key"]
+                    .iter()
+                    .any(|word| rest.starts_with(word))
+        })
+    })
+}
+
+// Seven or more digits in one group (phone, card, ID numbers), even when split by single separators;
+// years and resolutions such as "2026" or "1080p" stay readable.
+fn contains_long_number(text: &str) -> bool {
+    let mut digits = 0;
+    let mut separated = false;
+    for character in text.chars() {
+        if character.is_ascii_digit() {
+            digits += 1;
+            separated = false;
+            if digits >= 7 {
+                return true;
+            }
+        } else if digits > 0 && !separated && matches!(character, ' ' | '-' | '.' | '/') {
+            separated = true;
+        } else {
+            digits = 0;
+            separated = false;
+        }
+    }
+    false
 }
 
 fn preferred_gallery_title<'a>(
@@ -6627,6 +6659,36 @@ mod tests {
             ),
             "Image creation"
         );
+    }
+
+    #[test]
+    fn gallery_titles_allow_years_and_ordinary_words_but_not_personal_numbers_or_credentials() {
+        for title in [
+            "Poster for the 2026 design summit",
+            "Secret garden at dusk",
+            "Secretary portrait",
+            "1080p wallpaper",
+            "Password manager icon",
+        ] {
+            assert_eq!(
+                gallery_creation_title(Some(title), None, GenerationKind::Image),
+                title
+            );
+        }
+        for title in [
+            "My SSN is 123-45-6789",
+            "Card 4111 1111 1111 1111",
+            "Call 555-123-4567",
+            "My password is hunter2",
+            "Password: hunter2",
+            "Client secret = abc",
+        ] {
+            assert_eq!(
+                gallery_creation_title(Some(title), None, GenerationKind::Image),
+                "Image creation",
+                "{title}"
+            );
+        }
     }
 
     #[test]
