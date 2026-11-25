@@ -78,6 +78,7 @@ impl From<AvailableModel> for CatalogModel {
 #[derive(Default)]
 struct CatalogState {
     models: Option<Vec<CatalogModel>>,
+    error: Option<SharedString>,
     revision: u64,
     fetch_task: Option<Task<()>>,
 }
@@ -483,15 +484,16 @@ fn refresh_catalog(
     });
     let revision = catalog.update(cx, |catalog, _| {
         catalog.revision = catalog.revision.wrapping_add(1);
-        catalog.models = None;
         catalog.fetch_task = None;
+        // A refresh keeps the last live list, so a failed fetch does not swap in the built-in one.
+        if !managed_account || key.is_none() {
+            catalog.models = None;
+            catalog.error = None;
+        }
         catalog.revision
     });
     state.update(cx, |_, cx| cx.notify());
-    if !managed_account {
-        return;
-    }
-    let Some(key) = key else {
+    let Some(key) = key.filter(|_| managed_account) else {
         return;
     };
     let catalog_for_task = catalog.downgrade();
@@ -511,13 +513,30 @@ fn refresh_catalog(
                         return false;
                     }
                     catalog.models = Some(models);
+                    catalog.error = None;
                     true
                 });
                 if changed {
                     state_for_task.update(cx, |_, cx| cx.notify());
                 }
             }
-            Err(error) => log::warn!("Fanta model catalog unavailable: {error:#}"),
+            Err(error) => {
+                log::warn!("Fanta model catalog unavailable: {error:#}");
+                let changed = catalog_for_task.update(cx, |catalog, _| {
+                    if catalog.revision != revision {
+                        return false;
+                    }
+                    catalog.error = Some(if catalog.models.is_some() {
+                        "Could not refresh the Fanta model list. The last list loaded is shown.".into()
+                    } else {
+                        "Could not load the Fanta model list. The built-in list is shown.".into()
+                    });
+                    true
+                });
+                if changed {
+                    state_for_task.update(cx, |_, cx| cx.notify());
+                }
+            }
         }
     });
     catalog.update(cx, |catalog, _| catalog.fetch_task = Some(task));
@@ -591,6 +610,11 @@ impl AnthropicCompatibleLanguageModelProvider {
             &self.http_client,
             cx,
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn catalog_error(&self, cx: &App) -> Option<SharedString> {
+        self.catalog.read(cx).error.clone()
     }
 
     fn models(&self, cx: &App) -> Vec<CatalogModel> {
@@ -755,10 +779,18 @@ impl LanguageModelProvider for AnthropicCompatibleLanguageModelProvider {
             &ClientSettings::get_global(cx).server_url,
         ) {
             let client = self.client.clone();
+            let catalog = self.catalog.clone();
             return Some(ProviderSettingsView::SubPage(SubPageProviderSettings::new(
                 move |_window, cx| {
-                    cx.new(|cx| AccountConfigurationView::new(state.clone(), client.clone(), cx))
-                        .into()
+                    cx.new(|cx| {
+                        AccountConfigurationView::new(
+                            state.clone(),
+                            catalog.clone(),
+                            client.clone(),
+                            cx,
+                        )
+                    })
+                    .into()
                 },
             )));
         }
@@ -796,16 +828,23 @@ impl LanguageModelProvider for AnthropicCompatibleLanguageModelProvider {
 
 struct AccountConfigurationView {
     state: Entity<State>,
+    catalog: Entity<CatalogState>,
     client: Arc<Client>,
     sign_in_task: Option<Task<()>>,
     sign_in_error: Option<SharedString>,
 }
 
 impl AccountConfigurationView {
-    fn new(state: Entity<State>, client: Arc<Client>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        state: Entity<State>,
+        catalog: Entity<CatalogState>,
+        client: Arc<Client>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
         Self {
             state,
+            catalog,
             client,
             sign_in_task: None,
             sign_in_error: None,
@@ -858,6 +897,10 @@ impl Render for AccountConfigurationView {
             .when_some(self.sign_in_error.clone(), |this, error| {
                 this.child(Label::new(error).color(Color::Error))
             })
+            .when_some(
+                self.catalog.read(cx).error.clone().filter(|_| signed_in),
+                |this, error| this.child(Label::new(error).color(Color::Warning)),
+            )
             .child(
                 Button::new("fanta-manage-account", "Manage account and billing").on_click(
                     |_, window, cx| {
