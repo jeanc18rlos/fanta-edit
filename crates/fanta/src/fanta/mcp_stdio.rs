@@ -90,7 +90,7 @@ fn process_is_alive(pid: i64) -> bool {
 }
 
 fn pump(stream: UnixStream) -> io::Result<()> {
-    let (mut from_server, mut to_server) = split(stream)?;
+    let (from_server, mut to_server) = split(stream)?;
 
     // The request side runs on its own thread and is never joined: it spends
     // its life blocked in a `read` on stdin, which nothing can interrupt. When
@@ -112,9 +112,29 @@ fn pump(stream: UnixStream) -> io::Result<()> {
 
     // Returning here means the app closed the connection, which ends the
     // bridge whether or not stdin is still open.
-    let mut stdout = io::stdout().lock();
-    io::copy(&mut from_server, &mut stdout)?;
-    stdout.flush()
+    forward(from_server, io::stdout().lock())
+}
+
+/// Copies responses to the client as they arrive.
+///
+/// Not `io::copy`: on Linux it moves bytes from a socket to a pipe with
+/// `splice`, which keeps the pipe locked while it waits for the next message.
+/// A client reading that pipe then gets no response until the stream ends.
+fn forward(mut from_server: impl io::Read, mut to_client: impl io::Write) -> io::Result<()> {
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = match from_server.read(&mut buffer) {
+            Ok(0) => return to_client.flush(),
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(response) = buffer.get(..read) else {
+            return Err(io::Error::other("the live MCP socket read past its buffer"));
+        };
+        to_client.write_all(response)?;
+        to_client.flush()?;
+    }
 }
 
 /// The request direction of the connection. `finish` half-closes it so the
@@ -190,5 +210,43 @@ impl io::Write for RequestWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::forward;
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn a_response_reaches_the_client_while_the_stream_stays_open() {
+        let (mut app, bridge) = UnixStream::pair().expect("socket pair");
+        let (mut client, to_client) = std::io::pipe().expect("pipe");
+        let forwarding = thread::spawn(move || forward(bridge, to_client));
+
+        app.write_all(b"{\"id\":1}\n").expect("the app writes a response");
+
+        // Read on a thread so that a response held back fails the test instead of hanging it.
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut response = [0u8; 9];
+            let read = client.read_exact(&mut response).map(|()| response);
+            sender.send(read).expect("the test is still waiting");
+        });
+        let response = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the response arrives while the app keeps the stream open")
+            .expect("the client reads the response");
+        assert_eq!(&response, b"{\"id\":1}\n");
+
+        drop(app);
+        forwarding
+            .join()
+            .expect("the forwarding thread ends")
+            .expect("forwarding ends cleanly when the app closes the stream");
     }
 }
