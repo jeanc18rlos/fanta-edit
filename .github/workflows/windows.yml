@@ -38,8 +38,10 @@ jobs:
     env:
       # The image's MSVC standard library refuses the Clang in C:\Program Files\LLVM as too old.
       # Visual Studio's own Clang always matches its library, so Skia and bindgen use that one.
+      # CLANG_PATH is where bindgen asks for Clang's own headers: they must match its libclang.
       LLVM_HOME: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64
       LIBCLANG_PATH: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64\bin
+      CLANG_PATH: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64\bin\clang.exe
     steps:
       # Skia and the Rust target tree nest deeply enough to pass MAX_PATH.
       - name: Allow long paths
