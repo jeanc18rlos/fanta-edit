@@ -1374,6 +1374,8 @@ impl FigView {
             let (width, height) = bounds_size(bounds);
             DVec2::new(width, height)
         });
+        // Read-only events bypass the tool shell, so the tool can stay active.
+        let kind = self.tools.kind();
         let tools = &mut self.tools;
         let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
@@ -1384,8 +1386,8 @@ impl FigView {
                 }
                 if let (Some(viewport), Some(screen_size)) = (viewport.as_mut(), screen_size) {
                     let mut tool_context =
-                        tool_context(&mut document.doc, viewport, screen_size, ToolKind::Select);
-                    tools.cancel_and_activate(ToolKind::Select, &mut tool_context);
+                        tool_context(&mut document.doc, viewport, screen_size, kind);
+                    tools.cancel_and_activate(kind, &mut tool_context);
                 } else {
                     tools.activate_without_context(ToolKind::Select);
                 }
@@ -1399,7 +1401,7 @@ impl FigView {
             item.finish_content_preview(preview_owner, false, cx);
         });
         self.viewport = viewport;
-        self.remember_tool_face(ToolKind::Select);
+        self.remember_tool_face(self.tools.kind());
         self.invalidate_canvas_cache();
         cx.notify();
     }

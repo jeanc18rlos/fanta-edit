@@ -5025,6 +5025,26 @@ async fn mounted_page_tab_activation_preserves_scene_generation_and_gpu_epoch(
     });
 }
 
+/// A source lock cancels Draw gestures but keeps the Brush, so the first drag
+/// after the lock clears draws instead of moving layers.
+#[gpui::test]
+async fn source_edit_lock_keeps_the_active_draw_tool(cx: &mut TestAppContext) {
+    init_visual_test(cx);
+    let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+    let (doc, _, images) = bitmap_canvas_doc();
+    let (item, view, mut visual) = mounted_canvas_interaction_fixture(&project, doc, images, cx);
+    view.update(&mut visual, |view, cx| view.set_editor_mode(EditorMode::Draw, cx));
+    visual.run_until_parked();
+    view.read_with(&visual, |view, _| assert_eq!(view.active_tool(), ToolKind::Brush));
+    for locked in [true, false] {
+        item.update(&mut visual, |item, cx| item.set_source_edit_locked(locked, cx));
+        visual.run_until_parked();
+        view.read_with(&visual, |view, _| {
+            assert_eq!(view.active_tool(), ToolKind::Brush, "locked: {locked}")
+        });
+    }
+}
+
 #[gpui::test]
 async fn source_edit_lock_keeps_page_navigation_on_the_edited_page(cx: &mut TestAppContext) {
     init_test(cx);
