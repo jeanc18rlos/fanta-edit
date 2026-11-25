@@ -9976,6 +9976,59 @@ async fn mounted_deactivation_cancels_canvas_press_before_content_preview(
     }
 }
 
+/// A8: while the pen drafts, Undo and Backspace each remove the last anchor
+/// without touching history; after Enter one Undo removes the whole path.
+#[gpui::test]
+async fn mounted_pen_undo_and_backspace_remove_draft_anchors_a8(cx: &mut TestAppContext) {
+    init_visual_test(cx);
+    let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+    let (doc, _, images) = bitmap_canvas_doc();
+    let (item, view, mut visual) = mounted_canvas_interaction_fixture(&project, doc, images, cx);
+    visual.update(|_, cx| {
+        cx.bind_keys([gpui::KeyBinding::new("backspace", DeleteSelection, Some("FigViewer"))]);
+    });
+    let center = view.read_with(&visual, |view, _| view.container_bounds.expect("canvas").center());
+    visual.update(|window, cx| {
+        let focus_handle = view.read(cx).focus_handle.clone();
+        focus_handle.focus(window, cx);
+        window.dispatch_action(ActivatePenTool.boxed_clone(), cx);
+    });
+    visual.run_until_parked();
+    let history = |visual: &mut gpui::VisualTestContext| {
+        item.read_with(visual, |item, _| {
+            let document = item.document().expect("document");
+            (document.doc.history.undo_depth(), document.doc.scene.len())
+        })
+    };
+    let before = history(&mut visual);
+    for offset in [(-80.0, -152.0), (80.0, -152.0), (80.0, -80.0), (-80.0, -80.0)] {
+        mounted_canvas_click(&mut visual, center + point(px(offset.0), px(offset.1)), 1);
+    }
+    let anchors = |visual: &mut gpui::VisualTestContext| {
+        view.read_with(visual, |view, _| {
+            assert_eq!(view.active_tool(), ToolKind::Pen);
+            view.tools
+                .overlays
+                .iter()
+                .filter(|overlay| matches!(overlay, fanta_tools::ToolOverlay::PathAnchor { .. }))
+                .count()
+        })
+    };
+    assert_eq!(anchors(&mut visual), 4);
+    visual.simulate_keystrokes("cmd-z");
+    assert_eq!(anchors(&mut visual), 3, "Undo removes the last anchor");
+    visual.simulate_keystrokes("backspace");
+    assert_eq!(anchors(&mut visual), 2, "Backspace removes the last anchor");
+    assert_eq!(history(&mut visual), before, "no history entry while drafting");
+    visual.simulate_keystrokes("enter");
+    visual.run_until_parked();
+    let after_enter = history(&mut visual);
+    assert_eq!(after_enter.1, before.1 + 1, "Enter commits the path");
+    visual.simulate_keystrokes("cmd-z");
+    visual.run_until_parked();
+    assert_eq!(history(&mut visual).1, before.1, "one Undo removes the whole path");
+}
+
 #[gpui::test]
 async fn mounted_pen_anchors_survive_pending_press_deactivation(cx: &mut TestAppContext) {
     init_visual_test(cx);

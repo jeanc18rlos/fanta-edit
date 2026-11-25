@@ -4661,6 +4661,10 @@ impl FigView {
         }) {
             return;
         }
+        if self.tools.undo_draft() {
+            cx.notify();
+            return;
+        }
         self.finish_document_edits(cx);
         let previous_pages = self.item.read(cx).doc().map(|doc| doc.pages().to_vec());
         let changed = self.item.update(cx, |item, cx| match item.undo(cx) {
@@ -4874,6 +4878,8 @@ impl FigView {
                 self.finish_document_edits(cx);
                 self.dispatch_tool_event(key_event(LogicalKey::Delete, window.modifiers()), cx);
             }
+        } else if self.tools.undo_draft() {
+            cx.notify();
         } else {
             self.delete_selected_nodes(cx);
         }

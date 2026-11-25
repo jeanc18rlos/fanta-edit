@@ -98,6 +98,12 @@ impl Tool for PenTool {
         self.dragging = false;
     }
 
+    fn undo_draft(&mut self) -> Option<ToolResponse> {
+        self.anchors.pop()?;
+        self.dragging = false;
+        Some(self.preview())
+    }
+
     fn deactivate(&mut self, _ctx: &mut ToolContext) {
         self.anchors.clear();
         self.dragging = false;
@@ -180,11 +186,7 @@ impl PenTool {
                     ToolResponse::cursor(CursorHint::Crosshair)
                 }
             }
-            LogicalKey::Delete => {
-                self.anchors.pop();
-                self.dragging = false;
-                self.preview()
-            }
+            LogicalKey::Delete => self.undo_draft().unwrap_or_else(|| self.preview()),
             _ => ToolResponse::empty(),
         }
     }
@@ -711,6 +713,32 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// A8: Undo during a draft removes one anchor and adds no history entry;
+    /// with no anchors left it falls through to document history.
+    #[test]
+    fn a8_undo_draft_pops_one_anchor_without_history() {
+        let (mut doc, mut viewport, snap, size) = ctx_pieces();
+        let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+        let mut tool = PenTool::new();
+        draft_triangle(&mut tool, &mut ctx);
+        let depth = ctx.doc.history.undo_depth();
+        let response = tool.undo_draft().expect("an anchor to undo");
+        assert_eq!(tool.anchor_count(), 2);
+        assert_eq!(
+            response
+                .overlays
+                .iter()
+                .filter(|overlay| matches!(overlay, ToolOverlay::PathAnchor { .. }))
+                .count(),
+            2
+        );
+        assert!(tool.undo_draft().is_some());
+        assert!(tool.undo_draft().is_some());
+        assert!(!tool.is_drafting());
+        assert!(tool.undo_draft().is_none(), "Undo reaches document history");
+        assert_eq!(ctx.doc.history.undo_depth(), depth);
     }
 
     #[test]

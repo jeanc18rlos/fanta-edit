@@ -413,6 +413,20 @@ impl ToolShell {
         response
     }
 
+    /// Undo inside the active tool's draft. False when the tool has nothing
+    /// to undo there.
+    pub fn undo_draft(&mut self) -> bool {
+        let Some(response) = self.tool.undo_draft() else {
+            return false;
+        };
+        self.overlays = response.overlays.to_vec();
+        self.append_selection_region_overlay();
+        if response.cursor.is_some() {
+            self.cursor = response.cursor;
+        }
+        true
+    }
+
     pub fn refresh_overlays(&mut self, doc: &Doc) -> bool {
         let Some(overlays) = self.tool.overlays_after_document_change(doc) else {
             return false;

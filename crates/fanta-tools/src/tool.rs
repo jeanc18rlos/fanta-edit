@@ -259,6 +259,12 @@ pub trait Tool {
         None
     }
 
+    /// Undo inside the tool's own draft, such as the pen's last anchor. `None`
+    /// when there is nothing to undo there, so Undo reaches document history.
+    fn undo_draft(&mut self) -> Option<ToolResponse> {
+        None
+    }
+
     /// Hook called when the tool becomes active. Defaults to no-op. Tools that
     /// must reset internal state on (re-)activation override this.
     fn activate(&mut self, _ctx: &mut ToolContext) {}

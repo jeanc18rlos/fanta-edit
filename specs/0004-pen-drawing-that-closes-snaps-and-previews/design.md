@@ -73,10 +73,15 @@ changes, so no decision record is needed.
 
 ### Undo while drafting (R9)
 
-- `Tool` gains `fn undo_draft(&mut self) -> bool`, defaulting to `false`.
-  `FigView::undo` (`view.rs`) asks the active tool first and returns when it
-  handled the undo. The pen pops its last anchor; with no anchors left it
-  returns `false`, so Undo reaches document history again.
+- `Tool` gains `fn undo_draft(&mut self) -> Option<ToolResponse>`,
+  defaulting to `None`. It returns the tool's new overlays, because the shell
+  has no other way to repaint the draft without an event. `FigView::undo`
+  (`view.rs`) asks the active tool first and returns when it handled the
+  undo. The pen pops its last anchor; with no anchors left it returns `None`,
+  so Undo reaches document history again.
+- Delete and Backspace reach the view as `DeleteSelection`, which deleted the
+  selected nodes and never reached the pen. It now asks the active tool's
+  `undo_draft` first, so they also remove the draft's last anchor.
 
 ### Options and hints (R10)
 
@@ -101,7 +106,7 @@ impl SnapCandidates { pub fn push_point(&mut self, point: DVec2); }
 pub struct PenOptions { pub snap_to_path_points: bool, pub angle_step_degrees: f64, pub handle_mode: HandleMode }
 pub enum HandleMode { Mirrored, Aligned, Independent }
 impl ToolContext<'_> { pub fn snap_point_with_points(&self, world: DVec2, exclude: &[NodeId], points: &[DVec2]) -> SnapResult; }
-pub trait Tool { fn undo_draft(&mut self) -> bool { false } /* … */ }
+pub trait Tool { fn undo_draft(&mut self) -> Option<ToolResponse> { None } /* … */ }
 pub enum ToolOverlay { /* … */ PreviewPath { world_points: Vec<[f64; 2]>, closed: bool, filled: bool }, PenCloseTarget { world: [f64; 2] } }
 pub enum CursorHint { /* … */ Pointer }
 pub enum LogicalKey { /* … */ Space }
