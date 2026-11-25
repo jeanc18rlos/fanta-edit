@@ -360,7 +360,8 @@ jobs:
   mac-app-store-runtime:
     if: ${{ (github.event_name != 'workflow_dispatch' || !inputs.native_video_only) && !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
     runs-on: macos-26
-    timeout-minutes: 90
+    # The same suite as `mac-app-store` in nightly.yml, with its limit: 70 to 75 minutes here.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
