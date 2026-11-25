@@ -248,6 +248,11 @@ pub struct Client {
 #[error("Sign-in was canceled.")]
 pub struct SignInCanceled;
 
+/// A sign-in that waited for another attempt which ended without signing in; that attempt reports why.
+#[derive(Error, Debug)]
+#[error("Sign-in did not complete.")]
+pub struct SignInEndedElsewhere;
+
 #[derive(Error, Debug)]
 pub enum EstablishConnectionError {
     #[error("upgrade required")]
@@ -741,6 +746,7 @@ impl Client {
         cx.spawn(async move |cx| {
             if let Err(error) = client.sign_in_with_optional_connect(try_provider, cx).await
                 && error.downcast_ref::<SignInCanceled>().is_none()
+                && error.downcast_ref::<SignInEndedElsewhere>().is_none()
             {
                 log::error!("sign-in failed: {error:#}");
                 let message = error.to_string();
@@ -1175,7 +1181,7 @@ impl Client {
             if self.account_access_token().is_some() {
                 return Ok(());
             }
-            anyhow::bail!("Sign-in did not complete.");
+            return Err(SignInEndedElsewhere.into());
         }
 
         let (is_staff_tx, is_staff_rx) = oneshot::channel::<bool>();
@@ -2564,6 +2570,51 @@ mod tests {
         release_tx.send(()).ok();
         sign_in.await.expect("the saved sign-in should be accepted");
         assert_eq!(*client.status().borrow(), Status::Authenticated);
+    }
+
+    #[gpui::test]
+    async fn test_a_waiting_sign_in_adds_no_notice_of_its_own(cx: &mut TestAppContext) {
+        init_test(cx);
+        let client = cx.update(|cx| {
+            Client::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::with_200_response(),
+                cx,
+            )
+        });
+        client.override_authenticate(|cx| cx.background_spawn(future::pending()));
+        cx.update(|cx| {
+            client.sign_in_and_report(false, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|cx| client.sign_in_and_report(false, cx));
+        cx.run_until_parked();
+        client.cancel_sign_in(&cx.to_async());
+        cx.run_until_parked();
+        assert_eq!(*client.status().borrow(), Status::SignedOut);
+        assert_eq!(client.account_notices().borrow().as_deref(), None);
+
+        let (fail_tx, fail_rx) = oneshot::channel::<()>();
+        let fail_rx = Arc::new(Mutex::new(Some(fail_rx)));
+        client.override_authenticate(move |cx| {
+            let fail_rx = fail_rx.lock().take();
+            cx.background_spawn(async move {
+                if let Some(fail_rx) = fail_rx {
+                    fail_rx.await.ok();
+                }
+                Err(anyhow!("Could not open the sign-in page."))
+            })
+        });
+        cx.update(|cx| client.sign_in_and_report(false, cx));
+        cx.run_until_parked();
+        cx.update(|cx| client.sign_in_and_report(false, cx));
+        cx.run_until_parked();
+        fail_tx.send(()).ok();
+        cx.run_until_parked();
+        assert_eq!(
+            client.account_notices().borrow().as_deref(),
+            Some("Could not sign in: Could not open the sign-in page.")
+        );
     }
 
     #[gpui::test]
