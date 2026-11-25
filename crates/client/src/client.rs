@@ -172,8 +172,7 @@ pub fn init(client: &Arc<Client>, cx: &mut App) {
         let client = client.clone();
         move |_: &SignIn, cx| {
             if let Some(client) = client.upgrade() {
-                cx.spawn(async move |cx| client.sign_in_with_optional_connect(false, cx).await)
-                    .detach_and_log_err(cx);
+                client.sign_in_and_report(false, cx);
             }
         }
     })
@@ -2461,6 +2460,37 @@ mod tests {
         second.await.expect("the second sign-in should share the first");
         assert_eq!(*attempts.lock(), 1);
         assert_eq!(*client.status().borrow(), Status::Authenticated);
+    }
+
+    #[gpui::test]
+    async fn test_sign_in_action_reports_failures(cx: &mut TestAppContext) {
+        init_test(cx);
+        let client = cx.update(|cx| {
+            Client::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::with_200_response(),
+                cx,
+            )
+        });
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Err(anyhow!(
+                    "Sign-in timed out after 10 minutes. Please try signing in again."
+                ))
+            })
+        });
+        cx.update(|cx| {
+            init(&client, cx);
+            cx.dispatch_action(&SignIn);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            client.account_notices().borrow().as_deref(),
+            Some(
+                "Could not sign in: Sign-in timed out after 10 minutes. Please try signing in again."
+            )
+        );
     }
 
     #[test]
