@@ -1145,15 +1145,23 @@ fn released_unreadable_notice(released: usize) -> Option<String> {
 }
 
 // A running job is saved again by its next poll; a finished one already shows its result.
-fn status_save_failure(error: &anyhow::Error, still_running: bool) -> SharedString {
+fn status_save_failure(
+    error: &anyhow::Error,
+    still_running: bool,
+    shown_error: Option<&SharedString>,
+) -> Option<SharedString> {
+    // The cause is a local storage error the user cannot act on, so it goes to the log.
+    log::error!("Could not save generation status: {error:#}");
+    // A finished job's own failure says more than the save failure, so it stays on screen.
+    if !still_running && shown_error.is_some() {
+        return None;
+    }
     let next = if still_running {
         "Fanta will try again at the next status check."
     } else {
         "The result shown here is not affected."
     };
-    // The cause is a local storage error the user cannot act on, so it goes to the log.
-    log::error!("Could not save generation status: {error:#}");
-    format!("Could not save this generation's status. {next}").into()
+    Some(format!("Could not save this generation's status. {next}").into())
 }
 
 #[derive(Debug)]
@@ -3475,9 +3483,14 @@ impl GenerationWorkspace {
                                 Err(error) => Some(error),
                             };
                             this.accept_response(&response, cx);
-                            if let Some(error) = persistence_error {
-                                this.error =
-                                    Some(status_save_failure(&error, response.should_poll()));
+                            if let Some(error) = persistence_error
+                                && let Some(message) = status_save_failure(
+                                    &error,
+                                    response.should_poll(),
+                                    this.error.as_ref(),
+                                )
+                            {
+                                this.error = Some(message);
                             }
                             true
                         })
@@ -3640,9 +3653,14 @@ impl GenerationWorkspace {
                                 Err(error) => Some(error),
                             };
                             this.accept_response(&response, cx);
-                            if let Some(error) = persistence_error {
-                                this.error =
-                                    Some(status_save_failure(&error, response.should_poll()));
+                            if let Some(error) = persistence_error
+                                && let Some(message) = status_save_failure(
+                                    &error,
+                                    response.should_poll(),
+                                    this.error.as_ref(),
+                                )
+                            {
+                                this.error = Some(message);
                             }
                             true
                         })
@@ -8061,18 +8079,23 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    async fn generation_status_save_failure_names_no_missing_control(
+    async fn assert_status_save_failure(
+        finished_with_media: bool,
+        expected: &str,
         cx: &mut gpui::TestAppContext,
     ) {
         let mut png = Cursor::new(Vec::new());
         image::DynamicImage::new_rgba8(1, 1)
             .write_to(&mut png, image::ImageFormat::Png)
             .expect("generated image");
-        let completed = json!({
-            "id": "status-save", "status": "succeeded", "model": "fanta-image-1",
-            "output": [{"data_url": format!("data:image/png;base64,{}", STANDARD.encode(png.into_inner()))}],
-        });
+        let completed = if finished_with_media {
+            json!({
+                "id": "status-save", "status": "succeeded", "model": "fanta-image-1",
+                "output": [{"data_url": format!("data:image/png;base64,{}", STANDARD.encode(png.into_inner()))}],
+            })
+        } else {
+            json!({"id": "status-save", "status": "failed", "error": {"message": "The model refused this prompt."}})
+        };
         let http = http_client::FakeHttpClient::create(move |request| {
             let completed = completed.clone();
             async move {
@@ -8123,14 +8146,29 @@ mod tests {
         cx.executor().advance_clock(Duration::from_secs(2));
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert_eq!(view.outputs.len(), 1);
+            assert_eq!(view.outputs.len(), usize::from(finished_with_media));
             assert_eq!(
                 view.error.as_ref().map(ToString::to_string).as_deref(),
-                Some(
-                    "Could not save this generation's status. The result shown here is not affected."
-                )
+                Some(expected)
             );
         });
+    }
+
+    #[gpui::test]
+    async fn generation_status_save_failure_names_no_missing_control(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_status_save_failure(
+            true,
+            "Could not save this generation's status. The result shown here is not affected.",
+            cx,
+        )
+        .await;
+    }
+
+    #[gpui::test]
+    async fn generation_status_save_failure_keeps_the_job_failure(cx: &mut gpui::TestAppContext) {
+        assert_status_save_failure(false, "The model refused this prompt.", cx).await;
     }
 
     #[gpui::test]
