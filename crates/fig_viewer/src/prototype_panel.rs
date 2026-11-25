@@ -738,6 +738,21 @@ impl FantaPrototypePanel {
         self.focus_handle.focus(window, cx);
     }
 
+    // The app's keymap turns Escape in an editor into this action, and bound actions run
+    // before raw key listeners, so `handle_key_down` alone never sees that Escape.
+    fn handle_editor_cancel(
+        &mut self,
+        _: &editor::actions::Cancel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing_parameter.is_some() {
+            self.cancel_parameter_edit(window, cx);
+        } else {
+            cx.propagate();
+        }
+    }
+
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -827,19 +842,24 @@ impl FantaPrototypePanel {
             return false;
         };
         let preview_owner = cx.entity_id();
-        self.item.update(cx, |item, cx| {
-            match item.apply_for_preview_owner(preview_owner, operation, cx) {
-                Ok(()) => true,
-                Err(error) => {
-                    log::error!("Fanta prototype panel failed to apply operation: {error:#}");
-                    false
-                }
+        let result = self.item.update(cx, |item, cx| {
+            item.apply_for_preview_owner(preview_owner, operation, cx)
+        });
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                log::error!("Fanta prototype panel failed to apply operation: {error:#}");
+                crate::view::show_canvas_notice_deferred(
+                    format!("Could not change the prototype: {error:#}"),
+                    cx,
+                );
+                false
             }
-        })
+        }
     }
 
-    fn add_interaction(&mut self, node: NodeId, cx: &mut Context<Self>) {
-        self.apply_operation(|doc| add_reaction_operation(doc, node), cx);
+    fn add_interaction(&mut self, node: NodeId, cx: &mut Context<Self>) -> bool {
+        self.apply_operation(|doc| add_reaction_operation(doc, node), cx)
     }
 
     fn remove_interaction(&mut self, node: NodeId, reaction: ReactionId, cx: &mut Context<Self>) {
@@ -859,8 +879,15 @@ impl FantaPrototypePanel {
     ) {
         self.apply_operation(
             |doc| {
+                let trigger = choice.into_trigger();
+                // Re-picking the checked kind would reset its delay or keys to defaults.
+                if std::mem::discriminant(&reaction_by_id(doc, node, reaction)?.trigger)
+                    == std::mem::discriminant(&trigger)
+                {
+                    return None;
+                }
                 set_reaction_operation(doc, node, reaction, |reaction| {
-                    reaction.trigger = choice.into_trigger();
+                    reaction.trigger = trigger;
                 })
             },
             cx,
@@ -877,6 +904,11 @@ impl FantaPrototypePanel {
         self.apply_operation(
             |doc| {
                 let action = action_for_choice(doc, node, choice)?;
+                if std::mem::discriminant(&reaction_by_id(doc, node, reaction)?.action)
+                    == std::mem::discriminant(&action)
+                {
+                    return None;
+                }
                 set_reaction_operation(doc, node, reaction, |reaction| {
                     reaction.action = action;
                 })
@@ -913,6 +945,12 @@ impl FantaPrototypePanel {
     ) {
         self.apply_operation(
             |doc| {
+                if matches!(
+                    reaction_by_id(doc, node, reaction)?.action,
+                    Action::UpdateVariant { component: current, .. } if current == component
+                ) {
+                    return None;
+                }
                 let variant = default_variant_value(doc, component);
                 set_reaction_operation(doc, node, reaction, |reaction| {
                     reaction.action = Action::UpdateVariant { component, variant };
@@ -1028,6 +1066,15 @@ impl FantaPrototypePanel {
         self.finish_parameter_edit(cx);
         self.apply_operation(
             |doc| {
+                let current = reaction_by_id(doc, node, reaction)?.transition.as_ref();
+                if choice != TransitionChoice::Instant
+                    && current.is_some_and(|transition| {
+                        std::mem::discriminant(&transition.style)
+                            == std::mem::discriminant(&transition_style(choice))
+                    })
+                {
+                    return None;
+                }
                 set_reaction_operation(doc, node, reaction, |reaction| {
                     if choice == TransitionChoice::Instant {
                         reaction.transition = None;
@@ -1105,6 +1152,8 @@ impl FantaPrototypePanel {
                         TransitionStyle::SlideIn { .. } => TransitionStyle::SlideIn { direction },
                         TransitionStyle::Push { .. } => TransitionStyle::Push { direction },
                         TransitionStyle::MoveIn { .. } => TransitionStyle::MoveIn { direction },
+                        TransitionStyle::SlideOut { .. } => TransitionStyle::SlideOut { direction },
+                        TransitionStyle::MoveOut { .. } => TransitionStyle::MoveOut { direction },
                         style => style,
                     };
                 })
@@ -2404,6 +2453,7 @@ impl FantaPrototypePanel {
         self.ensure_parameter_editor(window, cx);
         let mut root = v_flex()
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::handle_editor_cancel))
             .on_key_down(cx.listener(Self::handle_key_down))
             .size_full()
             .bg(cx.theme().colors().panel_background);
@@ -2487,7 +2537,7 @@ impl FantaPrototypePanel {
                                 .icon_size(IconSize::Small)
                                 .tooltip(Tooltip::text("Add interaction"))
                                 .on_click(cx.listener(move |panel, _, _, cx| {
-                                    panel.add_interaction(node, cx)
+                                    panel.add_interaction(node, cx);
                                 })),
                         )
                         .into_any_element()
@@ -3730,6 +3780,299 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "fanta-gpui-ui")]
+    async fn mounted_panel_with_delay_interactions(
+        reaction_count: usize,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<FantaPrototypePanel>,
+        &mut gpui::VisualTestContext,
+        Entity<FigItem>,
+        NodeId,
+        Vec<Reaction>,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
+            crate::theme_bridge::init(cx);
+        });
+        let (mut doc, first, _) = document_with_two_frames();
+        let reactions: Vec<Reaction> = (0..reaction_count)
+            .map(|_| Reaction {
+                id: ReactionId::new(),
+                trigger: Trigger::AfterDelay { delay_ms: 300 },
+                action: Action::Back,
+                extra_actions: Vec::new(),
+                transition: None,
+                animation: None,
+            })
+            .collect();
+        for reaction in &reactions {
+            doc.apply(Operation::AddReaction {
+                node: first,
+                reaction: reaction.clone(),
+            })
+            .expect("initial interaction");
+        }
+        doc.selection.select_only(first);
+        doc.history = Default::default();
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/PrototypeParameterKeys.fanta"),
+            doc,
+            cx,
+        );
+        let (panel, visual) = cx.add_window_view({
+            let item = item.clone();
+            move |_, cx| FantaPrototypePanel::new(item, cx)
+        });
+        visual.simulate_resize(gpui::size(px(400.0), px(1000.0)));
+        let selected = reactions.first().map(|reaction| reaction.id);
+        panel.update(visual, |panel, cx| {
+            panel.selected_reaction = selected;
+            cx.notify();
+        });
+        visual.run_until_parked();
+        (panel, visual, item, first, reactions)
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn start_delay_edit(
+        panel: &Entity<FantaPrototypePanel>,
+        node: NodeId,
+        reaction: ReactionId,
+        text: &str,
+        visual: &mut gpui::VisualTestContext,
+    ) {
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.start_parameter_edit(
+                    ReactionParameter {
+                        node,
+                        reaction,
+                        kind: ParameterKind::Delay,
+                    },
+                    "300".into(),
+                    window,
+                    cx,
+                );
+                panel
+                    .parameter_editor
+                    .clone()
+                    .expect("parameter editor")
+                    .update(cx, |editor, cx| editor.set_text(text, window, cx));
+            });
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_prototype_parameter_error_is_shown(cx: &mut TestAppContext) {
+        let (panel, visual, _, first, reactions) =
+            mounted_panel_with_delay_interactions(1, cx).await;
+        start_delay_edit(&panel, first, reactions[0].id, "invalid", visual);
+        assert!(panel.read_with(visual, |panel, _| panel.parameter_error.is_some()));
+        assert!(
+            visual.debug_bounds("prototype-parameter-error").is_some(),
+            "the invalid draft explains itself in the default inspector"
+        );
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_prototype_parameter_enter_commits_and_escape_cancels(cx: &mut TestAppContext) {
+        let (panel, visual, item, first, reactions) =
+            mounted_panel_with_delay_interactions(1, cx).await;
+        let reaction = reactions[0].id;
+        start_delay_edit(&panel, first, reaction, "900", visual);
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        assert!(panel.read_with(visual, |panel, _| panel.editing_parameter.is_none()));
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                reaction_by_id(doc, first, reaction)
+                    .expect("interaction")
+                    .trigger,
+                Trigger::AfterDelay { delay_ms: 900 }
+            );
+        });
+
+        start_delay_edit(&panel, first, reaction, "1500", visual);
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        assert!(panel.read_with(visual, |panel, _| panel.editing_parameter.is_none()));
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                reaction_by_id(doc, first, reaction)
+                    .expect("interaction")
+                    .trigger,
+                Trigger::AfterDelay { delay_ms: 900 }
+            );
+        });
+
+        // The app's keymap turns Escape in an editor into this action, which runs before key listeners.
+        start_delay_edit(&panel, first, reaction, "1500", visual);
+        visual.update(|window, cx| {
+            window.dispatch_action(Box::new(editor::actions::Cancel), cx);
+        });
+        visual.run_until_parked();
+        assert!(panel.read_with(visual, |panel, _| panel.editing_parameter.is_none()));
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                reaction_by_id(doc, first, reaction)
+                    .expect("interaction")
+                    .trigger,
+                Trigger::AfterDelay { delay_ms: 900 }
+            );
+        });
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_prototype_failed_add_keeps_the_selected_interaction(cx: &mut TestAppContext) {
+        let (panel, visual, item, first, reactions) =
+            mounted_panel_with_delay_interactions(2, cx).await;
+        start_delay_edit(&panel, first, reactions[0].id, "invalid", visual);
+        let add = visual
+            .debug_bounds("editor-prototype-inspector-add")
+            .expect("Add interaction");
+        visual.simulate_click(add.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.scene.get(first).expect("frame").reactions.len(), 2);
+        });
+        assert_eq!(
+            panel.read_with(visual, |panel, _| panel.selected_reaction),
+            Some(reactions[0].id),
+            "a refused add must not open another interaction's details"
+        );
+    }
+
+    #[gpui::test]
+    async fn an_unusable_presentation_background_shows_a_canvas_notice(cx: &mut TestAppContext) {
+        use fanta_gpui::properties_tabs::{PrototypeInspector, PrototypeInspectorAction};
+
+        init_test(cx);
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
+        });
+        let (doc, _, _) = document_with_two_frames();
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/PrototypeBackground.fanta"),
+            doc,
+            cx,
+        );
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let panel = cx.update(|_, cx| cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx)));
+        let inspector = cx.update(|_, cx| {
+            cx.new(|cx| PrototypeInspector::new("background-test", Default::default(), cx))
+        });
+        let presentation_before = item.read_with(cx, |item, _| {
+            item.doc().expect("document").presentation.clone()
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.handle_shared_action(
+                &inspector,
+                &PrototypeInspectorAction::BackgroundChangeRequested { hex: "ABC".into() },
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc().expect("document").presentation,
+                presentation_before
+            );
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.notification_ids().contains(
+                    &workspace::notifications::NotificationId::named(
+                        crate::view::CANVAS_NOTICE_ID.into()
+                    )
+                ),
+                "a background color that cannot be applied must say so"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn a_refused_prototype_change_shows_a_canvas_notice(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (mut doc, first, _) = document_with_two_frames();
+        let reaction = Reaction {
+            id: ReactionId::new(),
+            trigger: Trigger::Click,
+            action: Action::Back,
+            extra_actions: Vec::new(),
+            transition: None,
+            animation: None,
+        };
+        doc.apply(Operation::AddReaction {
+            node: first,
+            reaction: reaction.clone(),
+        })
+        .expect("add interaction");
+        doc.selection.select_only(first);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/PrototypeRefused.fanta"),
+            doc,
+            cx,
+        );
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let panel = cx.update(|_, cx| cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx)));
+        let other_view = workspace.entity_id();
+        item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(other_view, cx, |_| {
+                ((), DocChange::ContentPreview)
+            })
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.set_trigger_choice(first, reaction.id, TriggerChoice::Hover, cx);
+        });
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(reaction_by_id(doc, first, reaction.id), Some(&reaction));
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.notification_ids().contains(
+                    &workspace::notifications::NotificationId::named(
+                        crate::view::CANVAS_NOTICE_ID.into()
+                    )
+                ),
+                "a refused prototype change must explain itself"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn action_choices_require_their_targets_before_applying(cx: &mut TestAppContext) {
         init_test(cx);
@@ -3817,6 +4160,103 @@ mod tests {
                 reaction_by_id(doc, first_id, reaction_id).map(|reaction| &reaction.action),
                 Some(&Action::Navigate { to: second_id })
             );
+        });
+    }
+
+    async fn panel_with_reaction(
+        reaction: Reaction,
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::WindowHandle<FantaPrototypePanel>,
+        Entity<FigItem>,
+        NodeId,
+    ) {
+        init_test(cx);
+        let (mut doc, first, _) = document_with_two_frames();
+        doc.apply(Operation::AddReaction {
+            node: first,
+            reaction,
+        })
+        .expect("add interaction");
+        doc.selection.select_only(first);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/PrototypeChoices.fanta"),
+            doc,
+            cx,
+        );
+        let panel_item = item.clone();
+        let panel = cx.add_window(move |_, cx| FantaPrototypePanel::new(panel_item, cx));
+        (panel, item, first)
+    }
+
+    #[gpui::test]
+    async fn direction_applies_to_out_transitions(cx: &mut TestAppContext) {
+        let reaction = Reaction {
+            id: ReactionId::new(),
+            trigger: Trigger::Click,
+            action: Action::Back,
+            extra_actions: Vec::new(),
+            transition: Some(Transition {
+                style: TransitionStyle::SlideOut {
+                    direction: Direction::Left,
+                },
+                duration_ms: 300,
+                easing: Easing::EaseInOut,
+            }),
+            animation: None,
+        };
+        let reaction_id = reaction.id;
+        let (panel, item, first) = panel_with_reaction(reaction, cx).await;
+        panel
+            .update(cx, |panel, _, cx| {
+                panel.set_transition_direction(first, reaction_id, DirectionChoice::Up, cx);
+            })
+            .expect("pick a direction");
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            assert_eq!(
+                reaction_by_id(doc, first, reaction_id)
+                    .and_then(|reaction| reaction.transition.as_ref())
+                    .map(|transition| transition.style),
+                Some(TransitionStyle::SlideOut {
+                    direction: Direction::Up
+                })
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn reselecting_the_current_choice_keeps_its_parameters(cx: &mut TestAppContext) {
+        let reaction = Reaction {
+            id: ReactionId::new(),
+            trigger: Trigger::AfterDelay { delay_ms: 2000 },
+            action: Action::OpenLink {
+                url: "https://example.com".into(),
+            },
+            extra_actions: Vec::new(),
+            transition: Some(Transition {
+                style: TransitionStyle::SlideIn {
+                    direction: Direction::Up,
+                },
+                duration_ms: 300,
+                easing: Easing::EaseInOut,
+            }),
+            animation: None,
+        };
+        let original = reaction.clone();
+        let (panel, item, first) = panel_with_reaction(reaction, cx).await;
+        panel
+            .update(cx, |panel, _, cx| {
+                panel.set_trigger_choice(first, original.id, TriggerChoice::AfterDelay, cx);
+                panel.set_action_choice(first, original.id, ActionChoice::OpenLink, cx);
+                panel.set_transition_choice(first, original.id, TransitionChoice::SlideIn, cx);
+            })
+            .expect("reselect the current choices");
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            assert_eq!(reaction_by_id(doc, first, original.id), Some(&original));
         });
     }
 
@@ -5219,9 +5659,21 @@ impl FantaPrototypePanel {
             panel.update(cx, |panel, cx| panel.set_view_data(data, cx));
         }
         v_flex()
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::handle_editor_cancel))
+            .on_key_down(cx.listener(Self::handle_key_down))
             .size_full()
             .min_h_0()
             .child(div().flex_1().min_h_0().children(self.shared.clone()))
+            .children(self.parameter_error.clone().map(|error| {
+                h_flex()
+                    .debug_selector(|| "prototype-parameter-error".to_owned())
+                    .flex_none()
+                    .px_3()
+                    .py_1()
+                    .bg(cx.theme().status().error_background)
+                    .child(Label::new(error).size(LabelSize::Small))
+            }))
             .children(detail.map(|detail| {
                 div()
                     .id("prototype-interaction-detail")
@@ -5280,6 +5732,10 @@ impl FantaPrototypePanel {
             Intent::BackgroundChangeRequested { hex } => {
                 let value = format!("#{}", hex.trim_start_matches('#'));
                 let Some(color) = fanta_doc::Color::from_hex(&value) else {
+                    crate::view::show_canvas_notice_deferred(
+                        format!("Could not use {value} as the background: enter #RRGGBB"),
+                        cx,
+                    );
                     return;
                 };
                 self.apply_operation(
@@ -5316,16 +5772,17 @@ impl FantaPrototypePanel {
         }
         match action {
             Intent::ConnectionAddRequested => {
-                self.add_interaction(node, cx);
-                self.selected_reaction = self.item.read(cx).document().and_then(|document| {
-                    document
-                        .doc
-                        .scene
-                        .get(node)?
-                        .reactions
-                        .last()
-                        .map(|reaction| reaction.id)
-                });
+                if self.add_interaction(node, cx) {
+                    self.selected_reaction = self.item.read(cx).document().and_then(|document| {
+                        document
+                            .doc
+                            .scene
+                            .get(node)?
+                            .reactions
+                            .last()
+                            .map(|reaction| reaction.id)
+                    });
+                }
             }
             Intent::ConnectionEditRequested { id } => {
                 self.finish_parameter_edit(cx);

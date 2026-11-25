@@ -78,10 +78,11 @@ impl ActiveTransition {
 }
 
 /// Map linear progress `t` through an easing curve. Endpoints are exact
-/// (`ease(_, 0) == 0`, `ease(_, 1) == 1`). Springs may return values ABOVE
-/// 1.0 mid-flight — that overshoot flows into the directional offsets so a
-/// bouncy slide visibly overshoots its resting position; consumers that need
-/// saturation (crossfade weights) clamp at their own boundary.
+/// (`ease(_, 0) == 0`, `ease(_, 1) == 1`). Springs, and cubic beziers whose
+/// control points leave 0..1, may return values outside 0..1 mid-flight —
+/// that overshoot flows into the directional offsets so a bouncy slide
+/// visibly overshoots its resting position; consumers that need saturation
+/// (crossfade weights) clamp at their own boundary.
 pub(crate) fn ease(easing: Easing, t: f64) -> f64 {
     let t = t.clamp(0.0, 1.0);
     match easing {
@@ -125,7 +126,7 @@ fn cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, mut t: f64) -> f64 {
     for _ in 0..8 {
         let error = coordinate(parameter, x1, x2) - t;
         if error.abs() <= 1e-7 {
-            return coordinate(parameter, y1, y2).clamp(0.0, 1.0);
+            return coordinate(parameter, y1, y2);
         }
         let slope = derivative(parameter, x1, x2);
         if slope.abs() <= 1e-7 {
@@ -147,7 +148,7 @@ fn cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, mut t: f64) -> f64 {
             high = parameter;
         }
     }
-    coordinate(parameter, y1, y2).clamp(0.0, 1.0)
+    coordinate(parameter, y1, y2)
 }
 
 /// The unit vector, in pixel space (x right, y down), that content entering
@@ -610,6 +611,21 @@ mod tests {
             0.5,
         );
         assert!(custom > 0.3 && custom < 0.7);
+    }
+
+    #[test]
+    fn custom_cubic_bezier_can_overshoot_like_a_spring() {
+        let back_out = Easing::CubicBezier {
+            x1: 0.34,
+            y1: 1.56,
+            x2: 0.64,
+            y2: 1.0,
+        };
+        assert!(
+            (0..=20).any(|step| ease(back_out, f64::from(step) / 20.0) > 1.01),
+            "a back-out curve passes its resting value before settling"
+        );
+        assert_eq!(ease(back_out, 1.0), 1.0);
     }
 
     #[test]
