@@ -524,7 +524,7 @@ impl FigView {
                     )
                 });
                 if let Some((id, operation)) = created {
-                    self.apply_motion_operation(Some(operation), "adding inspector comment", cx);
+                    self.apply_motion_operation(Some(operation), "add the comment", cx);
                     self.comment_state.open_thread = Some(id);
                 }
             }
@@ -537,7 +537,7 @@ impl FigView {
                         .read(cx)
                         .document()
                         .and_then(|document| toggle_resolved_op(&document.doc, root, id));
-                    self.apply_motion_operation(operation, "resolving inspector comment", cx);
+                    self.apply_motion_operation(operation, "resolve the comment", cx);
                 }
             }
             CommentsInspectorAction::ReplyRequested { thread_id, body } => {
@@ -553,7 +553,7 @@ impl FigView {
                             None,
                         )
                     });
-                    self.apply_motion_operation(operation, "replying to inspector comment", cx);
+                    self.apply_motion_operation(operation, "reply to the comment", cx);
                 }
             }
             CommentsInspectorAction::FilterChangeRequested { .. } => {}

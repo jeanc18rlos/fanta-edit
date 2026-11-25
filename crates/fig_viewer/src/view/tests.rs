@@ -12168,3 +12168,65 @@ async fn canvas_create_rectangle_and_undo_restores_state(cx: &mut TestAppContext
         );
     });
 }
+
+#[gpui::test]
+async fn failed_timeline_clip_rename_shows_a_notice(cx: &mut TestAppContext) {
+    init_visual_test(cx);
+    let file_system = FakeFs::new(cx.executor());
+    let project = Project::test(file_system.clone(), [], cx).await;
+    cx.update(|cx| {
+        client::Client::set_global(project.read(cx).client(), cx);
+        <dyn fs::Fs>::set_global(file_system, cx);
+    });
+    let mut doc = doc_with_one_page();
+    let clip_id = AnimationClipId::new();
+    doc.apply(Operation::CreateAnimationClip {
+        clip: Box::new(AnimationClip::new(clip_id, "Entrance", 1_000)),
+    })
+    .expect("create clip");
+    doc.history = Default::default();
+    let item = crate::document::ready_item_for_test(
+        &project,
+        std::path::PathBuf::from("/tmp/Timeline-rename.fig"),
+        doc,
+        cx,
+    );
+    let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+        workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+    });
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let view = cx.update(|window, cx| {
+        let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+        });
+        window.activate_window();
+        view
+    });
+    cx.run_until_parked();
+    let other_owner = workspace.entity_id();
+    item.update(cx, |item, cx| {
+        item.with_document_for_preview_owner(other_owner, cx, |_| ((), DocChange::ContentPreview))
+            .expect("another owner's preview");
+    });
+
+    view.update(cx, |view, cx| {
+        view.active_motion_clip = Some(clip_id);
+        view.rename_motion_clip("Exit", cx);
+    });
+    cx.run_until_parked();
+
+    workspace.read_with(cx, |workspace, _| {
+        assert!(
+            workspace
+                .notification_ids()
+                .contains(&NotificationId::named(CANVAS_NOTICE_ID.into())),
+            "a timeline edit that could not be applied must say so"
+        );
+    });
+    item.read_with(cx, |item, _| {
+        let doc = item.doc().expect("document");
+        assert_eq!(doc.motion.clip(clip_id).expect("clip").name, "Entrance");
+    });
+}

@@ -1871,7 +1871,7 @@ impl FigView {
         let operation = self.item.read(cx).document().and_then(|document| {
             set_keyframe_interpolation_operation(&document.doc, clip_id, &keyframe, interpolation)
         });
-        self.apply_motion_operation(operation, "setting keyframe interpolation", cx);
+        self.apply_motion_operation(operation, "set the keyframe interpolation", cx);
     }
 
     fn set_motion_keyframe_easing(
@@ -1891,7 +1891,7 @@ impl FigView {
         let operation = self.item.read(cx).document().and_then(|document| {
             set_keyframe_easing_operation(&document.doc, clip_id, &keyframe, easing)
         });
-        self.apply_motion_operation(operation, "setting keyframe easing", cx);
+        self.apply_motion_operation(operation, "set the keyframe easing", cx);
     }
 
     fn edit_motion_keyframe_easing(
@@ -2129,7 +2129,8 @@ impl FigView {
         let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
             if let Err(error) = item.apply_for_preview_owner(preview_owner, operation, cx) {
-                log::error!("{action} failed: {error:#}");
+                log::error!("could not {action}: {error:#}");
+                show_canvas_notice_deferred(format!("Could not {action}: {error:#}"), cx);
             }
         });
     }
@@ -2152,7 +2153,7 @@ impl FigView {
             .read(cx)
             .document()
             .and_then(|document| delete_keyframe_operation(&document.doc, clip_id, &keyframe));
-        self.apply_motion_operation(operation, "deleting motion keyframe", cx);
+        self.apply_motion_operation(operation, "delete the keyframe", cx);
     }
 
     fn rename_motion_clip(&mut self, name: &str, cx: &mut Context<Self>) {
@@ -2169,7 +2170,7 @@ impl FigView {
             .read(cx)
             .document()
             .and_then(|document| rename_clip_operation(&document.doc, clip_id, name));
-        self.apply_motion_operation(operation, "renaming motion clip", cx);
+        self.apply_motion_operation(operation, "rename the animation", cx);
     }
 
     fn set_motion_clip_duration(&mut self, duration_us: i64, cx: &mut Context<Self>) {
@@ -2185,7 +2186,7 @@ impl FigView {
             self.item.read(cx).document().and_then(|document| {
                 set_clip_duration_operation(&document.doc, clip_id, duration_us)
             });
-        self.apply_motion_operation(operation, "changing motion clip duration", cx);
+        self.apply_motion_operation(operation, "change the animation duration", cx);
     }
 
     /// The timeline's loop toggles are the clip's authored loop mode, so the
@@ -2205,7 +2206,7 @@ impl FigView {
             self.item.read(cx).document().and_then(|document| {
                 set_clip_loop_mode_operation(&document.doc, clip_id, loop_mode)
             });
-        self.apply_motion_operation(operation, "changing motion clip loop mode", cx);
+        self.apply_motion_operation(operation, "change the loop mode", cx);
     }
 
     fn create_motion_clip(&mut self, cx: &mut Context<Self>) {
