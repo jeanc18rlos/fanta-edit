@@ -1778,11 +1778,13 @@ impl Client {
         self.cloud_client.clear_credentials();
         self.disconnect(cx);
 
-        if had_credentials {
-            self.credentials_provider
-                .delete_credentials(cx)
-                .await
-                .log_err();
+        if had_credentials
+            && let Err(error) = self.credentials_provider.delete_credentials(cx).await
+        {
+            log::error!("failed to delete saved credentials: {error:#}");
+            self.notify_account(
+                "Could not remove your saved sign-in from the system keychain, so Fanta may sign you in again the next time it opens.",
+            );
         }
     }
 
@@ -2102,6 +2104,8 @@ mod tests {
         reads: Mutex<usize>,
         writes: Mutex<usize>,
         deletes: Mutex<usize>,
+        fail_writes: Mutex<bool>,
+        fail_deletes: Mutex<bool>,
     }
 
     impl CredentialsProvider for CountingCredentialsProvider {
@@ -2137,6 +2141,7 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
             async move {
                 *self.writes.lock() += 1;
+                anyhow::ensure!(!*self.fail_writes.lock(), "keychain is locked");
                 *self.credentials.lock() = Some((username.to_string(), password.to_vec()));
                 Ok(())
             }
@@ -2150,6 +2155,7 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
             async move {
                 *self.deletes.lock() += 1;
+                anyhow::ensure!(!*self.fail_deletes.lock(), "keychain is locked");
                 *self.credentials.lock() = None;
                 Ok(())
             }
@@ -2241,6 +2247,46 @@ mod tests {
         assert_eq!(credentials.user_id, 2);
         assert_eq!(*provider.reads.lock(), 1);
         assert_eq!(*provider.writes.lock(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_sign_out_reports_a_saved_sign_in_it_could_not_remove(cx: &mut TestAppContext) {
+        init_test(cx);
+        let provider = Arc::new(CountingCredentialsProvider::default());
+        *provider.fail_deletes.lock() = true;
+        let client = cx.update(|cx| {
+            cx.set_global(fanta_credentials_provider::FantaCredentialsProvider(
+                provider.clone(),
+            ));
+            Client::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::with_200_response(),
+                cx,
+            )
+        });
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(Credentials {
+                    user_id: 2,
+                    access_token: "new-token".into(),
+                })
+            })
+        });
+        client
+            .sign_in(false, &cx.to_async())
+            .await
+            .expect("sign-in should succeed");
+
+        client.sign_out(&cx.to_async()).await;
+
+        assert_eq!(*client.status().borrow(), Status::SignedOut);
+        assert_eq!(*provider.deletes.lock(), 1);
+        assert_eq!(
+            client.account_notices().borrow().as_deref(),
+            Some(
+                "Could not remove your saved sign-in from the system keychain, so Fanta may sign you in again the next time it opens."
+            )
+        );
     }
 
     #[test]
