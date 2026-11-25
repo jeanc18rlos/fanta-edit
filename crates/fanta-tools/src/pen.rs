@@ -160,6 +160,9 @@ impl PenTool {
                 self.closing = false;
                 self.color = Some(ctx.new_shape_fill);
 
+                if self.anchors.last().is_some_and(|last| last.pos == pos) {
+                    return self.preview();
+                }
                 // Starting a fresh path clears any prior selection so a stray
                 // Backspace can't delete an unrelated node mid-draw.
                 if self.anchors.is_empty() {
@@ -914,6 +917,25 @@ mod tests {
             overlay,
             ToolOverlay::PenCloseTarget { .. } | ToolOverlay::PreviewPath { filled: true, .. }
         )));
+    }
+
+    /// A double-click lands its second press on the anchor the first placed,
+    /// which must not add a duplicate anchor.
+    #[test]
+    fn double_click_places_one_anchor() {
+        let (mut doc, mut viewport, snap, size) = ctx_pieces();
+        let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+        let mut tool = PenTool::new();
+        click(&mut tool, &mut ctx, [400.0, 300.0]);
+        click(&mut tool, &mut ctx, [400.0, 300.0]);
+        assert_eq!(tool.anchor_count(), 1, "an exact double-click");
+        click(&mut tool, &mut ctx, [500.0, 300.0]);
+        click(&mut tool, &mut ctx, [502.0, 301.0]);
+        assert_eq!(
+            tool.anchor_count(),
+            2,
+            "the second press snaps onto the last anchor"
+        );
     }
 
     #[test]
