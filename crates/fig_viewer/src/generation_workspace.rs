@@ -5914,12 +5914,16 @@ fn build_screen_request(
                     .iter()
                     .any(|candidate| option_value(candidate).as_deref() == Some(value)),
                 "Choose a valid {}.",
-                option_label(key),
+                option_label(key).to_lowercase(),
             );
         }
         let field = control["request_field"].as_str().unwrap_or(key);
         let encoded = if control["default"].is_boolean() || value == "true" || value == "false" {
-            ensure!(matches!(value, "true" | "false"), "Choose a valid {key}.");
+            ensure!(
+                matches!(value, "true" | "false"),
+                "Choose On or Off for {}.",
+                option_label(key)
+            );
             json!(value == "true")
         } else if control["default"].is_number()
             || matches!(
@@ -5934,9 +5938,13 @@ fn build_screen_request(
                     | "num_outputs"
             )
         {
-            let number: Value =
-                serde_json::from_str(value).with_context(|| format!("Choose a valid {key}."))?;
-            ensure!(number.is_number(), "Choose a valid {key}.");
+            let number: Value = serde_json::from_str(value)
+                .with_context(|| format!("Choose a valid {}.", option_label(key).to_lowercase()))?;
+            ensure!(
+                number.is_number(),
+                "Choose a valid {}.",
+                option_label(key).to_lowercase()
+            );
             number
         } else {
             json!(value)
@@ -6121,12 +6129,13 @@ fn build_request(
             let value = text
                 .trim()
                 .parse::<f64>()
-                .with_context(|| format!("Enter a valid value for {key}."))?;
+                .with_context(|| format!("Enter a valid value for {}.", option_label(key)))?;
             let min = model.capabilities[key]["min"].as_f64().unwrap_or(0.);
             let max = model.capabilities[key]["max"].as_f64().unwrap_or(100.);
             ensure!(
                 value.is_finite() && (min..=max).contains(&value),
-                "{key} must be between {min} and {max}."
+                "{} must be between {min} and {max}.",
+                option_label(key)
             );
             ensure!(
                 key != "steps" || value.fract() == 0.,
@@ -9650,6 +9659,61 @@ mod tests {
 
         submission.options[1].value = "3".into();
         assert!(build_screen_request(&model, &submission, None, None, None).is_err());
+    }
+
+    #[test]
+    fn invalid_control_values_name_the_control_label() {
+        let mut video = model("video");
+        video.capabilities = json!({
+            "operations": ["text_to_video"],
+            "controls": {
+                "fps": {"default": 16, "location": "input"},
+                "generate_audio": {"default": true, "location": "input"}
+            }
+        });
+        for (key, value, expected) in [
+            ("fps", "fast", "Choose a valid frame rate."),
+            (
+                "generate_audio",
+                "maybe",
+                "Choose On or Off for Generate audio.",
+            ),
+        ] {
+            let mut submission =
+                screen_submission(&video, GenerationRecipe::TextVideo, "A fox running");
+            submission
+                .options
+                .push(fanta_gpui::generation::GenerationOptionSelection {
+                    key: key.into(),
+                    value: value.into(),
+                });
+            let error = build_screen_request(&video, &submission, None, None, None)
+                .expect_err("invalid control value");
+            assert_eq!(error.to_string(), expected);
+        }
+        let mut legacy = model("image");
+        legacy.capabilities = json!({"steps": {"min": 10, "max": 50}});
+        for (steps, expected) in [
+            ("many", "Enter a valid value for Steps."),
+            ("60", "Steps must be between 10 and 50."),
+        ] {
+            let error = build_request(
+                &legacy,
+                "A fox",
+                "",
+                "1024x1024",
+                "",
+                steps,
+                "",
+                "",
+                "",
+                None,
+                None,
+                &[],
+            )
+            .expect_err("invalid legacy steps");
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[gpui::test]
