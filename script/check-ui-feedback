@@ -37,7 +37,7 @@ ADVICE = {
     "debug-in-notice": "Write the name the user sees, not a Rust Debug form.",
     "notice-wording": 'Start a failure with "Could not …".',
 }
-NOTICE_CALL = re.compile(r"\b(?:show_canvas_notice(?:_deferred)?|notify_unavailable)\(")
+NOTICE_CALL = re.compile(r"\b(?:show_(?:workspace_)?canvas_notice(?:_deferred)?|notify_unavailable)\(")
 ERR_HANDLER = re.compile(r"\bErr\([^()]*\)\s*(=>|=(?!=))")
 LOGS = re.compile(r"\blog::\w+!|\beprintln!")
 SURFACES = re.compile(

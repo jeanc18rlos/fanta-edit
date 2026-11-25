@@ -9,6 +9,10 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 - Inside a `Workspace::register_action` handler or a `workspace.update`/`update_in` closure, show notices with `show_workspace_canvas_notice(workspace, ..)`, never `show_canvas_notice`. The latter updates the window's workspace again and GPUI panics on the double lease. (#131)
 - Tool and MCP connection methods can run inside a `FigView` or `FigItem` update. Defer work that reads the same entity to a spawned foreground task: code before the first `.await` still runs while the caller holds the lease. (#26)
 
+## Telling the user
+
+- A failure of something the user asked for must reach them: `show_canvas_notice` or `show_canvas_notice_deferred` with a "Could not …" sentence, never a Rust `Debug` form. A control that is not wired calls `notify_unavailable`. `.log_err()` alone hides the failure: one pass found 32 of these and five actions that did nothing. `script/check-ui-feedback`, part of `script/gate`, fails a change that adds one; background work nobody waits for takes a `// silent: <reason>` comment. (#245)
+
 ## Rendering and performance
 
 - GPUI re-renders every visible view on every window redraw, regardless of subscriptions. Panel `render` must be O(visible content): build anything O(document) (layer trees, page, component and asset snapshots, layer-action availability) in event handlers and cache it. Build document-wide lookups once per projection, never per row, and run reference scans only when a command executes. (#40)
