@@ -11788,7 +11788,7 @@ mod tests {
             (
                 // The panel's move-up button on the last track.
                 DesignPanelAction::GridTracksReorderRequested {
-                    node_id: node_id.clone(),
+                    node_id,
                     axis: DesignGridTrackAxis::Column,
                     from_indices: vec![2],
                     insertion_index: 1,
