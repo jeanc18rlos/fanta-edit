@@ -267,8 +267,23 @@ def base_revision():
     return None
 
 
-def added_sites(base_sources, head_sources):
+def changed_lines(revision, paths):
+    """Per path, the working-tree lines the change adds or rewrites."""
+    lines = collections.defaultdict(set)
+    path = None
+    for line in (git("diff", "-U0", "--no-renames", revision, "--", *paths) or "").splitlines():
+        hunk = re.match(r"@@ -\S+ \+(\d+)(?:,(\d+))? @@", line)
+        if line.startswith("+++ "):
+            path = line[len("+++ b/") :]
+        elif hunk:
+            start, count = int(hunk[1]), int(hunk[2] or 1)
+            lines[path].update(range(start, start + count))
+    return lines
+
+
+def added_sites(base_sources, head_sources, new_lines=None):
     """Per rule, the sites the change adds, when it raises the rule's count."""
+    new_lines = new_lines or {}
     base = collections.defaultdict(collections.Counter)
     head = collections.defaultdict(list)
     for source in base_sources.values():
@@ -283,11 +298,17 @@ def added_sites(base_sources, head_sources):
             continue
         remaining = collections.Counter(base[rule])
         added[rule] = []
-        for path, line, text in sites:
+        # Many sites read the same (`.log_err();`), so untouched lines take the base's
+        # sites first: what is left over is then the site the change wrote.
+        untouched_first = sorted(
+            sites, key=lambda site: site[0] not in base_sources or site[1] in new_lines.get(site[0], ())
+        )
+        for path, line, text in untouched_first:
             if remaining[text]:
                 remaining[text] -= 1
             else:
                 added[rule].append((path, line, text))
+        added[rule].sort()
     return added
 
 
@@ -304,11 +325,12 @@ def check_change():
     head_sources = {
         path: (ROOT / path).read_text(encoding="utf-8") for path in paths if (ROOT / path).is_file()
     }
-    added = added_sites(base_sources, head_sources)
+    added = added_sites(base_sources, head_sources, changed_lines(revision, paths) if paths else {})
     for rule, sites in sorted(added.items()):
-        print(f"{rule}: this change adds {len(sites)}. {ADVICE[rule]}")
+        print(f"{rule}: this change adds more than it removes. It wrote or rewrote:")
         for path, line, text in sites:
             print(f"  {path}:{line}: {text[:110]}")
+        print(ADVICE[rule])
     if added:
         print(f"A site that is right as it stands takes `{ALLOW} <reason>` on the line above.")
         return 1
@@ -380,6 +402,11 @@ def self_test():
     assert added_sites(old, moved) == {}
     grown = {"a.rs": old["a.rs"] + "\nfn b() { load(cx).log_err(); }"}
     assert added_sites(old, grown) == {"silent-failure": [("a.rs", 2, "fn b() { load(cx).log_err(); }")]}
+    one = {"a.rs": "fn a() {\n    save(cx).log_err();\n}"}
+    twin = {"a.rs": "fn b() {\n    save(cx).log_err();\n}\n" + one["a.rs"]}
+    assert added_sites(one, twin, {"a.rs": {1, 2, 3}}) == {
+        "silent-failure": [("a.rs", 2, "save(cx).log_err();")]
+    }
     print("script/check-ui-feedback: self-test passes")
     return 0
 
