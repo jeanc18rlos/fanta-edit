@@ -2609,6 +2609,7 @@ impl FigView {
                 matches!(
                     overlay,
                     fanta_tools::ToolOverlay::PreviewLine { .. }
+                        | fanta_tools::ToolOverlay::PreviewPath { .. }
                         | fanta_tools::ToolOverlay::PreviewRect { .. }
                         | fanta_tools::ToolOverlay::PreviewEllipse { .. }
                 )

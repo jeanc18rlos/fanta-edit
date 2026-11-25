@@ -10010,23 +10010,25 @@ async fn mounted_pen_anchors_survive_pending_press_deactivation(cx: &mut TestApp
         click_count: 1,
         first_mouse: false,
     });
-    let expected_lines = vec![
-        fanta_tools::ToolOverlay::PreviewLine {
-            world_start: [-80.0, -152.0],
-            world_end: [80.0, -152.0],
-        },
-        fanta_tools::ToolOverlay::PreviewLine {
-            world_start: [80.0, -152.0],
-            world_end: [80.0, -80.0],
-        },
-    ];
+    // The anchors, not the previewed curve, which a held-press move reshapes.
+    let expected_lines: Vec<_> = [[-80.0, -152.0], [80.0, -152.0], [80.0, -80.0]]
+        .map(|world| fanta_tools::ToolOverlay::PathAnchor {
+            world,
+            selected: false,
+        })
+        .to_vec();
+    let pen_anchors = |view: &FigView| {
+        view.tools
+            .overlays
+            .iter()
+            .filter(|overlay| matches!(overlay, fanta_tools::ToolOverlay::PathAnchor { .. }))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
     view.read_with(&visual, |view, _| {
         assert_eq!(view.active_tool(), ToolKind::Pen);
         assert!(view.primary_pressed);
-        assert_eq!(
-            view.tools.overlays.get(..2),
-            Some(expected_lines.as_slice())
-        );
+        assert_eq!(pen_anchors(view), expected_lines);
     });
     let (expected, assets) = item.read_with(&visual, |item, _| {
         let document = item.document().expect("document");
@@ -10046,10 +10048,7 @@ async fn mounted_pen_anchors_survive_pending_press_deactivation(cx: &mut TestApp
         });
         view.read_with(&visual, |view, _| {
             assert_eq!(view.active_tool(), ToolKind::Pen);
-            assert_eq!(
-                view.tools.overlays.get(..2),
-                Some(expected_lines.as_slice())
-            );
+            assert_eq!(pen_anchors(view), expected_lines);
         });
         visual.simulate_event(MouseMoveEvent {
             position: third_anchor + point(px(12.0), px(14.0)),
@@ -10058,10 +10057,7 @@ async fn mounted_pen_anchors_survive_pending_press_deactivation(cx: &mut TestApp
         });
         view.read_with(&visual, |view, _| {
             assert_eq!(view.active_tool(), ToolKind::Pen);
-            assert_eq!(
-                view.tools.overlays.get(..2),
-                Some(expected_lines.as_slice())
-            );
+            assert_eq!(pen_anchors(view), expected_lines);
         });
         item.read_with(&visual, |item, _| {
             let document = item.document().expect("document");

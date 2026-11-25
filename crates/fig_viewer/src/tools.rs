@@ -459,6 +459,7 @@ impl ToolShell {
             Some(CursorHint::Grab) => CursorStyle::OpenHand,
             Some(CursorHint::Grabbing) => CursorStyle::ClosedHand,
             Some(CursorHint::Text) => CursorStyle::IBeam,
+            Some(CursorHint::Pointer) => CursorStyle::PointingHand,
             Some(CursorHint::Move) | Some(CursorHint::Default) => CursorStyle::Arrow,
             None => match self.kind {
                 ToolKind::Hand => CursorStyle::OpenHand,

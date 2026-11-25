@@ -16,9 +16,10 @@
 //! pen is *sticky* — after a commit it stays active so you can draw the next
 //! path, matching Figma.
 //!
-//! Live preview uses straight [`ToolOverlay::PreviewLine`] segments between
-//! anchors plus a rubber-band to the cursor (there is no cubic-preview overlay
-//! yet); the committed geometry is the exact cubic.
+//! The live preview is a [`ToolOverlay::PreviewPath`] of the draft's curves plus
+//! the segment a press would add, ending at the snapped cursor. Inside the
+//! close distance it previews the filled shape, rings the first anchor and
+//! shows the pointer cursor.
 
 use crate::context::ToolContext;
 use crate::event::{Button, KeyEvent, LogicalKey, PointerEvent, ToolEvent};
@@ -57,8 +58,11 @@ pub struct PenTool {
     /// True between Press and Release on the most-recent anchor (adjusting its
     /// tangent by dragging).
     dragging: bool,
-    /// Last-known cursor in world space (for the rubber-band preview).
+    /// Where a press would place the next anchor, in world space (for the
+    /// rubber-band preview).
     cursor: DVec2,
+    /// The pointer is within the close distance of the first anchor.
+    closing: bool,
 }
 
 impl PenTool {
@@ -117,6 +121,7 @@ impl PenTool {
                 let world = ctx.screen_to_world(screen);
                 let pos = self.snap(ctx, world);
                 self.cursor = pos;
+                self.closing = false;
 
                 // Starting a fresh path clears any prior selection so a stray
                 // Backspace can't delete an unrelated node mid-draw.
@@ -132,15 +137,19 @@ impl PenTool {
                 self.preview()
             }
             PointerEvent::Move { screen, .. } => {
-                let world = ctx.screen_to_world(DVec2::from(screen));
-                self.cursor = world;
+                let screen = DVec2::from(screen);
+                let world = ctx.screen_to_world(screen);
                 if self.dragging {
+                    self.cursor = world;
                     // Drag sets a symmetric tangent on the just-placed anchor.
                     if let Some(last) = self.anchors.last_mut() {
                         let t = world - last.pos;
                         last.tan_out = Some(t);
                         last.tan_in = Some(-t);
                     }
+                } else {
+                    self.closing = self.within_close_distance(ctx, screen);
+                    self.cursor = self.snap(ctx, world);
                 }
                 self.preview()
             }
@@ -194,20 +203,52 @@ impl PenTool {
         ctx.snap_point_with_points(world, &[], &points).world
     }
 
-    /// Build straight-segment preview overlays between anchors plus a rubber-band
-    /// to the cursor while drafting.
+    /// The draft's curves, the segment a press would add, its anchors, the
+    /// last anchor's handles and, inside the close distance, the close ring.
     fn preview(&self) -> ToolResponse {
-        let mut response = ToolResponse::cursor(CursorHint::Crosshair);
+        let closing = self.closing && !self.dragging && self.anchors.len() >= 2;
+        let mut response = ToolResponse::cursor(if closing {
+            CursorHint::Pointer
+        } else {
+            CursorHint::Crosshair
+        });
+        let (Some(first), Some(last)) = (self.anchors.first(), self.anchors.last()) else {
+            return response;
+        };
+        let mut world_points = vec![[first.pos.x, first.pos.y]];
         for pair in self.anchors.windows(2) {
-            response.overlays.push(ToolOverlay::PreviewLine {
-                world_start: [pair[0].pos.x, pair[0].pos.y],
-                world_end: [pair[1].pos.x, pair[1].pos.y],
+            flatten_segment(&mut world_points, &pair[0], &pair[1]);
+        }
+        if closing {
+            flatten_segment(&mut world_points, last, first);
+        } else if !self.dragging {
+            let next = Anchor {
+                pos: self.cursor,
+                tan_in: None,
+                tan_out: None,
+            };
+            flatten_segment(&mut world_points, last, &next);
+        }
+        response.overlays.push(ToolOverlay::PreviewPath {
+            world_points,
+            closed: closing,
+            filled: closing,
+        });
+        for anchor in &self.anchors {
+            response.overlays.push(ToolOverlay::PathAnchor {
+                world: [anchor.pos.x, anchor.pos.y],
+                selected: false,
             });
         }
-        if let Some(last) = self.anchors.last() {
-            response.overlays.push(ToolOverlay::PreviewLine {
-                world_start: [last.pos.x, last.pos.y],
-                world_end: [self.cursor.x, self.cursor.y],
+        for ctrl in [last.ctrl_in(), last.ctrl_out()].into_iter().flatten() {
+            response.overlays.push(ToolOverlay::PathHandle {
+                world_anchor: [last.pos.x, last.pos.y],
+                world_ctrl: [ctrl.x, ctrl.y],
+            });
+        }
+        if closing {
+            response.overlays.push(ToolOverlay::PenCloseTarget {
+                world: [first.pos.x, first.pos.y],
             });
         }
         response
@@ -292,6 +333,27 @@ impl PenTool {
             tracing::warn!(target: "fanta-tools.pen", "create failed: {e}");
         } else {
             ctx.doc.selection.select_only(id);
+        }
+    }
+}
+
+/// Append the points after `a` on the segment `a`→`b` that [`seg`] would build.
+fn flatten_segment(points: &mut Vec<[f64; 2]>, a: &Anchor, b: &Anchor) {
+    const STEPS: usize = 16;
+    match (a.ctrl_out(), b.ctrl_in()) {
+        (None, None) => points.push([b.pos.x, b.pos.y]),
+        (c1, c2) => {
+            let ctrl1 = c1.unwrap_or(a.pos);
+            let ctrl2 = c2.unwrap_or(b.pos);
+            for step in 1..=STEPS {
+                let t = step as f64 / STEPS as f64;
+                let u = 1.0 - t;
+                let point = a.pos * (u * u * u)
+                    + ctrl1 * (3.0 * u * u * t)
+                    + ctrl2 * (3.0 * u * t * t)
+                    + b.pos * (t * t * t);
+                points.push([point.x, point.y]);
+            }
         }
     }
 }
@@ -581,6 +643,76 @@ mod tests {
         }
     }
 
+    /// A3: inside the close distance a hover shows the ring, the close cursor
+    /// and a filled preview; away from it the preview is the curve a press
+    /// would make, ending at the snapped point.
+    #[test]
+    fn a3_hover_previews_close_and_snapped_curve() {
+        let (mut doc, mut viewport, snap, size) =
+            pieces_at_zoom(1.0, fanta_canvas::SnapTargets::GRID);
+        let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+        let mut tool = PenTool::new();
+        click(&mut tool, &mut ctx, [400.0, 300.0]);
+        click(&mut tool, &mut ctx, [600.0, 300.0]);
+        // The third anchor is dragged, so the next segment is a curve.
+        tool.handle_event(&mut ctx, press([600.0, 500.0]));
+        tool.handle_event(&mut ctx, mv([640.0, 500.0]));
+        tool.handle_event(&mut ctx, release([640.0, 500.0]));
+
+        let response = tool.handle_event(&mut ctx, mv([405.0, 303.0]));
+        assert_eq!(response.cursor, Some(CursorHint::Pointer));
+        assert!(
+            response
+                .overlays
+                .contains(&ToolOverlay::PenCloseTarget { world: [0.0, 0.0] })
+        );
+        assert!(response.overlays.iter().any(|overlay| matches!(
+            overlay,
+            ToolOverlay::PreviewPath { closed: true, filled: true, world_points }
+                if world_points.last() == Some(&[0.0, 0.0])
+        )));
+
+        // World (101, 151): the 8-unit grid snaps it to (104, 152).
+        let response = tool.handle_event(&mut ctx, mv([501.0, 451.0]));
+        assert_eq!(response.cursor, Some(CursorHint::Crosshair));
+        assert!(
+            !response
+                .overlays
+                .iter()
+                .any(|overlay| matches!(overlay, ToolOverlay::PenCloseTarget { .. }))
+        );
+        let Some(ToolOverlay::PreviewPath {
+            world_points,
+            closed: false,
+            filled: false,
+        }) = response.overlays.first()
+        else {
+            panic!("expected an open path preview, got {:?}", response.overlays);
+        };
+        assert_eq!(world_points.last(), Some(&[104.0, 152.0]));
+        let curve = world_points
+            .iter()
+            .skip_while(|point| **point != [200.0, 200.0])
+            .collect::<Vec<_>>();
+        assert!(curve.len() > 2, "the new segment is flattened as a curve");
+        assert_eq!(
+            response
+                .overlays
+                .iter()
+                .filter(|overlay| matches!(overlay, ToolOverlay::PathAnchor { .. }))
+                .count(),
+            3
+        );
+        assert_eq!(
+            response
+                .overlays
+                .iter()
+                .filter(|overlay| matches!(overlay, ToolOverlay::PathHandle { .. }))
+                .count(),
+            2
+        );
+    }
+
     #[test]
     fn rubber_band_preview_present_while_drafting() {
         let (mut doc, mut viewport, snap, size) = ctx_pieces();
@@ -591,7 +723,7 @@ mod tests {
         assert!(
             r.overlays
                 .iter()
-                .any(|o| matches!(o, ToolOverlay::PreviewLine { .. }))
+                .any(|o| matches!(o, ToolOverlay::PreviewPath { .. }))
         );
     }
 }
