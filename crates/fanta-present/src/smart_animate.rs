@@ -260,53 +260,55 @@ impl SmartAnimate {
                 // tween clip_size for groups (resize during smart animate motion)
                 if let NodeData::Group(g) = &mut node.data {
                     if let (Some(from_c), Some(to_c)) = (tween.from_clip, tween.to_clip) {
-                        let w = lerp(from_c[0], to_c[0], e);
-                        let h = lerp(from_c[1], to_c[1], e);
+                        let w = length(from_c[0], to_c[0], e);
+                        let h = length(from_c[1], to_c[1], e);
                         g.clip_size = Some([w, h]);
                     }
                     if let (Some(from_size), Some(to_size)) =
                         (tween.from_local_size, tween.to_local_size)
                     {
                         g.local_size = Some([
-                            lerp(from_size[0], to_size[0], e),
-                            lerp(from_size[1], to_size[1], e),
+                            length(from_size[0], to_size[0], e),
+                            length(from_size[1], to_size[1], e),
                         ]);
                     }
                     // tween corner for rounded motion (uniform)
                     if let (Some(from_r), Some(to_r)) = (tween.from_corner, tween.to_corner) {
-                        g.corner_radius = Some(lerp(from_r, to_r, e));
+                        g.corner_radius = Some(length(from_r, to_r, e));
                     }
                     // per-corner radii (mixed rounded rects during motion)
                     if let (Some(from_cs), Some(to_cs)) = (tween.from_corners, tween.to_corners) {
                         g.corner_radii = Some([
-                            lerp(from_cs[0], to_cs[0], e),
-                            lerp(from_cs[1], to_cs[1], e),
-                            lerp(from_cs[2], to_cs[2], e),
-                            lerp(from_cs[3], to_cs[3], e),
+                            length(from_cs[0], to_cs[0], e),
+                            length(from_cs[1], to_cs[1], e),
+                            length(from_cs[2], to_cs[2], e),
+                            length(from_cs[3], to_cs[3], e),
                         ]);
                     }
                     // corner smoothing (Figma "corner radius" advanced)
                     if let (Some(from_sm), Some(to_sm)) = (tween.from_smoothing, tween.to_smoothing)
                     {
-                        g.corner_smoothing = lerp(from_sm as f64, to_sm as f64, e) as f32;
+                        g.corner_smoothing =
+                            lerp(from_sm as f64, to_sm as f64, e).clamp(0.0, 1.0) as f32;
                     }
                 }
                 // Also support tweening rounded corners on vectors during Smart Animate (motion fidelity)
                 if let NodeData::Vector(v) = &mut node.data {
                     if let (Some(from_r), Some(to_r)) = (tween.from_corner, tween.to_corner) {
-                        v.corner_radius = Some(lerp(from_r, to_r, e));
+                        v.corner_radius = Some(length(from_r, to_r, e));
                     }
                     if let (Some(from_cs), Some(to_cs)) = (tween.from_corners, tween.to_corners) {
                         v.corner_radii = Some([
-                            lerp(from_cs[0], to_cs[0], e),
-                            lerp(from_cs[1], to_cs[1], e),
-                            lerp(from_cs[2], to_cs[2], e),
-                            lerp(from_cs[3], to_cs[3], e),
+                            length(from_cs[0], to_cs[0], e),
+                            length(from_cs[1], to_cs[1], e),
+                            length(from_cs[2], to_cs[2], e),
+                            length(from_cs[3], to_cs[3], e),
                         ]);
                     }
                     if let (Some(from_sm), Some(to_sm)) = (tween.from_smoothing, tween.to_smoothing)
                     {
-                        v.corner_smoothing = lerp(from_sm as f64, to_sm as f64, e) as f32;
+                        v.corner_smoothing =
+                            lerp(from_sm as f64, to_sm as f64, e).clamp(0.0, 1.0) as f32;
                     }
                 }
             }
@@ -372,6 +374,11 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
 }
 
+/// Sizes and radii keep an overshooting curve's motion but never go negative.
+fn length(a: f64, b: f64, t: f64) -> f64 {
+    lerp(a, b, t).max(0.0)
+}
+
 fn lerp6(a: [f64; 6], b: [f64; 6], t: f64) -> [f64; 6] {
     std::array::from_fn(|i| lerp(a[i], b[i], t))
 }
@@ -420,5 +427,63 @@ mod tests {
         };
         assert_eq!(group.local_size, Some([160.0, 80.0]));
         assert_eq!(group.clip_size, None);
+    }
+
+    #[test]
+    fn an_overshooting_shrink_never_yields_a_negative_size_or_radius() {
+        let mut doc = Doc::new();
+        let mut frames = Vec::new();
+        for _ in 0..2 {
+            let frame = CanvasNode::new(NodeData::Group(GroupNode {
+                clip_size: Some([400.0, 300.0]),
+                ..Default::default()
+            }));
+            frames.push(frame.id);
+            doc.apply(Operation::create_node(frame)).unwrap();
+        }
+        let mut card_id = None;
+        for (frame, size, radius, smoothing) in
+            [(frames[0], 100.0, 20.0, 0.5), (frames[1], 0.0, 0.0, 1.0)]
+        {
+            let mut card = CanvasNode::new(NodeData::Group(GroupNode {
+                clip_size: Some([size, size]),
+                local_size: Some([size, size]),
+                corner_radius: Some(radius),
+                corner_radii: Some([radius; 4]),
+                corner_smoothing: smoothing,
+                ..Default::default()
+            }));
+            card.name = "Card".into();
+            card.parent = Some(frame);
+            card_id = Some(card.id);
+            doc.apply(Operation::create_node(card)).unwrap();
+        }
+        let card_id = card_id.expect("destination card");
+        let back_out = fanta_doc::Easing::CubicBezier {
+            x1: 0.34,
+            y1: 1.56,
+            x2: 0.64,
+            y2: 1.0,
+        };
+
+        let mut animation = prepare(&doc, frames[0], frames[1]).expect("smart animate");
+        for step in 0..=20 {
+            animation.apply(crate::transition::ease(back_out, f64::from(step) / 20.0));
+            let NodeData::Group(group) = &animation.scene.get(card_id).unwrap().data else {
+                panic!("expected group");
+            };
+            let lengths = [
+                group.clip_size.unwrap_or_default(),
+                group.local_size.unwrap_or_default(),
+            ]
+            .concat()
+            .into_iter()
+            .chain(group.corner_radius)
+            .chain(group.corner_radii.unwrap_or_default());
+            for length in lengths {
+                assert!(length >= 0.0, "step {step} produced {length}");
+            }
+            assert!((0.0..=1.0).contains(&group.corner_smoothing));
+        }
     }
 }
