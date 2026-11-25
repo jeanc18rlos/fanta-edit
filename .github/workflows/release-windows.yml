@@ -30,6 +30,11 @@ jobs:
     name: Build x86_64 installer
     runs-on: windows-2025
     timeout-minutes: 330
+    env:
+      # The image's MSVC standard library refuses the Clang in C:\Program Files\LLVM as too old.
+      # Visual Studio's own Clang always matches its library, so Skia and bindgen use that one.
+      LLVM_HOME: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64
+      LIBCLANG_PATH: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64\bin
     steps:
       # Skia and the Rust target tree nest deeply enough to pass MAX_PATH.
       - name: Allow long paths
