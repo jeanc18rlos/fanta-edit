@@ -1108,8 +1108,8 @@ fn restore_journal(snapshot: JournalSnapshot, account: Arc<str>) -> Result<Resto
                 history.extend(run);
                 submissions.extend(submission);
             }
+            // silent: restore_history tells the user once, from the returned unreadable keys.
             Err(error) => {
-                // silent: restore_history tells the user once, from the returned unreadable keys.
                 log::warn!("Skipping unreadable saved generation {key}: {error:#}");
                 unreadable.push(key);
             }
@@ -3463,6 +3463,7 @@ impl GenerationWorkspace {
                             }
                             true
                         })
+                        // silent: the update fails only when the workspace was closed, so no screen is left to tell.
                         .log_err()
                         .unwrap_or(false);
                     if !applied {
@@ -3627,6 +3628,7 @@ impl GenerationWorkspace {
                             }
                             true
                         })
+                        // silent: the update fails only when the workspace was closed, so no screen is left to tell.
                         .log_err()
                         .unwrap_or(false);
                     if applied && response.should_poll() {
@@ -3651,6 +3653,7 @@ impl GenerationWorkspace {
                         this.fail(error, cx);
                         this.pending = still_running;
                     })
+                    // silent: the update fails only when the workspace was closed, so no screen is left to tell.
                     .log_err();
                 }
             }
