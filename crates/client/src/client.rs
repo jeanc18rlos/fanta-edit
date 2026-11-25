@@ -1007,33 +1007,37 @@ impl Client {
         if credentials.is_none() {
             let mut status_rx = self.status();
             let _ = status_rx.next().await;
-            futures::select_biased! {
-                authenticate = self.authenticate(cx).fuse() => {
-                    match authenticate {
-                        Ok(creds) => {
-                            if IMPERSONATE_LOGIN.is_none()
-                                && let Err(error) = self
-                                    .credentials_provider
-                                    .write_credentials(creds.user_id, creds.access_token.clone(), cx)
-                                    .await
-                            {
-                                log::error!("failed to save credentials: {error:#}");
-                                self.notify_account(
-                                    "Could not save your sign-in to the system keychain, so you will need to sign in again the next time Fanta opens.",
-                                );
-                            }
-
-                            credentials = Some(creds);
-                        },
-                        Err(err) => {
-                            self.set_status(Status::AuthenticationError, cx);
-                            return Err(err);
-                        }
+            // A dropped attempt would otherwise leave the status on Authenticating with nobody to finish it.
+            let sign_out_if_dropped = util::defer({
+                let client = self.clone();
+                let cx = cx.clone();
+                move || client.set_status(Status::SignedOut, &cx)
+            });
+            let authenticate = futures::select_biased! {
+                authenticate = self.authenticate(cx).fuse() => Some(authenticate),
+                _ = status_rx.next().fuse() => None,
+            };
+            sign_out_if_dropped.abort();
+            match authenticate {
+                Some(Ok(creds)) => {
+                    if IMPERSONATE_LOGIN.is_none()
+                        && let Err(error) = self
+                            .credentials_provider
+                            .write_credentials(creds.user_id, creds.access_token.clone(), cx)
+                            .await
+                    {
+                        log::error!("failed to save credentials: {error:#}");
+                        self.notify_account(
+                            "Could not save your sign-in to the system keychain, so you will need to sign in again the next time Fanta opens.",
+                        );
                     }
+                    credentials = Some(creds);
                 }
-                _ = status_rx.next().fuse() => {
-                    return Err(SignInCanceled.into());
+                Some(Err(err)) => {
+                    self.set_status(Status::AuthenticationError, cx);
+                    return Err(err);
                 }
+                None => return Err(SignInCanceled.into()),
             }
         }
 
@@ -2460,6 +2464,54 @@ mod tests {
         second.await.expect("the second sign-in should share the first");
         assert_eq!(*attempts.lock(), 1);
         assert_eq!(*client.status().borrow(), Status::Authenticated);
+    }
+
+    #[gpui::test]
+    async fn test_dropped_browser_sign_in_does_not_strand_the_next_one(cx: &mut TestAppContext) {
+        init_test(cx);
+        let client = cx.update(|cx| {
+            Client::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::with_200_response(),
+                cx,
+            )
+        });
+        let attempts = Arc::new(Mutex::new(0));
+        client.override_authenticate({
+            let attempts = attempts.clone();
+            move |cx| {
+                *attempts.lock() += 1;
+                let first_attempt = *attempts.lock() == 1;
+                cx.background_spawn(async move {
+                    if first_attempt {
+                        future::pending::<()>().await;
+                    }
+                    Ok(Credentials {
+                        user_id: 2,
+                        access_token: "token".into(),
+                    })
+                })
+            }
+        });
+
+        let first = cx.spawn({
+            let client = client.clone();
+            move |cx| async move { client.sign_in_with_optional_connect(false, &cx).await }
+        });
+        cx.run_until_parked();
+        assert_eq!(*client.status().borrow(), Status::Authenticating);
+        drop(first);
+        cx.run_until_parked();
+        assert_eq!(*client.status().borrow(), Status::SignedOut);
+
+        let second = cx.spawn({
+            let client = client.clone();
+            move |cx| async move { client.sign_in_with_optional_connect(false, &cx).await }
+        });
+        cx.run_until_parked();
+        assert_eq!(*client.status().borrow(), Status::Authenticated);
+        second.await.expect("the next sign-in should run its own attempt");
+        assert_eq!(*attempts.lock(), 2);
     }
 
     #[gpui::test]
