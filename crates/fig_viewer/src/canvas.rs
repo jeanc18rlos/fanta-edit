@@ -6234,6 +6234,7 @@ impl CanvasElement {
                         if *filled {
                             match build(PathBuilder::fill()) {
                                 Ok(path) => window.paint_path(path, selection_fill.opacity(0.25)),
+                                // silent: paint runs every frame, so a notice would repeat.
                                 Err(error) => {
                                     log::warn!("failed to build pen fill preview: {error:#}")
                                 }
@@ -6241,6 +6242,7 @@ impl CanvasElement {
                         }
                         match build(PathBuilder::stroke(px(1.))) {
                             Ok(path) => window.paint_path(path, accent),
+                            // silent: paint runs every frame, so a notice would repeat.
                             Err(error) => log::warn!("failed to build pen preview: {error:#}"),
                         }
                     }
