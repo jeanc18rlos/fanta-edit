@@ -5887,15 +5887,7 @@ fn option_choice_label(key: &str, value: &str) -> String {
             _ => value.to_owned(),
         };
     }
-    if value.contains('_') {
-        let mut chars = value.chars();
-        return chars
-            .next()
-            .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-            .unwrap_or_default()
-            .replace('_', " ");
-    }
-    value.to_owned()
+    value.replace('_', " ")
 }
 
 fn generation_templates() -> Vec<GenerationTemplate> {
@@ -9838,7 +9830,12 @@ mod tests {
     fn option_labels_read_as_plain_words_and_keep_millisecond_lengths() {
         assert_eq!(option_label("num_outputs"), "Number of outputs");
         assert_eq!(option_label("cfg_scale"), "Guidance scale");
-        assert_eq!(option_choice_label("quality", "pro_max"), "Pro max");
+        assert_eq!(option_choice_label("quality", "pro"), "pro");
+        assert_eq!(option_choice_label("quality", "pro_max"), "pro max");
+        assert_eq!(
+            option_choice_label("output_format", "mp3_44100_128"),
+            "mp3 44100 128"
+        );
         assert_eq!(option_choice_label("music_length_ms", "30000"), "30 s");
         assert_eq!(option_choice_label("music_length_ms", "2500"), "2.5 s");
         assert_eq!(option_choice_label("music_length_ms", "2999"), "2.999 s");
