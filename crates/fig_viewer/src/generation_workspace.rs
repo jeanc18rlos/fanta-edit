@@ -1109,6 +1109,7 @@ fn restore_journal(snapshot: JournalSnapshot, account: Arc<str>) -> Result<Resto
                 submissions.extend(submission);
             }
             Err(error) => {
+                // silent: restore_history tells the user once, from the returned unreadable keys.
                 log::warn!("Skipping unreadable saved generation {key}: {error:#}");
                 unreadable.push(key);
             }
