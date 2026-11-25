@@ -855,6 +855,7 @@ impl FantaMotionPanel {
                     AnimationSettings::for_property(property),
                 )
             },
+            |_| Some("Could not add animation on this layer".to_string()),
             cx,
         );
         if applied {
@@ -915,6 +916,7 @@ impl FantaMotionPanel {
         let applied = self.apply_transaction(
             "Remove Animation",
             |doc| remove_animation_transaction(doc, active_clip, node, property),
+            |_| None,
             cx,
         );
         if applied && self.selected_property == Some(property) {
@@ -934,6 +936,7 @@ impl FantaMotionPanel {
         self.apply_transaction(
             "Edit Animation",
             |doc| edit_animation_transaction(doc, active_clip, node, property, update),
+            |doc| edit_animation_refusal(doc, active_clip, node, property),
             cx,
         );
     }
@@ -942,10 +945,11 @@ impl FantaMotionPanel {
         &mut self,
         label: &'static str,
         build: impl FnOnce(&Doc) -> Option<Transaction>,
+        refusal: impl FnOnce(&Doc) -> Option<String>,
         cx: &mut Context<Self>,
     ) -> bool {
         self.finish_continuous_edits(cx);
-        let transaction = {
+        let (transaction, refusal) = {
             let item = self.item.read(cx);
             if !item.is_editable() {
                 return false;
@@ -953,13 +957,20 @@ impl FantaMotionPanel {
             let Some(document) = item.document() else {
                 return false;
             };
-            build(&document.doc)
+            let transaction = build(&document.doc);
+            let refusal = transaction
+                .is_none()
+                .then(|| refusal(&document.doc))
+                .flatten();
+            (transaction, refusal)
         };
-        let action = label.to_lowercase();
         let Some(mut transaction) = transaction else {
-            show_canvas_notice_deferred(format!("Could not {action} on this layer"), cx);
+            if let Some(message) = refusal {
+                show_canvas_notice_deferred(message, cx);
+            }
             return false;
         };
+        let action = label.to_lowercase();
         transaction.label = label.to_string();
         let applied = self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
@@ -1869,6 +1880,29 @@ fn snap_near_integer(value: f64) -> f64 {
     } else {
         value
     }
+}
+
+/// Why an edit of an animation that still exists produced no change; `None`
+/// when the animation is gone, which is not worth a notice.
+fn edit_animation_refusal(
+    doc: &Doc,
+    active_clip: Option<AnimationClipId>,
+    node: NodeId,
+    property: AnimationProperty,
+) -> Option<String> {
+    let clip = resolved_clip(doc, active_clip)?;
+    let animated = clip.tracks.values().any(|track| {
+        track.target.node == node && property_for_target(track.target.property) == Some(property)
+    });
+    if !animated {
+        return None;
+    }
+    Some(if infer_settings(doc, clip, node, property).is_none() {
+        "Could not edit animation: the panel edits only animations made of two linear keyframes"
+            .to_string()
+    } else {
+        "Could not edit animation with these settings".to_string()
+    })
 }
 
 fn edit_animation_transaction(
@@ -3146,6 +3180,40 @@ mod tests {
         mounted.item.read_with(cx, |item, _| {
             assert_eq!(item.doc().expect("document").history.undo_depth(), 0)
         });
+    }
+
+    #[gpui::test]
+    async fn removing_an_animation_twice_shows_no_notice(cx: &mut gpui::TestAppContext) {
+        let (mut document, node) = document_with_selected_node();
+        let clip = create_clip(&mut document, "Double remove");
+        let add = build_animation_transaction(
+            &document,
+            Some(clip),
+            node,
+            AnimationProperty::Position,
+            AnimationSettings::for_property(AnimationProperty::Position),
+        )
+        .expect("position animation");
+        document.apply_transaction(add).expect("add animation");
+        document.history = Default::default();
+        let (mounted, cx) = mount_panel_in_workspace(document, clip, cx).await;
+
+        for _ in 0..2 {
+            mounted.panel.update(cx, |panel, cx| {
+                panel.remove_animation(node, AnimationProperty::Position, cx)
+            });
+        }
+        cx.run_until_parked();
+
+        mounted.item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let clip = doc.motion.clip(clip).expect("clip");
+            assert!(animation_summaries(doc, clip, node).is_empty());
+        });
+        assert!(
+            !shows_canvas_notice(&mounted.workspace, cx),
+            "removing an animation that is already gone is not a failure"
+        );
     }
 
     #[gpui::test]
