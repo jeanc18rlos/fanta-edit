@@ -121,7 +121,8 @@ impl PenTool {
                 let screen = DVec2::from(screen);
                 // Raw pointer, so snapping cannot pull a press off the first anchor.
                 if self.within_close_distance(ctx, screen) {
-                    self.commit(ctx, true);
+                    let close = self.close_has_area();
+                    self.commit(ctx, close);
                     return ToolResponse::cursor(CursorHint::Crosshair);
                 }
                 let world = ctx.screen_to_world(screen);
@@ -199,6 +200,15 @@ impl PenTool {
                 .is_some_and(|first| ctx.world_to_screen(first.pos).distance(screen) <= CLOSE_PX)
     }
 
+    /// Two straight anchors close into a fill with no area, which cannot be seen.
+    fn close_has_area(&self) -> bool {
+        self.anchors.len() > 2
+            || self
+                .anchors
+                .iter()
+                .any(|anchor| anchor.tan_in.is_some() || anchor.tan_out.is_some())
+    }
+
     /// Snap against the scene and the draft's own anchors.
     fn snap(&self, ctx: &ToolContext, world: DVec2) -> DVec2 {
         let points: SmallVec<[DVec2; 16]> = self.anchors.iter().map(|anchor| anchor.pos).collect();
@@ -208,7 +218,7 @@ impl PenTool {
     /// The draft's curves, the segment a press would add, its anchors, the
     /// last anchor's handles and, inside the close distance, the close ring.
     fn preview(&self) -> ToolResponse {
-        let closing = self.closing && !self.dragging && self.anchors.len() >= 2;
+        let closing = self.closing && !self.dragging && self.close_has_area();
         let mut response = ToolResponse::cursor(if closing {
             CursorHint::Pointer
         } else {
@@ -739,6 +749,29 @@ mod tests {
         assert!(!tool.is_drafting());
         assert!(tool.undo_draft().is_none(), "Undo reaches document history");
         assert_eq!(ctx.doc.history.undo_depth(), depth);
+    }
+
+    /// draw-tools-2: closing two straight anchors would make an invisible
+    /// zero-area fill, so the press commits the open line instead.
+    #[test]
+    fn closing_two_straight_anchors_commits_the_open_line() {
+        let (mut doc, mut viewport, snap, size) = ctx_pieces();
+        let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+        let mut tool = PenTool::new();
+        click(&mut tool, &mut ctx, [400.0, 300.0]);
+        click(&mut tool, &mut ctx, [500.0, 300.0]);
+        click(&mut tool, &mut ctx, [400.0, 300.0]);
+        assert!(!tool.is_drafting());
+        assert_eq!(ctx.doc.scene.len(), 1);
+        let id = ctx.doc.scene.roots()[0];
+        match ctx.doc.scene.get(id).map(|node| &node.data) {
+            Some(NodeData::Vector(v)) => {
+                assert_eq!(v.path.segments.len(), 2, "move and one line");
+                assert_eq!(v.strokes.len(), 1);
+                assert!(v.fills.is_empty());
+            }
+            _ => panic!("expected vector"),
+        }
     }
 
     #[test]
