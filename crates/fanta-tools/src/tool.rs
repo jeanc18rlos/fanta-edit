@@ -259,6 +259,11 @@ pub trait Tool {
         None
     }
 
+    /// Whether the tool holds an uncommitted draft, such as pen anchors.
+    fn has_draft(&self) -> bool {
+        false
+    }
+
     /// Undo inside the tool's own draft, such as the pen's last anchor. `None`
     /// when there is nothing to undo there, so Undo reaches document history.
     fn undo_draft(&mut self) -> Option<ToolResponse> {

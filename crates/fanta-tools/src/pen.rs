@@ -113,6 +113,10 @@ impl Tool for PenTool {
         ctx.new_shape_fill = next_color;
     }
 
+    fn has_draft(&self) -> bool {
+        self.is_drafting()
+    }
+
     fn undo_draft(&mut self) -> Option<ToolResponse> {
         self.anchors.pop()?;
         self.dragging = false;

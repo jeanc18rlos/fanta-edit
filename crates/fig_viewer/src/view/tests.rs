@@ -9976,6 +9976,116 @@ async fn mounted_deactivation_cancels_canvas_press_before_content_preview(
     }
 }
 
+/// Redo has no meaning inside a pen draft: while anchors are placed it is
+/// refused with a notice, and once the draft is empty it redoes history.
+#[gpui::test]
+async fn mounted_pen_redo_is_refused_while_drafting(cx: &mut TestAppContext) {
+    init_visual_test(cx);
+    cx.update(|cx| {
+        cx.bind_keys([
+            gpui::KeyBinding::new("cmd-z", Undo, Some("FigViewer")),
+            gpui::KeyBinding::new("cmd-shift-z", Redo, Some("FigViewer")),
+        ]);
+    });
+    let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+    let (mut doc, _, images) = bitmap_canvas_doc();
+    let mut rectangle = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        200.0,
+        100.0,
+        40.0,
+        40.0,
+        Color::BLACK,
+    )));
+    rectangle.parent = doc.active_page();
+    doc.apply(Operation::create_node(rectangle)).expect("rectangle");
+    assert!(doc.undo().expect("undo the rectangle"));
+    let item = crate::document::ready_item_for_test(
+        &project,
+        std::path::PathBuf::from("/tmp/PenRedo.fig"),
+        doc,
+        cx,
+    );
+    item.update(cx, |item, cx| {
+        item.with_document(cx, |document| {
+            let (_, mut assets) = document.doc_and_assets();
+            for (expected, bytes) in images {
+                let (actual, _) = assets.add_image(bytes).expect("fixture image");
+                assert_eq!(actual, expected);
+            }
+            ((), DocChange::None)
+        });
+    });
+    let window = cx.add_window(|window, cx| {
+        workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+    });
+    let multi_workspace = window.entity(cx).expect("multi workspace");
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let view = window
+        .update(cx, |_, window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            window.activate_window();
+            view.update(cx, |view, cx| {
+                view.set_viewport_silent(Viewport::default());
+                view.focus_handle.focus(window, cx);
+                cx.notify();
+            });
+            view
+        })
+        .expect("mount the view in a workspace");
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(size(px(1400.0), px(900.0)));
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear());
+    visual.update(|window, cx| {
+        window.dispatch_action(ActivatePenTool.boxed_clone(), cx);
+    });
+    visual.run_until_parked();
+    let center = view.read_with(&visual, |view, _| view.container_bounds.expect("canvas").center());
+    for offset in [(-80.0, -152.0), (80.0, -152.0), (80.0, -80.0)] {
+        mounted_canvas_click(&mut visual, center + point(px(offset.0), px(offset.1)), 1);
+    }
+    let anchors = |visual: &mut gpui::VisualTestContext| {
+        view.read_with(visual, |view, _| {
+            assert_eq!(view.active_tool(), ToolKind::Pen);
+            view.tools
+                .overlays
+                .iter()
+                .filter(|overlay| matches!(overlay, fanta_tools::ToolOverlay::PathAnchor { .. }))
+                .count()
+        })
+    };
+    let history = |visual: &mut gpui::VisualTestContext| {
+        item.read_with(visual, |item, _| {
+            let doc = &item.document().expect("document").doc;
+            (doc.scene.len(), doc.history.redo_depth())
+        })
+    };
+    let before = history(&mut visual);
+    assert_eq!(before.1, 1, "the rectangle waits on the redo stack");
+    visual.simulate_keystrokes("cmd-z");
+    assert_eq!(anchors(&mut visual), 2);
+    let notice = NotificationId::named(CANVAS_NOTICE_ID.into());
+    workspace.read_with(&visual, |workspace, _| {
+        assert!(!workspace.notification_ids().contains(&notice));
+    });
+    visual.simulate_keystrokes("cmd-shift-z");
+    visual.run_until_parked();
+    assert_eq!(anchors(&mut visual), 2, "Redo keeps the draft");
+    assert_eq!(history(&mut visual), before, "Redo leaves history alone while drafting");
+    workspace.read_with(&visual, |workspace, _| {
+        assert!(workspace.notification_ids().contains(&notice), "Redo says why it did nothing");
+    });
+    visual.simulate_keystrokes("cmd-z cmd-z");
+    assert_eq!(anchors(&mut visual), 0);
+    visual.simulate_keystrokes("cmd-shift-z");
+    visual.run_until_parked();
+    assert_eq!(history(&mut visual), (before.0 + 1, 0), "with no draft Redo redoes history");
+}
+
 /// A8: while the pen drafts, Undo and Backspace each remove the last anchor
 /// without touching history; after Enter one Undo removes the whole path.
 #[gpui::test]

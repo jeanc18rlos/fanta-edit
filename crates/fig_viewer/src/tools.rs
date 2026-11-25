@@ -414,6 +414,10 @@ impl ToolShell {
         response
     }
 
+    pub fn has_draft(&self) -> bool {
+        self.tool.has_draft()
+    }
+
     /// Undo inside the active tool's draft. False when the tool has nothing
     /// to undo there.
     pub fn undo_draft(&mut self) -> bool {

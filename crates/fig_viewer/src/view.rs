@@ -4702,6 +4702,14 @@ impl FigView {
         }) {
             return;
         }
+        // Redo would apply history underneath the draft's anchors.
+        if self.tools.has_draft() {
+            show_canvas_notice_deferred(
+                "Redo is not available while a path is being drawn.".into(),
+                cx,
+            );
+            return;
+        }
         self.finish_document_edits(cx);
         let previous_pages = self.item.read(cx).doc().map(|doc| doc.pages().to_vec());
         let changed = self.item.update(cx, |item, cx| match item.redo(cx) {
