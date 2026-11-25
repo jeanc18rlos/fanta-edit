@@ -9,6 +9,7 @@
 //!   commits. The draft's anchors are alignment snap targets.
 //! - **Enter** commits the current (open) path. **Escape** aborts the in-flight
 //!   path (a second Escape, with no path, exits to Select).
+//!   Switching tools commits a draft of two or more anchors as an open path.
 //! - **Delete/Backspace** removes the last placed anchor.
 //!
 //! A committed path is a [`VectorNode`]: an open path becomes a **stroke** in
@@ -24,7 +25,9 @@
 use crate::context::ToolContext;
 use crate::event::{Button, KeyEvent, LogicalKey, PointerEvent, ToolEvent};
 use crate::tool::{CursorHint, Tool, ToolOverlay, ToolResponse};
-use fanta_doc::{CanvasNode, Fill, NodeData, Operation, PathData, Stroke, Transform2D, VectorNode};
+use fanta_doc::{
+    CanvasNode, Color, Fill, NodeData, Operation, PathData, Stroke, Transform2D, VectorNode,
+};
 use glam::DVec2;
 use smallvec::SmallVec;
 
@@ -63,6 +66,9 @@ pub struct PenTool {
     cursor: DVec2,
     /// The pointer is within the close distance of the first anchor.
     closing: bool,
+    /// The color of the last press, kept for a commit on a tool switch whose
+    /// context carries the next tool's color.
+    color: Option<Color>,
 }
 
 impl PenTool {
@@ -98,6 +104,15 @@ impl Tool for PenTool {
         self.dragging = false;
     }
 
+    fn finish_draft(&mut self, ctx: &mut ToolContext) {
+        let next_color = ctx.new_shape_fill;
+        if let Some(color) = self.color {
+            ctx.new_shape_fill = color;
+        }
+        self.commit(ctx, false);
+        ctx.new_shape_fill = next_color;
+    }
+
     fn undo_draft(&mut self) -> Option<ToolResponse> {
         self.anchors.pop()?;
         self.dragging = false;
@@ -129,6 +144,7 @@ impl PenTool {
                 let pos = self.snap(ctx, world);
                 self.cursor = pos;
                 self.closing = false;
+                self.color = Some(ctx.new_shape_fill);
 
                 // Starting a fresh path clears any prior selection so a stray
                 // Backspace can't delete an unrelated node mid-draw.

@@ -265,6 +265,10 @@ pub trait Tool {
         None
     }
 
+    /// Hook called on a tool switch, before [`Tool::deactivate`], to keep work
+    /// the user would lose, such as a pen draft. A cancel does not call it.
+    fn finish_draft(&mut self, _ctx: &mut ToolContext) {}
+
     /// Hook called when the tool becomes active. Defaults to no-op. Tools that
     /// must reset internal state on (re-)activation override this.
     fn activate(&mut self, _ctx: &mut ToolContext) {}
