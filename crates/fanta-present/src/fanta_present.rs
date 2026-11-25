@@ -746,6 +746,9 @@ impl PlaybackSession {
             return false;
         }
         self.back_stack.clear();
+        // enter_frame keeps navigation transitions, which would keep compositing the old frames.
+        self.active_transition = None;
+        self.smart_animate = None;
         self.enter_frame(start);
         true
     }

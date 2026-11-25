@@ -6531,3 +6531,43 @@ fn transient_variable_revert_keeps_a_value_a_click_changed()
     );
     Ok(())
 }
+
+#[test]
+fn starting_a_flow_cancels_a_running_navigation_transition() {
+    let mut doc = Doc::new();
+    let b = frame_colored(500.0, Color::rgb(0, 0, 255));
+    let b_id = b.id;
+    doc.apply(Operation::create_node(b)).unwrap();
+    let c = frame_colored(1000.0, Color::rgb(0, 255, 0));
+    let c_id = c.id;
+    doc.apply(Operation::create_node(c)).unwrap();
+    let mut a = frame_colored(0.0, Color::rgb(255, 0, 0));
+    let a_id = a.id;
+    a.reactions.push(click_with(
+        1,
+        Action::Navigate { to: b_id },
+        Transition {
+            style: TransitionStyle::Dissolve,
+            duration_ms: 400,
+            easing: Easing::Linear,
+        },
+    ));
+    doc.apply(Operation::create_node(a)).unwrap();
+    doc.flows.push(fanta_doc::Flow {
+        name: "Second".into(),
+        start: c_id,
+    });
+
+    let mut session = PresentSession::new(&doc, Some(a_id), DVec2::splat(200.0)).unwrap();
+    session.handle_pointer(DVec2::new(100.0, 100.0), PointerEvent::Click);
+    assert!(session.active_transition.is_some(), "A to B is in flight");
+
+    assert!(session.start_flow(0));
+
+    assert_eq!(session.current_frame(), c_id);
+    assert!(
+        session.active_transition.is_none(),
+        "the old A to B transition must not keep rendering over the new flow"
+    );
+    assert!(session.smart_animate.is_none());
+}
