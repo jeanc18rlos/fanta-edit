@@ -96,6 +96,28 @@ changes, so no decision record is needed.
   close · Enter finishes · Esc cancels". This needs a fanta-ui pull request
   and a pin bump here (Q3).
 
+### Departures from the requirements, for the founder to accept or reject
+
+The code does these things that the requirements do not say:
+
+- **Deviation from R1 and R3.** A close that would enclose no visible shape
+  commits the draft as an open path instead. "No visible shape" means the
+  flattened closed outline is on average narrower than one screen pixel
+  (twice its area over its perimeter); this covers two straight anchors,
+  collinear anchors and a click whose release jittered a pixel. Hovering
+  such a close shows no ring, no pointer cursor and no fill.
+- **Addition.** Switching tools commits a draft of two or more anchors as an
+  open path, in the color it was drawn with (`Tool::finish_draft`, called by
+  `ToolShell::activate`). The switches that have no canvas context
+  (`activate_without_context`) discard it, as do Escape and the cancels.
+- **Addition to R9.** Delete and Backspace remove the draft's last anchor
+  like Undo; R9 names only Undo.
+- **Addition to R9.** Redo is refused while a draft has anchors, with the
+  notice "Redo is not available while a path is being drawn." It does not
+  redo removed anchors; with no draft it redoes history as before.
+- **Addition to R2.** A press that snaps onto the last anchor's exact
+  position, such as the second press of a double-click, adds no anchor.
+
 ## Interfaces and data
 
 ```rust
@@ -106,7 +128,12 @@ impl SnapCandidates { pub fn push_point(&mut self, point: DVec2); }
 pub struct PenOptions { pub snap_to_path_points: bool, pub angle_step_degrees: f64, pub handle_mode: HandleMode }
 pub enum HandleMode { Mirrored, Aligned, Independent }
 impl ToolContext<'_> { pub fn snap_point_with_points(&self, world: DVec2, exclude: &[NodeId], points: &[DVec2]) -> SnapResult; }
-pub trait Tool { fn undo_draft(&mut self) -> Option<ToolResponse> { None } /* … */ }
+pub trait Tool {
+    fn has_draft(&self) -> bool { false }
+    fn undo_draft(&mut self) -> Option<ToolResponse> { None }
+    fn finish_draft(&mut self, ctx: &mut ToolContext) {}
+    /* … */
+}
 pub enum ToolOverlay { /* … */ PreviewPath { world_points: Vec<[f64; 2]>, closed: bool, filled: bool }, PenCloseTarget { world: [f64; 2] } }
 pub enum CursorHint { /* … */ Pointer }
 pub enum LogicalKey { /* … */ Space }
