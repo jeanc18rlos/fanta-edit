@@ -949,20 +949,29 @@ impl FantaMotionPanel {
             };
             build(&document.doc)
         };
+        let action = label.to_lowercase();
         let Some(mut transaction) = transaction else {
+            show_canvas_notice_deferred(format!("Could not {action} on this layer"), cx);
             return false;
         };
         transaction.label = label.to_string();
-        self.item.update(cx, |item, cx| {
+        let applied = self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
-                if let Err(error) = document.doc.apply_transaction(transaction) {
-                    log::error!("motion panel edit failed: {error:#}");
-                    return (false, DocChange::None);
+                match document.doc.apply_transaction(transaction) {
+                    Ok(()) => (Ok(()), DocChange::Content),
+                    Err(error) => (Err(error), DocChange::None),
                 }
-                (true, DocChange::Content)
             })
-            .unwrap_or(false)
-        })
+        });
+        match applied {
+            Some(Ok(())) => true,
+            Some(Err(error)) => {
+                log::error!("motion panel edit failed: {error:#}");
+                show_canvas_notice_deferred(format!("Could not {action}: {error:#}"), cx);
+                false
+            }
+            None => false,
+        }
     }
 
     fn choice_dropdown<T: Copy + PartialEq + 'static>(
@@ -3109,5 +3118,26 @@ mod tests {
         mounted.item.read_with(cx, |item, _| {
             assert_eq!(item.doc().expect("document").history.undo_depth(), 0)
         });
+    }
+
+    #[gpui::test]
+    async fn adding_an_animation_the_layer_cannot_take_shows_a_notice(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (mut document, node) = document_with_selected_node();
+        document.scene.get_mut(node).expect("node").transform = Transform2D::scale(0.);
+        let clip = create_clip(&mut document, "Zero scale");
+        document.history = Default::default();
+        let (mounted, cx) = mount_panel_in_workspace(document, clip, cx).await;
+
+        mounted.panel.update(cx, |panel, cx| {
+            panel.add_animation(node, AnimationProperty::Scale, cx)
+        });
+        cx.run_until_parked();
+
+        assert!(
+            shows_canvas_notice(&mounted.workspace, cx),
+            "an Add Animation that does nothing must say so"
+        );
     }
 }
