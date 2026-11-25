@@ -3924,6 +3924,64 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn an_unusable_presentation_background_shows_a_canvas_notice(cx: &mut TestAppContext) {
+        use fanta_gpui::properties_tabs::{PrototypeInspector, PrototypeInspectorAction};
+
+        init_test(cx);
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
+        });
+        let (doc, _, _) = document_with_two_frames();
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/PrototypeBackground.fanta"),
+            doc,
+            cx,
+        );
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let panel = cx.update(|_, cx| cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx)));
+        let inspector = cx.update(|_, cx| {
+            cx.new(|cx| PrototypeInspector::new("background-test", Default::default(), cx))
+        });
+        let presentation_before = item.read_with(cx, |item, _| {
+            item.doc().expect("document").presentation.clone()
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.handle_shared_action(
+                &inspector,
+                &PrototypeInspectorAction::BackgroundChangeRequested { hex: "ABC".into() },
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc().expect("document").presentation,
+                presentation_before
+            );
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.notification_ids().contains(
+                    &workspace::notifications::NotificationId::named(
+                        crate::view::CANVAS_NOTICE_ID.into()
+                    )
+                ),
+                "a background color that cannot be applied must say so"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn a_refused_prototype_change_shows_a_canvas_notice(cx: &mut TestAppContext) {
         init_test(cx);
         let (mut doc, first, _) = document_with_two_frames();
@@ -5640,6 +5698,10 @@ impl FantaPrototypePanel {
             Intent::BackgroundChangeRequested { hex } => {
                 let value = format!("#{}", hex.trim_start_matches('#'));
                 let Some(color) = fanta_doc::Color::from_hex(&value) else {
+                    crate::view::show_canvas_notice_deferred(
+                        format!("Could not use {value} as the background: enter #RRGGBB"),
+                        cx,
+                    );
                     return;
                 };
                 self.apply_operation(
