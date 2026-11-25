@@ -11033,7 +11033,8 @@ impl FigView {
                         };
                         self.run_path_action(action, None, window, cx);
                     }
-                    DrawToolbarAction::ApplyCrop if self.tools.kind() == ToolKind::Crop => {
+                    // A crop click that lands after the Crop tool was left has nothing to act on.
+                    DrawToolbarAction::ApplyCrop => {
                         if self.tools.can_apply_crop() {
                             self.dispatch_tool_event(
                                 key_event(LogicalKey::Enter, window.modifiers()),
@@ -11041,13 +11042,14 @@ impl FigView {
                             );
                         }
                     }
-                    DrawToolbarAction::CancelCrop if self.tools.kind() == ToolKind::Crop => {
-                        self.dispatch_tool_event(
-                            key_event(LogicalKey::Escape, window.modifiers()),
-                            cx,
-                        );
+                    DrawToolbarAction::CancelCrop => {
+                        if self.tools.kind() == ToolKind::Crop {
+                            self.dispatch_tool_event(
+                                key_event(LogicalKey::Escape, window.modifiers()),
+                                cx,
+                            );
+                        }
                     }
-                    other => notify_unavailable(&format!("{other:?}"), window, cx),
                 }
             }
             ToolbarAction::CommandQueryChanged { .. } => {}

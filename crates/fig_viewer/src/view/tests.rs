@@ -7862,6 +7862,58 @@ async fn rejected_cross_document_canvas_paste_shows_notice_and_preserves_documen
     });
 }
 
+/// draw-view-7: a crop action that arrives after the Crop tool was left does
+/// nothing, instead of saying "ApplyCrop is not available".
+#[gpui::test]
+async fn stale_crop_toolbar_actions_show_no_unavailable_notice(cx: &mut TestAppContext) {
+    init_visual_test(cx);
+    let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+    let (doc, _, _) = text_selection_doc(false);
+    let item = crate::document::ready_item_for_test(
+        &project,
+        std::path::PathBuf::from("/tmp/StaleCropAction.fig"),
+        doc,
+        cx,
+    );
+    let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+        workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+    });
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let view = cx.update(|window, cx| {
+        let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+        });
+        window.activate_window();
+        view
+    });
+    cx.run_until_parked();
+    let notice = NotificationId::named(CANVAS_NOTICE_ID.into());
+    for action in [
+        fanta_gpui::toolbar::DrawToolbarAction::ApplyCrop,
+        fanta_gpui::toolbar::DrawToolbarAction::CancelCrop,
+    ] {
+        view.update_in(cx, |view, window, cx| {
+            assert_ne!(view.active_tool(), ToolKind::Crop);
+            let panel = view.gpui_toolbar.as_ref().expect("toolbar").panel.clone();
+            view.handle_toolbar_action(
+                &panel,
+                &fanta_gpui::toolbar::ToolbarAction::DrawActionInvoked { action },
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                !workspace.notification_ids().contains(&notice),
+                "{action:?} raised a notice"
+            );
+        });
+    }
+}
+
 #[gpui::test]
 async fn refused_undo_and_redo_show_a_canvas_notice(cx: &mut TestAppContext) {
     init_visual_test(cx);
