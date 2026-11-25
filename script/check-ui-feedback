@@ -6,13 +6,15 @@ the parent commit in a pull-request checkout) and counts, in the files the
 change touches under the editor's interface crates:
 
   silent-failure    an error that is logged, discarded or dropped and never
-                    shown: `.log_err()`, `let _ = …`, an `Err` arm that only logs
+                    shown: `.log_err()`, `.detach_and_log_err(cx)`, `let _ = …`,
+                    an `Err` arm that only logs
   unwired-control   an empty `=> {}` arm for a panel's `…Requested` action
   debug-in-notice   `{:?}` in a message passed to a canvas notice
   notice-wording    a message that opens with "Couldn't", "Can't" or "Unable to"
 
 The change may not raise a count. A site that is right as it stands takes a
-`// silent: <reason>` comment on its line or the line above. It needs no build.
+`// silent: <reason>` comment on its line, the line above, or the line above
+the statement it ends. It needs no build.
 
   script/check-ui-feedback          check the change against its base
   script/check-ui-feedback --all    list every site in the tree; never fails
@@ -38,7 +40,9 @@ ADVICE = {
     "notice-wording": 'Start a failure with "Could not …".',
 }
 NOTICE_CALL = re.compile(r"\b(?:show_(?:workspace_)?canvas_notice(?:_deferred)?|notify_unavailable)\(")
-ERR_HANDLER = re.compile(r"\bErr\([^()]*\)\s*(=>|=(?!=))")
+ERR_HANDLER = re.compile(r"\bErr\((?:[^()]|\([^()]*\))*\)\s*(=>|=(?!=))")
+DISCARDS = re.compile(r"\.log_err\(\)|\.detach_and_log_err\(|^\s*let _ = ", re.MULTILINE)
+TEST_MODULE = re.compile(r"^#\[cfg\(test\)\]\n(?:pub(?:\(\w+\))? )?mod \w+ \{", re.MULTILINE)
 LOGS = re.compile(r"\blog::\w+!|\beprintln!")
 SURFACES = re.compile(
     r"notice|notify_|[Tt]oast|prompt|\.fail\(|error_message|\berror\s*=[^=]|set_error"
@@ -46,7 +50,9 @@ SURFACES = re.compile(
 )
 WORDING = re.compile(r"(?:Couldn't|Can't|Unable to)\b")
 # A literal in one of these never reaches the user as a notice.
-NOT_A_NOTICE = re.compile(r"log::|tracing::|\.context\(|anyhow!|bail!|expect\(|assert|panic!|unreachable!")
+NOT_A_NOTICE = re.compile(
+    r"log::|tracing::|context\(|anyhow!|format_err!|bail!|expect\(|assert|panic!|unreachable!"
+)
 CLOSERS = {"{": "}", "(": ")", "[": "]"}
 
 
@@ -141,7 +147,9 @@ def err_handler_body(masked, match):
             if masked[index] == ";":
                 return None
             index += 1
-        return masked[index : closing(masked, index)] if index < len(masked) else None
+        if index >= len(masked) or masked[match.end() : index].rstrip().endswith("else"):
+            return None
+        return masked[index : closing(masked, index)]
     while index < len(masked) and masked[index].isspace():
         index += 1
     if index < len(masked) and masked[index] == "{":
@@ -197,37 +205,56 @@ def enclosing_calls(masked, offset):
     return " ".join(heads)
 
 
+def statement_line(masked, offset):
+    """The line on which the statement, argument or match arm holding `offset` starts."""
+    depth, index = 0, offset - 1
+    while index >= 0:
+        character = masked[index]
+        if character in ")]":
+            depth += 1
+        elif character in "([" and depth:
+            depth -= 1
+        elif not depth and character in ";{},([":
+            break
+        index -= 1
+    start = index + 1
+    while start < offset and masked[start].isspace():
+        start += 1
+    return masked.count("\n", 0, start)
+
+
 def find_sites(source):
     """Every site in one file, as (rule, line number, line text)."""
     masked, literals = mask(source)
-    lines = source.splitlines()
+    lines = source.split("\n")
     line_of = lambda offset: masked.count("\n", 0, offset)
     found = []
 
-    for match in re.finditer(r"\.log_err\(\)|^\s*let _ = ", masked, re.MULTILINE):
-        found.append(("silent-failure", line_of(match.end() - 1)))
+    for match in DISCARDS.finditer(masked):
+        found.append(("silent-failure", match.end() - len(match.group().lstrip())))
     for match in ERR_HANDLER.finditer(masked):
         body = err_handler_body(masked, match)
         if body is None or SURFACES.search(body):
             continue
         if LOGS.search(body) or not body.strip("{}() \n"):
-            found.append(("silent-failure", line_of(match.start())))
+            found.append(("silent-failure", match.start()))
     for match in re.finditer(r"=>\s*\{\s*\}", masked):
         if unwired_arm(masked, match.start()):
-            found.append(("unwired-control", line_of(match.start())))
+            found.append(("unwired-control", match.start()))
     for match in NOTICE_CALL.finditer(masked):
         if masked[: match.start()].rstrip().endswith("fn"):
             continue
         arguments = source[match.end() : closing(masked, match.end() - 1)]
         if re.search(r":#?\?\}", arguments):
-            found.append(("debug-in-notice", line_of(match.start())))
+            found.append(("debug-in-notice", match.start()))
     for start, end in literals:
         if WORDING.match(source[start:end]) and not NOT_A_NOTICE.search(enclosing_calls(masked, start)):
-            found.append(("notice-wording", line_of(start)))
+            found.append(("notice-wording", start))
 
     sites = []
-    for rule, line in found:
-        if ALLOW in lines[line] or (line and ALLOW in lines[line - 1]):
+    for rule, offset in found:
+        line, first = line_of(offset), statement_line(masked, offset)
+        if any(ALLOW in lines[near] for near in {line, line - 1, first, first - 1} if near >= 0):
             continue
         sites.append((rule, line + 1, lines[line].strip()))
     return sites
@@ -246,9 +273,16 @@ def is_checked(path):
 
 
 def production_code(source):
-    """The file without its trailing `#[cfg(test)] mod … {` block."""
-    tests = re.search(r"^#\[cfg\(test\)\]\n(?:pub(?:\(\w+\))? )?mod \w+ \{", source, re.MULTILINE)
-    return source[: tests.start()] if tests else source
+    """The file with each `#[cfg(test)] mod … {` block emptied; line numbers stay."""
+    masked, _ = mask(source)
+    kept, index = [], 0
+    for tests in TEST_MODULE.finditer(masked):
+        if tests.start() < index:
+            continue
+        end = closing(masked, tests.end() - 1)
+        kept += [source[index : tests.start()], "\n" * source.count("\n", tests.start(), end)]
+        index = end
+    return "".join(kept) + source[index:]
 
 
 def git(*arguments):
@@ -259,12 +293,12 @@ def git(*arguments):
 
 
 def base_revision():
+    revision = git("merge-base", BASE, "HEAD")
     # A pull-request checkout has no origin/main; its merge commit's first parent is the base.
-    for arguments in (["merge-base", BASE, "HEAD"], ["rev-parse", "--verify", "--quiet", "HEAD^1"]):
-        revision = git(*arguments)
-        if revision and revision.strip():
-            return revision.strip()
-    return None
+    # The parent of any other commit is not: it would hide all but the last commit.
+    if not revision and git("rev-parse", "--verify", "--quiet", "HEAD^2"):
+        revision = git("rev-parse", "--verify", "--quiet", "HEAD^1")
+    return (revision or "").strip() or None
 
 
 def changed_lines(revision, paths):
@@ -316,8 +350,13 @@ def check_change():
     revision = base_revision()
     if revision is None:
         print("script/check-ui-feedback: no base commit to compare with (fetch-depth: 2 in CI)")
-        return 1 if os.environ.get("CI") else 0
-    changed = (git("diff", "--name-only", "--no-renames", revision) or "").splitlines()
+        return 1 if os.environ.get("GITHUB_EVENT_NAME") == "pull_request" else 0
+    changed = git("diff", "--name-only", "--no-renames", revision)
+    # 9: a git failure is not "nothing changed".
+    if changed is None:
+        print(f"script/check-ui-feedback: git could not compare the tree with {revision}")
+        return 1
+    changed = changed.splitlines()
     changed += (git("ls-files", "--others", "--exclude-standard") or "").splitlines()
     paths = sorted({path for path in changed if is_checked(path)})
     base_sources = {path: git("show", f"{revision}:{path}") for path in paths}
@@ -332,7 +371,7 @@ def check_change():
             print(f"  {path}:{line}: {text[:110]}")
         print(ADVICE[rule])
     if added:
-        print(f"A site that is right as it stands takes `{ALLOW} <reason>` on the line above.")
+        print(f"A site that is right as it stands takes `{ALLOW} <reason>` above its statement.")
         return 1
     print(f"script/check-ui-feedback: nothing added in {len(paths)} changed interface files")
     return 0
@@ -370,6 +409,23 @@ def self_test():
     # Text inside a string or a comment is not code.
     assert rules('fn a() { let text = "x.log_err(); } Err(e) => {}"; } // y.log_err()') == []
     assert rules("// silent: nobody waits for the cache\nfn a() { warm(cx).log_err(); }") == []
+    assert rules("fn a() { cx.spawn(export(path)).detach_and_log_err(cx); }") == ["silent-failure"]
+    assert rules("fn a() { match save() { Err(Error::Io(error)) => {}, Ok(()) => {} } }") == [
+        "silent-failure"
+    ]
+    # In a let-else the block is the success path.
+    assert rules('fn a() { let Err(error) = save() else { log::info!("saved"); return; }; }') == []
+    # The comment may sit above the statement that a chained call ends.
+    chained = "fn a() {\n    // silent: a cache\n    self.warm(\n        first,\n        second,\n    )\n    .log_err();\n}"
+    assert rules(chained) == []
+    assert rules(chained.replace("// silent: a cache", "// a cache")) == ["silent-failure"]
+    arms = "match x {\n    // silent: one\n    A => a().log_err(),\n    B => b().log_err(),\n}"
+    assert [line for _, line, _ in find_sites(arms)] == [4]
+    # A form feed is not a line break.
+    assert find_sites('fn a() { let text = "a\fb";\n    save(cx).log_err(); }')[0][1:] == (
+        2,
+        "save(cx).log_err(); }",
+    )
 
     arm = "match action {\n    Action::RenameRequested { .. } => {}\n}"
     assert rules(arm) == ["unwired-control"]
@@ -388,11 +444,16 @@ def self_test():
     assert rules('fn a() { show_canvas_notice(format!("Could not save {name}."), window, cx); }') == []
     assert rules('fn a() -> String { "Unable to encode the selection.".into() }') == ["notice-wording"]
     assert rules('fn a() { log::error!("Unable to encode the selection."); }') == []
+    assert rules('fn a() { read().with_context(|| format!("Unable to read {path}"))?; }') == []
     logged_then_shown = 'fn a() -> String { log::error!("{error:#}"); format!("Unable to encode: {error}") }'
     assert rules(logged_then_shown) == ["notice-wording"]
 
     tested = 'fn a() {}\n#[cfg(test)]\nmod tests {\n    fn b() { save().log_err(); }\n}\n'
     assert rules(production_code(tested)) == []
+    # Code below a test module in the middle of a file is still checked, on its own line.
+    assert find_sites(production_code(tested + "fn c() { load().log_err(); }\n")) == [
+        ("silent-failure", 6, "fn c() { load().log_err(); }")
+    ]
     assert is_checked("crates/fig_viewer/src/view.rs")
     assert not is_checked("crates/fig_viewer/src/view/tests.rs")
     assert not is_checked("crates/client/src/client.rs")

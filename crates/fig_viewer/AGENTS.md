@@ -11,7 +11,7 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 
 ## Telling the user
 
-- A failure of something the user asked for must reach them: `show_canvas_notice` or `show_canvas_notice_deferred` with a "Could not …" sentence, never a Rust `Debug` form. A control that is not wired calls `notify_unavailable`. `.log_err()` alone hides the failure: one pass found 32 of these and five actions that did nothing. `script/check-ui-feedback`, part of `script/gate`, fails a change that adds one; background work nobody waits for takes a `// silent: <reason>` comment. (#245)
+- A failure of something the user asked for must reach them: `show_canvas_notice` or `show_canvas_notice_deferred` with a "Could not …" sentence, never a Rust `Debug` form. A control that is not wired calls `notify_unavailable`. `.log_err()` or `.detach_and_log_err(cx)` alone hides the failure: one pass found 32 of these and five actions that did nothing. `script/check-ui-feedback`, part of `script/gate`, fails a change that adds one; background work nobody waits for takes a `// silent: <reason>` comment. (#245)
 
 ## Rendering and performance
 
