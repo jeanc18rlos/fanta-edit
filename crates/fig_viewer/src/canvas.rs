@@ -6208,6 +6208,56 @@ impl CanvasElement {
                             BorderStyle::Solid,
                         ));
                     }
+                    ToolOverlay::PreviewPath {
+                        world_points,
+                        closed,
+                        filled,
+                    } => {
+                        let positions = || {
+                            world_points
+                                .iter()
+                                .map(|world| project(DVec2::new(world[0], world[1])))
+                        };
+                        let build = |mut builder: PathBuilder| {
+                            let mut points = positions();
+                            if let Some(first) = points.next() {
+                                builder.move_to(first);
+                                for position in points {
+                                    builder.line_to(position);
+                                }
+                                if *closed {
+                                    builder.close();
+                                }
+                            }
+                            builder.build()
+                        };
+                        if *filled {
+                            match build(PathBuilder::fill()) {
+                                Ok(path) => window.paint_path(path, selection_fill.opacity(0.25)),
+                                // silent: paint runs every frame, so a notice would repeat.
+                                Err(error) => {
+                                    log::warn!("failed to build pen fill preview: {error:#}")
+                                }
+                            }
+                        }
+                        match build(PathBuilder::stroke(px(1.))) {
+                            Ok(path) => window.paint_path(path, accent),
+                            // silent: paint runs every frame, so a notice would repeat.
+                            Err(error) => log::warn!("failed to build pen preview: {error:#}"),
+                        }
+                    }
+                    ToolOverlay::PenCloseTarget { world } => {
+                        let center = project(DVec2::new(world[0], world[1]));
+                        let radius = px(7.);
+                        paint_ellipse_outline(
+                            Bounds {
+                                origin: point(center.x - radius, center.y - radius),
+                                size: size(radius * 2., radius * 2.),
+                            },
+                            accent,
+                            window,
+                        );
+                    }
                     ToolOverlay::PathInsertHint { world } => {
                         let center = project(DVec2::new(world[0], world[1]));
                         let dot = px(5.);

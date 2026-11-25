@@ -2609,6 +2609,7 @@ impl FigView {
                 matches!(
                     overlay,
                     fanta_tools::ToolOverlay::PreviewLine { .. }
+                        | fanta_tools::ToolOverlay::PreviewPath { .. }
                         | fanta_tools::ToolOverlay::PreviewRect { .. }
                         | fanta_tools::ToolOverlay::PreviewEllipse { .. }
                 )
@@ -4660,6 +4661,10 @@ impl FigView {
         }) {
             return;
         }
+        if self.tools.undo_draft() {
+            cx.notify();
+            return;
+        }
         self.finish_document_edits(cx);
         let previous_pages = self.item.read(cx).doc().map(|doc| doc.pages().to_vec());
         let changed = self.item.update(cx, |item, cx| match item.undo(cx) {
@@ -4695,6 +4700,14 @@ impl FigView {
         if self.defer_after_preserved_design_draft(window, cx, |view, window, cx| {
             view.redo(&Redo, window, cx)
         }) {
+            return;
+        }
+        // Redo would apply history underneath the draft's anchors.
+        if self.tools.has_draft() {
+            show_canvas_notice_deferred(
+                "Redo is not available while a path is being drawn.".into(),
+                cx,
+            );
             return;
         }
         self.finish_document_edits(cx);
@@ -4873,6 +4886,8 @@ impl FigView {
                 self.finish_document_edits(cx);
                 self.dispatch_tool_event(key_event(LogicalKey::Delete, window.modifiers()), cx);
             }
+        } else if self.tools.undo_draft() {
+            cx.notify();
         } else {
             self.delete_selected_nodes(cx);
         }

@@ -155,6 +155,17 @@ pub enum ToolOverlay {
     /// An insert-anchor hint — the pen "+" glyph — at a world position on a
     /// path segment the cursor is hovering (node-edit tool).
     PathInsertHint { world: [f64; 2] },
+
+    /// The pen's draft flattened to a world-space polyline, ending with the
+    /// segment a press would add. `filled` previews the shape a close makes.
+    PreviewPath {
+        world_points: Vec<[f64; 2]>,
+        closed: bool,
+        filled: bool,
+    },
+
+    /// A ring on the pen draft's first anchor: a press there closes the path.
+    PenCloseTarget { world: [f64; 2] },
 }
 
 /// One snap guide — the world-space line the renderer should draw to indicate
@@ -214,6 +225,8 @@ pub enum CursorHint {
     Grabbing,
     /// Text-entry I-beam (reserved for the future text tool).
     Text,
+    /// Pointing hand — a press acts on the hovered target, such as closing a pen path.
+    Pointer,
 }
 
 /// The interface every tool implements.
@@ -245,6 +258,21 @@ pub trait Tool {
     fn translating_root(&self) -> Option<NodeId> {
         None
     }
+
+    /// Whether the tool holds an uncommitted draft, such as pen anchors.
+    fn has_draft(&self) -> bool {
+        false
+    }
+
+    /// Undo inside the tool's own draft, such as the pen's last anchor. `None`
+    /// when there is nothing to undo there, so Undo reaches document history.
+    fn undo_draft(&mut self) -> Option<ToolResponse> {
+        None
+    }
+
+    /// Hook called on a tool switch, before [`Tool::deactivate`], to keep work
+    /// the user would lose, such as a pen draft. A cancel does not call it.
+    fn finish_draft(&mut self, _ctx: &mut ToolContext) {}
 
     /// Hook called when the tool becomes active. Defaults to no-op. Tools that
     /// must reset internal state on (re-)activation override this.
