@@ -22,6 +22,7 @@ use crate::document::{DocChange, FigItem, FigItemEvent};
 use crate::motion_edit::{MotionPropertyEditSession, evaluated_motion_value};
 use crate::properties_ops::{fanta_color_rgba, format_number};
 use crate::timeline::{TimelineEvent, TimelineProperty, TimelineShell};
+use crate::view::show_canvas_notice_deferred;
 
 const DEFAULT_CLIP_DURATION_MS: u32 = 2_000;
 const DEFAULT_ANIMATION_DURATION_MS: u32 = 500;
@@ -675,6 +676,12 @@ impl FantaMotionPanel {
         let value = edited
             .then(|| parse_motion_numeric_value(property, text.trim()))
             .flatten();
+        if edited && value.is_none() {
+            show_canvas_notice_deferred(
+                format!("Could not set {}: enter a number", property.label()),
+                cx,
+            );
+        }
         if let Some(value) = value.clone() {
             self.preview_property_value(value, cx);
         }
@@ -713,6 +720,12 @@ impl FantaMotionPanel {
             });
             if restored.is_none() {
                 item.finish_content_preview(preview_owner, false, cx);
+                if commit {
+                    show_canvas_notice_deferred(
+                        "Could not set the keyframe: the design cannot be edited right now".into(),
+                        cx,
+                    );
+                }
                 return;
             }
             let operation = if commit { session.operation() } else { None };
@@ -723,6 +736,7 @@ impl FantaMotionPanel {
             if let Err(error) = item.apply_for_preview_owner(preview_owner, operation, cx) {
                 item.finish_content_preview(preview_owner, false, cx);
                 log::error!("committing an Auto key property failed: {error:#}");
+                show_canvas_notice_deferred(format!("Could not set the keyframe: {error:#}"), cx);
             }
         });
     }
@@ -841,6 +855,7 @@ impl FantaMotionPanel {
                     AnimationSettings::for_property(property),
                 )
             },
+            |_| Some("Could not add animation on this layer".to_string()),
             cx,
         );
         if applied {
@@ -901,6 +916,7 @@ impl FantaMotionPanel {
         let applied = self.apply_transaction(
             "Remove Animation",
             |doc| remove_animation_transaction(doc, active_clip, node, property),
+            |_| None,
             cx,
         );
         if applied && self.selected_property == Some(property) {
@@ -920,6 +936,7 @@ impl FantaMotionPanel {
         self.apply_transaction(
             "Edit Animation",
             |doc| edit_animation_transaction(doc, active_clip, node, property, update),
+            |doc| edit_animation_refusal(doc, active_clip, node, property),
             cx,
         );
     }
@@ -928,10 +945,11 @@ impl FantaMotionPanel {
         &mut self,
         label: &'static str,
         build: impl FnOnce(&Doc) -> Option<Transaction>,
+        refusal: impl FnOnce(&Doc) -> Option<String>,
         cx: &mut Context<Self>,
     ) -> bool {
         self.finish_continuous_edits(cx);
-        let transaction = {
+        let (transaction, refusal) = {
             let item = self.item.read(cx);
             if !item.is_editable() {
                 return false;
@@ -939,22 +957,38 @@ impl FantaMotionPanel {
             let Some(document) = item.document() else {
                 return false;
             };
-            build(&document.doc)
+            let transaction = build(&document.doc);
+            let refusal = transaction
+                .is_none()
+                .then(|| refusal(&document.doc))
+                .flatten();
+            (transaction, refusal)
         };
         let Some(mut transaction) = transaction else {
+            if let Some(message) = refusal {
+                show_canvas_notice_deferred(message, cx);
+            }
             return false;
         };
+        let action = label.to_lowercase();
         transaction.label = label.to_string();
-        self.item.update(cx, |item, cx| {
+        let applied = self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
-                if let Err(error) = document.doc.apply_transaction(transaction) {
-                    log::error!("motion panel edit failed: {error:#}");
-                    return (false, DocChange::None);
+                match document.doc.apply_transaction(transaction) {
+                    Ok(()) => (Ok(()), DocChange::Content),
+                    Err(error) => (Err(error), DocChange::None),
                 }
-                (true, DocChange::Content)
             })
-            .unwrap_or(false)
-        })
+        });
+        match applied {
+            Some(Ok(())) => true,
+            Some(Err(error)) => {
+                log::error!("motion panel edit failed: {error:#}");
+                show_canvas_notice_deferred(format!("Could not {action}: {error:#}"), cx);
+                false
+            }
+            None => false,
+        }
     }
 
     fn choice_dropdown<T: Copy + PartialEq + 'static>(
@@ -1666,10 +1700,14 @@ impl Render for FantaMotionPanel {
                     )
                     .child(animation_section);
                 if animations.is_empty() {
-                    content = content.child(InspectorEmptyState::new(
-                        "Bring the selection to life",
-                        "Use + to add Position, Scale, Rotation, Size, or Opacity. Each animation creates readable start and end keyframes.",
-                    ));
+                    content = content.child(if editable {
+                        InspectorEmptyState::new(
+                            "Bring the selection to life",
+                            "Use + to add Position, Scale, Rotation, Size, or Opacity. Each animation creates readable start and end keyframes.",
+                        )
+                    } else {
+                        InspectorEmptyState::new("No animations", "This design is read-only.")
+                    });
                 }
                 if let Some(property) = self.selected_property
                     && let Some(summary) = animations.iter().find(|item| item.property == property)
@@ -1842,6 +1880,29 @@ fn snap_near_integer(value: f64) -> f64 {
     } else {
         value
     }
+}
+
+/// Why an edit of an animation that still exists produced no change; `None`
+/// when the animation is gone, which is not worth a notice.
+fn edit_animation_refusal(
+    doc: &Doc,
+    active_clip: Option<AnimationClipId>,
+    node: NodeId,
+    property: AnimationProperty,
+) -> Option<String> {
+    let clip = resolved_clip(doc, active_clip)?;
+    let animated = clip.tracks.values().any(|track| {
+        track.target.node == node && property_for_target(track.target.property) == Some(property)
+    });
+    if !animated {
+        return None;
+    }
+    Some(if infer_settings(doc, clip, node, property).is_none() {
+        "Could not edit animation: the panel edits only animations made of two linear keyframes"
+            .to_string()
+    } else {
+        "Could not edit animation with these settings".to_string()
+    })
 }
 
 fn edit_animation_transaction(
@@ -2960,6 +3021,219 @@ mod tests {
                 .expect("restored scale animation")
                 .property,
             AnimationProperty::Scale
+        );
+    }
+
+    struct WorkspacePanel {
+        item: Entity<FigItem>,
+        panel: Entity<FantaMotionPanel>,
+        workspace: Entity<workspace::Workspace>,
+    }
+
+    async fn mount_panel_in_workspace(
+        document: Doc,
+        clip: AnimationClipId,
+        cx: &mut gpui::TestAppContext,
+    ) -> (WorkspacePanel, &mut gpui::VisualTestContext) {
+        use project::{FakeFs, Project};
+        use settings::SettingsStore;
+
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            #[cfg(feature = "fanta-gpui-ui")]
+            {
+                gpui_component::init(cx);
+                fanta_gpui::init(cx);
+                crate::theme_bridge::init(cx);
+            }
+        });
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        cx.update(|cx| {
+            client::Client::set_global(project.read(cx).client(), cx);
+            <dyn fs::Fs>::set_global(file_system, cx);
+        });
+        let item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/Motion-panel-notice.fig".into(),
+            document,
+            cx,
+        );
+        let (multi_workspace, visual) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(visual, |multi_workspace, _| {
+            multi_workspace.workspace().clone()
+        });
+        let panel = visual.update(|window, cx| {
+            let timeline = cx.new(|cx| {
+                let mut timeline = TimelineShell::new();
+                timeline.set_model(
+                    crate::timeline::TimelineViewModel::for_clip("Notice", 2_000_000, Vec::new()),
+                    cx,
+                );
+                timeline.seek_to(500_000, cx);
+                timeline
+            });
+            window.activate_window();
+            cx.new(|cx| {
+                let mut panel = FantaMotionPanel::new(item.clone(), timeline, window, cx);
+                panel.set_active_clip(Some(clip), cx);
+                panel.set_auto_keyframe(true, cx);
+                panel
+            })
+        });
+        visual.run_until_parked();
+        (
+            WorkspacePanel {
+                item,
+                panel,
+                workspace,
+            },
+            visual,
+        )
+    }
+
+    fn shows_canvas_notice(
+        workspace: &Entity<workspace::Workspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> bool {
+        workspace.read_with(cx, |workspace, _| {
+            workspace
+                .notification_ids()
+                .contains(&workspace::notifications::NotificationId::named(
+                    crate::view::CANVAS_NOTICE_ID.into(),
+                ))
+        })
+    }
+
+    fn type_into_position_x(
+        panel: &Entity<FantaMotionPanel>,
+        text: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        let text = text.to_string();
+        panel.update_in(cx, |panel, window, cx| {
+            panel.start_numeric_property(
+                TimelineProperty::PositionX,
+                ResolvedVarValue::Float { value: 300. },
+                window,
+                cx,
+            );
+            panel
+                .field_editor
+                .update(cx, |editor, cx| editor.set_text(text, window, cx));
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn failed_auto_key_commit_shows_a_notice(cx: &mut gpui::TestAppContext) {
+        let (mut document, _) = document_with_selected_node();
+        let clip = create_clip(&mut document, "Auto key failure");
+        document.history = Default::default();
+        let (mounted, cx) = mount_panel_in_workspace(document, clip, cx).await;
+        type_into_position_x(&mounted.panel, "42", cx);
+        mounted
+            .item
+            .read_with(cx, |item, _| assert!(item.content_preview_active()));
+        mounted
+            .item
+            .update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+
+        mounted
+            .panel
+            .update(cx, |panel, cx| panel.commit_numeric_property(cx));
+        cx.run_until_parked();
+
+        assert!(
+            shows_canvas_notice(&mounted.workspace, cx),
+            "a typed value that could not be committed must not vanish silently"
+        );
+        mounted.item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0)
+        });
+    }
+
+    #[gpui::test]
+    async fn invalid_numeric_motion_input_shows_a_notice(cx: &mut gpui::TestAppContext) {
+        let (mut document, _) = document_with_selected_node();
+        let clip = create_clip(&mut document, "Invalid input");
+        document.history = Default::default();
+        let (mounted, cx) = mount_panel_in_workspace(document, clip, cx).await;
+        type_into_position_x(&mounted.panel, "12px", cx);
+
+        mounted
+            .panel
+            .update(cx, |panel, cx| panel.commit_numeric_property(cx));
+        cx.run_until_parked();
+
+        assert!(
+            shows_canvas_notice(&mounted.workspace, cx),
+            "rejected input must say why the field reverted"
+        );
+        mounted.item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0)
+        });
+    }
+
+    #[gpui::test]
+    async fn removing_an_animation_twice_shows_no_notice(cx: &mut gpui::TestAppContext) {
+        let (mut document, node) = document_with_selected_node();
+        let clip = create_clip(&mut document, "Double remove");
+        let add = build_animation_transaction(
+            &document,
+            Some(clip),
+            node,
+            AnimationProperty::Position,
+            AnimationSettings::for_property(AnimationProperty::Position),
+        )
+        .expect("position animation");
+        document.apply_transaction(add).expect("add animation");
+        document.history = Default::default();
+        let (mounted, cx) = mount_panel_in_workspace(document, clip, cx).await;
+
+        for _ in 0..2 {
+            mounted.panel.update(cx, |panel, cx| {
+                panel.remove_animation(node, AnimationProperty::Position, cx)
+            });
+        }
+        cx.run_until_parked();
+
+        mounted.item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let clip = doc.motion.clip(clip).expect("clip");
+            assert!(animation_summaries(doc, clip, node).is_empty());
+        });
+        assert!(
+            !shows_canvas_notice(&mounted.workspace, cx),
+            "removing an animation that is already gone is not a failure"
+        );
+    }
+
+    #[gpui::test]
+    async fn adding_an_animation_the_layer_cannot_take_shows_a_notice(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (mut document, node) = document_with_selected_node();
+        document.scene.get_mut(node).expect("node").transform = Transform2D::scale(0.);
+        let clip = create_clip(&mut document, "Zero scale");
+        document.history = Default::default();
+        let (mounted, cx) = mount_panel_in_workspace(document, clip, cx).await;
+
+        mounted.panel.update(cx, |panel, cx| {
+            panel.add_animation(node, AnimationProperty::Scale, cx)
+        });
+        cx.run_until_parked();
+
+        assert!(
+            shows_canvas_notice(&mounted.workspace, cx),
+            "an Add Animation that does nothing must say so"
         );
     }
 }

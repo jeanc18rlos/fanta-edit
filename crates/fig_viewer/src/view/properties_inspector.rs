@@ -524,7 +524,7 @@ impl FigView {
                     )
                 });
                 if let Some((id, operation)) = created {
-                    self.apply_motion_operation(Some(operation), "adding inspector comment", cx);
+                    self.apply_motion_operation(Some(operation), "add the comment", cx);
                     self.comment_state.open_thread = Some(id);
                 }
             }
@@ -537,7 +537,7 @@ impl FigView {
                         .read(cx)
                         .document()
                         .and_then(|document| toggle_resolved_op(&document.doc, root, id));
-                    self.apply_motion_operation(operation, "resolving inspector comment", cx);
+                    self.apply_motion_operation(operation, "resolve the comment", cx);
                 }
             }
             CommentsInspectorAction::ReplyRequested { thread_id, body } => {
@@ -553,7 +553,7 @@ impl FigView {
                             None,
                         )
                     });
-                    self.apply_motion_operation(operation, "replying to inspector comment", cx);
+                    self.apply_motion_operation(operation, "reply to the comment", cx);
                 }
             }
             CommentsInspectorAction::FilterChangeRequested { .. } => {}
@@ -591,6 +591,117 @@ mod tests {
         assert!(!motion_preset_available(&doc, true));
         doc.selection.replace_with([locked_id]);
         assert!(!motion_preset_available(&doc, true));
+    }
+
+    #[gpui::test]
+    async fn motion_duration_on_one_keyframe_explains_why_nothing_changed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::view::{CANVAS_NOTICE_ID, EditorMode, FigView};
+        use fanta_doc::{
+            AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, BoundProp, Keyframe,
+            KeyframeId, MotionProperty, MotionTarget, ResolvedVarValue, TextNode,
+        };
+        use fanta_gpui::properties_tabs::MotionInspectorAction;
+        use gpui::AppContext as _;
+        use project::{FakeFs, Project};
+        use workspace::notifications::NotificationId;
+
+        cx.update(|cx| {
+            zlog::init_test();
+            assets::Assets.load_test_fonts(cx);
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
+            crate::theme_bridge::init(cx);
+        });
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        cx.update(|cx| {
+            client::Client::set_global(project.read(cx).client(), cx);
+            <dyn fs::Fs>::set_global(file_system, cx);
+        });
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page))
+            .expect("create page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let mut target = CanvasNode::new(NodeData::Text(TextNode::new("Target", 120., 40.)));
+        target.parent = Some(page_id);
+        let target_id = target.id;
+        doc.apply(Operation::create_node(target))
+            .expect("create target");
+        doc.selection.select_only(target_id);
+        let clip_id = AnimationClipId::new();
+        let mut clip = AnimationClip::new(clip_id, "Entrance", 1_500);
+        let track_id = AnimationTrackId::new();
+        let mut track = AnimationTrack::new(
+            track_id,
+            MotionTarget::new(
+                target_id,
+                MotionProperty::Bound {
+                    prop: BoundProp::Opacity,
+                },
+            ),
+        );
+        let keyframe = Keyframe::new(
+            KeyframeId::new(),
+            300,
+            ResolvedVarValue::Float { value: 1. },
+        );
+        track.keyframes.insert(keyframe.id, keyframe);
+        clip.tracks.insert(track_id, track);
+        doc.motion.clips.insert(clip_id, clip);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Motion-duration.fig"),
+            doc,
+            cx,
+        );
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let view = cx.update(|window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            window.activate_window();
+            view
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| view.set_editor_mode(EditorMode::Motion, cx));
+        cx.run_until_parked();
+        let motion = view.read_with(cx, |view, _| {
+            view.gpui_properties
+                .as_ref()
+                .expect("properties inspector")
+                .motion
+                .clone()
+        });
+
+        motion.update(cx, |_, cx| {
+            cx.emit(MotionInspectorAction::DurationChangeRequested { duration_ms: 500 })
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace
+                    .notification_ids()
+                    .contains(&NotificationId::named(CANVAS_NOTICE_ID.into())),
+                "a duration typed for one keyframe must not be dropped silently"
+            );
+        });
     }
 }
 
@@ -784,6 +895,7 @@ impl FigView {
             | MotionInspectorAction::DelayChangeRequested { .. }
             | MotionInspectorAction::EasingChangeRequested { .. } => {
                 let mut operations = vec![];
+                let mut keys_share_one_time = false;
                 if let Some(clip) = self
                     .active_motion_clip
                     .and_then(|id| self.item.read(cx).document()?.doc.motion.clip(id))
@@ -807,6 +919,7 @@ impl FigView {
                         .flat_map(|track| track.keyframes.values().map(|key| key.time_ms))
                         .max()
                         .unwrap_or(clip.duration_ms);
+                    keys_share_one_time = start == end;
                     let mut duration = clip.duration_ms;
                     for track in selected {
                         let mut changed = track.clone();
@@ -848,6 +961,20 @@ impl FigView {
                             new: duration,
                         });
                     }
+                }
+                // Scaling keyframes that sit at one moment cannot lengthen anything.
+                if keys_share_one_time
+                    && matches!(
+                        action,
+                        MotionInspectorAction::DurationChangeRequested { .. }
+                    )
+                {
+                    show_canvas_notice(
+                        "Add a second keyframe to set a duration".into(),
+                        window,
+                        cx,
+                    );
+                    return;
                 }
                 self.apply_inspector_operations(operations, "Edit animation settings", window, cx);
             }

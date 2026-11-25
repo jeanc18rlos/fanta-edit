@@ -290,6 +290,10 @@ pub(crate) fn sample_times(duration_ms: u32, fps: u16, loop_mode: LoopMode) -> R
     if duration_ms == 0 || steps == 0 {
         return Ok(vec![0]);
     }
+    ensure!(
+        steps <= MAX_FRAMES,
+        "the animation needs {steps} frames; the limit is {MAX_FRAMES}. Lower its frame rate or duration"
+    );
     let at = |index: usize| -> u32 {
         (index as f64 * 1000.0 / fps)
             .round()
@@ -945,6 +949,12 @@ pub(crate) mod tests {
 
         assert_eq!(sample_times(0, 30, LoopMode::Once).expect("still"), vec![0]);
         assert!(sample_times(600_000, 120, LoopMode::Repeat).is_err());
+    }
+
+    #[test]
+    fn sampling_rejects_an_oversized_clip_before_allocating_its_frames() {
+        // About 2.8e11 frames: building the list first would need over a terabyte.
+        assert!(sample_times(u32::MAX, u16::MAX, LoopMode::Repeat).is_err());
     }
 
     #[test]
