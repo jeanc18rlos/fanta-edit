@@ -502,11 +502,30 @@ pub fn delete_operations(doc: &Doc) -> Vec<Operation> {
             }
         }
     }
-    // Exports reject a flow start that points at a missing frame.
+    operations.extend(flow_cleanup_operations(doc, &deleted));
+    operations
+}
+
+/// Clear the flow start and drop the named flows that start at a deleted node.
+/// Exports reject a flow that points at a missing frame, and a flow is defined
+/// by its starting frame, so deleting the frame removes the flow.
+pub fn flow_cleanup_operations(doc: &Doc, deleted: &HashSet<NodeId>) -> Vec<Operation> {
+    let mut operations = Vec::new();
     if let Some(start) = doc.flow_start.filter(|start| deleted.contains(start)) {
         operations.push(Operation::SetFlowStart {
             old: Some(start),
             new: None,
+        });
+    }
+    if doc.flows.iter().any(|flow| deleted.contains(&flow.start)) {
+        operations.push(Operation::SetFlows {
+            old: doc.flows.clone(),
+            new: doc
+                .flows
+                .iter()
+                .filter(|flow| !deleted.contains(&flow.start))
+                .cloned()
+                .collect(),
         });
     }
     operations

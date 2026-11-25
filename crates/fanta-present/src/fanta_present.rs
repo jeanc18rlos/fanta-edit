@@ -3436,8 +3436,6 @@ impl PlaybackSession {
         ))
     }
 
-    /// Push an overlay frame onto the stack, placed per its settings at the
-    /// current layer's zoom. A missing or bounds-less overlay frame is a no-op.
     fn report_missing_target(&mut self, action: &str) {
         self.playback_events.push(PlaybackEvent::Diagnostic {
             diagnostic: PlaybackDiagnostic {
@@ -3447,6 +3445,8 @@ impl PlaybackSession {
         });
     }
 
+    /// Push an overlay frame onto the stack, placed per its settings at the
+    /// current layer's zoom. A missing or bounds-less overlay frame is a no-op.
     fn open_overlay(
         &mut self,
         frame: NodeId,

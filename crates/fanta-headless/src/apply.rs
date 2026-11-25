@@ -2507,8 +2507,13 @@ fn apply_one(
                 .descendants_of(id)
                 .filter_map(|descendant| doc.scene.get(descendant).cloned())
                 .collect();
-            removed_nodes.extend(snapshot.iter().map(|node| node.id));
+            let deleted: HashSet<NodeId> = snapshot.iter().map(|node| node.id).collect();
+            let flow_cleanup = crate::clipboard::flow_cleanup_operations(doc, &deleted);
+            removed_nodes.extend(deleted);
             doc.apply(Operation::DeleteSubtree { snapshot })?;
+            for operation in flow_cleanup {
+                doc.apply(operation)?;
+            }
             Ok(Applied::changed())
         }
         DesignOp::Select { ids } => {
@@ -3703,6 +3708,58 @@ mod tests {
             0,
             "no undo step for a failed batch"
         );
+    }
+
+    #[test]
+    fn agent_delete_of_a_flow_start_frame_keeps_the_document_exportable() {
+        let (mut doc, _) = doc_with_page();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame",
+                 "x": 0.0, "y": 0.0, "width": 100.0, "height": 100.0},
+            ])),
+            "Create",
+        );
+        let start = created_id(&outcome, 0);
+        doc.apply(Operation::SetFlowStart {
+            old: None,
+            new: Some(start),
+        })
+        .unwrap();
+        doc.apply(Operation::SetFlows {
+            old: Vec::new(),
+            new: vec![fanta_doc::Flow {
+                name: "Onboarding".into(),
+                start,
+            }],
+        })
+        .unwrap();
+        doc.history = Default::default();
+        let flows = doc.flows.clone();
+
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([{"op": "delete", "id": start.to_string()}])),
+            "Delete",
+        );
+
+        assert_eq!(outcome.value["applied"], json!(true));
+        assert_eq!(doc.flow_start, None);
+        assert!(doc.flows.is_empty());
+        assert!(
+            fanta_format::runtime::RuntimeProgram::from_document(
+                doc.clone(),
+                BTreeMap::new(),
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .is_ok(),
+            "the export accepts the document"
+        );
+        assert!(doc.undo().unwrap());
+        assert_eq!(doc.flow_start, Some(start));
+        assert_eq!(doc.flows, flows);
     }
 
     #[test]
