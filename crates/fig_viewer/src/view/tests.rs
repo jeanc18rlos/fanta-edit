@@ -7914,6 +7914,92 @@ async fn stale_crop_toolbar_actions_show_no_unavailable_notice(cx: &mut TestAppC
     }
 }
 
+/// draw-view-5: a Magic Wand click in the empty band of a fitted image says
+/// why nothing was selected instead of swallowing the click.
+#[gpui::test]
+async fn magic_wand_outside_a_fitted_image_shows_a_notice(cx: &mut TestAppContext) {
+    init_visual_test(cx);
+    let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(2, 2, image::Rgba([48, 96, 192, 255])))
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .expect("fixture PNG");
+    let bytes = encoded.into_inner();
+    let asset = fanta_format::asset_id_for_bytes(&bytes);
+    let mut doc = doc_with_one_page();
+    let mut bitmap = CanvasNode::new(NodeData::Bitmap(fanta_doc::BitmapNode {
+        asset,
+        natural_size: [2, 2],
+        local_size: [200.0, 100.0],
+        crop: None,
+        fit: fanta_doc::ImageFitMode::Fit,
+        tint: None,
+    }));
+    bitmap.parent = doc.active_page();
+    bitmap.transform = Transform2D::translation(-100.0, -50.0);
+    doc.apply(Operation::create_node(bitmap)).expect("bitmap");
+    doc.history = Default::default();
+    let item = crate::document::ready_item_for_test(
+        &project,
+        std::path::PathBuf::from("/tmp/FittedImageWand.fig"),
+        doc,
+        cx,
+    );
+    item.update(cx, |item, cx| {
+        item.with_document(cx, |document| {
+            let (_, mut assets) = document.doc_and_assets();
+            assets.add_image(bytes).expect("fixture image");
+            ((), DocChange::None)
+        });
+    });
+    let window = cx.add_window(|window, cx| {
+        workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+    });
+    let multi_workspace = window.entity(cx).expect("multi workspace");
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let view = window
+        .update(cx, |_, window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            window.activate_window();
+            view.update(cx, |view, cx| {
+                view.set_viewport_silent(Viewport::default());
+                cx.notify();
+            });
+            view
+        })
+        .expect("mount the view in a workspace");
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(size(px(1400.0), px(900.0)));
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear());
+    view.update(&mut visual, |view, cx| {
+        view.set_editor_mode(EditorMode::Draw, cx);
+        view.activate_tool(ToolKind::MagicWand, cx);
+    });
+    visual.run_until_parked();
+    let center = view.read_with(&visual, |view, _| {
+        assert_eq!(view.active_tool(), ToolKind::MagicWand);
+        view.container_bounds.expect("canvas").center()
+    });
+    let notice = NotificationId::named(CANVAS_NOTICE_ID.into());
+    workspace.read_with(&visual, |workspace, _| {
+        assert!(!workspace.notification_ids().contains(&notice));
+    });
+    // The square image fits the middle 100 of the 200-wide frame.
+    mounted_canvas_click(&mut visual, center + point(px(-90.0), px(0.0)), 1);
+    visual.run_until_parked();
+    workspace.read_with(&visual, |workspace, _| {
+        assert!(
+            workspace.notification_ids().contains(&notice),
+            "a wand click that matches nothing explains itself"
+        );
+    });
+}
+
 #[gpui::test]
 async fn refused_undo_and_redo_show_a_canvas_notice(cx: &mut TestAppContext) {
     init_visual_test(cx);

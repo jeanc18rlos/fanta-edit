@@ -3139,6 +3139,11 @@ impl FigView {
                         if let Some(region) = region {
                             this.wand_override = Some((target, region));
                             this.dispatch_tool_event(event, cx);
+                        } else {
+                            show_canvas_notice_deferred(
+                                "Magic Wand found no image pixels at that point.".into(),
+                                cx,
+                            );
                         }
                     }
                     Err(error) => {
