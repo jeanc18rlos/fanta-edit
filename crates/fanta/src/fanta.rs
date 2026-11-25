@@ -2221,6 +2221,26 @@ pub fn watch_user_agents_md(fs: Arc<dyn fs::Fs>, cx: &mut App) {
     });
 }
 
+/// Shows the account messages the client cannot show itself, such as a sign-in that was not saved.
+pub fn watch_account_notices(client: &Arc<client::Client>, cx: &mut App) {
+    struct AccountNotice;
+    let mut notices = client.account_notices();
+    cx.spawn(async move |cx| {
+        while let Some(notice) = notices.next().await {
+            let Some(message) = notice else {
+                continue;
+            };
+            cx.update(|cx| {
+                show_app_notification(NotificationId::unique::<AccountNotice>(), cx, move |cx| {
+                    let message = message.clone();
+                    cx.new(|cx| MessageNotification::new(message, cx))
+                })
+            });
+        }
+    })
+    .detach();
+}
+
 pub fn watch_settings_files(fs: Arc<dyn fs::Fs>, cx: &mut App) {
     MigrationNotification::set_global(cx.new(|_| MigrationNotification), cx);
 

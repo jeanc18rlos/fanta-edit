@@ -26,7 +26,7 @@ use futures::{
     future::BoxFuture,
     stream::BoxStream,
 };
-use gpui::{App, AsyncApp, Entity, Global, Task, TaskExt, WeakEntity, actions};
+use gpui::{App, AsyncApp, Entity, Global, SharedString, Task, TaskExt, WeakEntity, actions};
 use http_client::{HttpClient, HttpClientWithUrl, http, read_proxy_from_env};
 use parking_lot::{Mutex, RwLock};
 use postage::watch;
@@ -340,6 +340,10 @@ struct ClientState {
     /// Bumped each time the cloud websocket finishes its handshake. Starts at `0` so
     /// subscribers can distinguish "no connection yet" from a real reconnect.
     cloud_connection_id: (watch::Sender<u64>, watch::Receiver<u64>),
+    account_notice: (
+        watch::Sender<Option<SharedString>>,
+        watch::Receiver<Option<SharedString>>,
+    ),
     _reconnect_task: Option<Task<()>>,
     _cloud_connection_task: Option<Task<()>>,
 }
@@ -454,6 +458,7 @@ impl Default for ClientState {
             stored_credentials: None,
             status: watch::channel_with(Status::SignedOut),
             cloud_connection_id: watch::channel_with(0),
+            account_notice: watch::channel(),
             _reconnect_task: None,
             _cloud_connection_task: None,
         }
@@ -702,6 +707,26 @@ impl Client {
     /// initial `0` means no reconnection yet.
     pub fn cloud_connection_id(&self) -> watch::Receiver<u64> {
         self.state.read().cloud_connection_id.1.clone()
+    }
+
+    /// Account messages for the app to show, such as a sign-in that could not be saved.
+    pub fn account_notices(&self) -> watch::Receiver<Option<SharedString>> {
+        self.state.read().account_notice.1.clone()
+    }
+
+    pub fn notify_account(&self, message: impl Into<SharedString>) {
+        let message = message.into();
+        log::warn!("account notice: {message}");
+        *self.state.write().account_notice.0.borrow_mut() = Some(message);
+    }
+
+    /// Ends a session whose account could not be loaded, keeping the saved sign-in so Sign In can retry it.
+    pub fn abandon_session(self: &Arc<Self>, message: impl Into<SharedString>, cx: &AsyncApp) {
+        self.state.write().credentials = None;
+        self.cloud_client.clear_credentials();
+        self.peer.teardown();
+        self.set_status(Status::AuthenticationError, cx);
+        self.notify_account(message);
     }
 
     fn set_status(self: &Arc<Self>, status: Status, cx: &AsyncApp) {

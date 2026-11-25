@@ -589,6 +589,7 @@ fn main() {
         fanta::move_to_applications::init(cx);
         project::Project::init(&client, cx);
         client::init(&client, cx);
+        fanta::watch_account_notices(&client, cx);
         feature_flags::FeatureFlagStore::init(cx);
 
         let system_id = cx.foreground_executor().block_on(system_id).ok();
