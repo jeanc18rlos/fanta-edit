@@ -4,6 +4,9 @@ ignore-hidden = false
 extend-exclude = [
     ".git/",
 
+    # Fuzz seeds are parser inputs, binary ones included.
+    "crates/*/fuzz/seeds/",
+
     # Contributor names aren't typos.
     ".mailmap",
 

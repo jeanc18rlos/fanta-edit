@@ -1,0 +1,26 @@
+[package]
+name = "fanta-bundle-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "GPL-3.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace: libfuzzer-sys and the nightly toolchain stay out of the
+# root workspace and its Cargo.lock.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fanta-bundle = { path = ".." }
+serde_json = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[[bin]]
+name = "load_bundle"
+path = "fuzz_targets/load_bundle.rs"
+test = false
+doc = false
+bench = false

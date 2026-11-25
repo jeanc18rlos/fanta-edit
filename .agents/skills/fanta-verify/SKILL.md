@@ -58,3 +58,13 @@ Run `cargo run -p fig_viewer --example <name> -- <arguments>`; each example's he
 ## Report
 
 List the commands you ran with their results, the stages you skipped and why, and anything you verified only by reading code.
+
+## Fuzzing the parsers
+
+The four crates that read files from outside each have a `fuzz/` directory (`cargo fuzz` layout, its own workspace and `Cargo.lock`, outside the root workspace): `fanta-fig-interop` (`read_fig`, `kiwi`), `fanta-fnx` (`parse`), `fanta-format` (`read_project`) and `fanta-bundle` (`load_bundle`). `.github/workflows/fuzz.yml` runs each for five minutes.
+
+- Run one with `script/fuzz <crate> <target> [seconds]`, for example `script/fuzz fanta-fnx parse 60`. It needs `cargo install --locked cargo-fuzz@0.13.2` and the nightly that `script/fuzz --toolchain` prints. The script sets the input size, time and memory limits; do not put limits in a target.
+- Committed seeds are in `fuzz/seeds/<target>`. The `read_project` seeds are generated from `crates/fanta-format/tests/corpus`: run `script/fuzz-seeds` after that corpus changes. Inputs the run finds go to the ignored `fuzz/corpus`, and a crash to `fuzz/artifacts/<target>/`.
+- To turn a crash into a regression test: shrink it with `cargo +<nightly> fuzz tmin <target> <artifact>` from the crate directory, fix the parser so it returns the crate's error, add a unit test in the crate that feeds the shrunk bytes, and copy the input into `fuzz/seeds/<target>`. Do not commit or post the input before the fix is merged.
+- The repository is public, so the nightly job neither uploads nor prints a crashing input: it shows the target, libFuzzer's seed and the input's SHA-256. To reproduce, run the target locally for the same five minutes on the same commit, with `-seed=<n>` added to the libFuzzer arguments in `script/fuzz`, and compare the SHA-256 of the file in `fuzz/artifacts/<target>/`.
+- Each `fuzz/Cargo.lock` is the root `Cargo.lock` cut down to what the target needs, so the fuzzer runs the dependency versions the app ships. After the root lock changes a parser's dependencies, copy it over `fuzz/Cargo.lock` and run `cargo metadata` in `fuzz/` to trim it. `script/fuzz` checks the lock with `cargo metadata --locked` first (cargo-fuzz has no `--locked`), so a stale one fails the run.

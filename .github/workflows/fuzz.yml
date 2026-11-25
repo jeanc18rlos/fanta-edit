@@ -1,0 +1,71 @@
+name: Fuzz
+
+# Five minutes on each fuzz target of the parsers that read files from outside (spec 0012 R13, R14).
+# Called by the Nightly workflow; a crash fails the job. The repository is public and both
+# libFuzzer and cargo-fuzz print a crashing input, so the run's output goes to a file and a
+# crash shows only the target, libFuzzer's seed and the input's SHA-256; nothing is uploaded.
+# To reproduce, run `script/fuzz <crate> <target> 300` locally on the same commit (the seeds
+# are committed), with `-seed=<n>` added to the libFuzzer arguments in script/fuzz, and compare
+# the SHA-256 of the file in fuzz/artifacts/<target>. Output is shown when there is no input,
+# which is a build failure.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+jobs:
+  fuzz:
+    name: ${{ matrix.crate }} ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { crate: fanta-fig-interop, target: read_fig }
+          - { crate: fanta-fig-interop, target: kiwi }
+          - { crate: fanta-fnx, target: parse }
+          - { crate: fanta-format, target: read_project }
+          - { crate: fanta-bundle, target: load_bundle }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned nightly and cargo-fuzz
+        run: |
+          toolchain="$(script/fuzz --toolchain)"
+          rustup toolchain install "$toolchain" --profile minimal
+          cargo "+$toolchain" install --locked cargo-fuzz@0.13.2
+
+      - name: Fuzz for five minutes
+        env:
+          CRATE: ${{ matrix.crate }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          log="$RUNNER_TEMP/fuzz.log"
+          if script/fuzz "$CRATE" "$TARGET" 300 >"$log" 2>&1; then
+            tail -n 3 "$log"
+            exit 0
+          fi
+          shopt -s nullglob
+          inputs=("crates/$CRATE/fuzz/artifacts/$TARGET"/*)
+          if (( ${#inputs[@]} == 0 )); then
+            cat "$log"
+            exit 1
+          fi
+          grep -a -m 1 '^INFO: Seed:' "$log" || true
+          for input in "${inputs[@]}"; do
+            echo "$CRATE $TARGET: input with SHA-256 $(sha256sum "$input" | cut -d' ' -f1)"
+          done
+          exit 1
