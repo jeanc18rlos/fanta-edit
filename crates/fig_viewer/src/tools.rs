@@ -335,6 +335,7 @@ impl ToolShell {
         if self.kind == kind {
             return;
         }
+        self.tool.finish_draft(ctx);
         self.tool.deactivate(ctx);
         self.kind = kind;
         self.translation = None;
@@ -413,6 +414,24 @@ impl ToolShell {
         response
     }
 
+    pub fn has_draft(&self) -> bool {
+        self.tool.has_draft()
+    }
+
+    /// Undo inside the active tool's draft. False when the tool has nothing
+    /// to undo there.
+    pub fn undo_draft(&mut self) -> bool {
+        let Some(response) = self.tool.undo_draft() else {
+            return false;
+        };
+        self.overlays = response.overlays.to_vec();
+        self.append_selection_region_overlay();
+        if response.cursor.is_some() {
+            self.cursor = response.cursor;
+        }
+        true
+    }
+
     pub fn refresh_overlays(&mut self, doc: &Doc) -> bool {
         let Some(overlays) = self.tool.overlays_after_document_change(doc) else {
             return false;
@@ -459,6 +478,7 @@ impl ToolShell {
             Some(CursorHint::Grab) => CursorStyle::OpenHand,
             Some(CursorHint::Grabbing) => CursorStyle::ClosedHand,
             Some(CursorHint::Text) => CursorStyle::IBeam,
+            Some(CursorHint::Pointer) => CursorStyle::PointingHand,
             Some(CursorHint::Move) | Some(CursorHint::Default) => CursorStyle::Arrow,
             None => match self.kind {
                 ToolKind::Hand => CursorStyle::OpenHand,
@@ -769,6 +789,55 @@ mod tests {
             serde_json::to_value(&*context.doc).expect("after switches"),
             expected
         );
+    }
+
+    /// draw-tools-10: a tool switch keeps a pen draft of two or more anchors as
+    /// an open path in the draft's color; a cancel still discards it.
+    #[test]
+    fn tool_switch_commits_pen_draft_and_cancel_discards_it() {
+        let draw_color = Color::rgb(0x12, 0x34, 0x56);
+        for cancel in [false, true] {
+            let mut doc = Doc::new();
+            let mut viewport = Viewport::default();
+            let mut shell = ToolShell::new();
+            let screen_size = DVec2::new(800.0, 600.0);
+            let mut context = tool_context(&mut doc, &mut viewport, screen_size, ToolKind::Pen);
+            shell.activate(ToolKind::Pen, &mut context);
+            context.new_shape_fill = draw_color;
+            for screen in [[400.0, 300.0], [500.0, 300.0], [500.0, 400.0]] {
+                shell.handle_event(
+                    &mut context,
+                    press_event(DVec2::from(screen), Button::Primary, Modifiers::none(), 1),
+                );
+                shell.handle_event(
+                    &mut context,
+                    release_event(DVec2::from(screen), Button::Primary, Modifiers::none()),
+                );
+            }
+            let mut context = tool_context(&mut doc, &mut viewport, screen_size, ToolKind::Rect);
+            if cancel {
+                shell.cancel_and_activate(ToolKind::Rect, &mut context);
+                assert_eq!(context.doc.scene.len(), 0, "cancel discards the draft");
+                continue;
+            }
+            shell.activate(ToolKind::Rect, &mut context);
+            let roots = context.doc.scene.roots().to_vec();
+            assert_eq!(roots.len(), 1, "the switch keeps the draft");
+            match roots
+                .first()
+                .and_then(|id| context.doc.scene.get(*id))
+                .map(|node| &node.data)
+            {
+                Some(fanta_doc::NodeData::Vector(vector)) => {
+                    assert!(vector.fills.is_empty(), "an open path");
+                    assert_eq!(
+                        vector.strokes.first().map(|stroke| stroke.paint.clone()),
+                        Some(fanta_doc::Fill::solid(draw_color))
+                    );
+                }
+                other => panic!("expected a vector, got {other:?}"),
+            }
+        }
     }
 
     /// Filled shapes land in Figma's neutral grey; the tools that spend the

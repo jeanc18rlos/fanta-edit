@@ -2,7 +2,7 @@ use super::*;
 use fanta_gpui::timeline::{
     self as shared, Timeline, TimelineAction as Action, TimelineEasing, TimelinePlayback,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub(super) struct TimelineAdapter {
     pub panel: Entity<Timeline>,
@@ -95,6 +95,21 @@ pub(super) fn property_name(property: MotionProperty) -> &'static str {
             prop: BoundProp::ClipHeight,
         } => "Height",
         MotionProperty::Bound { .. } => "Property",
+    }
+}
+
+fn keyframe_value_label(value: &ResolvedVarValue) -> SharedString {
+    match value {
+        ResolvedVarValue::Float { value } => format!("{value:.2}").into(),
+        ResolvedVarValue::Color { value } => value.to_hex().into(),
+        ResolvedVarValue::String { value } | ResolvedVarValue::Enum { value } => {
+            value.clone().into()
+        }
+        ResolvedVarValue::Boolean { value } => if *value { "On" } else { "Off" }.into(),
+        ResolvedVarValue::TextStyle { .. } => "Text style".into(),
+        ResolvedVarValue::Image { value } => {
+            if value.is_some() { "Image" } else { "No image" }.into()
+        }
     }
 }
 
@@ -193,10 +208,7 @@ impl FigView {
                     .map(|key| shared::TimelineKeyframe {
                         id: key.id.to_string().into(),
                         time_ms: key.time_ms,
-                        value: match &key.value {
-                            ResolvedVarValue::Float { value } => format!("{value:.2}").into(),
-                            _ => format!("{:?}", key.value).into(),
-                        },
+                        value: keyframe_value_label(&key.value),
                         easing: shared_easing(key.easing, key.interpolation),
                     })
                     .collect::<Vec<_>>();
@@ -284,7 +296,7 @@ impl FigView {
                 if *playback == TimelinePlayback::PingPong { self.timeline_shell.update(cx, |clock, cx| clock.set_ping_pong_playback(cx)); }
                 else { self.timeline_shell.update(cx, |clock, cx| clock.set_loop_playback(*playback == TimelinePlayback::Loop, cx)); }
             }
-            Action::SeekRequested { time_ms } => { self.timeline_shell.update(cx, |clock, cx| clock.set_playhead(i64::from(*time_ms) * 1000, cx)); }
+            Action::SeekRequested { time_ms } => { self.timeline_shell.update(cx, |clock, cx| clock.seek_to(i64::from(*time_ms) * 1000, cx)); }
             Action::DurationChangeRequested { duration_ms } => { if self.active_motion_clip.is_none() { self.create_motion_clip(cx); } self.set_motion_clip_duration(i64::from(*duration_ms) * 1000, cx); }
             Action::ZoomChangeRequested { zoom } => { if let Some(adapter) = &mut self.gpui_timeline { adapter.zoom = *zoom; } }
             Action::HeightChangeRequested { height } => { if let Some(adapter) = &mut self.gpui_timeline { adapter.height = *height; } }
@@ -331,7 +343,7 @@ impl FigView {
                 self.apply_inspector_operations(operation.into_iter().collect(), "Add keyframe", window, cx);
             }
             Action::AddKeyframeRequested { time_ms } => {
-                self.timeline_shell.update(cx, |clock, cx| clock.set_playhead(i64::from(*time_ms) * 1000, cx));
+                self.timeline_shell.update(cx, |clock, cx| clock.seek_to(i64::from(*time_ms) * 1000, cx));
                 let operations = self.active_motion_clip.and_then(|clip_id| {
                     let doc = &self.item.read(cx).document()?.doc;
                     let clip = doc.motion.clip(clip_id)?;
@@ -365,8 +377,10 @@ impl FigView {
                 }
             }
             Action::KeyframesMoveRequested { .. } | Action::KeyframesDeleteRequested { .. } | Action::KeyframesDuplicateRequested { .. } | Action::EasingChangeRequested { .. } | Action::TrackTimingChangeRequested { .. } => {
-                let operations = self.timeline_edit_operations(action, cx);
-                self.apply_inspector_operations(operations, "Edit animation", window, cx);
+                match self.timeline_edit_operations(action, cx) {
+                    Ok(operations) => self.apply_inspector_operations(operations, "Edit animation", window, cx),
+                    Err(message) => show_canvas_notice(message.into(), window, cx),
+                }
             }
             Action::CollapsedChanged { .. } | Action::EmptyStateDismissed => {}
             Action::HelpRequested => show_canvas_notice("Drag keys or timing bars to retime. Double-click a layer name to rename it. Use the + beside a property to add a keyframe.".into(), window, cx),
@@ -399,9 +413,13 @@ impl FigView {
         cx.notify();
     }
 
-    fn timeline_edit_operations(&self, action: &Action, cx: &App) -> Vec<Operation> {
+    fn timeline_edit_operations(
+        &self,
+        action: &Action,
+        cx: &App,
+    ) -> Result<Vec<Operation>, &'static str> {
         let Some(clip_id) = self.active_motion_clip else {
-            return vec![];
+            return Ok(vec![]);
         };
         let Some(clip) = self
             .item
@@ -409,7 +427,11 @@ impl FigView {
             .document()
             .and_then(|document| document.doc.motion.clip(clip_id))
         else {
-            return vec![];
+            return Ok(vec![]);
+        };
+        let shares_a_time = |keyframes: &BTreeMap<KeyframeId, Keyframe>| {
+            let mut times = HashSet::new();
+            !keyframes.values().all(|key| times.insert(key.time_ms))
         };
         let mut operations = vec![];
         for track in clip.tracks.values() {
@@ -494,16 +516,21 @@ impl FigView {
                     _ => {}
                 }
             }
+            // The evaluator keeps one keyframe per time, so a second one would silently do nothing.
+            if shares_a_time(&changed.keyframes) && !shares_a_time(&track.keyframes) {
+                return Err("Two keyframes of one property cannot share a time");
+            }
             if changed != *track {
                 operations.push(Operation::SetAnimationTrack {
                     clip: clip_id,
                     track: track.id,
                     old: Some(Box::new(track.clone())),
-                    new: Some(Box::new(changed)),
+                    // An empty track would leave a property row whose + adds nothing.
+                    new: (!changed.keyframes.is_empty()).then(|| Box::new(changed)),
                 });
             }
         }
-        operations
+        Ok(operations)
     }
 }
 
@@ -511,7 +538,8 @@ impl FigView {
 mod tests {
     use super::*;
     use fanta_doc::{
-        AnimationClip, AnimationClipId, CanvasNode, Doc, GroupNode, NodeData, TextNode,
+        AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, CanvasNode, Doc,
+        GroupNode, MotionTarget, NodeData, TextNode,
     };
     use gpui::{TestAppContext, VisualTestContext};
     use project::{FakeFs, Project};
@@ -577,6 +605,209 @@ mod tests {
                 .clone()
         });
         (view, timeline, target_id, cx.clone())
+    }
+
+    fn insert_opacity_track(
+        view: &Entity<FigView>,
+        target_id: NodeId,
+        times: &[u32],
+        cx: &mut VisualTestContext,
+    ) -> (AnimationTrackId, Vec<KeyframeId>) {
+        let track_id = AnimationTrackId::new();
+        let mut track = AnimationTrack::new(
+            track_id,
+            MotionTarget::new(
+                target_id,
+                MotionProperty::Bound {
+                    prop: BoundProp::Opacity,
+                },
+            ),
+        );
+        let keyframe_ids = times
+            .iter()
+            .map(|time_ms| {
+                let keyframe = Keyframe::new(
+                    KeyframeId::new(),
+                    *time_ms,
+                    ResolvedVarValue::Float {
+                        value: f64::from(*time_ms) / 1_000.,
+                    },
+                );
+                let id = keyframe.id;
+                track.keyframes.insert(id, keyframe);
+                id
+            })
+            .collect();
+        view.update(cx, |view, cx| {
+            let clip_id = view.active_motion_clip.expect("active clip");
+            view.item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document
+                        .doc
+                        .motion
+                        .clips
+                        .get_mut(&clip_id)
+                        .expect("clip")
+                        .tracks
+                        .insert(track_id, track);
+                    ((), DocChange::Content)
+                });
+            });
+        });
+        cx.run_until_parked();
+        (track_id, keyframe_ids)
+    }
+
+    fn active_clip_track(
+        view: &Entity<FigView>,
+        track_id: AnimationTrackId,
+        cx: &mut VisualTestContext,
+    ) -> Option<AnimationTrack> {
+        view.read_with(cx, |view, cx| {
+            let clip_id = view.active_motion_clip.expect("active clip");
+            let document = view.item.read(cx).document().expect("document");
+            document
+                .doc
+                .motion
+                .clip(clip_id)
+                .expect("clip")
+                .tracks
+                .get(&track_id)
+                .cloned()
+        })
+    }
+
+    #[test]
+    fn keyframe_values_read_as_the_inspector_shows_them() {
+        let label = |value| keyframe_value_label(&value).to_string();
+        assert_eq!(label(ResolvedVarValue::Float { value: 0.5 }), "0.50");
+        assert_eq!(
+            label(ResolvedVarValue::Color {
+                value: fanta_doc::Color::from_hex("#FF0000").expect("color"),
+            }),
+            "#FF0000"
+        );
+        assert_eq!(label(ResolvedVarValue::Boolean { value: true }), "On");
+        assert_eq!(
+            label(ResolvedVarValue::String {
+                value: "Hello".into()
+            }),
+            "Hello"
+        );
+        assert_eq!(
+            label(ResolvedVarValue::Enum {
+                value: "Open".into()
+            }),
+            "Open"
+        );
+        assert_eq!(label(ResolvedVarValue::Image { value: None }), "No image");
+    }
+
+    #[gpui::test]
+    async fn deleting_a_property_last_keyframe_removes_its_track(cx: &mut TestAppContext) {
+        let (view, timeline, target_id, mut cx) = setup(cx, true).await;
+        let cx = &mut cx;
+        let (track_id, keyframe_ids) = insert_opacity_track(&view, target_id, &[0, 500], cx);
+        let [first, second] = keyframe_ids.as_slice() else {
+            panic!("expected two keyframes");
+        };
+
+        timeline.update(cx, |_, cx| {
+            cx.emit(Action::KeyframesDeleteRequested {
+                keyframe_ids: vec![first.to_string().into()],
+            })
+        });
+        cx.run_until_parked();
+        let track = active_clip_track(&view, track_id, cx).expect("track keeps its other keyframe");
+        assert_eq!(track.keyframes.keys().collect::<Vec<_>>(), [second]);
+
+        timeline.update(cx, |_, cx| {
+            cx.emit(Action::KeyframesDeleteRequested {
+                keyframe_ids: vec![second.to_string().into()],
+            })
+        });
+        cx.run_until_parked();
+        assert!(
+            active_clip_track(&view, track_id, cx).is_none(),
+            "an empty track would leave a property row whose + adds nothing"
+        );
+    }
+
+    #[gpui::test]
+    async fn retiming_keyframes_never_stacks_two_on_one_property_time(cx: &mut TestAppContext) {
+        let (view, timeline, target_id, mut cx) = setup(cx, true).await;
+        let cx = &mut cx;
+        let (track_id, keyframe_ids) = insert_opacity_track(&view, target_id, &[0, 500], cx);
+        let [first, second] = keyframe_ids.as_slice() else {
+            panic!("expected two keyframes");
+        };
+        let times = |cx: &mut VisualTestContext| {
+            let track = active_clip_track(&view, track_id, cx).expect("track");
+            let mut times = track
+                .keyframes
+                .values()
+                .map(|key| key.time_ms)
+                .collect::<Vec<_>>();
+            times.sort();
+            times
+        };
+        let actions = [
+            Action::KeyframesMoveRequested {
+                keyframes: vec![shared::TimelineKeyframeTime {
+                    id: second.to_string().into(),
+                    time_ms: 0,
+                }],
+            },
+            Action::KeyframesDuplicateRequested {
+                keyframe_ids: vec![first.to_string().into()],
+                offset_ms: 0,
+            },
+            Action::TrackTimingChangeRequested {
+                track_id: target_id.to_string().into(),
+                start_ms: 200,
+                end_ms: 200,
+            },
+        ];
+        for action in actions {
+            timeline.update(cx, |_, cx| cx.emit(action.clone()));
+            cx.run_until_parked();
+            assert_eq!(times(cx), [0, 500], "{action:?} stacked two keyframes");
+        }
+
+        timeline.update(cx, |_, cx| {
+            cx.emit(Action::KeyframesMoveRequested {
+                keyframes: vec![shared::TimelineKeyframeTime {
+                    id: second.to_string().into(),
+                    time_ms: 900,
+                }],
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(times(cx), [0, 900]);
+    }
+
+    #[gpui::test]
+    async fn seeking_during_playback_keeps_the_requested_time(cx: &mut TestAppContext) {
+        let (view, timeline, _, mut cx) = setup(cx, true).await;
+        let cx = &mut cx;
+        timeline.update(cx, |_, cx| {
+            cx.emit(Action::PlayStateChangeRequested { playing: true })
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, cx| view.timeline_shell.read(cx).is_playing()));
+
+        timeline.update(cx, |_, cx| {
+            cx.emit(Action::SeekRequested { time_ms: 1_200 })
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.timeline_shell.read(cx).playhead_us()),
+            1_200_000
+        );
     }
 
     #[gpui::test]

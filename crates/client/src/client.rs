@@ -26,7 +26,7 @@ use futures::{
     future::BoxFuture,
     stream::BoxStream,
 };
-use gpui::{App, AsyncApp, Entity, Global, Task, TaskExt, WeakEntity, actions};
+use gpui::{App, AsyncApp, Entity, Global, SharedString, Task, TaskExt, WeakEntity, actions};
 use http_client::{HttpClient, HttpClientWithUrl, http, read_proxy_from_env};
 use parking_lot::{Mutex, RwLock};
 use postage::watch;
@@ -172,8 +172,7 @@ pub fn init(client: &Arc<Client>, cx: &mut App) {
         let client = client.clone();
         move |_: &SignIn, cx| {
             if let Some(client) = client.upgrade() {
-                cx.spawn(async move |cx| client.sign_in_with_optional_connect(false, cx).await)
-                    .detach_and_log_err(cx);
+                client.sign_in_and_report(false, cx);
             }
         }
     })
@@ -243,6 +242,16 @@ pub struct Client {
     #[cfg(any(test, feature = "test-support"))]
     rpc_url: RwLock<Option<Url>>,
 }
+
+/// A browser sign-in that ended because the status changed, for example through [`Client::cancel_sign_in`].
+#[derive(Error, Debug)]
+#[error("Sign-in was canceled.")]
+pub struct SignInCanceled;
+
+/// A sign-in that waited for another attempt which ended without signing in; that attempt reports why.
+#[derive(Error, Debug)]
+#[error("Sign-in did not complete.")]
+pub struct SignInEndedElsewhere;
 
 #[derive(Error, Debug)]
 pub enum EstablishConnectionError {
@@ -340,6 +349,11 @@ struct ClientState {
     /// Bumped each time the cloud websocket finishes its handshake. Starts at `0` so
     /// subscribers can distinguish "no connection yet" from a real reconnect.
     cloud_connection_id: (watch::Sender<u64>, watch::Receiver<u64>),
+    account_notice: (
+        watch::Sender<Option<SharedString>>,
+        watch::Receiver<Option<SharedString>>,
+    ),
+    waiting_for_browser: bool,
     _reconnect_task: Option<Task<()>>,
     _cloud_connection_task: Option<Task<()>>,
 }
@@ -454,6 +468,8 @@ impl Default for ClientState {
             stored_credentials: None,
             status: watch::channel_with(Status::SignedOut),
             cloud_connection_id: watch::channel_with(0),
+            account_notice: watch::channel(),
+            waiting_for_browser: false,
             _reconnect_task: None,
             _cloud_connection_task: None,
         }
@@ -704,6 +720,55 @@ impl Client {
         self.state.read().cloud_connection_id.1.clone()
     }
 
+    /// Account messages for the app to show, such as a sign-in that could not be saved.
+    pub fn account_notices(&self) -> watch::Receiver<Option<SharedString>> {
+        self.state.read().account_notice.1.clone()
+    }
+
+    pub fn notify_account(&self, message: impl Into<SharedString>) {
+        let message = message.into();
+        log::warn!("account notice: {message}");
+        *self.state.write().account_notice.0.borrow_mut() = Some(message);
+    }
+
+    /// Ends a session whose account could not be loaded, keeping the saved sign-in so Sign In can retry it.
+    pub fn abandon_session(self: &Arc<Self>, message: impl Into<SharedString>, cx: &AsyncApp) {
+        self.state.write().credentials = None;
+        self.cloud_client.clear_credentials();
+        self.peer.teardown();
+        self.set_status(Status::AuthenticationError, cx);
+        self.notify_account(message);
+    }
+
+    /// Signs in from a control that has no place to show an error: failures become account notices.
+    pub fn sign_in_and_report(self: &Arc<Self>, try_provider: bool, cx: &mut App) {
+        let client = self.clone();
+        cx.spawn(async move |cx| {
+            if let Err(error) = client.sign_in_with_optional_connect(try_provider, cx).await
+                && error.downcast_ref::<SignInCanceled>().is_none()
+                && error.downcast_ref::<SignInEndedElsewhere>().is_none()
+            {
+                log::error!("sign-in failed: {error:#}");
+                let message = error.to_string();
+                let full_stop = if message.ends_with('.') { "" } else { "." };
+                client.notify_account(format!("Could not sign in: {message}{full_stop}"));
+            }
+        })
+        .detach();
+    }
+
+    /// Whether a sign-in is waiting for the browser, the only step [`Client::cancel_sign_in`] can stop.
+    pub fn is_waiting_for_browser(&self) -> bool {
+        self.state.read().waiting_for_browser
+    }
+
+    /// Ends a sign-in that is still waiting for the browser; other steps cannot be stopped.
+    pub fn cancel_sign_in(self: &Arc<Self>, cx: &AsyncApp) {
+        if self.is_waiting_for_browser() {
+            self.set_status(Status::SignedOut, cx);
+        }
+    }
+
     fn set_status(self: &Arc<Self>, status: Status, cx: &AsyncApp) {
         log::info!("set status on client {}: {:?}", self.id(), status);
         let mut state = self.state.write();
@@ -949,30 +1014,47 @@ impl Client {
         }
 
         if credentials.is_none() {
+            // A dropped attempt would otherwise leave the status on Authenticating with nobody to finish it.
+            let sign_out_if_dropped = util::defer({
+                let client = self.clone();
+                let cx = cx.clone();
+                move || {
+                    client.state.write().waiting_for_browser = false;
+                    client.set_status(Status::SignedOut, &cx)
+                }
+            });
+            self.state.write().waiting_for_browser = true;
+            // Re-announce the status so views redraw and offer to cancel the browser wait.
+            let status = *self.status().borrow();
+            self.set_status(status, cx);
             let mut status_rx = self.status();
             let _ = status_rx.next().await;
-            futures::select_biased! {
-                authenticate = self.authenticate(cx).fuse() => {
-                    match authenticate {
-                        Ok(creds) => {
-                            if IMPERSONATE_LOGIN.is_none() {
-                                self.credentials_provider
-                                    .write_credentials(creds.user_id, creds.access_token.clone(), cx)
-                                    .await
-                                    .log_err();
-                            }
-
-                            credentials = Some(creds);
-                        },
-                        Err(err) => {
-                            self.set_status(Status::AuthenticationError, cx);
-                            return Err(err);
-                        }
+            let authenticate = futures::select_biased! {
+                authenticate = self.authenticate(cx).fuse() => Some(authenticate),
+                _ = status_rx.next().fuse() => None,
+            };
+            self.state.write().waiting_for_browser = false;
+            sign_out_if_dropped.abort();
+            match authenticate {
+                Some(Ok(creds)) => {
+                    if IMPERSONATE_LOGIN.is_none()
+                        && let Err(error) = self
+                            .credentials_provider
+                            .write_credentials(creds.user_id, creds.access_token.clone(), cx)
+                            .await
+                    {
+                        log::error!("failed to save credentials: {error:#}");
+                        self.notify_account(
+                            "Could not save your sign-in to the system keychain, so you will need to sign in again the next time Fanta opens.",
+                        );
                     }
+                    credentials = Some(creds);
                 }
-                _ = status_rx.next().fuse() => {
-                    return Err(anyhow!("authentication canceled"));
+                Some(Err(err)) => {
+                    self.set_status(Status::AuthenticationError, cx);
+                    return Err(err);
                 }
+                None => return Err(SignInCanceled.into()),
             }
         }
 
@@ -1082,6 +1164,24 @@ impl Client {
         // Don't try to sign in again if we're already connected to Collab, as it will temporarily disconnect us.
         if self.status().borrow().is_connected() {
             return Ok(());
+        }
+
+        // Starting another attempt would cancel the pending one and open a second browser tab.
+        let pending = matches!(
+            *self.status().borrow(),
+            Status::Authenticating | Status::Reauthenticating
+        ) && self.account_access_token().is_none();
+        if pending {
+            let mut status = self.status();
+            while let Some(status) = status.next().await {
+                if !matches!(status, Status::Authenticating | Status::Reauthenticating) {
+                    break;
+                }
+            }
+            if self.account_access_token().is_some() {
+                return Ok(());
+            }
+            return Err(SignInEndedElsewhere.into());
         }
 
         let (is_staff_tx, is_staff_rx) = oneshot::channel::<bool>();
@@ -1753,11 +1853,13 @@ impl Client {
         self.cloud_client.clear_credentials();
         self.disconnect(cx);
 
-        if had_credentials {
-            self.credentials_provider
-                .delete_credentials(cx)
-                .await
-                .log_err();
+        if had_credentials
+            && let Err(error) = self.credentials_provider.delete_credentials(cx).await
+        {
+            log::error!("failed to delete saved credentials: {error:#}");
+            self.notify_account(
+                "Could not remove your saved sign-in from the system keychain, so Fanta may sign you in again the next time it opens.",
+            );
         }
     }
 
@@ -2077,6 +2179,8 @@ mod tests {
         reads: Mutex<usize>,
         writes: Mutex<usize>,
         deletes: Mutex<usize>,
+        fail_writes: Mutex<bool>,
+        fail_deletes: Mutex<bool>,
     }
 
     impl CredentialsProvider for CountingCredentialsProvider {
@@ -2112,6 +2216,7 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
             async move {
                 *self.writes.lock() += 1;
+                anyhow::ensure!(!*self.fail_writes.lock(), "keychain is locked");
                 *self.credentials.lock() = Some((username.to_string(), password.to_vec()));
                 Ok(())
             }
@@ -2125,6 +2230,7 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
             async move {
                 *self.deletes.lock() += 1;
+                anyhow::ensure!(!*self.fail_deletes.lock(), "keychain is locked");
                 *self.credentials.lock() = None;
                 Ok(())
             }
@@ -2216,6 +2322,330 @@ mod tests {
         assert_eq!(credentials.user_id, 2);
         assert_eq!(*provider.reads.lock(), 1);
         assert_eq!(*provider.writes.lock(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_sign_out_reports_a_saved_sign_in_it_could_not_remove(cx: &mut TestAppContext) {
+        init_test(cx);
+        let provider = Arc::new(CountingCredentialsProvider::default());
+        *provider.fail_deletes.lock() = true;
+        let client = cx.update(|cx| {
+            cx.set_global(fanta_credentials_provider::FantaCredentialsProvider(
+                provider.clone(),
+            ));
+            Client::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::with_200_response(),
+                cx,
+            )
+        });
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(Credentials {
+                    user_id: 2,
+                    access_token: "new-token".into(),
+                })
+            })
+        });
+        client
+            .sign_in(false, &cx.to_async())
+            .await
+            .expect("sign-in should succeed");
+
+        client.sign_out(&cx.to_async()).await;
+
+        assert_eq!(*client.status().borrow(), Status::SignedOut);
+        assert_eq!(*provider.deletes.lock(), 1);
+        assert_eq!(
+            client.account_notices().borrow().as_deref(),
+            Some(
+                "Could not remove your saved sign-in from the system keychain, so Fanta may sign you in again the next time it opens."
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_sign_in_reports_credentials_it_could_not_save(cx: &mut TestAppContext) {
+        init_test(cx);
+        let provider = Arc::new(CountingCredentialsProvider::default());
+        *provider.fail_writes.lock() = true;
+        let client = cx.update(|cx| {
+            cx.set_global(fanta_credentials_provider::FantaCredentialsProvider(
+                provider.clone(),
+            ));
+            Client::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::with_200_response(),
+                cx,
+            )
+        });
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(Credentials {
+                    user_id: 2,
+                    access_token: "new-token".into(),
+                })
+            })
+        });
+
+        client
+            .sign_in(false, &cx.to_async())
+            .await
+            .expect("an unsaved sign-in should still sign in");
+
+        assert_eq!(*client.status().borrow(), Status::Authenticated);
+        assert_eq!(*provider.writes.lock(), 1);
+        assert_eq!(
+            client.account_notices().borrow().as_deref(),
+            Some(
+                "Could not save your sign-in to the system keychain, so you will need to sign in again the next time Fanta opens."
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_reported_sign_in_shows_failures_and_can_be_canceled(cx: &mut TestAppContext) {
+        init_test(cx);
+        let client = cx.update(|cx| {
+            Client::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::with_200_response(),
+                cx,
+            )
+        });
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async { Err(anyhow!("Could not open the sign-in page.")) })
+        });
+        cx.update(|cx| client.sign_in_and_report(false, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            client.account_notices().borrow().as_deref(),
+            Some("Could not sign in: Could not open the sign-in page.")
+        );
+
+        client.set_status(Status::SignedOut, &cx.to_async());
+        *client.state.write().account_notice.0.borrow_mut() = None;
+        client.override_authenticate(|cx| cx.background_spawn(future::pending()));
+        cx.update(|cx| client.sign_in_and_report(false, cx));
+        cx.run_until_parked();
+        assert_eq!(*client.status().borrow(), Status::Authenticating);
+
+        client.cancel_sign_in(&cx.to_async());
+        cx.run_until_parked();
+        assert_eq!(*client.status().borrow(), Status::SignedOut);
+        assert_eq!(client.account_notices().borrow().as_deref(), None);
+    }
+
+    #[gpui::test]
+    async fn test_second_sign_in_waits_for_the_pending_browser_sign_in(cx: &mut TestAppContext) {
+        init_test(cx);
+        let client = cx.update(|cx| {
+            Client::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::with_200_response(),
+                cx,
+            )
+        });
+        let (finish_tx, finish_rx) = oneshot::channel::<()>();
+        let finish_rx = Arc::new(Mutex::new(Some(finish_rx)));
+        let attempts = Arc::new(Mutex::new(0));
+        client.override_authenticate({
+            let attempts = attempts.clone();
+            move |cx| {
+                *attempts.lock() += 1;
+                let finish_rx = finish_rx.lock().take();
+                cx.background_spawn(async move {
+                    finish_rx.context("a second browser sign-in was started")?.await?;
+                    Ok(Credentials {
+                        user_id: 2,
+                        access_token: "token".into(),
+                    })
+                })
+            }
+        });
+
+        let first = cx.spawn({
+            let client = client.clone();
+            move |cx| async move { client.sign_in_with_optional_connect(false, &cx).await }
+        });
+        cx.run_until_parked();
+        let second = cx.spawn({
+            let client = client.clone();
+            move |cx| async move { client.sign_in_with_optional_connect(false, &cx).await }
+        });
+        cx.run_until_parked();
+        finish_tx.send(()).ok();
+        cx.run_until_parked();
+
+        first.await.expect("the first sign-in should complete");
+        second.await.expect("the second sign-in should share the first");
+        assert_eq!(*attempts.lock(), 1);
+        assert_eq!(*client.status().borrow(), Status::Authenticated);
+    }
+
+    #[gpui::test]
+    async fn test_dropped_browser_sign_in_does_not_strand_the_next_one(cx: &mut TestAppContext) {
+        init_test(cx);
+        let client = cx.update(|cx| {
+            Client::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::with_200_response(),
+                cx,
+            )
+        });
+        let attempts = Arc::new(Mutex::new(0));
+        client.override_authenticate({
+            let attempts = attempts.clone();
+            move |cx| {
+                *attempts.lock() += 1;
+                let first_attempt = *attempts.lock() == 1;
+                cx.background_spawn(async move {
+                    if first_attempt {
+                        future::pending::<()>().await;
+                    }
+                    Ok(Credentials {
+                        user_id: 2,
+                        access_token: "token".into(),
+                    })
+                })
+            }
+        });
+
+        let first = cx.spawn({
+            let client = client.clone();
+            move |cx| async move { client.sign_in_with_optional_connect(false, &cx).await }
+        });
+        cx.run_until_parked();
+        assert_eq!(*client.status().borrow(), Status::Authenticating);
+        drop(first);
+        cx.run_until_parked();
+        assert_eq!(*client.status().borrow(), Status::SignedOut);
+
+        let second = cx.spawn({
+            let client = client.clone();
+            move |cx| async move { client.sign_in_with_optional_connect(false, &cx).await }
+        });
+        cx.run_until_parked();
+        assert_eq!(*client.status().borrow(), Status::Authenticated);
+        second.await.expect("the next sign-in should run its own attempt");
+        assert_eq!(*attempts.lock(), 2);
+    }
+
+    #[gpui::test]
+    async fn test_cancel_is_refused_while_the_saved_sign_in_is_checked(cx: &mut TestAppContext) {
+        init_test(cx);
+        let provider = Arc::new(CountingCredentialsProvider::default());
+        *provider.credentials.lock() = Some(("1".into(), b"saved-token".to_vec()));
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let http_client = FakeHttpClient::create(move |_request| {
+            let release_rx = release_rx.lock().take();
+            async move {
+                if let Some(release_rx) = release_rx {
+                    release_rx.await.ok();
+                }
+                Ok(http_client::Response::builder()
+                    .status(200)
+                    .body("{}".into())?)
+            }
+        });
+        let client = cx.update(|cx| {
+            cx.set_global(fanta_credentials_provider::FantaCredentialsProvider(
+                provider.clone(),
+            ));
+            Client::new(Arc::new(FakeSystemClock::new()), http_client, cx)
+        });
+
+        let sign_in = cx.spawn({
+            let client = client.clone();
+            move |cx| async move { client.sign_in(true, &cx).await }
+        });
+        cx.run_until_parked();
+        assert_eq!(*client.status().borrow(), Status::Authenticating);
+        assert!(!client.is_waiting_for_browser());
+
+        client.cancel_sign_in(&cx.to_async());
+        assert_eq!(*client.status().borrow(), Status::Authenticating);
+
+        release_tx.send(()).ok();
+        sign_in.await.expect("the saved sign-in should be accepted");
+        assert_eq!(*client.status().borrow(), Status::Authenticated);
+    }
+
+    #[gpui::test]
+    async fn test_a_waiting_sign_in_adds_no_notice_of_its_own(cx: &mut TestAppContext) {
+        init_test(cx);
+        let client = cx.update(|cx| {
+            Client::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::with_200_response(),
+                cx,
+            )
+        });
+        client.override_authenticate(|cx| cx.background_spawn(future::pending()));
+        cx.update(|cx| {
+            client.sign_in_and_report(false, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|cx| client.sign_in_and_report(false, cx));
+        cx.run_until_parked();
+        client.cancel_sign_in(&cx.to_async());
+        cx.run_until_parked();
+        assert_eq!(*client.status().borrow(), Status::SignedOut);
+        assert_eq!(client.account_notices().borrow().as_deref(), None);
+
+        let (fail_tx, fail_rx) = oneshot::channel::<()>();
+        let fail_rx = Arc::new(Mutex::new(Some(fail_rx)));
+        client.override_authenticate(move |cx| {
+            let fail_rx = fail_rx.lock().take();
+            cx.background_spawn(async move {
+                if let Some(fail_rx) = fail_rx {
+                    fail_rx.await.ok();
+                }
+                Err(anyhow!("Could not open the sign-in page."))
+            })
+        });
+        cx.update(|cx| client.sign_in_and_report(false, cx));
+        cx.run_until_parked();
+        cx.update(|cx| client.sign_in_and_report(false, cx));
+        cx.run_until_parked();
+        fail_tx.send(()).ok();
+        cx.run_until_parked();
+        assert_eq!(
+            client.account_notices().borrow().as_deref(),
+            Some("Could not sign in: Could not open the sign-in page.")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_sign_in_action_reports_failures(cx: &mut TestAppContext) {
+        init_test(cx);
+        let client = cx.update(|cx| {
+            Client::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::with_200_response(),
+                cx,
+            )
+        });
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Err(anyhow!(
+                    "Sign-in timed out after 10 minutes. Please try signing in again."
+                ))
+            })
+        });
+        cx.update(|cx| {
+            init(&client, cx);
+            cx.dispatch_action(&SignIn);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            client.account_notices().borrow().as_deref(),
+            Some(
+                "Could not sign in: Sign-in timed out after 10 minutes. Please try signing in again."
+            )
+        );
     }
 
     #[test]

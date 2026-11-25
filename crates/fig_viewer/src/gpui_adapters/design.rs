@@ -27,10 +27,10 @@ use fanta_gpui::design::{
     DesignExportMode, DesignExportSizing as DesignPanelExportSizing, DesignExportViewData,
     DesignFontFamily, DesignFontSource, DesignFontStyle, DesignFontViewData, DesignGradientStop,
     DesignGridAutoTracks, DesignGridItemAlignment, DesignGridItemsPositioning, DesignGridTrack,
-    DesignGridTrackSizing, DesignImageFilters, DesignItemSpacingMode, DesignLayout,
-    DesignLayoutAlignSelf, DesignLayoutMode, DesignLayoutPositioning, DesignLetterSpacing,
-    DesignLineHeight, DesignMaskType, DesignMediaCropAction, DesignMediaCropToolState,
-    DesignMediaKind, DesignMediaPaintAsset, DesignMediaPaintCapabilities,
+    DesignGridTrackAxis, DesignGridTrackSizing, DesignImageFilters, DesignItemSpacingMode,
+    DesignLayout, DesignLayoutAlignSelf, DesignLayoutMode, DesignLayoutPositioning,
+    DesignLetterSpacing, DesignLineHeight, DesignMaskType, DesignMediaCropAction,
+    DesignMediaCropToolState, DesignMediaKind, DesignMediaPaintAsset, DesignMediaPaintCapabilities,
     DesignMediaPaintPlacement, DesignMediaPaintView, DesignMediaPaintViewData,
     DesignMediaQuarterTurn, DesignPaint, DesignPaintBinding, DesignPaintCollectionEditMode,
     DesignPaintKind, DesignPaintPayload, DesignPaintProperty, DesignPaintSource,
@@ -67,12 +67,13 @@ use crate::export::{
     ExportFormat, ExportRequest, ExportSizing, prepare_export_requests, run_export_jobs,
 };
 use crate::properties_ops::{
-    apply_preview_operation, blurs_operations, default_blur, default_shadow,
+    apply_preview_operation, blurs_operations, child_transforms, default_blur, default_shadow,
     detach_instance_operations, effects_operations, field_operations, finite_transform_operations,
     format_number, instance_prop_operations, layout_gap_operations, layout_limit_operations,
-    layout_padding_operations, parse_color, parse_number, position_operations, read_field_text,
-    replace_data_operation, restore_snapshot, set_clip_content_meta_operation,
-    set_corner_radius_corner, set_fill_color, shadow_field_operations, stroke_list_mut,
+    layout_padding_operations, moved_paint_index, parse_color, parse_number, position_operations,
+    read_field_text, removed_paint_index, replace_data_operation, restore_snapshot,
+    set_clip_content_meta_operation, set_corner_radius_corner, set_fill_color,
+    shadow_field_operations, stroke_list_mut, with_paint_bindings_remapped,
 };
 use crate::properties_snapshot::PaintKind as EnginePaintKind;
 use crate::properties_snapshot::{
@@ -1360,6 +1361,40 @@ fn effect_ref(effect_id: &str) -> Option<EffectRef> {
         return index.parse().ok().map(EffectRef::Blur);
     }
     None
+}
+
+/// Moves one effect of the panel's list, which shows the node's shadows and
+/// then its blurs. `None` when the move crosses from one list to the other:
+/// the engine always draws shadows before blurs, so that order cannot be saved.
+fn effect_reorder_operations(
+    doc: &Doc,
+    id: NodeId,
+    from_index: usize,
+    to_index: usize,
+) -> Option<Vec<Operation>> {
+    let Some(node) = doc.scene.get(id) else {
+        return Some(Vec::new());
+    };
+    let shadows = node.effects.len();
+    match (from_index < shadows, to_index < shadows) {
+        (true, true) => Some(effects_operations(doc, id, |effects| {
+            move_list_item(effects, from_index, to_index)
+        })),
+        (false, false) => Some(blurs_operations(doc, id, |blurs| {
+            move_list_item(blurs, from_index - shadows, to_index - shadows)
+        })),
+        _ => None,
+    }
+}
+
+fn move_list_item<T>(list: &mut [T], from: usize, to: usize) {
+    if from < to {
+        if let Some(range) = list.get_mut(from..=to) {
+            range.rotate_left(1);
+        }
+    } else if let Some(range) = list.get_mut(to..=from) {
+        range.rotate_right(1);
+    }
 }
 
 fn design_layout(
@@ -3265,6 +3300,7 @@ impl FigView {
                             data: Box::new(node.data.clone()),
                             effects: node.effects.clone(),
                             blurs: node.blurs.clone(),
+                            children: child_transforms(&document.doc.scene, id),
                         },
                     )
                 };
@@ -3377,19 +3413,16 @@ impl FigView {
             return false;
         }
         let item = self.item().clone();
-        item.update(cx, |item, cx| {
+        let result = item.update(cx, |item, cx| {
             if !item.is_editable() {
-                return false;
+                return Ok(false);
             }
             if operations.len() == 1 {
-                let mut applied = false;
+                let mut applied = Ok(false);
                 for operation in operations {
-                    match item.apply_for_preview_owner(preview_owner, operation, cx) {
-                        Ok(()) => applied = true,
-                        Err(error) => {
-                            log::error!("fig design adapter failed to apply operation: {error:#}")
-                        }
-                    }
+                    applied = item
+                        .apply_for_preview_owner(preview_owner, operation, cx)
+                        .map(|()| true);
                 }
                 applied
             } else {
@@ -3397,21 +3430,37 @@ impl FigView {
                     .first()
                     .map(|operation| operation.label().to_string())
                     .unwrap_or_else(|| "Edit".to_string());
-                let applied = item.with_document_for_owner(preview_owner, cx, |document| {
+                item.with_document_for_owner(preview_owner, cx, |document| {
                     let doc = &mut document.doc;
                     doc.history.begin(label, &mut doc.scene);
                     for operation in operations {
                         if let Err(error) = doc.apply(operation) {
-                            log::error!("fig design adapter failed to apply operation: {error:#}");
-                            break;
+                            let error = match doc.abort_transaction() {
+                                Ok(()) => anyhow::anyhow!(error),
+                                Err(rollback_error) => {
+                                    anyhow::anyhow!("{error}; rolling back: {rollback_error}")
+                                }
+                            };
+                            return (Err(error), DocChange::None);
                         }
                     }
                     doc.history.commit(&mut doc.scene);
-                    ((), DocChange::Content)
-                });
-                applied.is_some()
+                    (Ok(true), DocChange::Content)
+                })
+                .unwrap_or(Ok(false))
             }
-        })
+        });
+        match result {
+            Ok(applied) => applied,
+            Err(error) => {
+                log::error!("fig design adapter failed to apply operation: {error:#}");
+                crate::view::show_canvas_notice_deferred(
+                    format!("Could not apply that change: {}", error.root_cause()),
+                    cx,
+                );
+                false
+            }
+        }
     }
 
     fn design_export_target_matches(&self, target: &DesignPanelTarget, cx: &Context<Self>) -> bool {
@@ -4168,7 +4217,7 @@ impl FigView {
                 self.finish_document_edits_for_external_change(cx);
                 self.forget_hidden_paint_alpha(id, is_stroke);
                 let ops = self.design_ops(cx, |doc| {
-                    replace_data_operation(doc, id, |data| {
+                    let operations = replace_data_operation(doc, id, |data| {
                         if is_stroke {
                             if let Some(strokes) = stroke_list_mut(data)
                                 && from < strokes.len()
@@ -4208,7 +4257,14 @@ impl FigView {
                                 group.background_fills.extend(fills);
                             }
                         }
-                    })
+                    });
+                    with_paint_bindings_remapped(
+                        doc,
+                        id,
+                        is_stroke,
+                        moved_paint_index(from, to),
+                        operations,
+                    )
                 });
                 self.design_apply_ops(ops, cx);
             }
@@ -4225,7 +4281,22 @@ impl FigView {
                     return;
                 }
                 self.finish_document_edits_for_external_change(cx);
-                self.forget_hidden_paint_alpha(id, is_stroke);
+                // Adding appends, so remembered alphas keep their index, except
+                // a group without a primary background, which takes the new
+                // fill as its first paint.
+                let shifts_paints = !is_stroke
+                    && self
+                        .item()
+                        .read(cx)
+                        .document()
+                        .and_then(|document| document.doc.scene.get(id))
+                        .is_some_and(|node| {
+                            matches!(&node.data, NodeData::Group(group)
+                                if group.background.is_none() && !group.background_fills.is_empty())
+                        });
+                if shifts_paints {
+                    self.forget_hidden_paint_alpha(id, is_stroke);
+                }
                 let ops = self.design_ops(cx, |doc| {
                     replace_data_operation(doc, id, |data| {
                         if is_stroke {
@@ -4256,7 +4327,7 @@ impl FigView {
                 self.finish_document_edits_for_external_change(cx);
                 self.forget_hidden_paint_alpha(id, is_stroke);
                 let ops = self.design_ops(cx, |doc| {
-                    replace_data_operation(doc, id, |data| {
+                    let operations = replace_data_operation(doc, id, |data| {
                         if is_stroke {
                             if let Some(strokes) = stroke_list_mut(data)
                                 && index < strokes.len()
@@ -4266,7 +4337,14 @@ impl FigView {
                         } else {
                             crate::properties_ops::remove_fill(data, index);
                         }
-                    })
+                    });
+                    with_paint_bindings_remapped(
+                        doc,
+                        id,
+                        is_stroke,
+                        removed_paint_index(index),
+                        operations,
+                    )
                 });
                 self.design_apply_ops(ops, cx);
             }
@@ -4526,7 +4604,6 @@ impl FigView {
                     page_id,
                     *color,
                     DesignPanelEditPhase::Commit,
-                    window,
                     cx,
                 );
             }
@@ -4535,7 +4612,7 @@ impl FigView {
                 color,
                 phase,
             } => {
-                self.handle_design_page_background(page_id, *color, *phase, window, cx);
+                self.handle_design_page_background(page_id, *color, *phase, cx);
             }
             DesignPanelAction::PaintColorVariableDetachRequested {
                 node_id: target_node,
@@ -4616,6 +4693,56 @@ impl FigView {
                 adapter.panel.update(cx, |panel, cx| {
                     panel.set_active_surface(requested, cx);
                 });
+            }
+            DesignPanelAction::GridTrackAddRequested { node_id: id, .. }
+            | DesignPanelAction::GridTrackDeleteRequested { node_id: id, .. }
+            | DesignPanelAction::GridTracksReorderRequested { node_id: id, .. } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.finish_document_edits_for_external_change(cx);
+                let ops = self.design_ops(cx, |doc| grid_track_action_operations(doc, id, action));
+                self.design_apply_ops(ops, cx);
+            }
+            DesignPanelAction::GridDimensionsEditRequested {
+                node_id: id, phase, ..
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.handle_design_staged_edit(id, *phase, cx, |doc| {
+                    Some(grid_track_action_operations(doc, id, action))
+                });
+            }
+            DesignPanelAction::EffectReorderRequested {
+                node_id: id,
+                from_index,
+                to_index,
+                ..
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.finish_document_edits_for_external_change(cx);
+                let mut crosses_lists = false;
+                let ops = self.design_ops(cx, |doc| {
+                    effect_reorder_operations(doc, id, *from_index, *to_index).unwrap_or_else(
+                        || {
+                            crosses_lists = true;
+                            Vec::new()
+                        },
+                    )
+                });
+                if crosses_lists {
+                    crate::view::show_canvas_notice(
+                        "Could not move that effect there: shadows are always drawn before blurs."
+                            .to_string(),
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+                self.design_apply_ops(ops, cx);
             }
             _ => {
                 log::debug!("fig design adapter: unhandled action {action:?}");
@@ -5010,7 +5137,7 @@ impl FigView {
                 });
                 if let Err(error) = result {
                     log::warn!("boolean selection failed: {error:#}");
-                    crate::view::notify_unavailable("Boolean selection", window, cx);
+                    crate::view::show_canvas_notice(format!("{error:#}."), window, cx);
                 }
             }
             DesignSelectionHeaderCommand::EditObject => {
@@ -5090,6 +5217,44 @@ impl FigView {
             .all(|id| self.template_allows_node(*id, scope, "change that here", cx))
     }
 
+    /// Snapshot `id` so the gesture's previews and Cancel can restore it.
+    /// Callers check Fill mode for their own scope first.
+    fn begin_design_edit_session(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        self.finish_document_edits_for_external_change(cx);
+        let item = self.item().clone();
+        let (scene_instance, snapshot) = {
+            let item = item.read(cx);
+            if !item.is_editable() {
+                return;
+            }
+            let Some(document) = item.document() else {
+                return;
+            };
+            let Some(node) = document.doc.scene.get(id) else {
+                return;
+            };
+            (
+                document.doc.scene.instance_id(),
+                NodeSnapshot {
+                    id,
+                    transform: node.transform,
+                    opacity: node.opacity,
+                    data: Box::new(node.data.clone()),
+                    effects: node.effects.clone(),
+                    blurs: node.blurs.clone(),
+                    children: child_transforms(&document.doc.scene, id),
+                },
+            )
+        };
+        if let Some(adapter) = self.gpui_design.as_mut() {
+            adapter.session = Some(DesignEditSession {
+                scene_instance,
+                node: id,
+                snapshot,
+            });
+        }
+    }
+
     fn handle_design_phased_edit(
         &mut self,
         id: NodeId,
@@ -5107,38 +5272,7 @@ impl FigView {
                 if !self.design_property_allowed(&[id], property, cx) {
                     return;
                 }
-                self.finish_document_edits_for_external_change(cx);
-                let item = self.item().clone();
-                let (scene_instance, snapshot) = {
-                    let item = item.read(cx);
-                    if !item.is_editable() {
-                        return;
-                    }
-                    let Some(document) = item.document() else {
-                        return;
-                    };
-                    let Some(node) = document.doc.scene.get(id) else {
-                        return;
-                    };
-                    (
-                        document.doc.scene.instance_id(),
-                        NodeSnapshot {
-                            id,
-                            transform: node.transform,
-                            opacity: node.opacity,
-                            data: Box::new(node.data.clone()),
-                            effects: node.effects.clone(),
-                            blurs: node.blurs.clone(),
-                        },
-                    )
-                };
-                if let Some(adapter) = self.gpui_design.as_mut() {
-                    adapter.session = Some(DesignEditSession {
-                        scene_instance,
-                        node: id,
-                        snapshot,
-                    });
-                }
+                self.begin_design_edit_session(id, cx);
             }
             DesignPanelEditPhase::Preview => {
                 let Some(session) = self.design_edit_session_for_preview(id, cx) else {
@@ -5270,14 +5404,7 @@ impl FigView {
                 let DesignMediaPaintPlacement::Crop { transform } = media_placement(&media) else {
                     return;
                 };
-                self.handle_design_phased_edit(
-                    id,
-                    DesignPanelProperty::Opacity,
-                    &DesignPanelValue::Number(0.0),
-                    DesignPanelEditPhase::Begin,
-                    window,
-                    cx,
-                );
+                self.begin_design_edit_session(id, cx);
                 if let Some(adapter) = self.gpui_design.as_mut() {
                     adapter.crop_session = Some(DesignCropSession {
                         node: id,
@@ -6006,22 +6133,11 @@ impl FigView {
             };
             pattern.source_node_id = source.to_string().into();
         }
-        // Route through the shared phased machinery by synthesizing the
-        // property key: paint edits reuse a whole-node snapshot, so Begin /
-        // Preview / Cancel behave exactly like ordinary property gestures.
+        // Paint edits reuse the whole-node session of ordinary property
+        // gestures; Cancel synthesizes a property key to share its restore.
         let build = move |doc: &Doc| paint_edit_operations(doc, id, is_stroke, index, &value);
         match phase {
-            DesignPanelEditPhase::Begin => {
-                self.handle_design_phased_edit(
-                    id,
-                    DesignPanelProperty::Opacity,
-                    &DesignPanelValue::Number(0.0),
-                    DesignPanelEditPhase::Begin,
-                    window,
-                    cx,
-                );
-                // Begin captured the snapshot; nothing document-facing yet.
-            }
+            DesignPanelEditPhase::Begin => self.begin_design_edit_session(id, cx),
             DesignPanelEditPhase::Preview => {
                 let Some(session) = self.design_edit_session_for_preview(id, cx) else {
                     return;
@@ -6180,17 +6296,28 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if phase == DesignPanelEditPhase::Begin {
+            self.handle_design_phased_edit(id, property, value, phase, window, cx);
+            return;
+        }
+        self.handle_design_staged_edit(id, phase, cx, |doc| {
+            effect_edit_operations(doc, id, reference, property, value)
+        });
+    }
+
+    /// Previews, commits or cancels one gesture's operations against the
+    /// session its Begin opened, so a drag lands as one undo step.
+    fn handle_design_staged_edit(
+        &mut self,
+        id: NodeId,
+        phase: DesignPanelEditPhase,
+        cx: &mut Context<Self>,
+        build: impl Fn(&Doc) -> Option<Vec<Operation>>,
+    ) {
         let preview_owner = cx.entity_id();
         match phase {
             DesignPanelEditPhase::Begin => {
-                self.handle_design_phased_edit(
-                    id,
-                    property,
-                    value,
-                    DesignPanelEditPhase::Begin,
-                    window,
-                    cx,
-                );
+                self.begin_design_edit_session(id, cx);
                 return;
             }
             DesignPanelEditPhase::Preview => {
@@ -6206,9 +6333,7 @@ impl FigView {
                         if !restore_design_edit_session(&mut document.doc, &session) {
                             return ((), DocChange::None);
                         }
-                        if let Some(operations) =
-                            effect_edit_operations(&document.doc, id, reference, property, value)
-                        {
+                        if let Some(operations) = build(&document.doc) {
                             for operation in &operations {
                                 apply_preview_operation(&mut document.doc, operation);
                             }
@@ -6255,12 +6380,7 @@ impl FigView {
             });
             return;
         }
-        let ops = self.design_ops(cx, |doc| {
-            effect_edit_operations(doc, id, reference, property, value).unwrap_or_else(|| {
-                log::debug!("fig design adapter: unhandled effect edit {property:?}");
-                Vec::new()
-            })
-        });
+        let ops = self.design_ops(cx, |doc| build(doc).unwrap_or_default());
         let committed = self.design_apply_ops(ops, cx);
         if session.is_some() {
             item.update(cx, |item, cx| {
@@ -6325,6 +6445,7 @@ impl FigView {
         };
         self.finish_document_edits_for_external_change(cx);
         let value = value.cloned();
+        let mut rejected = None;
         let ops = self.design_ops(cx, |doc| {
             let kind = current_prop_kind(doc, id, prop);
             if !matches!(
@@ -6347,16 +6468,24 @@ impl FigView {
                     Some(VarValue::Boolean { value: *value })
                 }
                 Some(DesignComponentPropertyValue::Text(text)) => match kind {
-                    Some(EnginePropKind::Number) => match text.trim().parse::<f64>() {
-                        Ok(value) if value.is_finite() => Some(VarValue::Float { value }),
-                        _ => return Vec::new(),
-                    },
+                    Some(EnginePropKind::Number) => {
+                        match crate::properties_ops::parse_number(text) {
+                            Some(value) => Some(VarValue::Float { value }),
+                            None => {
+                                rejected = Some("number");
+                                return Vec::new();
+                            }
+                        }
+                    }
                     Some(EnginePropKind::Text) => Some(VarValue::String {
                         value: text.to_string(),
                     }),
                     Some(EnginePropKind::Color) => match parse_color(text) {
                         Some(value) => Some(VarValue::Color { value }),
-                        None => return Vec::new(),
+                        None => {
+                            rejected = Some("color");
+                            return Vec::new();
+                        }
                     },
                     _ => return Vec::new(),
                 },
@@ -6367,6 +6496,13 @@ impl FigView {
             };
             instance_prop_operations(doc, id, prop, new)
         });
+        if let Some(kind) = rejected {
+            crate::view::show_canvas_notice_deferred(
+                format!("Could not read that as a {kind}."),
+                cx,
+            );
+            return;
+        }
         self.design_apply_ops(ops, cx);
     }
 
@@ -6375,7 +6511,6 @@ impl FigView {
         page_id: &SharedString,
         color: DesignColor,
         phase: DesignPanelEditPhase,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let preview_owner = cx.entity_id();
@@ -6399,14 +6534,7 @@ impl FigView {
             })
         };
         match phase {
-            DesignPanelEditPhase::Begin => self.handle_design_phased_edit(
-                root,
-                DesignPanelProperty::Opacity,
-                &DesignPanelValue::Number(0.0),
-                DesignPanelEditPhase::Begin,
-                window,
-                cx,
-            ),
+            DesignPanelEditPhase::Begin => self.begin_design_edit_session(root, cx),
             DesignPanelEditPhase::Preview => {
                 let Some(session) = self.design_edit_session_for_preview(root, cx) else {
                     return;
@@ -7747,7 +7875,7 @@ fn crop_transform_for_state(
     {
         return None;
     }
-    let width = transform.m11 / state.zoom;
+    let mut width = transform.m11 / state.zoom;
     let mut height = transform.m22 / state.zoom;
     let ratio = match state.aspect_ratio {
         fanta_gpui::design::DesignMediaCropAspectRatio::Free => None,
@@ -7758,6 +7886,12 @@ fn crop_transform_for_state(
     };
     if let Some(ratio) = ratio {
         height = width * source_aspect / ratio;
+        // Shrink both sides together so the crop keeps its ratio inside the image.
+        let overflow = width.max(height);
+        if overflow > 1.0 {
+            width /= overflow;
+            height /= overflow;
+        }
     }
     if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
         return None;
@@ -9235,13 +9369,12 @@ fn property_operations(
             let count = number(value)?.round().clamp(1.0, 256.0) as usize;
             let columns = property == P::GridColumnCount;
             Some(grid_layout_operations(doc, id, move |grid| {
-                let (tracks, default) = if columns {
-                    (&mut grid.columns, GridTrack::Flex { fr: 1.0 })
+                let tracks = if columns {
+                    &mut grid.columns
                 } else {
-                    (&mut grid.rows, GridTrack::Hug)
+                    &mut grid.rows
                 };
-                let fill = tracks.last().copied().unwrap_or(default);
-                tracks.resize(count, fill);
+                resize_grid_tracks(tracks, count, columns);
             }))
         }
         (P::GridColumnTrack(index), V::GridTrack(track))
@@ -9905,9 +10038,9 @@ mod tests {
         InstanceNode, PathData, TextPathNode, TextStyleRun, VectorNode,
     };
     use fanta_gpui::design::{
-        DesignFontCatalogState, DesignFontSelection, DesignPageBackground, DesignPageViewData,
-        DesignPaintEdit, DesignPaintTarget, DesignPanelInspectionContext, DesignPanelPermissions,
-        DesignPanelSurface, DesignTypographyTarget,
+        DesignFontCatalogState, DesignFontSelection, DesignGridDimensions, DesignPageBackground,
+        DesignPageViewData, DesignPaintEdit, DesignPaintTarget, DesignPanelInspectionContext,
+        DesignPanelPermissions, DesignPanelSurface, DesignTypographyTarget,
     };
     use gpui::{
         Entity, Modifiers, MouseButton, TestAppContext, VisualTestContext, point, px, size,
@@ -10324,6 +10457,25 @@ mod tests {
         let crop = crop_transform_for_state(state, 2.0).expect("valid crop");
         assert!((crop.m11 - 0.5).abs() < 1e-6);
         assert!((crop.m22 - 1.0).abs() < 1e-6);
+        assert!(crop.tx >= 0.0 && crop.ty >= 0.0);
+        assert!(crop.tx + crop.m11 <= 1.0 && crop.ty + crop.m22 <= 1.0);
+    }
+
+    #[test]
+    fn square_crop_of_a_landscape_image_keeps_the_ratio_inside_the_image() {
+        let state = DesignMediaCropToolState {
+            active: true,
+            transform: DesignPaintTransform::IDENTITY,
+            zoom: 1.0,
+            aspect_ratio: fanta_gpui::design::DesignMediaCropAspectRatio::Square,
+        };
+        let source_aspect = 1.5;
+        let crop = crop_transform_for_state(state, source_aspect).expect("valid crop");
+        assert!(
+            (crop.m11 * source_aspect / crop.m22 - 1.0).abs() < 1e-6,
+            "the crop window is square in image pixels: {crop:?}"
+        );
+        assert!(crop.m11 <= 1.0 && crop.m22 <= 1.0);
         assert!(crop.tx >= 0.0 && crop.ty >= 0.0);
         assert!(crop.tx + crop.m11 <= 1.0 && crop.ty + crop.m22 <= 1.0);
     }
@@ -11016,6 +11168,7 @@ mod tests {
                     data: Box::new(node.data.clone()),
                     effects: node.effects.clone(),
                     blurs: node.blurs.clone(),
+                    children: Vec::new(),
                 },
             )
         };
@@ -11548,6 +11701,365 @@ mod tests {
                 .and_then(|child| child.layout_child)
                 .is_none_or(|child| child.grid.is_none())
         );
+    }
+
+    /// A selected grid frame with columns `[80px, 2fr, 1fr]` around the rectangle.
+    fn doc_with_grid_frame() -> (Doc, NodeId) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        let create =
+            crate::layer_context_ops::auto_layout(&doc, rect, Some(LayoutMode::Horizontal))
+                .expect("wrap the rectangle in auto layout");
+        let group = crate::layer_context_ops::created_roots(&create)[0];
+        for operation in create {
+            doc.apply(operation).expect("create layout frame");
+        }
+        for (property, value) in [
+            (
+                DesignPanelProperty::LayoutMode,
+                DesignPanelValue::LayoutMode(DesignLayoutMode::Grid),
+            ),
+            (
+                DesignPanelProperty::GridColumnCount,
+                DesignPanelValue::Number(3.0),
+            ),
+            (
+                DesignPanelProperty::GridColumnTrack(0),
+                DesignPanelValue::GridTrack(DesignGridTrack::fixed(80.0)),
+            ),
+            (
+                DesignPanelProperty::GridColumnTrackValue(1),
+                DesignPanelValue::Number(2.0),
+            ),
+        ] {
+            for operation in property_operations(&doc, group, property, &value).expect("grid") {
+                doc.apply(operation).expect("apply grid control");
+            }
+        }
+        doc.selection.replace_with([group]);
+        (doc, group)
+    }
+
+    fn grid_tracks(doc: &Doc, id: NodeId) -> (Vec<GridTrack>, Vec<GridTrack>) {
+        let Some(NodeData::Group(group)) = doc.scene.get(id).map(|node| &node.data) else {
+            panic!("grid frame");
+        };
+        let grid = group.grid.clone().expect("grid tracks");
+        (grid.columns, grid.rows)
+    }
+
+    #[gpui::test]
+    async fn grid_track_buttons_add_delete_and_move_tracks_with_one_undo_each(
+        cx: &mut TestAppContext,
+    ) {
+        let (doc, group) = doc_with_grid_frame();
+        let (view, panel, mut visual) = setup_view(doc, cx).await;
+        let item = view.read_with(&visual, |view, _| view.item().clone());
+        let node_id: SharedString = group.to_string().into();
+        let fixed = GridTrack::Fixed { size: 80.0 };
+        let two = GridTrack::Flex { fr: 2.0 };
+        let one = GridTrack::Flex { fr: 1.0 };
+        let cases = [
+            (
+                DesignPanelAction::GridTrackAddRequested {
+                    node_id: node_id.clone(),
+                    axis: DesignGridTrackAxis::Column,
+                    insertion_index: 1,
+                },
+                vec![fixed, one, two, one],
+            ),
+            (
+                DesignPanelAction::GridTrackDeleteRequested {
+                    node_id: node_id.clone(),
+                    axis: DesignGridTrackAxis::Column,
+                    index: 0,
+                },
+                vec![two, one],
+            ),
+            (
+                // The panel's move-down button on the first track.
+                DesignPanelAction::GridTracksReorderRequested {
+                    node_id: node_id.clone(),
+                    axis: DesignGridTrackAxis::Column,
+                    from_indices: vec![0],
+                    insertion_index: 2,
+                },
+                vec![two, fixed, one],
+            ),
+            (
+                // The panel's move-up button on the last track.
+                DesignPanelAction::GridTracksReorderRequested {
+                    node_id,
+                    axis: DesignGridTrackAxis::Column,
+                    from_indices: vec![2],
+                    insertion_index: 1,
+                },
+                vec![fixed, one, two],
+            ),
+        ];
+        for (action, expected) in cases {
+            let (before, depth) = item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                (grid_tracks(doc, group), doc.history.undo_depth())
+            });
+            panel.update_in(&mut visual, |_, _, cx| cx.emit(action.clone()));
+            visual.run_until_parked();
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(grid_tracks(doc, group).0, expected, "{action:?}");
+                assert_eq!(doc.history.undo_depth(), depth + 1, "{action:?}");
+            });
+            let echoed = panel.read_with(&visual, |panel, _| {
+                panel
+                    .node()
+                    .layout
+                    .as_ref()
+                    .expect("layout")
+                    .grid_columns
+                    .clone()
+            });
+            let expected_echo: Vec<DesignGridTrack> =
+                expected.iter().map(design_grid_track).collect();
+            assert_eq!(echoed, expected_echo, "the panel shows the new tracks");
+            item.update(&mut visual, |item, cx| {
+                assert!(item.undo(cx).expect("one Undo"));
+            });
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(grid_tracks(doc, group), before, "{action:?}");
+                assert_eq!(doc.history.undo_depth(), depth);
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn effect_drag_reorders_shadows_and_blurs_with_one_undo_each(cx: &mut TestAppContext) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        let node = doc.scene.get_mut(rect).expect("rectangle");
+        node.effects.push(default_shadow());
+        node.effects.push(Shadow {
+            kind: ShadowKind::Inner,
+            ..default_shadow()
+        });
+        node.blurs.push(default_blur(BlurKind::Layer));
+        node.blurs.push(default_blur(BlurKind::Background));
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut visual) = setup_view(doc, cx).await;
+        let item = view.read_with(&visual, |view, _| view.item().clone());
+        use DesignEffectKind::{BackgroundBlur, DropShadow, InnerShadow, LayerBlur};
+        for (from_index, to_index, expected) in [
+            (0, 1, [InnerShadow, DropShadow, LayerBlur, BackgroundBlur]),
+            (3, 2, [DropShadow, InnerShadow, BackgroundBlur, LayerBlur]),
+        ] {
+            let depth = item.read_with(&visual, |item, _| {
+                item.doc().expect("document").history.undo_depth()
+            });
+            panel.update_in(&mut visual, |_, _, cx| {
+                cx.emit(DesignPanelAction::EffectReorderRequested {
+                    node_id: rect.to_string().into(),
+                    effect_id: SharedString::default(),
+                    from_index,
+                    to_index,
+                })
+            });
+            visual.run_until_parked();
+            let kinds = |doc: &Doc| {
+                design_effects(doc.scene.get(rect).expect("rectangle"))
+                    .iter()
+                    .map(|effect| effect.kind)
+                    .collect::<Vec<_>>()
+            };
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(kinds(doc), expected);
+                assert_eq!(doc.history.undo_depth(), depth + 1);
+            });
+            let echoed = panel.read_with(&visual, |panel, _| {
+                panel
+                    .node()
+                    .effects
+                    .iter()
+                    .map(|effect| effect.kind)
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(echoed, expected, "the panel shows the new order");
+            item.update(&mut visual, |item, cx| {
+                assert!(item.undo(cx).expect("one Undo"));
+            });
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(
+                    kinds(doc),
+                    [DropShadow, InnerShadow, LayerBlur, BackgroundBlur]
+                );
+                assert_eq!(doc.history.undo_depth(), depth);
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn paint_bindings_follow_their_paint_when_paints_move_or_go(cx: &mut TestAppContext) {
+        let (mut doc, _page, rect, _, _, color) = doc_with_bound_paints();
+        let node = doc.scene.get_mut(rect).expect("rectangle");
+        let NodeData::Vector(vector) = &mut node.data else {
+            panic!("vector")
+        };
+        vector
+            .fills
+            .push(Fill::solid(FantaColor::rgb(0x10, 0x20, 0x30)));
+        vector
+            .strokes
+            .push(fanta_doc::Stroke::solid(FantaColor::WHITE, 4.));
+        node.bindings
+            .insert(BoundProp::StrokeWidth { index: 1 }, color);
+        let original = node.bindings.clone();
+        let alias = original[&BoundProp::StrokeColor { index: 0 }];
+        let (view, panel, mut visual) = setup_view(doc, cx).await;
+        let item = view.read_with(&visual, |view, _| view.item().clone());
+        let id: SharedString = rect.to_string().into();
+        let fill = DesignPanelCollection::Fill;
+        let stroke = DesignPanelCollection::Stroke;
+        let reorder = |collection, from_index, to_index| DesignPanelAction::PaintReorderRequested {
+            node_id: id.clone(),
+            collection,
+            target: DesignPaintTarget::WholeLayer,
+            paint_id: SharedString::default(),
+            from_index,
+            to_index,
+        };
+        let remove = |collection, index| DesignPanelAction::CollectionItemRemoveRequested {
+            node_id: id.clone(),
+            collection,
+            target: DesignPaintTarget::WholeLayer,
+            index,
+        };
+        let cases = [
+            (
+                reorder(fill, 0, 1),
+                vec![
+                    (BoundProp::FillColor { index: 1 }, color),
+                    (BoundProp::StrokeColor { index: 0 }, alias),
+                    (BoundProp::StrokeWidth { index: 1 }, color),
+                ],
+            ),
+            (
+                reorder(stroke, 1, 0),
+                vec![
+                    (BoundProp::FillColor { index: 0 }, color),
+                    (BoundProp::StrokeColor { index: 1 }, alias),
+                    (BoundProp::StrokeWidth { index: 0 }, color),
+                ],
+            ),
+            (
+                remove(fill, 0),
+                vec![
+                    (BoundProp::StrokeColor { index: 0 }, alias),
+                    (BoundProp::StrokeWidth { index: 1 }, color),
+                ],
+            ),
+            (
+                remove(stroke, 0),
+                vec![
+                    (BoundProp::FillColor { index: 0 }, color),
+                    (BoundProp::StrokeWidth { index: 0 }, color),
+                ],
+            ),
+        ];
+        for (action, expected) in cases {
+            let depth = item.read_with(&visual, |item, _| {
+                item.doc().expect("document").history.undo_depth()
+            });
+            panel.update_in(&mut visual, |_, _, cx| cx.emit(action.clone()));
+            visual.run_until_parked();
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                let bindings = &doc.scene.get(rect).expect("rectangle").bindings;
+                assert_eq!(
+                    bindings.clone(),
+                    expected.into_iter().collect::<BTreeMap<_, _>>(),
+                    "{action:?}"
+                );
+                assert_eq!(doc.history.undo_depth(), depth + 1, "{action:?}");
+            });
+            item.update(&mut visual, |item, cx| {
+                assert!(item.undo(cx).expect("one Undo"));
+            });
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(doc.scene.get(rect).expect("rectangle").bindings, original);
+                assert_eq!(doc.history.undo_depth(), depth);
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn grid_dimensions_gesture_previews_and_commits_one_undo_step(cx: &mut TestAppContext) {
+        let (doc, group) = doc_with_grid_frame();
+        let (view, panel, mut visual) = setup_view(doc, cx).await;
+        let item = view.read_with(&visual, |view, _| view.item().clone());
+        let node_id: SharedString = group.to_string().into();
+        let (before, depth) = item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            (grid_tracks(doc, group), doc.history.undo_depth())
+        });
+        let rows = before.1.len();
+        let emit = |visual: &mut VisualTestContext, columns: usize, phase: DesignPanelEditPhase| {
+            let action = DesignPanelAction::GridDimensionsEditRequested {
+                node_id: node_id.clone(),
+                dimensions: DesignGridDimensions::new(columns, rows).expect("dimensions"),
+                phase,
+            };
+            panel.update_in(visual, |_, _, cx| cx.emit(action));
+            visual.run_until_parked();
+        };
+        emit(&mut visual, 3, DesignPanelEditPhase::Begin);
+        emit(&mut visual, 4, DesignPanelEditPhase::Preview);
+        emit(&mut visual, 5, DesignPanelEditPhase::Preview);
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(grid_tracks(doc, group).0.len(), 5, "the preview shows");
+            assert_eq!(doc.history.undo_depth(), depth, "previews add no undo step");
+        });
+        emit(&mut visual, 5, DesignPanelEditPhase::Cancel);
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(grid_tracks(doc, group), before, "Cancel restores");
+            assert_eq!(doc.history.undo_depth(), depth);
+        });
+
+        emit(&mut visual, 3, DesignPanelEditPhase::Begin);
+        emit(&mut visual, 4, DesignPanelEditPhase::Preview);
+        emit(&mut visual, 2, DesignPanelEditPhase::Commit);
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(grid_tracks(doc, group).0, before.0[..2].to_vec());
+            assert_eq!(doc.history.undo_depth(), depth + 1, "one gesture, one step");
+        });
+        // The picker sends a lone Commit.
+        emit(&mut visual, 4, DesignPanelEditPhase::Commit);
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(grid_tracks(doc, group).0.len(), 4);
+            assert_eq!(doc.history.undo_depth(), depth + 2);
+        });
+        let echoed = panel.read_with(&visual, |panel, _| {
+            panel
+                .node()
+                .layout
+                .as_ref()
+                .expect("layout")
+                .grid_columns
+                .len()
+        });
+        assert_eq!(echoed, 4, "the panel shows the new column count");
+        item.update(&mut visual, |item, cx| {
+            assert!(item.undo(cx).expect("Undo"));
+            assert!(item.undo(cx).expect("Undo"));
+        });
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(grid_tracks(doc, group), before);
+            assert_eq!(doc.history.undo_depth(), depth);
+        });
     }
 
     #[test]
@@ -13504,6 +14016,54 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn adding_a_fill_keeps_a_hidden_paints_remembered_alpha(cx: &mut TestAppContext) {
+        let (mut doc, _, rect) = doc_with_rect();
+        let NodeData::Vector(vector) = &mut doc.scene.get_mut(rect).expect("rectangle").data else {
+            panic!("rectangle is a vector");
+        };
+        vector.fills = vec![Fill::Solid {
+            color: FantaColor::rgba(0xe0, 0x30, 0x30, 0x66),
+            blend: BlendMode::Normal,
+        }]
+        .into();
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        emit_inspector_paint(
+            &panel,
+            &mut cx,
+            rect,
+            DesignPaintProperty::Visible,
+            DesignPaintValue::Bool(false),
+            DesignPanelEditPhase::Commit,
+        );
+        panel.update_in(&mut cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::CollectionItemAddRequested {
+                node_id: rect.to_string().into(),
+                collection: DesignPanelCollection::Fill,
+                target: DesignPaintTarget::WholeLayer,
+            });
+        });
+        cx.run_until_parked();
+        emit_inspector_paint(
+            &panel,
+            &mut cx,
+            rect,
+            DesignPaintProperty::Visible,
+            DesignPaintValue::Bool(true),
+            DesignPanelEditPhase::Commit,
+        );
+        item.read_with(&cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            assert_eq!(
+                paint_alpha(&paint_at(doc, rect, false, 0)),
+                HiddenPaintAlpha::Solid(0x66),
+                "showing the paint again restores the alpha it had before hiding"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn inspector_pending_image_source_reuse_supports_stroke_and_single_undo(
         cx: &mut TestAppContext,
     ) {
@@ -14749,6 +15309,63 @@ mod tests {
                 "Literal"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn component_number_edit_reads_like_other_number_fields(cx: &mut TestAppContext) {
+        let (mut doc, page, master_root) = doc_with_rect();
+        let component = ComponentId::new();
+        let number_prop = ComponentPropId::new();
+        let mut definition = ComponentDef::new(component, master_root, "Badge");
+        definition.props = vec![ComponentPropDef {
+            id: number_prop,
+            name: "Count".into(),
+            kind: ComponentPropKind::Number,
+            formatter: Default::default(),
+            default: VarValue::Float { value: 0.0 },
+            bindings: Vec::new(),
+        }];
+        doc.components.defs.insert(component, definition);
+        let mut instance = CanvasNode::new(NodeData::Instance(InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [120.0, 60.0],
+        }));
+        instance.parent = Some(page);
+        let id = instance.id;
+        doc.scene.insert(instance).expect("insert instance");
+        doc.selection.replace_with([id]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        for (text, expected) in [("12px", 12.0), ("1,5", 1.5), ("\u{2212}3", -3.0)] {
+            panel.update_in(cx, |_, _, cx| {
+                cx.emit(DesignPanelAction::ComponentPropertyChangeRequested {
+                    node_id: id.to_string().into(),
+                    property_id: number_prop.to_string().into(),
+                    value: DesignComponentPropertyValue::Text(text.into()),
+                });
+            });
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let doc = &item.document().expect("document ready").doc;
+                let NodeData::Instance(instance) =
+                    &doc.scene.get(id).expect("instance exists").data
+                else {
+                    panic!("instance node");
+                };
+                assert_eq!(
+                    instance.prop_values.get(&number_prop),
+                    Some(&VarValue::Float { value: expected }),
+                    "{text}"
+                );
+            });
+        }
     }
 
     #[gpui::test]
@@ -16073,6 +16690,50 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn fill_mode_paint_gesture_ignores_a_locked_layer_opacity(cx: &mut TestAppContext) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        doc.scene.get_mut(rect).expect("rect exists").editing =
+            Some(Box::new(fanta_doc::EditingRules {
+                disabled_scopes: [Scope::LayerOpacity].into(),
+                placeholder: None,
+            }));
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| {
+            view.template_fill = true;
+            view.refresh_gpui_design(cx);
+        });
+        cx.run_until_parked();
+
+        let paint = DesignPaint::solid(DesignColor::rgb(0x22, 0xbb, 0x77));
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PaintEditRequested {
+                node_id: SharedString::from(rect.to_string()),
+                collection: DesignPanelCollection::Fill,
+                target: DesignPaintTarget::WholeLayer,
+                paint_id: SharedString::from(format!("{rect}-fill-0")),
+                index: 0,
+                edit: DesignPaintEdit {
+                    property: DesignPaintProperty::Payload,
+                    value: DesignPaintValue::Payload(paint.payload),
+                },
+                phase: DesignPanelEditPhase::Begin,
+            });
+        });
+        cx.run_until_parked();
+        let session_open = view.read_with(cx, |view, _| {
+            view.gpui_design
+                .as_ref()
+                .is_some_and(|adapter| adapter.session.is_some())
+        });
+        assert!(
+            session_open,
+            "a fill gesture must not be refused for the layer-opacity scope"
+        );
+    }
+
+    #[gpui::test]
     async fn gradient_picker_edits_round_trip_and_undo(cx: &mut TestAppContext) {
         let (mut doc, _page, rect) = doc_with_rect();
         if let Some(node) = doc.scene.get_mut(rect)
@@ -17142,6 +17803,117 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn frame_width_scrub_restores_constrained_children_each_frame(cx: &mut TestAppContext) {
+        let (mut doc, page, _rect) = doc_with_rect();
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([200.0, 100.0]),
+            ..Default::default()
+        }));
+        frame.parent = Some(page);
+        let frame_id = frame.id;
+        doc.scene.insert(frame).expect("insert frame");
+        let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+            FantaColor::BLACK,
+        )));
+        child.parent = Some(frame_id);
+        child.transform = Transform2D::translation(170.0, 10.0);
+        child.constraints = Some(fanta_doc::Constraints {
+            horizontal: fanta_doc::ConstraintH::Right,
+            vertical: fanta_doc::ConstraintV::Top,
+        });
+        let child_id = child.id;
+        doc.scene.insert(child).expect("insert child");
+        doc.selection.replace_with([frame_id]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        let emit = |cx: &mut VisualTestContext, value: f32, phase: DesignPanelEditPhase| {
+            panel.update_in(cx, |_, _, cx| {
+                cx.emit(DesignPanelAction::PropertyEditRequested {
+                    node_id: SharedString::from(frame_id.to_string()),
+                    property: DesignPanelProperty::Width,
+                    value: DesignPanelValue::Number(value),
+                    phase,
+                });
+            });
+            cx.run_until_parked();
+        };
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let child_x = |cx: &mut VisualTestContext| {
+            item.read_with(cx, |item, _| {
+                let doc = &item.document().expect("document ready").doc;
+                doc.scene
+                    .get(child_id)
+                    .expect("child exists")
+                    .transform
+                    .to_components()[4]
+            })
+        };
+
+        emit(cx, 200.0, DesignPanelEditPhase::Begin);
+        emit(cx, 300.0, DesignPanelEditPhase::Preview);
+        emit(cx, 310.0, DesignPanelEditPhase::Preview);
+        assert_eq!(
+            child_x(cx),
+            280.0,
+            "each preview frame pins the child from its gesture-start position"
+        );
+        emit(cx, 310.0, DesignPanelEditPhase::Cancel);
+        assert_eq!(child_x(cx), 170.0, "cancel restores the child");
+    }
+
+    #[gpui::test]
+    async fn a_batch_that_fails_part_way_leaves_the_document_untouched(cx: &mut TestAppContext) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        doc.selection.replace_with([rect]);
+        let (view, _panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let opacity_before = item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            doc.scene.get(rect).expect("rect exists").opacity
+        });
+        let missing = NodeId::new();
+        let applied = view.update_in(cx, |view, _, cx| {
+            view.design_apply_ops(
+                vec![
+                    Operation::SetOpacity {
+                        id: rect,
+                        old: opacity_before,
+                        new: fanta_doc::UnitInterval::new(0.25),
+                    },
+                    Operation::SetOpacity {
+                        id: missing,
+                        old: opacity_before,
+                        new: fanta_doc::UnitInterval::new(0.25),
+                    },
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(!applied, "a failed batch is not reported as applied");
+        item.update(cx, |item, cx| {
+            let doc = &item.document().expect("document ready").doc;
+            assert_eq!(
+                doc.scene.get(rect).expect("rect exists").opacity,
+                opacity_before,
+                "the operations before the failure are rolled back"
+            );
+            assert!(
+                !item.undo(cx).expect("undo call succeeds"),
+                "a failed batch leaves no undo step"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn aligning_a_three_node_selection_is_one_undo_step(cx: &mut TestAppContext) {
         let (mut doc, _page, ids) = doc_with_three_squares();
         doc.selection.replace_with(ids);
@@ -17642,6 +18414,112 @@ fn grid_layout_operations(
             change(grid);
         }
     })
+}
+
+fn default_grid_track(columns: bool) -> GridTrack {
+    if columns {
+        GridTrack::Flex { fr: 1.0 }
+    } else {
+        GridTrack::Hug
+    }
+}
+
+fn resize_grid_tracks(tracks: &mut Vec<GridTrack>, count: usize, columns: bool) {
+    let fill = tracks
+        .last()
+        .copied()
+        .unwrap_or_else(|| default_grid_track(columns));
+    tracks.resize(count, fill);
+}
+
+fn grid_axis_tracks(
+    grid: &mut fanta_doc::GridLayout,
+    axis: DesignGridTrackAxis,
+) -> &mut Vec<GridTrack> {
+    match axis {
+        DesignGridTrackAxis::Column => &mut grid.columns,
+        DesignGridTrackAxis::Row => &mut grid.rows,
+    }
+}
+
+/// The panel's grid track buttons and dimensions picker as document edits.
+fn grid_track_action_operations(
+    doc: &Doc,
+    id: NodeId,
+    action: &DesignPanelAction,
+) -> Vec<Operation> {
+    match action {
+        DesignPanelAction::GridTrackAddRequested {
+            axis,
+            insertion_index,
+            ..
+        } => grid_layout_operations(doc, id, |grid| {
+            let tracks = grid_axis_tracks(grid, *axis);
+            let index = (*insertion_index).min(tracks.len());
+            tracks.insert(
+                index,
+                default_grid_track(*axis == DesignGridTrackAxis::Column),
+            );
+        }),
+        DesignPanelAction::GridTrackDeleteRequested { axis, index, .. } => {
+            grid_layout_operations(doc, id, |grid| {
+                let tracks = grid_axis_tracks(grid, *axis);
+                // A grid keeps at least one track on each axis.
+                if tracks.len() > 1 && *index < tracks.len() {
+                    tracks.remove(*index);
+                }
+            })
+        }
+        DesignPanelAction::GridTracksReorderRequested {
+            axis,
+            from_indices,
+            insertion_index,
+            ..
+        } => grid_layout_operations(doc, id, |grid| {
+            reorder_grid_tracks(
+                grid_axis_tracks(grid, *axis),
+                from_indices,
+                *insertion_index,
+            );
+        }),
+        DesignPanelAction::GridDimensionsEditRequested { dimensions, .. } => {
+            grid_layout_operations(doc, id, |grid| {
+                resize_grid_tracks(&mut grid.columns, dimensions.columns.clamp(1, 256), true);
+                resize_grid_tracks(&mut grid.rows, dimensions.rows.clamp(1, 256), false);
+            })
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Moves the tracks at `from_indices` to sit before `insertion_index`, both
+/// counted in the original order (Figma's `fromIndices`/`insertionIndex`).
+fn reorder_grid_tracks(
+    tracks: &mut Vec<GridTrack>,
+    from_indices: &[usize],
+    insertion_index: usize,
+) {
+    let mut moving: Vec<usize> = from_indices
+        .iter()
+        .copied()
+        .filter(|index| *index < tracks.len())
+        .collect();
+    moving.sort_unstable();
+    moving.dedup();
+    let insertion_index = insertion_index.min(tracks.len());
+    let before_insertion = moving
+        .iter()
+        .filter(|index| **index < insertion_index)
+        .count();
+    let moved: Vec<GridTrack> = moving
+        .iter()
+        .filter_map(|index| tracks.get(*index).copied())
+        .collect();
+    for index in moving.iter().rev() {
+        tracks.remove(*index);
+    }
+    let insertion_index = insertion_index.saturating_sub(before_insertion);
+    tracks.splice(insertion_index..insertion_index, moved);
 }
 
 /// How many rows a grid frame's children occupy, auto-added ones included.

@@ -259,6 +259,48 @@ impl GenerationJournal {
         }).await
     }
 
+    // The user cannot see or resolve unreadable records, so the oldest give way only when a limit is full.
+    pub(super) async fn release_unreadable(
+        &self,
+        key: String,
+        unreadable: Vec<String>,
+    ) -> Result<usize> {
+        self.change(move |journal| {
+            if journal
+                .records
+                .iter()
+                .any(|stored| stored.record.key == key)
+            {
+                return Ok(0);
+            }
+            let mut released = 0;
+            loop {
+                let unresolved_full = journal
+                    .records
+                    .iter()
+                    .filter(|stored| stored.record.result.is_none())
+                    .count()
+                    >= MAX_UNRESOLVED;
+                if !unresolved_full && unfinished_count(journal) < MAX_UNFINISHED {
+                    return Ok(released);
+                }
+                let Some(index) = journal.records.iter().rposition(|stored| {
+                    unreadable.contains(&stored.record.key)
+                        && if unresolved_full {
+                            stored.record.result.is_none()
+                        } else {
+                            !record_finished(&stored.record)
+                        }
+                }) else {
+                    return Ok(released);
+                };
+                journal.records.remove(index);
+                released += 1;
+            }
+        })
+        .await
+    }
+
     pub(super) async fn accept(&self, key: &str, result: SavedRunResult) -> Result<JournalRecord> {
         let key = key.to_owned();
         self.change(move |journal| {
@@ -1053,6 +1095,138 @@ mod tests {
         }
         .await
         .expect("accepted pruning never evicts unresolved requests");
+    }
+
+    #[gpui::test]
+    async fn generation_journal_releases_unreadable_records_only_from_a_full_limit() {
+        async {
+            let directory = tempfile::tempdir()?;
+            let journal = GenerationJournal::new(
+                store(&directory.path().join("history.sqlite")).await?,
+                scope(),
+            )?;
+            let keys = |prefix: &str, count: usize| {
+                (0..count)
+                    .map(|index| format!("{prefix}-{index}"))
+                    .collect::<Vec<_>>()
+            };
+
+            for key in keys("unresolved", 3) {
+                journal.prepare(submission(&key)).await?;
+            }
+            let before = journal.load().await?;
+            assert_eq!(
+                journal
+                    .release_unreadable("new".into(), keys("unresolved", 3))
+                    .await?,
+                0,
+                "a limit that is not full releases nothing"
+            );
+            assert_eq!(journal.load().await?, before);
+
+            for key in keys("readable", 5) {
+                journal.prepare(submission(&key)).await?;
+            }
+            assert_eq!(
+                journal
+                    .release_unreadable("new".into(), vec!["absent".into()])
+                    .await?,
+                0,
+                "a limit full of readable records releases nothing"
+            );
+            assert!(journal.prepare(submission("new")).await.is_err());
+
+            assert_eq!(
+                journal
+                    .release_unreadable("readable-4".into(), keys("unresolved", 3))
+                    .await?,
+                0,
+                "a key that is already stored needs no room"
+            );
+            assert_eq!(
+                journal
+                    .release_unreadable("new".into(), keys("unresolved", 3))
+                    .await?,
+                1
+            );
+            assert!(
+                !journal
+                    .load()
+                    .await?
+                    .records
+                    .iter()
+                    .any(|record| record.key == "unresolved-0"),
+                "the oldest unreadable record gives way"
+            );
+            journal.prepare(submission("new")).await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await
+        .expect("unreadable records give way only to a full limit");
+    }
+
+    #[gpui::test]
+    async fn generation_journal_releases_an_unreadable_running_record_only_for_the_unfinished_limit()
+     {
+        async {
+            let directory = tempfile::tempdir()?;
+            let journal = GenerationJournal::new(
+                store(&directory.path().join("history.sqlite")).await?,
+                scope(),
+            )?;
+            for index in 0..31 {
+                let key = format!("running-{index}");
+                journal.prepare(submission(&key)).await?;
+                journal.accept(&key, pending(&key)).await?;
+            }
+            let unreadable = vec!["running-0".to_owned()];
+            assert_eq!(
+                journal
+                    .release_unreadable("new".into(), unreadable.clone())
+                    .await?,
+                0,
+                "31 unfinished records leave room"
+            );
+            journal.prepare(submission("unresolved")).await?;
+            assert_eq!(
+                journal
+                    .release_unreadable("new".into(), unreadable.clone())
+                    .await?,
+                1,
+                "the full unfinished limit releases the unreadable running record"
+            );
+            assert!(
+                !journal
+                    .load()
+                    .await?
+                    .records
+                    .iter()
+                    .any(|record| record.key == "running-0")
+            );
+
+            let directory = tempfile::tempdir()?;
+            let journal = GenerationJournal::new(
+                store(&directory.path().join("history.sqlite")).await?,
+                scope(),
+            )?;
+            journal.prepare(submission("running")).await?;
+            journal.accept("running", pending("running")).await?;
+            for index in 0..8 {
+                journal
+                    .prepare(submission(&format!("unresolved-{index}")))
+                    .await?;
+            }
+            assert_eq!(
+                journal
+                    .release_unreadable("new".into(), vec!["running".into()])
+                    .await?,
+                0,
+                "a running record cannot make room among unresolved requests"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await
+        .expect("running records give way only to the unfinished limit");
     }
 
     #[gpui::test]

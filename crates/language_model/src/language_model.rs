@@ -338,7 +338,7 @@ pub trait LanguageModelProvider: 'static {
     fn authentication_error_message(&self) -> SharedString {
         format!(
             "The API key for {} is invalid or has expired. \
-            Update your key in Settings > AI > LLM Providers to continue.",
+            Update your key in Settings > AI & models to continue.",
             self.name().0
         )
         .into()
@@ -351,7 +351,7 @@ pub trait LanguageModelProvider: 'static {
     fn missing_credentials_error_message(&self) -> SharedString {
         format!(
             "No API key is configured for {}. \
-            Add your key in Settings > AI > LLM Providers to continue.",
+            Add your key in Settings > AI & models to continue.",
             self.name().0
         )
         .into()

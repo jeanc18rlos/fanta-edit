@@ -125,9 +125,17 @@ impl Default for SnapEngine {
 pub enum SnapKind {
     Grid,
     PixelGrid,
-    NodeEdgeMin { source: NodeId },
-    NodeEdgeMax { source: NodeId },
-    NodeCenter { source: NodeId },
+    NodeEdgeMin {
+        source: NodeId,
+    },
+    NodeEdgeMax {
+        source: NodeId,
+    },
+    NodeCenter {
+        source: NodeId,
+    },
+    /// A loose point the caller added, such as an anchor of a path being drawn.
+    Point,
 }
 
 /// One axis's snap outcome.
@@ -217,6 +225,25 @@ impl SnapCandidates {
     pub fn is_empty(&self) -> bool {
         self.x.is_empty() && self.y.is_empty()
     }
+
+    /// Add a point's x and y as alignment candidates, at the edge threshold.
+    pub fn push_point(&mut self, point: DVec2) {
+        insert_sorted(&mut self.x, point.x);
+        insert_sorted(&mut self.y, point.y);
+    }
+}
+
+fn insert_sorted(axis: &mut SmallVec<[SnapCandidate; 16]>, coordinate: f64) {
+    let index =
+        axis.partition_point(|candidate| candidate.coordinate.total_cmp(&coordinate).is_le());
+    axis.insert(
+        index,
+        SnapCandidate {
+            coordinate,
+            kind: SnapKind::Point,
+            traversal_order: axis.len(),
+        },
+    );
 }
 
 // =============================================================================
@@ -384,6 +411,7 @@ impl SnapEngine {
                     self.thresholds.edge * pixel_to_world
                 }
                 SnapKind::NodeCenter { .. } => self.thresholds.center * pixel_to_world,
+                SnapKind::Point => self.thresholds.edge * pixel_to_world,
                 _ => continue,
             };
             if world_delta <= threshold_world {
@@ -442,6 +470,7 @@ impl SnapEngine {
                     self.thresholds.edge * pixel_to_world
                 }
                 SnapKind::NodeCenter { .. } => self.thresholds.center * pixel_to_world,
+                SnapKind::Point => self.thresholds.edge * pixel_to_world,
                 _ => continue,
             };
             if world_delta <= threshold_world {
@@ -629,6 +658,28 @@ mod tests {
         assert!(r.x.is_none());
         assert!(r.y.is_none());
         assert_eq!(r.world, DVec2::new(20.0, 20.0));
+    }
+
+    #[test]
+    fn pushed_point_is_an_alignment_candidate() {
+        let engine = SnapEngine {
+            targets: SnapTargets::empty(),
+            ..engine_with_zoom(2.0)
+        };
+        let mut candidates = SnapCandidates::default();
+        candidates.push_point(DVec2::new(50.0, -10.0));
+        candidates.push_point(DVec2::new(10.0, 300.0));
+        // 2 px at zoom 2 is 1 world unit: x aligns, y is far from both points.
+        let result = engine.snap_point_with(&candidates, DVec2::new(51.0, 100.0));
+        assert_eq!(result.world, DVec2::new(50.0, 100.0));
+        assert!(matches!(
+            result.x.map(|snap| snap.kind),
+            Some(SnapKind::Point)
+        ));
+        assert!(result.y.is_none());
+        // 8 px at zoom 2 is past the 6 px edge threshold.
+        let result = engine.snap_point_with(&candidates, DVec2::new(14.0, 100.0));
+        assert!(result.x.is_none());
     }
 
     // ---- snap to node edges/centers ----------------------------------------

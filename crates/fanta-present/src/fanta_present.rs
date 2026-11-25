@@ -746,6 +746,9 @@ impl PlaybackSession {
             return false;
         }
         self.back_stack.clear();
+        // enter_frame keeps navigation transitions, which would keep compositing the old frames.
+        self.active_transition = None;
+        self.smart_animate = None;
         self.enter_frame(start);
         true
     }
@@ -792,6 +795,7 @@ impl PlaybackSession {
         self.hover_chain.clear();
         self.active_scroll_animation = None;
         self.pending_url = None;
+        self.seed_initial_scroll_offsets(start);
         self.schedule_timers(start);
         self.camera = frame_camera(
             &self.resolved_layer(start, false).scene,
@@ -2969,6 +2973,7 @@ impl PlaybackSession {
         match action {
             Action::Navigate { to } => {
                 if !self.doc.scene.contains(*to) {
+                    self.report_missing_target("Navigate");
                     return PresentResponse::default();
                 }
                 let from_frame = self.current;
@@ -3220,6 +3225,16 @@ impl PlaybackSession {
                     }
 
                     // Default (no scrollable parent): pan the main camera.
+                    // An overlay draws with its own placement camera, so only
+                    // a reaction on the base frame may move this one.
+                    let from_base = self
+                        .dispatch_layer
+                        .map_or(self.overlays.is_empty(), |(layer, _)| {
+                            layer == self.current_layer
+                        });
+                    if !from_base {
+                        return PresentResponse::default();
+                    }
                     let cx = (bounds.min_x + bounds.max_x) * 0.5;
                     let cy = (bounds.min_y + bounds.max_y) * 0.5;
                     self.camera.center = [cx, cy];
@@ -3421,6 +3436,15 @@ impl PlaybackSession {
         ))
     }
 
+    fn report_missing_target(&mut self, action: &str) {
+        self.playback_events.push(PlaybackEvent::Diagnostic {
+            diagnostic: PlaybackDiagnostic {
+                code: "targetMissing".into(),
+                message: format!("{action} points at a frame that no longer exists"),
+            },
+        });
+    }
+
     /// Push an overlay frame onto the stack, placed per its settings at the
     /// current layer's zoom. A missing or bounds-less overlay frame is a no-op.
     fn open_overlay(
@@ -3430,6 +3454,7 @@ impl PlaybackSession {
         transition: Option<&Transition>,
     ) -> PresentResponse {
         if !self.doc.scene.contains(frame) {
+            self.report_missing_target("Open overlay");
             return PresentResponse::default();
         }
         let resolved = self.resolved_layer_with_identity(frame, self.next_layer, false);

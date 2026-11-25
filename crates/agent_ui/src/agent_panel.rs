@@ -6541,7 +6541,10 @@ impl AgentPanel {
     fn dismiss_ai_onboarding(&mut self, cx: &mut Context<Self>) {
         self.new_user_onboarding_upsell_dismissed
             .store(true, Ordering::Release);
-        OnboardingUpsell::set_dismissed(true, cx);
+        // A signed-out dismissal lasts for this session only, so the sign-in card returns at launch.
+        if self.user_store.read(cx).current_user().is_some() {
+            OnboardingUpsell::set_dismissed(true, cx);
+        }
         cx.notify();
     }
 
@@ -9425,6 +9428,45 @@ mod tests {
         });
 
         (panel, cx)
+    }
+
+    #[gpui::test]
+    async fn test_dismissing_onboarding_while_signed_out_is_not_remembered(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        panel.update(&mut cx, |panel, cx| {
+            assert!(panel.user_store.read(cx).current_user().is_none());
+            panel.dismiss_ai_onboarding(cx);
+            assert!(
+                panel
+                    .new_user_onboarding_upsell_dismissed
+                    .load(Ordering::Acquire)
+            );
+        });
+        cx.run_until_parked();
+        assert!(!cx.update(|_, cx| OnboardingUpsell::dismissed(cx)));
+    }
+
+    #[gpui::test]
+    async fn test_dismissing_onboarding_while_signed_in_is_remembered(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let client = panel.read_with(&cx, |panel, cx| {
+            panel
+                .workspace
+                .upgrade()
+                .map(|workspace| workspace.read(cx).client().clone())
+        });
+        let client = client.expect("the panel's workspace should be alive");
+        let _server = client::test::FakeServer::for_client(1, &client, &cx).await;
+        cx.run_until_parked();
+
+        panel.update(&mut cx, |panel, cx| {
+            assert!(panel.user_store.read(cx).current_user().is_some());
+            panel.dismiss_ai_onboarding(cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.update(|_, cx| OnboardingUpsell::dismissed(cx)));
     }
 
     async fn setup_visible_panel(

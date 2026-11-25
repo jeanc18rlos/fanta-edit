@@ -215,7 +215,11 @@ pub fn stroke_to_paint(stroke: &Stroke, local_bounds: [f32; 4]) -> Paint {
     paint.set_stroke_miter(stroke.miter_limit as f32);
     if !stroke.dash.is_empty() {
         // Skia takes a flat alternating on/off interval list.
-        let intervals: Vec<f32> = stroke.dash.iter().map(|v| *v as f32).collect();
+        let mut intervals: Vec<f32> = stroke.dash.iter().map(|v| *v as f32).collect();
+        // Skia rejects an odd count; SVG and Figma repeat the list to make it even.
+        if intervals.len() % 2 == 1 {
+            intervals.extend_from_within(..);
+        }
         if let Some(effect) = skia_safe::PathEffect::dash(&intervals, 0.0) {
             paint.set_path_effect(effect);
         }
@@ -856,6 +860,14 @@ mod tests {
         let paint = stroke_to_paint(&stroke, [0.0, 0.0, 100.0, 100.0]);
         assert_eq!(paint.style(), PaintStyle::Stroke);
         assert!((paint.stroke_width() - 4.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn odd_dash_pattern_repeats_instead_of_rendering_solid() {
+        let mut stroke = Stroke::solid(Color::BLACK, 4.0);
+        stroke.dash = vec![5.0];
+        let paint = stroke_to_paint(&stroke, [0.0, 0.0, 100.0, 100.0]);
+        assert!(paint.path_effect().is_some());
     }
 
     #[test]

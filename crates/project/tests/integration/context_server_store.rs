@@ -1780,6 +1780,18 @@ async fn test_fanta_mcp_follows_account_sign_in_and_sign_out(cx: &mut TestAppCon
     let (_fs, project) = setup_context_server_test(cx, json!({"code.rs": ""}), vec![]).await;
     let client = project.read_with(cx, |project, _| project.client());
     cx.update(|cx| client::Client::set_global(client.clone(), cx));
+    // A sign-in whose account cannot be loaded ends the session, so the account has to load.
+    client
+        .http_client()
+        .as_fake()
+        .replace_handler(|old_handler, request| async move {
+            if request.uri().path() != "/client/users/me" {
+                return old_handler(request).await;
+            }
+            Ok(json_response(serde_json::to_value(
+                client::test::make_get_authenticated_user_response(1, "test-account".into()),
+            )?))
+        });
     client.override_authenticate(|_| {
         Task::ready(Ok(client::Credentials {
             user_id: 1,

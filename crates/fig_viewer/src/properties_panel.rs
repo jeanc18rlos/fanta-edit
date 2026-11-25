@@ -46,7 +46,7 @@ use crate::inspector_widgets::{PanelDrag, TextDecorationGlyph, scrub_value, trac
 use crate::mode_overrides::mode_override_operation;
 use crate::panel_settings::FantaPropertiesPanelSettings;
 use crate::properties_ops::{
-    DEFAULT_PAGE_BACKGROUND, add_fill, apply_preview_operation, blurs_operations,
+    DEFAULT_PAGE_BACKGROUND, add_fill, apply_preview_operation, blurs_operations, child_transforms,
     combine_as_variants_operations, convert_paint_kind, create_component_operations, default_blur,
     default_shadow, detach_instance_operations, effects_operations, field_operations,
     finite_transform_operations, format_number, paint_slot_mut, parse_number, read_field_text,
@@ -755,16 +755,27 @@ impl FantaPropertiesPanel {
                 for operation in operations {
                     if let Err(error) = doc.apply(operation) {
                         log::error!("Fanta properties panel failed to apply operation: {error:#}");
-                        break;
+                        doc.abort_transaction().log_err();
+                        return (Err(error), DocChange::None);
                     }
                 }
                 doc.history.commit(&mut doc.scene);
-                ((), DocChange::Content)
+                (Ok(()), DocChange::Content)
             });
-            if applied.is_none() {
-                log::debug!("dropping inspector edit: the document is not ready");
+            match applied {
+                Some(Ok(())) => true,
+                Some(Err(error)) => {
+                    crate::view::show_canvas_notice_deferred(
+                        format!("Could not apply that change: {error}"),
+                        cx,
+                    );
+                    false
+                }
+                None => {
+                    log::debug!("dropping inspector edit: the document is not ready");
+                    false
+                }
             }
-            applied.is_some()
         })
     }
 
@@ -2451,6 +2462,7 @@ impl FantaPropertiesPanel {
             data: Box::new(node.data.clone()),
             effects: node.effects.clone(),
             blurs: node.blurs.clone(),
+            children: child_transforms(&document.doc.scene, id),
         })
     }
 

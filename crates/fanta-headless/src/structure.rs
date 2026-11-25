@@ -272,6 +272,10 @@ pub fn ungroup_operations(doc: &Doc, group: NodeId) -> Result<Ungrouped> {
     operations.push(Operation::DeleteSubtree {
         snapshot: vec![node.clone()],
     });
+    operations.extend(crate::clipboard::flow_cleanup_operations(
+        doc,
+        &std::collections::HashSet::from([group]),
+    ));
     Ok(Ungrouped {
         children,
         operations,
@@ -1303,5 +1307,110 @@ mod tests {
             image_layer_node(&doc, asset, [8, 8], [8.0, 8.0], Some(leaf), 0.0, 0.0, None).is_err()
         );
         assert!(image_layer_node(&doc, asset, [8, 8], [0.0, 8.0], None, 0.0, 0.0, None).is_err());
+    }
+
+    #[test]
+    fn deleting_the_flow_start_frame_clears_it_in_the_same_undo_step() {
+        let (mut doc, page) = page_doc();
+        let start = insert(
+            &mut doc,
+            frame(page, Transform2D::translation(0.0, 0.0), [100.0, 100.0]),
+        );
+        doc.apply(Operation::SetFlowStart {
+            old: None,
+            new: Some(start),
+        })
+        .unwrap();
+        doc.history = Default::default();
+
+        let operations = delete_layers_operations(&doc, &[start]).unwrap();
+        assert!(apply_transaction(&mut doc, "Delete", operations).unwrap());
+
+        assert!(!doc.scene.contains(start));
+        assert_eq!(doc.flow_start, None, "no flow may start at a deleted frame");
+        assert!(doc.undo().unwrap());
+        assert!(doc.scene.contains(start));
+        assert_eq!(doc.flow_start, Some(start), "one Undo restores both");
+    }
+
+    fn exports(doc: &Doc) -> bool {
+        fanta_format::runtime::RuntimeProgram::from_document(
+            doc.clone(),
+            Default::default(),
+            Vec::new(),
+            Default::default(),
+        )
+        .is_ok()
+    }
+
+    fn named_flow_doc() -> (Doc, NodeId, NodeId) {
+        let (mut doc, page) = page_doc();
+        let start = insert(
+            &mut doc,
+            frame(page, Transform2D::translation(0.0, 0.0), [100.0, 100.0]),
+        );
+        let kept = insert(
+            &mut doc,
+            frame(page, Transform2D::translation(200.0, 0.0), [100.0, 100.0]),
+        );
+        doc.apply(Operation::SetFlows {
+            old: Vec::new(),
+            new: vec![
+                fanta_doc::Flow {
+                    name: "Onboarding".into(),
+                    start,
+                },
+                fanta_doc::Flow {
+                    name: "Checkout".into(),
+                    start: kept,
+                },
+            ],
+        })
+        .unwrap();
+        doc.history = Default::default();
+        (doc, start, kept)
+    }
+
+    #[test]
+    fn deleting_a_named_flow_start_removes_the_flow_until_undo() {
+        let (mut doc, start, kept) = named_flow_doc();
+        let flows = doc.flows.clone();
+
+        let operations = delete_layers_operations(&doc, &[start]).unwrap();
+        assert!(apply_transaction(&mut doc, "Delete", operations).unwrap());
+
+        assert_eq!(
+            doc.flows.iter().map(|flow| flow.start).collect::<Vec<_>>(),
+            vec![kept]
+        );
+        assert!(exports(&doc), "the export accepts the document");
+        assert!(doc.undo().unwrap());
+        assert_eq!(doc.flows, flows, "one Undo brings the flow back");
+    }
+
+    #[test]
+    fn ungrouping_the_flow_start_frame_clears_the_flows_it_started() {
+        let (mut doc, start, kept) = named_flow_doc();
+        insert(&mut doc, rect(start, 10.0, 10.0, 20.0, 20.0));
+        doc.apply(Operation::SetFlowStart {
+            old: None,
+            new: Some(start),
+        })
+        .unwrap();
+        doc.history = Default::default();
+        let flows = doc.flows.clone();
+
+        let ungrouped = ungroup_operations(&doc, start).unwrap();
+        assert!(apply_transaction(&mut doc, "Ungroup", ungrouped.operations).unwrap());
+
+        assert_eq!(doc.flow_start, None);
+        assert_eq!(
+            doc.flows.iter().map(|flow| flow.start).collect::<Vec<_>>(),
+            vec![kept]
+        );
+        assert!(exports(&doc), "the export accepts the document");
+        assert!(doc.undo().unwrap());
+        assert_eq!(doc.flow_start, Some(start));
+        assert_eq!(doc.flows, flows);
     }
 }

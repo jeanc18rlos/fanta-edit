@@ -3604,6 +3604,37 @@ fn pr12_authored_initial_scroll_offset_seeds_on_frame_enter() {
 }
 
 #[test]
+fn restart_reseeds_the_authored_initial_scroll_offset() {
+    let mut doc = Doc::new();
+    let root = frame_sized(0.0, 0.0, 200.0, 200.0, Color::WHITE);
+    let root_id = root.id;
+    doc.apply(Operation::create_node(root)).unwrap();
+    let mut container = CanvasNode::new(NodeData::Group(GroupNode {
+        clip_size: Some([100.0, 100.0]),
+        scroll_direction: Some(ScrollDirection::Vertical),
+        scroll_offset: Some([0.0, 40.0]),
+        ..GroupNode::default()
+    }));
+    let container_id = container.id;
+    container.parent = Some(root_id);
+    container.transform = Transform2D::translation(50.0, 50.0);
+    doc.apply(Operation::create_node(container)).unwrap();
+    colored_child(
+        &mut doc,
+        container_id,
+        150.0,
+        40.0,
+        Color::rgb(0, 0, 255),
+        ScrollBehavior::Scrolls,
+    );
+
+    let mut session = PresentSession::new(&doc, Some(root_id), DVec2::splat(200.0)).unwrap();
+    session.set_scroll_offset(container_id, [0.0, 0.0]);
+    assert!(session.restart_at(root_id));
+    assert_eq!(session.scroll_offset(container_id), [0.0, 40.0]);
+}
+
+#[test]
 fn frame_without_authored_overflow_does_not_scroll() {
     // The legacy heuristic made every frame scrollable; authored axes say NO.
     let (mut doc, root, container) = scrolling_fixture(ScrollDirection::None);
@@ -6499,4 +6530,121 @@ fn transient_variable_revert_keeps_a_value_a_click_changed()
         "a value another reaction wrote survives the hover revert"
     );
     Ok(())
+}
+
+#[test]
+fn starting_a_flow_cancels_a_running_navigation_transition() {
+    let mut doc = Doc::new();
+    let b = frame_colored(500.0, Color::rgb(0, 0, 255));
+    let b_id = b.id;
+    doc.apply(Operation::create_node(b)).unwrap();
+    let c = frame_colored(1000.0, Color::rgb(0, 255, 0));
+    let c_id = c.id;
+    doc.apply(Operation::create_node(c)).unwrap();
+    let mut a = frame_colored(0.0, Color::rgb(255, 0, 0));
+    let a_id = a.id;
+    a.reactions.push(click_with(
+        1,
+        Action::Navigate { to: b_id },
+        Transition {
+            style: TransitionStyle::Dissolve,
+            duration_ms: 400,
+            easing: Easing::Linear,
+        },
+    ));
+    doc.apply(Operation::create_node(a)).unwrap();
+    doc.flows.push(fanta_doc::Flow {
+        name: "Second".into(),
+        start: c_id,
+    });
+
+    let mut session = PresentSession::new(&doc, Some(a_id), DVec2::splat(200.0)).unwrap();
+    session.handle_pointer(DVec2::new(100.0, 100.0), PointerEvent::Click);
+    assert!(session.active_transition.is_some(), "A to B is in flight");
+
+    assert!(session.start_flow(0));
+
+    assert_eq!(session.current_frame(), c_id);
+    assert!(
+        session.active_transition.is_none(),
+        "the old A to B transition must not keep rendering over the new flow"
+    );
+    assert!(session.smart_animate.is_none());
+}
+
+#[test]
+fn scroll_to_inside_an_overlay_leaves_the_base_camera_alone() {
+    // Overlay descendants get layer-local identities, so the overlay root is
+    // the target whose bounds this layer resolves.
+    let mut doc = Doc::new();
+    let mut overlay = frame_sized(1000.0, 0.0, 100.0, 100.0, Color::rgb(0, 255, 0));
+    let overlay_id = overlay.id;
+    overlay.reactions.push(click(
+        1,
+        Trigger::Click,
+        Action::ScrollTo { target: overlay_id },
+    ));
+    doc.apply(Operation::create_node(overlay)).unwrap();
+    let mut base = frame_sized(0.0, 0.0, 200.0, 200.0, Color::WHITE);
+    let base_id = base.id;
+    base.reactions.push(click(
+        2,
+        Trigger::Click,
+        Action::OpenOverlay {
+            frame: overlay_id,
+            overlay: OverlaySettings {
+                position: OverlayPosition::Center,
+                background_dim: false,
+                close_on_click_outside: false,
+            },
+        },
+    ));
+    doc.apply(Operation::create_node(base)).unwrap();
+
+    let mut session = PresentSession::new(&doc, Some(base_id), DVec2::splat(200.0)).unwrap();
+    session.handle_pointer(DVec2::new(100.0, 100.0), PointerEvent::Click);
+    assert_eq!(session.overlays.len(), 1, "overlay opened");
+    let base_camera = session.camera;
+
+    session.handle_pointer(DVec2::new(100.0, 100.0), PointerEvent::Click);
+
+    assert_eq!(
+        session.camera.center, base_camera.center,
+        "a ScrollTo fired in an overlay must not move the base frame's camera"
+    );
+}
+
+#[test]
+fn navigating_or_opening_an_overlay_to_a_missing_frame_reports_a_diagnostic() {
+    let missing = CanvasNode::new(NodeData::Group(GroupNode::default())).id;
+    for action in [
+        Action::Navigate { to: missing },
+        Action::OpenOverlay {
+            frame: missing,
+            overlay: OverlaySettings {
+                position: OverlayPosition::Center,
+                background_dim: false,
+                close_on_click_outside: false,
+            },
+        },
+    ] {
+        let mut doc = Doc::new();
+        let mut a = frame(0.0);
+        let a_id = a.id;
+        a.reactions.push(click(1, Trigger::Click, action.clone()));
+        doc.apply(Operation::create_node(a)).unwrap();
+        let mut session = PresentSession::new(&doc, Some(a_id), DVec2::splat(200.0)).unwrap();
+        session.take_playback_events();
+
+        session.handle_pointer(DVec2::new(100.0, 100.0), PointerEvent::Click);
+
+        assert_eq!(session.current_frame(), a_id);
+        assert!(
+            session.take_playback_events().iter().any(|event| matches!(
+                event,
+                PlaybackEvent::Diagnostic { diagnostic } if diagnostic.code == "targetMissing"
+            )),
+            "{action:?} to a deleted frame must report why nothing happened"
+        );
+    }
 }

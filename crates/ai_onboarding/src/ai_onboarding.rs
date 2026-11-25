@@ -2,19 +2,17 @@ mod agent_api_keys_onboarding;
 mod agent_panel_onboarding_card;
 mod agent_panel_onboarding_content;
 mod edit_prediction_onboarding_content;
-mod plan_definitions;
 
 pub use agent_api_keys_onboarding::{ApiKeysWithProviders, ApiKeysWithoutProviders};
 pub use agent_panel_onboarding_card::AgentPanelOnboardingCard;
 pub use agent_panel_onboarding_content::AgentPanelOnboarding;
 use cloud_api_types::Plan;
 pub use edit_prediction_onboarding_content::EditPredictionOnboarding;
-pub use plan_definitions::PlanDefinitions;
 
 use std::sync::Arc;
 
 use client::{Client, UserStore};
-use gpui::{AnyElement, Entity, IntoElement, ParentElement, TaskExt};
+use gpui::{AnyElement, Entity, IntoElement, ParentElement};
 use ui::{RegisterComponent, Tooltip, prelude::*};
 
 #[derive(PartialEq)]
@@ -28,7 +26,7 @@ impl From<client::Status> for SignInStatus {
     fn from(status: client::Status) -> Self {
         if status.is_signing_in() {
             Self::SigningIn
-        } else if status.is_signed_out() {
+        } else if status.is_signed_out() || matches!(status, client::Status::AuthenticationError) {
             Self::SignedOut
         } else {
             Self::SignedIn
@@ -39,6 +37,7 @@ impl From<client::Status> for SignInStatus {
 #[derive(RegisterComponent, IntoElement)]
 pub struct FantaAiOnboarding {
     pub sign_in_status: SignInStatus,
+    pub can_cancel_sign_in: bool,
     pub plan: Option<Plan>,
     pub account_too_young: bool,
     pub continue_with_fanta_ai: Arc<dyn Fn(&mut Window, &mut App)>,
@@ -58,15 +57,18 @@ impl FantaAiOnboarding {
 
         Self {
             sign_in_status: status.into(),
+            can_cancel_sign_in: client.is_waiting_for_browser(),
             plan: store.plan(),
             account_too_young: store.account_too_young(),
             continue_with_fanta_ai,
+            // While the browser sign-in is pending, the same button cancels it.
             sign_in: Arc::new(move |_window, cx| {
-                cx.spawn({
+                if client.is_waiting_for_browser() {
                     let client = client.clone();
-                    async move |cx| client.sign_in_with_optional_connect(true, cx).await
-                })
-                .detach_and_log_err(cx);
+                    cx.spawn(async move |cx| client.cancel_sign_in(cx)).detach();
+                } else {
+                    client.sign_in_and_report(true, cx);
+                }
             }),
             dismiss_onboarding: None,
         }
@@ -112,7 +114,11 @@ impl FantaAiOnboarding {
             SignInStatus::SigningIn => (
                 "Connect your Fanta account",
                 "Finish signing in in your browser to return to your design.",
-                "Signing in…",
+                if self.can_cancel_sign_in {
+                    "Cancel sign-in"
+                } else {
+                    "Signing in…"
+                },
                 self.sign_in.clone(),
             ),
             SignInStatus::SignedIn => (
@@ -132,7 +138,9 @@ impl FantaAiOnboarding {
                 Button::new("connect-fanta-account", button_label)
                     .full_width()
                     .style(ButtonStyle::Filled)
-                    .disabled(self.sign_in_status == SignInStatus::SigningIn)
+                    .disabled(
+                        self.sign_in_status == SignInStatus::SigningIn && !self.can_cancel_sign_in,
+                    )
                     .on_click(move |_, window, cx| callback(window, cx)),
             )
             .children(self.render_dismiss_button())
@@ -168,6 +176,7 @@ impl Component for FantaAiOnboarding {
                 AgentPanelOnboardingCard::new().child(
                     FantaAiOnboarding {
                         sign_in_status: SignInStatus::SignedOut,
+                        can_cancel_sign_in: false,
                         plan: None,
                         account_too_young: false,
                         continue_with_fanta_ai: Arc::new(|_, _| {}),
@@ -178,5 +187,17 @@ impl Component for FantaAiOnboarding {
                 ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_sign_in_is_shown_as_signed_out() {
+        assert!(SignInStatus::from(client::Status::AuthenticationError) == SignInStatus::SignedOut);
+        assert!(SignInStatus::from(client::Status::Authenticated) == SignInStatus::SignedIn);
+        assert!(SignInStatus::from(client::Status::Authenticating) == SignInStatus::SigningIn);
     }
 }

@@ -1101,24 +1101,26 @@ impl FigDocument {
         } else {
             old_active_page
         };
-        let snapshot = self
+        let snapshot: Vec<_> = self
             .doc
             .scene
             .descendants_of(root)
             .filter_map(|id| self.doc.scene.get(id).cloned())
             .collect();
-        self.apply_page_transaction(
-            "Delete Page",
-            vec![
-                Operation::SetPageRegistry {
-                    old_pages,
-                    new_pages,
-                    old_active_page,
-                    new_active_page,
-                },
-                Operation::DeleteSubtree { snapshot },
-            ],
-        )?;
+        let deleted = snapshot.iter().map(|node| node.id).collect();
+        let mut operations = vec![
+            Operation::SetPageRegistry {
+                old_pages,
+                new_pages,
+                old_active_page,
+                new_active_page,
+            },
+            Operation::DeleteSubtree { snapshot },
+        ];
+        operations.extend(fanta_headless::clipboard::flow_cleanup_operations(
+            &self.doc, &deleted,
+        ));
+        self.apply_page_transaction("Delete Page", operations)?;
         Ok(Some(
             self.doc
                 .pages()
@@ -5569,6 +5571,57 @@ mod tests {
             let index = document.page_index_for_root(Some(master)).expect("master");
             assert_eq!(document.pages[index].name.as_ref(), "Renamed component");
         });
+    }
+
+    #[test]
+    fn deleting_the_page_that_holds_the_flow_start_keeps_the_document_exportable() -> Result<()> {
+        use fanta_doc::{CanvasNode, GroupNode, NodeData};
+        let (mut doc, first, _, _) = doc_with_page_and_component();
+        let mut second = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        second.name = "Page 2".to_owned();
+        let second_root = second.id;
+        doc.apply(Operation::create_node(second))?;
+        doc.add_page(second_root);
+        let mut start = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([100.0, 100.0]),
+            ..GroupNode::default()
+        }));
+        start.parent = Some(second_root);
+        let start_id = start.id;
+        doc.apply(Operation::create_node(start))?;
+        doc.flow_start = Some(start_id);
+        doc.flows = vec![fanta_doc::Flow {
+            name: "Onboarding".into(),
+            start: start_id,
+        }];
+        doc.set_active_page(Some(first));
+        doc.history = Default::default();
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        let index = document
+            .doc
+            .pages()
+            .iter()
+            .position(|page| *page == second_root)
+            .expect("second page");
+
+        assert!(document.delete_page(index)?.is_some());
+
+        assert_eq!(document.doc.flow_start, None);
+        assert!(document.doc.flows.is_empty());
+        assert!(
+            fanta_format::runtime::RuntimeProgram::from_document(
+                document.doc.clone(),
+                BTreeMap::new(),
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .is_ok(),
+            "the export accepts the document"
+        );
+        assert!(document.doc.undo()?);
+        assert_eq!(document.doc.flow_start, Some(start_id));
+        assert_eq!(document.doc.flows.len(), 1);
+        Ok(())
     }
 
     #[test]

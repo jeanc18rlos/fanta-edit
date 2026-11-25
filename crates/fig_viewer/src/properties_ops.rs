@@ -6,9 +6,9 @@
 
 use fanta_canvas::transform_angle;
 use fanta_doc::{
-    BlendMode, Blur, BlurKind, Bounds as FantaBounds, Color as FantaColor, ComponentPropId, Doc,
-    Fill, Gradient, GroupNode, LayoutMode, NodeData, NodeId, Operation, Shadow, Transform2D,
-    UnitInterval, VarValue,
+    BlendMode, Blur, BlurKind, BoundProp, Bounds as FantaBounds, Color as FantaColor,
+    ComponentPropId, Doc, Fill, Gradient, GroupNode, LayoutMode, NodeData, NodeId, Operation,
+    Shadow, Transform2D, UnitInterval, VarValue,
 };
 use glam::DVec2;
 use gpui::Rgba;
@@ -881,6 +881,20 @@ pub(crate) fn restore_snapshot(doc: &mut Doc, snapshot: &NodeSnapshot) {
         doc.components
             .bump_preview_for_node(&doc.scene, snapshot.id);
     }
+    for (child_id, transform) in &snapshot.children {
+        if let Some(child) = doc.scene.get_mut(*child_id) {
+            child.transform = *transform;
+        }
+    }
+}
+
+/// The transforms of `id`'s direct children, for [`NodeSnapshot::children`].
+pub(crate) fn child_transforms(scene: &fanta_doc::Scene, id: NodeId) -> Vec<(NodeId, Transform2D)> {
+    scene
+        .children_of(Some(id))
+        .iter()
+        .filter_map(|child_id| Some((*child_id, scene.get(*child_id)?.transform)))
+        .collect()
 }
 
 /// Write an operation's `new` value straight into the scene WITHOUT history —
@@ -1129,6 +1143,93 @@ pub(crate) fn add_fill(data: &mut NodeData) {
     }
 }
 
+/// `paint_edit`, a change to `id`'s fills or strokes, preceded by the
+/// bind/unbind operations that keep each variable binding on its paint:
+/// `new_index` maps an old paint index to its new one, `None` for a removed
+/// paint. Nothing when the paint edit changes nothing.
+pub(crate) fn with_paint_bindings_remapped(
+    doc: &Doc,
+    id: NodeId,
+    is_stroke: bool,
+    new_index: impl Fn(usize) -> Option<usize>,
+    paint_edit: Vec<Operation>,
+) -> Vec<Operation> {
+    let Some(node) = doc.scene.get(id).filter(|_| !paint_edit.is_empty()) else {
+        return paint_edit;
+    };
+    let reindex = |prop: BoundProp| -> Option<Option<BoundProp>> {
+        let moved =
+            |index: u16| new_index(usize::from(index)).and_then(|index| u16::try_from(index).ok());
+        Some(match (prop, is_stroke) {
+            (BoundProp::FillColor { index }, false) => {
+                moved(index).map(|index| BoundProp::FillColor { index })
+            }
+            (BoundProp::ImageFill { index }, false) => {
+                moved(index).map(|index| BoundProp::ImageFill { index })
+            }
+            (BoundProp::StrokeColor { index }, true) => {
+                moved(index).map(|index| BoundProp::StrokeColor { index })
+            }
+            (BoundProp::StrokeWidth { index }, true) => {
+                moved(index).map(|index| BoundProp::StrokeWidth { index })
+            }
+            _ => return None,
+        })
+    };
+    let kept: std::collections::BTreeMap<BoundProp, _> = node
+        .bindings
+        .iter()
+        .filter_map(|(prop, variable)| Some((reindex(*prop)??, *variable)))
+        .collect();
+    let dropped = node
+        .bindings
+        .iter()
+        .filter(|(prop, _)| reindex(**prop).is_some() && !kept.contains_key(*prop));
+    // The paint goes away or moves, so nothing is baked onto the node.
+    let unbind = dropped.map(|(prop, variable)| Operation::UnbindProperty {
+        node: id,
+        prop: *prop,
+        variable: *variable,
+        old_data: Box::new(node.data.clone()),
+        new_data: Box::new(node.data.clone()),
+        old_opacity: node.opacity,
+        new_opacity: node.opacity,
+        old_flags: node.flags,
+        new_flags: node.flags,
+    });
+    let bind = kept
+        .iter()
+        .map(|(prop, variable)| (*prop, *variable))
+        .filter(|(prop, variable)| node.bindings.get(prop) != Some(variable))
+        .map(|(prop, variable)| Operation::BindProperty {
+            node: id,
+            prop,
+            old: node.bindings.get(&prop).copied(),
+            new: variable,
+        });
+    unbind.chain(bind).chain(paint_edit).collect()
+}
+
+/// Where each paint lands after `list.remove(from)` then `list.insert(to, _)`.
+pub(crate) fn moved_paint_index(from: usize, to: usize) -> impl Fn(usize) -> Option<usize> {
+    move |index| {
+        if index == from {
+            return Some(to);
+        }
+        let index = if index > from { index - 1 } else { index };
+        Some(if index >= to { index + 1 } else { index })
+    }
+}
+
+/// Where each paint lands after `list.remove(removed)`.
+pub(crate) fn removed_paint_index(removed: usize) -> impl Fn(usize) -> Option<usize> {
+    move |index| match index.cmp(&removed) {
+        std::cmp::Ordering::Less => Some(index),
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => Some(index - 1),
+    }
+}
+
 /// Figma's default blur radius for a freshly added layer / background blur.
 pub(crate) fn default_blur(kind: BlurKind) -> Blur {
     Blur { kind, radius: 4.0 }
@@ -1143,6 +1244,12 @@ pub(crate) fn format_number(value: f64) -> String {
         return "0".to_string();
     }
     let rounded = (value * 100.0).round() / 100.0;
+    if !rounded.is_finite() {
+        // Scaling by 100 overflowed; a value this large has no hundredths to round.
+        return format!("{value}");
+    }
+    // Adding zero turns -0.0 into 0.0, so a tiny negative never prints "-0".
+    let rounded = rounded + 0.0;
     if rounded.fract() == 0.0 {
         format!("{rounded:.0}")
     } else {
@@ -1151,8 +1258,22 @@ pub(crate) fn format_number(value: f64) -> String {
 }
 
 pub(crate) fn parse_number(text: &str) -> Option<f64> {
-    let cleaned = text.trim().trim_end_matches("px").trim();
-    cleaned
+    let cleaned = text
+        .trim()
+        .trim_end_matches("px")
+        .trim()
+        .replace('\u{2212}', "-");
+    // A single comma is a decimal comma. Several commas, or exactly three
+    // digits after one ("1,000"), look like thousands separators and stay
+    // rejected rather than guessed.
+    let decimal_comma = cleaned
+        .split_once(',')
+        .filter(|(_, fraction)| {
+            !cleaned.contains('.') && !fraction.contains(',') && fraction.len() != 3
+        })
+        .map(|(whole, fraction)| format!("{whole}.{fraction}"));
+    decimal_comma
+        .unwrap_or(cleaned)
         .parse::<f64>()
         .ok()
         .filter(|value| value.is_finite())
@@ -1196,6 +1317,29 @@ mod tests {
         HiddenPaintAlpha, opaque_paint_alpha, paint_alpha, paint_is_visible, set_paint_alpha,
         zeroed_paint_alpha,
     };
+
+    #[test]
+    fn format_number_round_trips_through_parse_number() {
+        assert_eq!(format_number(-0.001), "0");
+        assert_eq!(format_number(-1.25), "-1.25");
+        for value in [-0.001, 1e307, -1e307, 12.5] {
+            let text = format_number(value);
+            assert!(
+                parse_number(&text).is_some(),
+                "{value} formats as {text:?}, which parses back"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_number_accepts_a_decimal_comma_and_a_unicode_minus() {
+        assert_eq!(parse_number("1,5"), Some(1.5));
+        assert_eq!(parse_number("0,25px"), Some(0.25));
+        assert_eq!(parse_number("\u{2212}5px"), Some(-5.0));
+        assert_eq!(parse_number("1,000,000"), None);
+        assert_eq!(parse_number("1,200"), None);
+        assert_eq!(parse_number("1.5"), Some(1.5));
+    }
 
     #[test]
     fn font_weight_dropdown_labels_the_ladder_and_keeps_custom_weights() {
@@ -1852,6 +1996,7 @@ mod tests {
             data: Box::new(node.data.clone()),
             effects: node.effects.clone(),
             blurs: node.blurs.clone(),
+            children: Vec::new(),
         };
 
         let before = preview_rev(&doc);
@@ -1887,6 +2032,7 @@ mod tests {
             data: Box::new(node.data.clone()),
             effects: node.effects.clone(),
             blurs: node.blurs.clone(),
+            children: Vec::new(),
         };
 
         for operation in field_operations(&doc, &InspectorField::Width(id), "72") {
@@ -1994,6 +2140,7 @@ mod tests {
                 data: Box::new(node.data.clone()),
                 effects: node.effects.clone(),
                 blurs: node.blurs.clone(),
+                children: Vec::new(),
             }
         };
         for operation in

@@ -122,14 +122,14 @@ impl BrushTool {
             preview_points.push(latest);
         }
         let options = Self::stroke_options(ctx);
-        let outline = get_stroke(&preview_points, &options);
+        let outline = screen_scaled_stroke(&preview_points, &options, ctx);
         if !outline.is_empty() {
             let color = Self::stroke_color(ctx);
             let softness_radius = Self::softness_radius(ctx);
             if softness_radius > 0.0 {
                 let mut halo_options = options;
                 halo_options.size = (halo_options.size + softness_radius * 2.0).min(5000.0);
-                let halo = get_stroke(&preview_points, &halo_options);
+                let halo = screen_scaled_stroke(&preview_points, &halo_options, ctx);
                 if !halo.is_empty() {
                     response.overlays.push(ToolOverlay::PreviewBrushStroke {
                         world_outline: halo,
@@ -159,7 +159,7 @@ impl BrushTool {
             return;
         };
         let first = first.pt;
-        let outline = get_stroke(&self.points, &Self::stroke_options(ctx));
+        let outline = screen_scaled_stroke(&self.points, &Self::stroke_options(ctx), ctx);
         let Some(start) = outline.first() else {
             return;
         };
@@ -197,6 +197,34 @@ impl BrushTool {
             ctx.doc.selection.select_only(id);
         }
     }
+}
+
+/// Ink's fixed tolerances (the end-of-stroke cutoff, the single-tap offset) are
+/// pixels, so run it at screen scale and map the outline back to world units:
+/// otherwise a short stroke drawn zoomed in collapses to a dot at its end.
+fn screen_scaled_stroke(
+    points: &[InkPoint],
+    options: &StrokeOptions,
+    ctx: &ToolContext,
+) -> Vec<[f64; 2]> {
+    let zoom = ctx.viewport.zoom.max(f64::EPSILON);
+    let screen_points: Vec<InkPoint> = points
+        .iter()
+        .map(|point| InkPoint {
+            pt: point.pt * zoom,
+            ..*point
+        })
+        .collect();
+    let screen_options = StrokeOptions {
+        size: options.size * zoom,
+        taper_start: options.taper_start * zoom,
+        taper_end: options.taper_end * zoom,
+        ..*options
+    };
+    get_stroke(&screen_points, &screen_options)
+        .into_iter()
+        .map(|[x, y]| [x / zoom, y / zoom])
+        .collect()
 }
 
 impl Tool for BrushTool {
@@ -329,6 +357,44 @@ mod tests {
         assert_eq!(doc.scene.len(), 2);
         assert!(doc.redo().expect("redo ink mark"));
         assert_eq!(doc.scene.len(), 3);
+    }
+
+    #[test]
+    fn short_stroke_drawn_zoomed_in_keeps_its_length() {
+        let mut doc = Doc::new();
+        let mut viewport = Viewport {
+            zoom: 16.0,
+            ..Viewport::default()
+        };
+        let mut context = ToolContext::new(
+            &mut doc,
+            &mut viewport,
+            SnapEngine::default(),
+            DVec2::new(800.0, 600.0),
+        );
+        context.new_stroke_width = 2.0;
+        let mut brush = BrushTool::new();
+        brush.handle_event(&mut context, pointer([400.0, 300.0], "press"));
+        for step in 1..6 {
+            brush.handle_event(
+                &mut context,
+                pointer([400.0 + f64::from(step) * 4.0, 300.0], "move"),
+            );
+        }
+        brush.handle_event(&mut context, pointer([424.0, 300.0], "release"));
+        let node = doc
+            .scene
+            .get(*doc.scene.roots().last().expect("brush mark"))
+            .expect("brush node");
+        let NodeData::Vector(vector) = &node.data else {
+            panic!("brush mark must be a vector");
+        };
+        let bounds = vector.path.rough_bounds().expect("brush path bounds");
+        // 24 screen pixels at 1600% is 1.5 world units, plus the 2-unit tip.
+        assert!(
+            bounds.width() > 3.0,
+            "the stroke must not collapse to a dot at its end: {bounds:?}"
+        );
     }
 
     #[test]

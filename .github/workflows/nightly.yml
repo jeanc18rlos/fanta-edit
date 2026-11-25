@@ -27,7 +27,8 @@ jobs:
   mac-app-store:
     name: Mac App Store suite
     runs-on: macos-26
-    timeout-minutes: 90
+    # Builds cold (65 minutes on a normal night); a slow runner on 2026-11-24 was cut off at 90.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -93,13 +94,20 @@ jobs:
   # Advisory until the tree is clean (spec 0012 R19, T9): it never fails the run or opens the issue.
   custom-lints:
     name: Custom lints (advisory)
-    runs-on: ubuntu-22.04
+    # Checking the app builds Skia, which needs Ubuntu 24.04: see `linux-test` in check.yml.
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     continue-on-error: true
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+
+      # As in `linux-test`: the Skia build and a cold check of the app need the room.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - name: Install Linux dependencies
         run: ./script/linux
@@ -110,7 +118,13 @@ jobs:
           lint_toolchain="$(awk -F'"' '/^channel/ {print $2}' tooling/lints/rust-toolchain.toml)"
           rustup toolchain install "$lint_toolchain" --profile minimal \
             --component llvm-tools-preview --component rustc-dev --component rust-src
-          cargo install --locked cargo-dylint@6.4.0 dylint-link@6.4.0
+          # cargo-dylint 6.4.0 needs rustc 1.98, newer than the repository's toolchain.
+          rustup toolchain install 1.98.0 --profile minimal
+          cargo +1.98.0 install --locked cargo-dylint@6.4.0 dylint-link@6.4.0
+
+      - uses: $/.github/actions/prepare-skia-source
+        with:
+          offline: 'true'
 
       - name: Run the lints of tooling/lints on Fanta's GPUI crates
         run: cargo dylint --all -- --locked -p fig_viewer -p fanta_ui -p design_surface -p fanta

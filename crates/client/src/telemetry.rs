@@ -1054,7 +1054,11 @@ mod tests {
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            let settings_store = SettingsStore::test(cx);
+            let mut settings_store = SettingsStore::test(cx);
+            // Fanta ships with usage telemetry off; these tests cover the opted-in path.
+            settings_store.update_user_settings(cx, |content| {
+                content.telemetry.get_or_insert_default().metrics = Some(true);
+            });
             cx.set_global(settings_store);
         });
     }
