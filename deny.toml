@@ -20,6 +20,8 @@ ignore = [
     { id = "RUSTSEC-2026-0368", reason = "zip 2.4.2: extract creates symlinks that point outside the destination; extract is not called. Removed by zip >= 9." },
     { id = "RUSTSEC-2026-0369", reason = "zip 2.4.2: extract applies permissions through symlinks; extract is not called. Removed by zip >= 9." },
     { id = "RUSTSEC-2026-0429", reason = "zip 2.4.2: extract aborts on a symlink entry with a huge declared size; extract is not called. Removed by zip >= 9." },
+    { id = "RUSTSEC-2026-0545", reason = "zip 2.4.2: a truncated AES entry is accepted without its authentication code. Only by_name_decrypt and by_index_decrypt decrypt, and neither is called; by_name and by_index refuse an encrypted entry. Removed by zip >= 9." },
+    { id = "RUSTSEC-2026-0548", reason = "zip 2.4.2: ZipStreamReader and read_zipfile_from_stream take entry names from local headers; neither is called, entries are opened through ZipArchive. Removed by zip >= 9.0.5." },
     { id = "RUSTSEC-2026-0403", reason = "zstd-safe 5.0.2: write::Decoder exposes memory after a corrupt legacy frame. The .fig reader uses read::Decoder and the other callers decode_all or copy_decode, which are unaffected. Removed by moving the workspace zstd from 0.11 to >= 0.13.4 (agent, crashes, fanta-fig-interop, rpc); the 0.13 line through zip is already patched." },
 
     # Inherited from Zed; needs local files or a peer that Fanta does not have.
