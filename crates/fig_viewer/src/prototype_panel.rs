@@ -738,6 +738,21 @@ impl FantaPrototypePanel {
         self.focus_handle.focus(window, cx);
     }
 
+    // The app's keymap turns Escape in an editor into this action, and bound actions run
+    // before raw key listeners, so `handle_key_down` alone never sees that Escape.
+    fn handle_editor_cancel(
+        &mut self,
+        _: &editor::actions::Cancel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing_parameter.is_some() {
+            self.cancel_parameter_edit(window, cx);
+        } else {
+            cx.propagate();
+        }
+    }
+
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -2438,6 +2453,7 @@ impl FantaPrototypePanel {
         self.ensure_parameter_editor(window, cx);
         let mut root = v_flex()
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::handle_editor_cancel))
             .on_key_down(cx.listener(Self::handle_key_down))
             .size_full()
             .bg(cx.theme().colors().panel_background);
@@ -3888,6 +3904,23 @@ mod tests {
 
         start_delay_edit(&panel, first, reaction, "1500", visual);
         visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        assert!(panel.read_with(visual, |panel, _| panel.editing_parameter.is_none()));
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                reaction_by_id(doc, first, reaction)
+                    .expect("interaction")
+                    .trigger,
+                Trigger::AfterDelay { delay_ms: 900 }
+            );
+        });
+
+        // The app's keymap turns Escape in an editor into this action, which runs before key listeners.
+        start_delay_edit(&panel, first, reaction, "1500", visual);
+        visual.update(|window, cx| {
+            window.dispatch_action(Box::new(editor::actions::Cancel), cx);
+        });
         visual.run_until_parked();
         assert!(panel.read_with(visual, |panel, _| panel.editing_parameter.is_none()));
         item.read_with(visual, |item, _| {
@@ -5627,6 +5660,7 @@ impl FantaPrototypePanel {
         }
         v_flex()
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::handle_editor_cancel))
             .on_key_down(cx.listener(Self::handle_key_down))
             .size_full()
             .min_h_0()
