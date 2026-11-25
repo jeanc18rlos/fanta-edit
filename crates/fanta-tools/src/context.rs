@@ -194,6 +194,21 @@ impl<'a> ToolContext<'a> {
             .snap_point_with(&self.collect_snap_candidates(exclude), world)
     }
 
+    /// Snap `world` against the scene and the extra `points`, such as the
+    /// anchors of a path being drawn.
+    pub fn snap_point_with_points(
+        &self,
+        world: DVec2,
+        exclude: &[NodeId],
+        points: &[DVec2],
+    ) -> fanta_canvas::SnapResult {
+        let mut candidates = self.collect_snap_candidates(exclude);
+        for &point in points {
+            candidates.push_point(point);
+        }
+        self.snap.snap_point_with(&candidates, world)
+    }
+
     pub fn hit_test(&self, world_point: DVec2, precision: HitPrecision) -> Option<NodeId> {
         self.hit_test_in_scope(world_point, precision, self.scope())
     }

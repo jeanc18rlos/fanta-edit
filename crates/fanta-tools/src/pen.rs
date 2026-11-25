@@ -5,7 +5,8 @@
 //! - **Click** places an anchor. **Click-drag** sets that anchor's tangent
 //!   handles (symmetric: dragging out one side mirrors the other), turning the
 //!   adjoining segments into cubic curves — the standard pen gesture.
-//! - **Click near the first anchor** closes the path and commits.
+//! - **Click within 10 screen pixels of the first anchor** closes the path and
+//!   commits. The draft's anchors are alignment snap targets.
 //! - **Enter** commits the current (open) path. **Escape** aborts the in-flight
 //!   path (a second Escape, with no path, exits to Select).
 //! - **Delete/Backspace** removes the last placed anchor.
@@ -28,8 +29,8 @@ use smallvec::SmallVec;
 
 /// Stroke width baked into a committed open path (matches the line tool).
 const PEN_STROKE_WIDTH: f64 = 2.0;
-/// World-distance below which a click on the first anchor counts as "close".
-const CLOSE_DIST: f64 = 8.0;
+/// Screen distance within which a press on the first anchor closes the path.
+const CLOSE_PX: f64 = 10.0;
 
 /// One placed anchor: a position plus optional in/out tangent handles, stored as
 /// world-space DELTAS from the anchor (so they transform with the node later).
@@ -107,21 +108,15 @@ impl PenTool {
                 button: Button::Primary,
                 ..
             } => {
-                let world = ctx.screen_to_world(DVec2::from(screen));
-                let snap = ctx.snap_point(world, &[]);
-                let pos = snap.world;
-                self.cursor = pos;
-
-                // Click on the first anchor (with at least a triangle of points)
-                // closes the path and commits.
-                if self.anchors.len() >= 2 {
-                    if let Some(first) = self.anchors.first() {
-                        if (first.pos - pos).length() <= CLOSE_DIST {
-                            self.commit(ctx, true);
-                            return ToolResponse::cursor(CursorHint::Crosshair);
-                        }
-                    }
+                let screen = DVec2::from(screen);
+                // Raw pointer, so snapping cannot pull a press off the first anchor.
+                if self.within_close_distance(ctx, screen) {
+                    self.commit(ctx, true);
+                    return ToolResponse::cursor(CursorHint::Crosshair);
                 }
+                let world = ctx.screen_to_world(screen);
+                let pos = self.snap(ctx, world);
+                self.cursor = pos;
 
                 // Starting a fresh path clears any prior selection so a stray
                 // Backspace can't delete an unrelated node mid-draw.
@@ -183,6 +178,20 @@ impl PenTool {
             }
             _ => ToolResponse::empty(),
         }
+    }
+
+    fn within_close_distance(&self, ctx: &ToolContext, screen: DVec2) -> bool {
+        self.anchors.len() >= 2
+            && self
+                .anchors
+                .first()
+                .is_some_and(|first| ctx.world_to_screen(first.pos).distance(screen) <= CLOSE_PX)
+    }
+
+    /// Snap against the scene and the draft's own anchors.
+    fn snap(&self, ctx: &ToolContext, world: DVec2) -> DVec2 {
+        let points: SmallVec<[DVec2; 16]> = self.anchors.iter().map(|anchor| anchor.pos).collect();
+        ctx.snap_point_with_points(world, &[], &points).world
     }
 
     /// Build straight-segment preview overlays between anchors plus a rubber-band
@@ -471,6 +480,105 @@ mod tests {
         click(&mut tool, &mut ctx, [400.0, 300.0]);
         tool.handle_event(&mut ctx, key(LogicalKey::Enter));
         assert_eq!(doc.scene.len(), 0);
+    }
+
+    fn pieces_at_zoom(
+        zoom: f64,
+        targets: fanta_canvas::SnapTargets,
+    ) -> (Doc, Viewport, SnapEngine, DVec2) {
+        let (doc, _, mut snap, size) = ctx_pieces();
+        snap.zoom = zoom;
+        snap.targets = targets;
+        (
+            doc,
+            Viewport {
+                center: [0.0, 0.0],
+                zoom,
+            },
+            snap,
+            size,
+        )
+    }
+
+    fn draft_triangle(tool: &mut PenTool, ctx: &mut ToolContext) {
+        click(tool, ctx, [400.0, 300.0]);
+        click(tool, ctx, [600.0, 300.0]);
+        click(tool, ctx, [600.0, 500.0]);
+    }
+
+    /// A1: a press 9 screen pixels from the first anchor closes the path at
+    /// every zoom, and a press 12 pixels away places another anchor.
+    #[test]
+    fn a1_close_distance_is_ten_screen_pixels_at_every_zoom() {
+        for zoom in [0.25, 1.0, 8.0] {
+            let (mut doc, mut viewport, snap, size) =
+                pieces_at_zoom(zoom, fanta_canvas::SnapTargets::empty());
+            let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap.clone(), size);
+            let mut tool = PenTool::new();
+            draft_triangle(&mut tool, &mut ctx);
+            click(&mut tool, &mut ctx, [412.0, 300.0]);
+            assert_eq!(
+                tool.anchor_count(),
+                4,
+                "12 px does not close at zoom {zoom}"
+            );
+            assert_eq!(ctx.doc.scene.len(), 0);
+
+            let (mut doc, mut viewport, snap, size) =
+                pieces_at_zoom(zoom, fanta_canvas::SnapTargets::empty());
+            let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+            let mut tool = PenTool::new();
+            draft_triangle(&mut tool, &mut ctx);
+            click(&mut tool, &mut ctx, [409.0, 300.0]);
+            assert!(!tool.is_drafting(), "9 px closes at zoom {zoom}");
+            let id = ctx.doc.scene.roots()[0];
+            match &ctx.doc.scene.get(id).map(|node| &node.data) {
+                Some(NodeData::Vector(v)) => {
+                    assert!(matches!(v.path.segments.last(), Some(PathSegment::Close)));
+                }
+                _ => panic!("expected a closed vector at zoom {zoom}"),
+            }
+        }
+    }
+
+    /// A2: the first anchor wins over a grid line that is closer to the press.
+    #[test]
+    fn a2_first_anchor_wins_over_closer_grid_snap() {
+        let (mut doc, mut viewport, mut snap, size) =
+            pieces_at_zoom(1.0, fanta_canvas::SnapTargets::GRID);
+        snap.grid = fanta_canvas::SnapGrid {
+            spacing: 100.0,
+            origin: [9.0, 9.0],
+        };
+        let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+        let mut tool = PenTool::new();
+        draft_triangle(&mut tool, &mut ctx);
+        // World (6, 0): the grid line x = 9 is 3 px away, the first anchor 6 px.
+        click(&mut tool, &mut ctx, [406.0, 300.0]);
+        assert!(!tool.is_drafting(), "the press closes the path");
+        assert_eq!(ctx.doc.scene.len(), 1);
+    }
+
+    /// R2: the draft's other anchors align the next anchor without closing.
+    #[test]
+    fn draft_anchors_are_alignment_candidates() {
+        let (mut doc, mut viewport, snap, size) =
+            pieces_at_zoom(1.0, fanta_canvas::SnapTargets::empty());
+        let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+        let mut tool = PenTool::new();
+        draft_triangle(&mut tool, &mut ctx);
+        // 4 px right of the first anchor's x, far below it: x aligns to it.
+        click(&mut tool, &mut ctx, [404.0, 450.0]);
+        tool.handle_event(&mut ctx, key(LogicalKey::Enter));
+        let id = ctx.doc.scene.roots()[0];
+        let node = ctx.doc.scene.get(id).expect("committed node");
+        match &node.data {
+            NodeData::Vector(v) => match v.path.segments.last() {
+                Some(PathSegment::Line { to }) => assert!(to[0].abs() < 1e-9, "x = {}", to[0]),
+                other => panic!("expected a line, got {other:?}"),
+            },
+            _ => panic!("expected vector"),
+        }
     }
 
     #[test]
