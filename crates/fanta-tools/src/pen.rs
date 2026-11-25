@@ -128,6 +128,7 @@ impl Tool for PenTool {
     fn undo_draft(&mut self) -> Option<ToolResponse> {
         self.anchors.pop()?;
         self.dragging = false;
+        self.closing &= self.anchors.len() >= 2;
         Some(self.preview())
     }
 
@@ -264,7 +265,8 @@ impl PenTool {
     /// The draft's curves, the segment a press would add, its anchors, the
     /// last anchor's handles and, inside the close distance, the close ring.
     fn preview(&self) -> ToolResponse {
-        let closing = self.closing && !self.dragging && self.close_has_area();
+        let closing =
+            self.closing && !self.dragging && self.anchors.len() >= 2 && self.close_has_area();
         let mut response = ToolResponse::cursor(if closing {
             CursorHint::Pointer
         } else {
@@ -886,6 +888,32 @@ mod tests {
             Some(PathSegment::Close)
         ));
         assert_eq!(vector.fills.len(), 1);
+    }
+
+    /// Undo down to one anchor while the pointer rests on it clears the close
+    /// ring, cursor and fill: one anchor has nothing to close.
+    #[test]
+    fn undo_to_one_anchor_clears_the_close_preview() {
+        let (mut doc, mut viewport, snap, size) = ctx_pieces();
+        let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+        let mut tool = PenTool::new();
+        tool.handle_event(&mut ctx, press([400.0, 300.0]));
+        tool.handle_event(&mut ctx, mv([400.0, 360.0]));
+        tool.handle_event(&mut ctx, release([400.0, 360.0]));
+        click(&mut tool, &mut ctx, [500.0, 300.0]);
+        let hover = tool.handle_event(&mut ctx, mv([402.0, 300.0]));
+        assert_eq!(
+            hover.cursor,
+            Some(CursorHint::Pointer),
+            "the lens can close"
+        );
+        let response = tool.undo_draft().expect("an anchor to undo");
+        assert_eq!(tool.anchor_count(), 1);
+        assert_eq!(response.cursor, Some(CursorHint::Crosshair));
+        assert!(!response.overlays.iter().any(|overlay| matches!(
+            overlay,
+            ToolOverlay::PenCloseTarget { .. } | ToolOverlay::PreviewPath { filled: true, .. }
+        )));
     }
 
     #[test]
