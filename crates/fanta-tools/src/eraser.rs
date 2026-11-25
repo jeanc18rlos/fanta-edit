@@ -4,7 +4,7 @@ use crate::tool::{CursorHint, Tool, ToolResponse};
 use fanta_canvas::{BEZIER_FLATTEN_STEPS, hit_test::on_active_page};
 use fanta_doc::{
     BooleanNode, BooleanOp, Bounds, CanvasNode, NodeData, NodeFlags, NodeId, Operation, PathData,
-    PathSegment, Scene, SceneError, Transform2D,
+    PathSegment, Scene, SceneError, Scope, Transform2D,
 };
 use glam::DVec2;
 use std::collections::HashMap;
@@ -51,7 +51,7 @@ impl EraserTool {
             scope.is_none_or(|root| id != root && on_active_page(&ctx.doc.scene, id, root))
         });
         for id in candidates {
-            if !editable_mark(&ctx.doc.scene, id) {
+            if !editable_mark(&ctx.doc.scene, id) || !ctx.allows(id, Scope::ShapeChange) {
                 continue;
             }
             if !mark_intersects_sweep(&ctx.doc.scene, id, start, end, radius) {
@@ -671,6 +671,52 @@ mod tests {
             assert!(!painted_at(&ctx.doc.scene, wrapper, DVec2::new(x, 0.0)));
         }
         assert!(painted_at(&ctx.doc.scene, wrapper, DVec2::new(70.0, 0.0)));
+    }
+
+    #[test]
+    fn fill_mode_eraser_leaves_a_line_whose_shape_is_locked() {
+        let mut doc = Doc::new();
+        let mut path = PathData::new();
+        path.move_to(-60.0, 0.0).line_to(60.0, 0.0);
+        let line = CanvasNode::new(NodeData::Vector(VectorNode {
+            path,
+            strokes: [Stroke::solid(Color::BLACK, 12.0)].into_iter().collect(),
+            ..VectorNode::default()
+        }));
+        let line_id = line.id;
+        doc.apply(Operation::create_node(line))
+            .expect("create line");
+        doc.apply(Operation::SetEditingRules {
+            id: line_id,
+            old: None,
+            new: Some(Box::new(fanta_doc::EditingRules {
+                disabled_scopes: [fanta_doc::Scope::ShapeChange].into_iter().collect(),
+                placeholder: None,
+            })),
+        })
+        .expect("lock the line's shape");
+        let before = serde_json::to_value(&doc.scene).expect("scene before");
+        let mut viewport = Viewport::default();
+        let mut ctx = ToolContext::new(
+            &mut doc,
+            &mut viewport,
+            SnapEngine::default(),
+            DVec2::new(800.0, 600.0),
+        )
+        .with_template_fill(true);
+        ctx.new_stroke_width = 20.0;
+        let mut eraser = EraserTool::new();
+        eraser.handle_event(&mut ctx, pointer([400.0, 300.0], "press"));
+        eraser.handle_event(&mut ctx, pointer([400.0, 300.0], "release"));
+        assert_eq!(
+            serde_json::to_value(&ctx.doc.scene).expect("scene after"),
+            before
+        );
+
+        ctx.template_fill = false;
+        eraser.handle_event(&mut ctx, pointer([400.0, 300.0], "press"));
+        eraser.handle_event(&mut ctx, pointer([400.0, 300.0], "release"));
+        assert!(is_erased_mark(&ctx.doc.scene, ctx.doc.scene.roots()[0]));
     }
 
     #[test]

@@ -474,6 +474,9 @@ pub struct FigView {
     pub(crate) viewport: Option<Viewport>,
     pan_last_position: Option<Point<Pixels>>,
     primary_pressed: bool,
+    /// Where the primary gesture last reached the tool, so a release the
+    /// window never saw can end it there instead of at a later hover.
+    primary_drag_screen: Option<DVec2>,
     click_diagnostics: Option<ClickDiagnostics>,
     pub(crate) gesture_perf: Option<crate::gesture_perf::SharedGesturePerf>,
     /// A pointer button is down on the canvas, from the press until the
@@ -907,6 +910,7 @@ impl FigView {
             viewport: None,
             pan_last_position: None,
             primary_pressed: false,
+            primary_drag_screen: None,
             click_diagnostics: ClickDiagnostics::from_setting(
                 std::env::var_os("FANTA_INPUT_DIAGNOSTICS").as_deref(),
             ),
@@ -1370,6 +1374,8 @@ impl FigView {
             let (width, height) = bounds_size(bounds);
             DVec2::new(width, height)
         });
+        // Read-only events bypass the tool shell, so the tool can stay active.
+        let kind = self.tools.kind();
         let tools = &mut self.tools;
         let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
@@ -1380,8 +1386,8 @@ impl FigView {
                 }
                 if let (Some(viewport), Some(screen_size)) = (viewport.as_mut(), screen_size) {
                     let mut tool_context =
-                        tool_context(&mut document.doc, viewport, screen_size, ToolKind::Select);
-                    tools.cancel_and_activate(ToolKind::Select, &mut tool_context);
+                        tool_context(&mut document.doc, viewport, screen_size, kind);
+                    tools.cancel_and_activate(kind, &mut tool_context);
                 } else {
                     tools.activate_without_context(ToolKind::Select);
                 }
@@ -1395,7 +1401,7 @@ impl FigView {
             item.finish_content_preview(preview_owner, false, cx);
         });
         self.viewport = viewport;
-        self.remember_tool_face(ToolKind::Select);
+        self.remember_tool_face(self.tools.kind());
         self.invalidate_canvas_cache();
         cx.notify();
     }
@@ -1498,7 +1504,8 @@ impl FigView {
     fn cancel_tool_gesture_if_active(&mut self, cx: &mut Context<Self>) {
         // Select can be interrupted before its first preview. Reset that
         // press too, so the next hover cannot promote it into a drag.
-        let pending_selection = self.primary_pressed && self.tools.kind() == ToolKind::Select;
+        let kind = self.tools.kind();
+        let pending_selection = self.primary_pressed && kind == ToolKind::Select;
         if !pending_selection && !self.item.read(cx).content_preview_active() {
             return;
         }
@@ -1518,10 +1525,12 @@ impl FigView {
                             &mut document.doc,
                             viewport,
                             screen_size,
-                            ToolKind::Select,
+                            kind,
                         );
-                        tools.cancel_and_activate(ToolKind::Select, &mut tool_context);
+                        tools.cancel_and_activate(kind, &mut tool_context);
                     } else {
+                        // Without a context the tool cannot be rebuilt in
+                        // place, so fall back to a fresh Select tool.
                         tools.activate_without_context(ToolKind::Select);
                     }
                     let change = if document.doc.scene.revision() != revision_before {
@@ -1542,7 +1551,7 @@ impl FigView {
             self.end_gesture_perf("pointer_state_reset");
             self.primary_pressed = false;
             self.canvas_pointer_down = false;
-            self.remember_tool_face(ToolKind::Select);
+            self.remember_tool_face(self.tools.kind());
             self.invalidate_canvas_cache();
             cx.notify();
         }
@@ -3133,6 +3142,11 @@ impl FigView {
                         if let Some(region) = region {
                             this.wand_override = Some((target, region));
                             this.dispatch_tool_event(event, cx);
+                        } else {
+                            show_canvas_notice_deferred(
+                                "Magic Wand found no image pixels at that point.".into(),
+                                cx,
+                            );
                         }
                     }
                     Err(error) => {
@@ -4097,10 +4111,11 @@ impl FigView {
         let Some(button) = pointer_button(event.button) else {
             return "unsupported_button";
         };
+        let screen = screen_position_in_bounds(event.position, bounds);
         if button == ToolButton::Primary {
             self.primary_pressed = true;
+            self.primary_drag_screen = Some(screen);
         }
-        let screen = screen_position_in_bounds(event.position, bounds);
         self.dispatch_tool_event(
             press_event(screen, button, event.modifiers, event.click_count),
             cx,
@@ -4298,15 +4313,24 @@ impl FigView {
         let Some(bounds) = self.container_bounds else {
             return;
         };
-        if let Some(perf) = &self.gesture_perf {
-            let mut perf = perf.borrow_mut();
-            if event.pressed_button != Some(MouseButton::Left) {
-                perf.end("pointer_button_lost");
-            } else {
-                perf.pointer_move();
-            }
-        }
         let screen = screen_position_in_bounds(event.position, bounds);
+        if event.pressed_button != Some(MouseButton::Left) {
+            // Other tools finish where the drag last was: a brush or eraser
+            // following later hovers would paint or erase with no button down.
+            self.primary_pressed = false;
+            self.canvas_pointer_down = false;
+            let release_at = self.primary_drag_screen.take().unwrap_or(screen);
+            self.dispatch_tool_event(
+                release_event(release_at, ToolButton::Primary, event.modifiers),
+                cx,
+            );
+            self.end_gesture_perf("pointer_button_lost");
+            return;
+        }
+        if let Some(perf) = &self.gesture_perf {
+            perf.borrow_mut().pointer_move();
+        }
+        self.primary_drag_screen = Some(screen);
         self.dispatch_tool_event(move_event(screen, event.modifiers), cx);
     }
 
@@ -4671,6 +4695,7 @@ impl FigView {
             Ok(changed) => changed,
             Err(error) => {
                 log::error!("fig_viewer undo failed: {error:#}");
+                show_canvas_notice_deferred(format!("Could not undo: {error:#}"), cx);
                 false
             }
         });
@@ -4716,6 +4741,7 @@ impl FigView {
             Ok(changed) => changed,
             Err(error) => {
                 log::error!("fig_viewer redo failed: {error:#}");
+                show_canvas_notice_deferred(format!("Could not redo: {error:#}"), cx);
                 false
             }
         });
@@ -10288,6 +10314,7 @@ impl Item for FigView {
                 viewport,
                 pan_last_position: None,
                 primary_pressed: false,
+                primary_drag_screen: None,
                 click_diagnostics: ClickDiagnostics::from_setting(
                     std::env::var_os("FANTA_INPUT_DIAGNOSTICS").as_deref(),
                 ),
@@ -10906,7 +10933,9 @@ impl FigView {
                     self.set_editor_mode_from_action(EditorMode::Motion, window, cx)
                 }
                 ToolbarMode::Dev => self.set_editor_mode_from_action(EditorMode::Dev, window, cx),
-                ToolbarMode::Draw => self.set_editor_mode(EditorMode::Draw, cx),
+                ToolbarMode::Draw => {
+                    self.set_editor_mode_from_action(EditorMode::Draw, window, cx)
+                }
             },
             // The +/- steppers, the zoom menu's percent entries, typed
             // percentages, and the ZoomCanvasTo100 command action all arrive
@@ -10948,7 +10977,9 @@ impl FigView {
                 ToolbarCommand::OpenVariables => {
                     self.set_editor_workspace(EditorWorkspace::Variables, cx)
                 }
-                ToolbarCommand::OpenDrawMode => self.set_editor_mode(EditorMode::Draw, cx),
+                ToolbarCommand::OpenDrawMode => {
+                    self.set_editor_mode_from_action(EditorMode::Draw, window, cx)
+                }
                 ToolbarCommand::OpenDevMode => {
                     self.set_editor_mode_from_action(EditorMode::Dev, window, cx)
                 }
@@ -11024,7 +11055,8 @@ impl FigView {
                         };
                         self.run_path_action(action, None, window, cx);
                     }
-                    DrawToolbarAction::ApplyCrop if self.tools.kind() == ToolKind::Crop => {
+                    // A crop click that lands after the Crop tool was left has nothing to act on.
+                    DrawToolbarAction::ApplyCrop => {
                         if self.tools.can_apply_crop() {
                             self.dispatch_tool_event(
                                 key_event(LogicalKey::Enter, window.modifiers()),
@@ -11032,13 +11064,14 @@ impl FigView {
                             );
                         }
                     }
-                    DrawToolbarAction::CancelCrop if self.tools.kind() == ToolKind::Crop => {
-                        self.dispatch_tool_event(
-                            key_event(LogicalKey::Escape, window.modifiers()),
-                            cx,
-                        );
+                    DrawToolbarAction::CancelCrop => {
+                        if self.tools.kind() == ToolKind::Crop {
+                            self.dispatch_tool_event(
+                                key_event(LogicalKey::Escape, window.modifiers()),
+                                cx,
+                            );
+                        }
                     }
-                    other => notify_unavailable(&format!("{other:?}"), window, cx),
                 }
             }
             ToolbarAction::CommandQueryChanged { .. } => {}
