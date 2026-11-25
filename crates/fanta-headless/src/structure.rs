@@ -1304,4 +1304,28 @@ mod tests {
         );
         assert!(image_layer_node(&doc, asset, [8, 8], [0.0, 8.0], None, 0.0, 0.0, None).is_err());
     }
+
+    #[test]
+    fn deleting_the_flow_start_frame_clears_it_in_the_same_undo_step() {
+        let (mut doc, page) = page_doc();
+        let start = insert(
+            &mut doc,
+            frame(page, Transform2D::translation(0.0, 0.0), [100.0, 100.0]),
+        );
+        doc.apply(Operation::SetFlowStart {
+            old: None,
+            new: Some(start),
+        })
+        .unwrap();
+        doc.history = Default::default();
+
+        let operations = delete_layers_operations(&doc, &[start]).unwrap();
+        assert!(apply_transaction(&mut doc, "Delete", operations).unwrap());
+
+        assert!(!doc.scene.contains(start));
+        assert_eq!(doc.flow_start, None, "no flow may start at a deleted frame");
+        assert!(doc.undo().unwrap());
+        assert!(doc.scene.contains(start));
+        assert_eq!(doc.flow_start, Some(start), "one Undo restores both");
+    }
 }

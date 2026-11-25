@@ -847,6 +847,36 @@ mod tests {
     }
 
     #[test]
+    fn deleting_the_flow_start_frame_without_clearing_it_is_rejected() {
+        let mut document = Doc::new();
+        let page = document
+            .scene
+            .insert(CanvasNode::new(NodeData::Group(GroupNode::default())))
+            .expect("insert page");
+        document.add_page(page);
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([100.0, 100.0]),
+            ..GroupNode::default()
+        }));
+        frame.parent = Some(page);
+        let frame = document.scene.insert(frame).expect("insert frame");
+        document.flow_start = Some(frame);
+        let snapshot = vec![document.scene.get(frame).expect("frame").clone()];
+        document
+            .apply(fanta_doc::Operation::DeleteSubtree { snapshot })
+            .expect("delete frame");
+
+        let error =
+            RuntimeProgram::from_document(document, BTreeMap::new(), Vec::new(), BTreeMap::new())
+                .err()
+                .expect("a dangling flow start is rejected");
+        assert!(
+            error.to_string().contains("missing starting frame"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn bundles_are_deterministic_and_reload_without_a_parser() {
         let program = program();
         let bundle = program.to_bundle().expect("bundle");

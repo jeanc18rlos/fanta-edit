@@ -502,6 +502,13 @@ pub fn delete_operations(doc: &Doc) -> Vec<Operation> {
             }
         }
     }
+    // Exports reject a flow start that points at a missing frame.
+    if let Some(start) = doc.flow_start.filter(|start| deleted.contains(start)) {
+        operations.push(Operation::SetFlowStart {
+            old: Some(start),
+            new: None,
+        });
+    }
     operations
 }
 
