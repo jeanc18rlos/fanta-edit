@@ -68,4 +68,6 @@ these rules or when the index below is stale.
 | [0029](0029-deliver-business-events-through-the-backend-outbox.md) | Deliver business events through the backend outbox | proposed | 2026-11-07 |
 | [0030](0030-gate-merges-on-one-fast-required-check-and.md) | Gate merges on one fast required check and run each suite on the cheapest platform that can witness it | accepted | 2026-11-12 |
 | [0031](0031-split-the-desktop-layer-into-three-editor-layers.md) | Split the desktop layer into three editor layers | proposed | 2026-11-12 |
+| [0032](0032-return-to-fnx-source-and-export-plain-web.md) | Return to FNX source and export plain web files | proposed | 2026-11-24 |
+| [0033](0033-link-images-and-fonts-by-project-path.md) | Link images and fonts by project path | proposed | 2026-11-24 |
 <!-- decisions:end -->

@@ -52,4 +52,5 @@ has no open tasks. `script/architecture index --check` enforces both in CI.
 | [0012](0012-fast-gated-ci-and-the-agent-harness/spec.md) | Fast, gated CI and the agent harness | in-progress | 2026-11-12 | 0013, 0030 |
 | [0013](0013-split-the-editors-largest-files-and-cap-file-size/spec.md) | Split the editor's largest files and cap file size | draft | 2026-11-12 | 0023, 0031 |
 | [0014](0014-evaluate-the-product-agent-on-design-tasks/spec.md) | Evaluate the product agent on design tasks | draft | 2026-11-12 | — |
+| [0015](0015-return-to-fnx-source-with-linked-images-and/spec.md) | Return to FNX source with linked images and project fonts | draft | 2026-11-24 | 0032, 0033 |
 <!-- specs:end -->
