@@ -1094,12 +1094,12 @@ fn restore_record(
     Ok((run, submission))
 }
 
-fn restore_journal(
-    snapshot: JournalSnapshot,
-    account: Arc<str>,
-) -> Result<(Vec<Submission>, Vec<RunSummary>)> {
+type RestoredJournal = (Vec<Submission>, Vec<RunSummary>, Vec<String>);
+
+fn restore_journal(snapshot: JournalSnapshot, account: Arc<str>) -> Result<RestoredJournal> {
     let mut submissions = Vec::new();
     let mut history = Vec::new();
+    let mut unreadable = Vec::new();
     for record in snapshot.records {
         let key = record.key.clone();
         // One unreadable record (for example from a newer build) must not block the catalog and journal.
@@ -1108,10 +1108,13 @@ fn restore_journal(
                 history.extend(run);
                 submissions.extend(submission);
             }
-            Err(error) => log::warn!("Skipping unreadable saved generation {key}: {error:#}"),
+            Err(error) => {
+                log::warn!("Skipping unreadable saved generation {key}: {error:#}");
+                unreadable.push(key);
+            }
         }
     }
-    Ok((submissions, history))
+    Ok((submissions, history, unreadable))
 }
 
 async fn persist_generation_status(
@@ -1119,7 +1122,7 @@ async fn persist_generation_status(
     response: &mut GenerationResponse,
     account: Option<Arc<str>>,
     cx: &gpui::AsyncApp,
-) -> Result<Option<(Vec<Submission>, Vec<RunSummary>)>> {
+) -> Result<Option<RestoredJournal>> {
     let (changed, observed) = journal.observe_generation(response.saved_result()).await?;
     response.honor_saved_claim(observed.as_ref());
     if !changed {
@@ -1213,6 +1216,7 @@ struct GenerationWorkspace {
     playback_file: Option<tempfile::TempPath>,
     unresolved_submission: Option<Submission>,
     recovered_submissions: Vec<Submission>,
+    unreadable_records: Vec<String>,
     journal: Option<GenerationJournal>,
     _account_task: Task<()>,
     account: Option<Arc<str>>,
@@ -2570,6 +2574,7 @@ impl GenerationWorkspace {
             playback_file: None,
             unresolved_submission: None,
             recovered_submissions: Vec::new(),
+            unreadable_records: Vec::new(),
             journal: None,
             _account_task: account_task,
             account: client.account_access_token(),
@@ -2610,6 +2615,7 @@ impl GenerationWorkspace {
         self.preview_request = None;
         self.unresolved_submission = None;
         self.recovered_submissions.clear();
+        self.unreadable_records.clear();
         self.journal = None;
         self.source = None;
         self.end_frame = None;
@@ -2709,11 +2715,12 @@ impl GenerationWorkspace {
                 this.catalog_task = None;
                 this.catalog_request = None;
                 match result {
-                    Ok((models, journal, (submissions, history), member_id)) => {
+                    Ok((models, journal, (submissions, history, unreadable), member_id)) => {
                         this.models = models;
                         this.journal = Some(journal);
                         this.member_id = Some(member_id);
-                        this.restore_history(submissions, history);
+                        this.error = None;
+                        this.restore_history(submissions, history, unreadable);
                         this.choose_default_model();
                         this.apply_prepared_model();
                         if this.mode.generation_kind().is_some()
@@ -2732,7 +2739,6 @@ impl GenerationWorkspace {
                                 })
                                 .map(|model| model.id.clone());
                         }
-                        this.error = None;
                         // Legacy recovery fixtures provide strict HTTP scripts. Gallery
                         // requests are exercised separately from those submission flows.
                         #[cfg(not(test))]
@@ -2892,7 +2898,17 @@ impl GenerationWorkspace {
         }));
     }
 
-    fn restore_history(&mut self, mut submissions: Vec<Submission>, history: Vec<RunSummary>) {
+    fn restore_history(
+        &mut self,
+        mut submissions: Vec<Submission>,
+        history: Vec<RunSummary>,
+        unreadable: Vec<String>,
+    ) {
+        if self.unreadable_records.is_empty() && !unreadable.is_empty() {
+            self.error =
+                Some("Could not read some saved experiments, so they are not shown.".into());
+        }
+        self.unreadable_records = unreadable;
         self.unresolved_submission = if submissions.is_empty() {
             None
         } else {
@@ -3259,11 +3275,15 @@ impl GenerationWorkspace {
         } = submission;
         let client = self.client.clone();
         let base_url = self.base_url.clone();
+        let unreadable = self.unreadable_records.clone();
         self.pending = false;
         self.error = None;
         self.status = "Saving your request for recovery…".into();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = async {
+                if !unreadable.is_empty() {
+                    journal.release_unreadable(unreadable).await?;
+                }
                 let previous = journal.prepare(saved).await.map_err(|error| anyhow!("{error:#}"))?;
                 let mut response = match &previous.result {
                     Some(SavedRunResult::Generation { id, .. }) => {
@@ -3313,7 +3333,7 @@ impl GenerationWorkspace {
                 anyhow::Ok((response, restored))
             }.await;
             match result {
-                Ok((response, (submissions, history))) => {
+                Ok((response, (submissions, history, unreadable))) => {
                     let run = RunSummary {
                         result: RunResult::Generation { id: response.id.clone() },
                         model, prompt, source, mode,
@@ -3323,7 +3343,7 @@ impl GenerationWorkspace {
                             this.sync_account(cx);
                             return false;
                         }
-                        this.restore_history(submissions, history);
+                        this.restore_history(submissions, history, unreadable);
                         this.active_run = Some(run);
                         this.active_title = None;
                         this.outputs.clear();
@@ -3416,8 +3436,8 @@ impl GenerationWorkspace {
                             }
                             let persistence_error = match persisted {
                                 Ok(restored) => {
-                                    if let Some((submissions, history)) = restored {
-                                        this.restore_history(submissions, history);
+                                    if let Some((submissions, history, unreadable)) = restored {
+                                        this.restore_history(submissions, history, unreadable);
                                     }
                                     None
                                 }
@@ -3572,8 +3592,8 @@ impl GenerationWorkspace {
                         }
                         let persistence_error = match persisted {
                             Ok(restored) => {
-                                if let Some((submissions, history)) = restored {
-                                    this.restore_history(submissions, history);
+                                if let Some((submissions, history, unreadable)) = restored {
+                                    this.restore_history(submissions, history, unreadable);
                                 }
                                 None
                             }
@@ -6784,9 +6804,10 @@ mod tests {
                 record("readable", GenerationMode::Image.label()),
             ],
         };
-        let (submissions, history) =
+        let (submissions, history, unreadable) =
             restore_journal(snapshot, Arc::from("account")).expect("readable records restore");
         assert!(submissions.is_empty());
+        assert_eq!(unreadable, ["from-a-newer-build"]);
         assert_eq!(
             history
                 .iter()
@@ -7776,6 +7797,105 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         assert_generation_recovery_after_tab_close(true, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_recovery_unreadable_saved_requests_do_not_block_generate(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let submissions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let http = http_client::FakeHttpClient::create({
+            let submissions = submissions.clone();
+            move |request| {
+                let submissions = submissions.clone();
+                async move {
+                    let response = match (request.method(), request.uri().path()) {
+                        (&Method::GET, "/v1/models") => json!({"models": []}),
+                        (&Method::GET, "/v1/me") => recovery_account_fixture(),
+                        (&Method::POST, "/v1/generations") => {
+                            let key = request.headers()["Idempotency-Key"].to_str()?.to_owned();
+                            submissions.lock().expect("submission log").push(key);
+                            json!({"id": "after-unreadable", "status": "processing"})
+                        }
+                        route => panic!("Unexpected generation request: {route:?}"),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(response.to_string().into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Image, client.clone(), cx);
+        let journal = view
+            .read_with(cx, |view, _| view.journal.clone())
+            .expect("loaded journal");
+        for index in 0..8 {
+            journal
+                .prepare(SavedSubmission {
+                    key: format!("from-a-newer-build-{index}"),
+                    request: json!({"model": "fanta-hologram-1", "prompt": "A sunrise"}),
+                    model: "fanta-hologram-1".into(),
+                    prompt: "A sunrise".into(),
+                    source: None,
+                    mode: "Hologram".into(),
+                })
+                .await
+                .expect("saved request from a newer build");
+        }
+        let mut reopened_context = cx.cx.clone();
+        cx.update(|window, _| window.remove_window());
+        drop(view);
+        reopened_context.run_until_parked();
+        let (view, cx) =
+            visual_workspace_with_client(GenerationMode::Image, client, &mut reopened_context);
+        view.read_with(cx, |view, _| {
+            assert!(view.unresolved_submission.is_none());
+            assert_eq!(
+                view.error
+                    .as_ref()
+                    .map(|error| error.to_string())
+                    .as_deref(),
+                Some("Could not read some saved experiments, so they are not shown.")
+            );
+        });
+        view.update(cx, |view, cx| {
+            view.submit(
+                Submission {
+                    key: "after-unreadable".into(),
+                    request: json!({"model": "fanta-image-1", "prompt": "A sunrise"}),
+                    model: "fanta-image-1".into(),
+                    prompt: "A sunrise".into(),
+                    source: None,
+                    account,
+                    mode: GenerationMode::Image,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.error.is_none(), "{:?}", view.error);
+            assert_eq!(
+                view.history.first().and_then(RunSummary::generation_id),
+                Some("after-unreadable")
+            );
+        });
+        assert_eq!(
+            *submissions.lock().expect("submission log"),
+            ["after-unreadable"]
+        );
+        let remaining = journal.load().await.expect("journal").records;
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|record| record.key.starts_with("from-a-newer-build"))
+                .count(),
+            7,
+            "only the oldest unreadable request gives way"
+        );
     }
 
     #[gpui::test]

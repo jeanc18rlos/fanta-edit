@@ -259,6 +259,35 @@ impl GenerationJournal {
         }).await
     }
 
+    // The user cannot see or resolve unreadable records, so the oldest give way only when a limit is full.
+    pub(super) async fn release_unreadable(&self, unreadable: Vec<String>) -> Result<()> {
+        self.change(move |journal| {
+            loop {
+                let unresolved_full = journal
+                    .records
+                    .iter()
+                    .filter(|stored| stored.record.result.is_none())
+                    .count()
+                    >= MAX_UNRESOLVED;
+                if !unresolved_full && unfinished_count(journal) < MAX_UNFINISHED {
+                    return Ok(());
+                }
+                let Some(index) = journal.records.iter().rposition(|stored| {
+                    unreadable.contains(&stored.record.key)
+                        && if unresolved_full {
+                            stored.record.result.is_none()
+                        } else {
+                            !record_finished(&stored.record)
+                        }
+                }) else {
+                    return Ok(());
+                };
+                journal.records.remove(index);
+            }
+        })
+        .await
+    }
+
     pub(super) async fn accept(&self, key: &str, result: SavedRunResult) -> Result<JournalRecord> {
         let key = key.to_owned();
         self.change(move |journal| {
