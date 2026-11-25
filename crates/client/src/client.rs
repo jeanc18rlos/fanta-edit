@@ -980,11 +980,16 @@ impl Client {
                 authenticate = self.authenticate(cx).fuse() => {
                     match authenticate {
                         Ok(creds) => {
-                            if IMPERSONATE_LOGIN.is_none() {
-                                self.credentials_provider
+                            if IMPERSONATE_LOGIN.is_none()
+                                && let Err(error) = self
+                                    .credentials_provider
                                     .write_credentials(creds.user_id, creds.access_token.clone(), cx)
                                     .await
-                                    .log_err();
+                            {
+                                log::error!("failed to save credentials: {error:#}");
+                                self.notify_account(
+                                    "Could not save your sign-in to the system keychain, so you will need to sign in again the next time Fanta opens.",
+                                );
                             }
 
                             credentials = Some(creds);
@@ -2285,6 +2290,45 @@ mod tests {
             client.account_notices().borrow().as_deref(),
             Some(
                 "Could not remove your saved sign-in from the system keychain, so Fanta may sign you in again the next time it opens."
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_sign_in_reports_credentials_it_could_not_save(cx: &mut TestAppContext) {
+        init_test(cx);
+        let provider = Arc::new(CountingCredentialsProvider::default());
+        *provider.fail_writes.lock() = true;
+        let client = cx.update(|cx| {
+            cx.set_global(fanta_credentials_provider::FantaCredentialsProvider(
+                provider.clone(),
+            ));
+            Client::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::with_200_response(),
+                cx,
+            )
+        });
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(Credentials {
+                    user_id: 2,
+                    access_token: "new-token".into(),
+                })
+            })
+        });
+
+        client
+            .sign_in(false, &cx.to_async())
+            .await
+            .expect("an unsaved sign-in should still sign in");
+
+        assert_eq!(*client.status().borrow(), Status::Authenticated);
+        assert_eq!(*provider.writes.lock(), 1);
+        assert_eq!(
+            client.account_notices().borrow().as_deref(),
+            Some(
+                "Could not save your sign-in to the system keychain, so you will need to sign in again the next time Fanta opens."
             )
         );
     }
