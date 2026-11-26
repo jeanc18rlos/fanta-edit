@@ -89,7 +89,70 @@ if hashlib.sha256((root / "LICENSE").read_bytes()).hexdigest() != expected:
 PYTHON
 }
 
+# ADR 0026: the engine group of layers.toml is Apache-2.0. Runs its own
+# self-test first, on a temporary tree.
+check_engine_licenses () {
+    python3 - <<'PYTHON'
+import tempfile
+import tomllib
+from pathlib import Path
+
+# Still GPL: the founder's decision on its Spectrum golden fixtures is open
+# (spec 0002, T2). Delete the entry in the change that relicenses the crate.
+HELD_BACK = {"fanta-fig-interop"}
+
+
+def problems(root):
+    layers = tomllib.loads((root / "docs/architecture/layers.toml").read_text())["layer"]
+    engine = sorted(name for layer in layers if layer["group"] == "engine" for name in layer["crates"])
+    found = []
+    for name in engine:
+        directory = root / "crates" / name
+        license = tomllib.loads((directory / "Cargo.toml").read_text())["package"].get("license")
+        if name in HELD_BACK:
+            if license == "Apache-2.0":
+                found.append(f"{name} is Apache-2.0 now: remove it from HELD_BACK in script/check-licenses")
+        elif license != "Apache-2.0":
+            found.append(f'{name} is in the engine group and must say license = "Apache-2.0" (ADR 0026)')
+        elif not (directory / "LICENSE-APACHE").is_symlink() or (directory / "LICENSE-GPL").is_symlink():
+            found.append(f"{name} must link LICENSE-APACHE and not LICENSE-GPL (ADR 0026)")
+    return found
+
+
+def self_test():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / "docs/architecture").mkdir(parents=True)
+        (root / "docs/architecture/layers.toml").write_text(
+            '[[layer]]\ngroup = "engine"\ncrates = ["good", "gpl", "inherits", "unlinked", "fanta-fig-interop"]\n'
+            '[[layer]]\ngroup = "shell"\ncrates = "rest"\n'
+        )
+        crates = {
+            "good": ('"Apache-2.0"', "LICENSE-APACHE"),
+            "gpl": ('"GPL-3.0-or-later"', "LICENSE-GPL"),
+            "inherits": ("{ workspace = true }", "LICENSE-APACHE"),
+            "unlinked": ('"Apache-2.0"', "LICENSE-GPL"),
+            "fanta-fig-interop": ("{ workspace = true }", "LICENSE-GPL"),
+        }
+        for name, (license, link) in crates.items():
+            (root / "crates" / name).mkdir(parents=True)
+            (root / "crates" / name / "Cargo.toml").write_text(f"[package]\nlicense = {license}\n")
+            (root / "crates" / name / link).symlink_to(f"../../{link}")
+        flagged = [problem.split()[0] for problem in problems(root)]
+        assert flagged == ["gpl", "inherits", "unlinked"], flagged
+        (root / "crates/fanta-fig-interop/Cargo.toml").write_text('[package]\nlicense = "Apache-2.0"\n')
+        assert "fanta-fig-interop" in [problem.split()[0] for problem in problems(root)]
+
+
+self_test()
+found = problems(Path("."))
+if found:
+    raise SystemExit("\n".join(f"Error: {problem}" for problem in found))
+PYTHON
+}
+
 check_no_agpl_license_file
+check_engine_licenses
 
 git ls-files -z -- "Cargo.toml" "**/Cargo.toml" | while IFS= read -r -d '' cargo_toml; do
     [[ -f "$cargo_toml" ]] || continue

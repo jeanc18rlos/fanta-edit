@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-license = "GPL-3.0-or-later"
+license = "Apache-2.0"
 description = "The design ops, queries and comment drafts agents edit Fanta designs with, shared by the editor and the headless engine."
 
 [lib]

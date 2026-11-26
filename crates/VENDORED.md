@@ -23,11 +23,20 @@ Changes made while vendoring, and nothing else:
 - `repository`, `homepage`, `documentation` and `readme` were dropped from each
   `[package]` header; this workspace's `[workspace.package]` does not define
   them. `version`, `rust-version` and `license` were added to
-  `[workspace.package]` instead, so the headers still inherit.
+  `[workspace.package]` instead, so the headers inherited them. `license` no
+  longer is: see the first divergence below.
 - Each crate directory gained a `LICENSE-GPL` symlink, as `script/check-licenses`
   requires.
 
 Divergences from upstream made *after* vendoring, to be re-applied on a resync:
+
+- Licence (spec 0002 T2, ADR 0026): `fanta-canvas`, `fanta-doc`, `fanta-fnx`,
+  `fanta-format`, `fanta-present`, `fanta-render`, `fanta-text` and
+  `fanta-tools` set `license = "Apache-2.0"` in their own `[package]` header
+  instead of inheriting it, and link `LICENSE-APACHE` instead of
+  `LICENSE-GPL`. `fanta-fig-interop` still inherits the workspace's `GPL-3.0`
+  and links `LICENSE-GPL` (see `NOTICE.md`). `script/check-licenses` fails if
+  a resync undoes this.
 
 - `fanta-format`: the `AGENTS_MD` seed constant in
   `src/project/layout.rs` was rewritten for this product. The upstream text

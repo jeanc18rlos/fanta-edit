@@ -134,6 +134,8 @@ before attaching them. Send private account or billing reports to
 
 ## License
 
-GPL-3.0-or-later. See `NOTICE.md` and `LICENSE-GPL`.
+The editor is GPL-3.0-or-later (`LICENSE-GPL`). The engine crates listed in
+`NOTICE.md` are Apache-2.0 (`LICENSE-APACHE`). `NOTICE.md` has the scope and
+the third-party notices.
 The editor and vendored engine source are in this repository. The GPUI fork and
 reusable components are published from [fanta-ui](https://github.com/squidred-dev/fanta-ui).

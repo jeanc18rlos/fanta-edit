@@ -262,9 +262,11 @@ impl History {
   task and keep only the before-save snapshot synchronous.
 - **Stray `.fanta/` readers.** Any directory walker that does not skip it
   will index git objects. T4 greps for walkers and adds a test per one.
-- **Licence.** `fanta-format` is GPL today. Publishing the checker under a
-  permissive licence waits for the field change in spec 0002 T2 (ADR 0026
-  chose Apache-2.0 on 2026-11-12); T8 comes after it.
+- **Licence.** `fanta-format` and `fanta-doc` are Apache-2.0 since #231
+  (spec 0002 T2, ADR 0026). `fanta-format` embeds
+  `web/fanta-canvas-web/src/fanta-canvas.js`, which is outside the relicensed
+  crates; T8 waits for the founder's decision on that file, recorded as an
+  open item in spec 0002's `design.md`.
 
 ## Verification
 

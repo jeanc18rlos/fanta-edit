@@ -14,6 +14,12 @@
   then set the crates' `license` to `Apache-2.0` in the editor and update
   `NOTICE.md` (R9). Verify: `script/check-licenses`, and the sweep's list in
   the pull request.
+  Partly done 2026-11-13: the sweep is recorded in `design.md` and 17 crates
+  are Apache-2.0. `fanta-fig-interop` waits for the founder's decision on its
+  golden fixtures. Two more questions for the founder are open in
+  `design.md`: the canvas script `fanta-format` embeds, and Spectrum-derived
+  values in the relicensed crates' tests. `script/check-licenses` now checks
+  the engine group's licence fields and links.
 - [x] **T3.** Rename the cloud worker crate from `fanta-engine` to
   `fanta-worker` (Q2), paired with its deployment change in `fanta-backend`.
   Verify: both repositories' CI. Done in #229: the package, its directory

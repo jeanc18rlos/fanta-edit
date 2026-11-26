@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-license = "GPL-3.0-or-later"
+license = "Apache-2.0"
 description = "The design engine compiled to browser WebAssembly: load a project's files, apply design ops, emit the saved files (spec 0008 T1)."
 
 [lib]
